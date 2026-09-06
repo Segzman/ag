@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""agent - CLI helper for autonomous agents. Single file, stdlib only.
+
+State: ./.agent/ in cwd (override with --dir or $AGENT_CLI_DIR).
+All commands accept --json for machine-readable output:
+  {"ok": true, "cmd": "run", "data": {...}}
+  {"ok": false, "cmd": "run", "error": "...", "hint": "..."}
+"""
+import argparse, fnmatch, hashlib, json, os, re, shlex, subprocess, sys, time
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.1.0"
+MAX_OUT = 20000
+HISTORY_KEEP = 500
+DANGEROUS = [
+    (r"\brm\s+.*-[a-z]*r.*\s+/(?:\s|$)", "rm -rf /"),
+    (r"\brm\s+.*-[a-z]*r.*\s+~(?:\s|$|/)", "rm -rf home"),
+    (r"\bmkfs\b", "mkfs"),
+    (r"\bdd\b.*\bof=/dev/", "dd to device"),
+    (r":\(\)\s*\{\s*:\|\:&\s*\}", "fork bomb"),
+    (r"\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b", "shutdown/reboot"),
+    (r"\bchmod\s+-R\s+777\s+/", "chmod 777 /"),
+    (r">\s*/dev/sd[a-z]", "overwrite disk"),
+    (r"curl\b.*\|\s*(ba)?sh\b", "curl-pipe-shell"),
+    (r"wget\b.*\|\s*(ba)?sh\b", "wget-pipe-shell"),
+]
+
+def state_dir(explicit=None):
+    d = explicit or os.environ.get("AGENT_CLI_DIR")
+    if d: return Path(d).expanduser()
+    return Path.cwd() / ".agent"
+
+def ensure_state(sdir):
+    sdir.mkdir(parents=True, exist_ok=True)
+    for f, init in (("todos.json","[]"), ("approvals.json","[]")):
+        p = sdir / f
+        if not p.exists(): p.write_text(init)
+    for f in ("notes.jsonl","history.jsonl",):
+        p = sdir / f
+        if not p.exists(): p.touch()
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def emit(args, cmd, data=None, error=None, hint=None):
+    if getattr(args, "json", False):
+        obj = {"ok": error is None, "cmd": cmd}
+        if error is None: obj["data"] = data or {}
+        else:
+            obj["error"] = error
+            if hint: obj["hint"] = hint
+        print(json.dumps(obj))
+    else:
+        if error is not None:
+            print(f"error: {error}", file=sys.stderr)
+            if hint: print(f"hint: {hint}", file=sys.stderr)
+        elif isinstance(data, dict) and "_text" in data:
+            print(data["_text"])
+        elif data is not None:
+            print(json.dumps(data, indent=2))
+    return 0 if error is None else 1
+
+def cmd_hash(cmd_list):
+    return hashlib.sha256(json.dumps(cmd_list).encode()).hexdigest()[:16]
+
+def check_dangerous(cmd_str, sdir):
+    for pat, reason in DANGEROUS:
+        if re.search(pat, cmd_str):
+            # approved within 10 min?
+            try: approvals = json.loads((sdir/"approvals.json").read_text())
+            except Exception: approvals = []
+            h = hashlib.sha256(cmd_str.encode()).hexdigest()[:16]
+            for a in approvals:
+                if a.get("cmd_hash")==h and a.get("status")=="approved":
+                    if time.time()-a.get("approved_at",0) < 600: return None
+            return reason
+    return None
+
+def do_run(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    if not a.cmd:
+        return emit(a, "run", error="no command given", hint='agent run -- echo hi')
+    cmd_str = " ".join(a.cmd) if len(a.cmd)>1 or " " in a.cmd[0] else a.cmd[0]
+    # approval gate
+    reason = check_dangerous(cmd_str, sdir)
+    if reason and not a.force:
+        h = hashlib.sha256(cmd_str.encode()).hexdigest()[:16]
+        try: approvals = json.loads((sdir/"approvals.json").read_text())
+        except Exception: approvals = []
+        rid = h[:8]
+        if not any(x.get("id")==rid and x.get("status")=="pending" for x in approvals):
+            approvals.append({"id":rid,"cmd_hash":h,"cmd":cmd_str,"reason":reason,
+                "status":"pending","ts":now_iso()})
+            (sdir/"approvals.json").write_text(json.dumps(approvals, indent=2))
+        return emit(a, "run", error=f"blocked: {reason}",
+            hint=f"review then: agent approve {rid} && agent run --force -- {cmd_str}")
+    env = dict(os.environ)
+    for kv in (a.env or []):
+        if "=" in kv: k,v = kv.split("=",1); env[k]=v
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd_str, shell=True, capture_output=True, text=True,
+            timeout=a.timeout, cwd=a.cwd or None, env=env)
+        rc, out, err = p.returncode, p.stdout or "", p.stderr or ""
+    except subprocess.TimeoutExpired as e:
+        rc, out, err = 124, (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout,bytes) else (e.stdout or ""), f"timeout after {a.timeout}s"
+    dur = int((time.time()-t0)*1000)
+    trunc = len(out)>MAX_OUT or len(err)>MAX_OUT
+    data = {"exit":rc,"duration_ms":dur,"truncated":trunc,
+        "stdout":out[:MAX_OUT],"stderr":err[:MAX_OUT],
+        "cmd":cmd_str,"cwd":a.cwd or os.getcwd()}
+    # log
+    try:
+        with open(sdir/"history.jsonl","a") as f:
+            f.write(json.dumps({"ts":now_iso(),"cmd":cmd_str,"exit":rc,"dur_ms":dur})+"\n")
+        hist = (sdir/"history.jsonl").read_text().splitlines()
+        if len(hist)>HISTORY_KEEP:
+            (sdir/"history.jsonl").write_text("\n".join(hist[-HISTORY_KEEP:])+"\n")
+    except Exception: pass
+    if getattr(a,"json",False): return emit(a,"run",data)
+    if out: print(out, end="" if out.endswith("\n") else "\n")
+    if err: print(err, end="", file=sys.stderr)
+    if rc!=0: return emit(a,"run",error=f"exit {rc}", hint="use --json to get stdout/stderr parsed")
+    return emit(a,"run",{"_text":f"ok exit=0 {dur}ms","exit":0,"duration_ms":dur})
+
+def do_read(a):
+    p = Path(a.path).expanduser()
+    if not p.is_file(): return emit(a,"read",error=f"not a file: {a.path}")
+    lines = p.read_text(errors="replace").splitlines()
+    total = len(lines)
+    off = max(1,a.offset or 1)-1
+    chunk = lines[off:off+(a.limit or 200)]
+    text = "\n".join(f"{i+off+1}: {l}" for i,l in enumerate(chunk))
+    if getattr(a,"json",False):
+        return emit(a,"read",{"path":str(p),"total_lines":total,"offset":off+1,"lines":chunk})
+    return emit(a,"read",{"_text":text or "(empty)"})
+
+def do_write(a):
+    p = Path(a.path).expanduser()
+    text = a.text if a.text is not None else sys.stdin.read()
+    if a.mkdir: p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.parent.exists(): return emit(a,"write",error=f"no such dir: {p.parent}", hint="retry with --mkdir")
+    p.write_text(text)
+    return emit(a,"write",{"_text":f"wrote {len(text)}B -> {p}","path":str(p),"bytes":len(text)})
+
+def do_edit(a):
+    p = Path(a.path).expanduser()
+    if not p.is_file(): return emit(a,"edit",error=f"not a file: {a.path}")
+    src = p.read_text()
+    old = a.old if a.old is not None else sys.stdin.read()
+    if not old: return emit(a,"edit",error="empty --old", hint="pass --old OLD --new NEW")
+    n = src.count(old)
+    if n==0: return emit(a,"edit",error="oldString not found")
+    if n>1 and not a.replace_all:
+        return emit(a,"edit",error=f"found {n}x, ambiguous", hint="add --replace-all or widen context")
+    new = a.new or ""
+    p.write_text(src.replace(old,new) if a.replace_all else src.replace(old,new,1))
+    return emit(a,"edit",{"_text":f"edited {p} ({n}x)" if a.replace_all else f"edited {p}","path":str(p),"count":n if a.replace_all else 1})
+
+def do_ls(a):
+    root = Path(a.root or ".")
+    pat = a.pattern or "*"
+    hits = [str(p) for p in root.rglob("*") if fnmatch.fnmatch(p.name,pat) or fnmatch.fnmatch(str(p),pat)]
+    hits = sorted(h for h in hits if ".agent" not in h)[:500]
+    if getattr(a,"json",False): return emit(a,"ls",{"root":str(root),"pattern":pat,"files":hits})
+    return emit(a,"ls",{"_text":"\n".join(hits) or "(none)"})
+
+def do_grep(a):
+    root = Path(a.path or ".")
+    rx = re.compile(a.pattern)
+    inc = a.include or "*"
+    out, scanned = [], 0
+    for p in root.rglob("*"):
+        if not p.is_file() or ".agent" in str(p) or ".git/" in str(p): continue
+        if not fnmatch.fnmatch(p.name,inc): continue
+        try:
+            if p.stat().st_size>1_000_000: continue
+            txt = p.read_text(errors="replace")
+        except Exception: continue
+        scanned += 1
+        for i,l in enumerate(txt.splitlines(),1):
+            if rx.search(l):
+                out.append({"file":str(p),"line":i,"text":l[:300]})
+                if len(out)>= (a.max or 50): break
+        if len(out)>= (a.max or 50): break
+        if scanned>5000: break
+    if getattr(a,"json",False): return emit(a,"grep",{"matches":out,"scanned":scanned})
+    txt = "\n".join(f'{m["file"]}:{m["line"]}: {m["text"]}' for m in out) or "(none)"
+    return emit(a,"grep",{"_text":txt})
+
+def do_note(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    text = " ".join(a.text or []).strip()
+    if not text and not sys.stdin.isatty(): text = sys.stdin.read().strip()
+    if not text: return emit(a,"note",error="empty note")
+    with open(sdir/"notes.jsonl","a") as f:
+        f.write(json.dumps({"ts":now_iso(),"tag":a.tag or "","text":text})+"\n")
+    return emit(a,"note",{"_text":"noted","ts":now_iso()})
+
+def do_notes(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    try: rows = [json.loads(l) for l in (sdir/"notes.jsonl").read_text().splitlines() if l.strip()]
+    except Exception: rows = []
+    if a.grep: rows = [r for r in rows if a.grep.lower() in r.get("text","").lower()]
+    rows = rows[-(a.limit or 20):]
+    if getattr(a,"json",False): return emit(a,"notes",{"notes":rows})
+    txt = "\n".join(f'{r.get("ts","")} [{r.get("tag","")}] {r.get("text","")}' for r in rows) or "(none)"
+    return emit(a,"notes",{"_text":txt})
+
+def load_todos(sdir):
+    try: return json.loads((sdir/"todos.json").read_text())
+    except Exception: return []
+
+def do_todo(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    todos = load_todos(sdir)
+    if a.sub=="add":
+        text = " ".join(a.text or []).strip()
+        if not text: return emit(a,"todo",error="empty todo")
+        nid = (max([t["id"] for t in todos], default=0)+1)
+        todos.append({"id":nid,"text":text,"done":False,"ts":now_iso()})
+        (sdir/"todos.json").write_text(json.dumps(todos,indent=2))
+        return emit(a,"todo",{"_text":f"#{nid} added","id":nid})
+    if a.sub=="list":
+        open_only = not a.all
+        rows = [t for t in todos if not (open_only and t["done"])]
+        if getattr(a,"json",False): return emit(a,"todo",{"todos":rows})
+        txt = "\n".join(f'[{"x" if t["done"] else " "}] #{t["id"]} {t["text"]}' for t in rows) or "(none)"
+        return emit(a,"todo",{"_text":txt})
+    if a.sub=="done":
+        for t in todos:
+            if t["id"]==a.id: t["done"]=True
+        (sdir/"todos.json").write_text(json.dumps(todos,indent=2))
+        return emit(a,"todo",{"_text":f"#{a.id} done"})
+    if a.sub=="clear":
+        todos = [] if not a.done_only else [t for t in todos if not t["done"]]
+        (sdir/"todos.json").write_text(json.dumps(todos,indent=2))
+        return emit(a,"todo",{"_text":"cleared"})
+
+def do_history(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    try: rows = [json.loads(l) for l in (sdir/"history.jsonl").read_text().splitlines() if l.strip()]
+    except Exception: rows = []
+    rows = rows[-(a.limit or 20):]
+    if getattr(a,"json",False): return emit(a,"history",{"history":rows})
+    txt = "\n".join(f'{r.get("ts","")} exit={r.get("exit")} {r.get("dur_ms")}ms {r.get("cmd")}' for r in rows) or "(none)"
+    return emit(a,"history",{"_text":txt})
+
+def do_approvals(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    try: rows = json.loads((sdir/"approvals.json").read_text())
+    except Exception: rows = []
+    if getattr(a,"json",False): return emit(a,"approvals",{"approvals":rows})
+    txt = "\n".join(f'{r["id"]} [{r["status"]}] {r["reason"]}: {r["cmd"]}' for r in rows) or "(none)"
+    return emit(a,"approvals",{"_text":txt})
+
+def do_approve(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    try: rows = json.loads((sdir/"approvals.json").read_text())
+    except Exception: rows = []
+    for r in rows:
+        if r["id"]==a.id: r["status"]="approved"; r["approved_at"]=time.time()
+    else:
+        if not any(r["id"]==a.id for r in rows):
+            return emit(a,"approve",error=f"no such id: {a.id}")
+    (sdir/"approvals.json").write_text(json.dumps(rows,indent=2))
+    return emit(a,"approve",{"_text":f"{a.id} approved 10min"})
+
+def do_shell(a):
+    print(f"agent shell v{VERSION} (type exit, --json for machine mode)")
+    js = False
+    while True:
+        try: line = input("agent> ").strip()
+        except (EOFError,KeyboardInterrupt): break
+        if not line: continue
+        if line in ("exit","quit"): break
+        if line=="--json": js=True; continue
+        if line=="--text": js=False; continue
+        parts = shlex.split(line)
+        # dispatch one level: reuse main parser
+        rc = main(parts+ (["--json"] if js and "--json" not in parts else []))
+    return 0
+
+def do_selfcheck(a):
+    import tempfile
+    td = Path(tempfile.mkdtemp(prefix="agent-check-"))
+    class A: pass
+    def mk(**k):
+        o=A(); o.__dict__.update({"dir":str(td),"json":True,"timeout":5,"cwd":None,"env":[],"force":False,
+            "offset":1,"limit":200,"mkdir":False,"text":None,"old":None,"new":None,"replace_all":False,
+            "pattern":"*","root":".","path":".","include":"*","max":50,"tag":"","grep":None,"all":False,
+            "sub":None,"id":0,"done_only":False})
+        o.__dict__.update(k); return o
+    import io, contextlib
+    buf=io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert do_run(mk(cmd=["echo hi"]))==0
+        assert do_write(mk(path=str(td/"f.txt"),text="a\nb\n"))==0
+        assert do_read(mk(path=str(td/"f.txt")))==0
+        assert do_edit(mk(path=str(td/"f.txt"),old="a",new="z"))==0
+        assert "z" in (td/"f.txt").read_text()
+        assert do_note(mk(text=["hello"]))==0
+        assert do_todo(mk(sub="add",text=["task1"]))==0
+        assert do_todo(mk(sub="list"))==0
+        assert do_todo(mk(sub="done",id=1))==0
+        # danger blocked
+        rc = do_run(mk(cmd=["rm -rf /"]))
+        assert rc==1, "danger should block"
+    print(f"selfcheck ok ({td})")
+    return 0
+
+def build():
+    p = argparse.ArgumentParser(prog="agent", description="CLI helper for autonomous agents")
+    p.add_argument("--dir", default=None, help="state dir (default ./.agent)")
+    p.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    p.add_argument("--version", action="store_true")
+    sub = p.add_subparsers(dest="subcmd")
+    r = sub.add_parser("run", help="run shell cmd, logged"); r.add_argument("--timeout",type=int,default=30)
+    r.add_argument("--cwd",default=None); r.add_argument("--env",action="append",default=[])
+    r.add_argument("--force",action="store_true"); r.add_argument("cmd",nargs=argparse.REMAINDER)
+    rd = sub.add_parser("read",help="read file numbered"); rd.add_argument("path")
+    rd.add_argument("--offset",type=int,default=1); rd.add_argument("--limit",type=int,default=200)
+    w = sub.add_parser("write",help="write file (arg or stdin)"); w.add_argument("path")
+    w.add_argument("--text",default=None); w.add_argument("--mkdir",action="store_true")
+    e = sub.add_parser("edit",help="exact-string replace"); e.add_argument("path")
+    e.add_argument("--old",default=None); e.add_argument("--new",default=""); e.add_argument("--replace-all",action="store_true")
+    l = sub.add_parser("ls",help="glob files"); l.add_argument("pattern",nargs="?",default="*"); l.add_argument("--root",default=".")
+    g = sub.add_parser("grep",help="regex search"); g.add_argument("pattern"); g.add_argument("--path",default=".")
+    g.add_argument("--include",default="*"); g.add_argument("--max",type=int,default=50)
+    n = sub.add_parser("note",help="append memory"); n.add_argument("text",nargs="*"); n.add_argument("--tag",default="")
+    ns = sub.add_parser("notes",help="list memory"); ns.add_argument("--limit",type=int,default=20); ns.add_argument("--grep",default=None)
+    t = sub.add_parser("todo",help="task list"); ts=t.add_subparsers(dest="sub",required=True)
+    ta=ts.add_parser("add"); ta.add_argument("text",nargs="*")
+    tl=ts.add_parser("list"); tl.add_argument("--all",action="store_true")
+    td=ts.add_parser("done"); td.add_argument("id",type=int)
+    tc=ts.add_parser("clear"); tc.add_argument("--done-only",action="store_true")
+    h = sub.add_parser("history",help="run log"); h.add_argument("--limit",type=int,default=20)
+    sub.add_parser("approvals",help="list approval requests")
+    ap=sub.add_parser("approve",help="approve blocked cmd"); ap.add_argument("id")
+    sub.add_parser("shell",help="interactive REPL")
+    sub.add_parser("selfcheck",help="run built-in checks")
+    return p
+
+def main(argv=None):
+    if argv is None: argv = sys.argv[1:]
+    # --json anywhere (agents type `agent run --json -- ...`)
+    want_json = "--json" in argv
+    argv = [x for x in argv if x != "--json"]
+    p = build()
+    a = p.parse_args(argv)
+    if want_json: a.json = True
+    if getattr(a, "version", False): print(VERSION); return 0
+    if not getattr(a, "subcmd", None): p.print_help(); return 1
+    # strip leading -- from run
+    if a.subcmd=="run" and a.cmd and a.cmd[0]=="--": a.cmd=a.cmd[1:]
+    fn = {"run":do_run,"read":do_read,"write":do_write,"edit":do_edit,"ls":do_ls,
+        "grep":do_grep,"note":do_note,"notes":do_notes,"todo":do_todo,"history":do_history,
+        "approvals":do_approvals,"approve":do_approve,"shell":do_shell,"selfcheck":do_selfcheck}[a.subcmd]
+    return fn(a)
+
+if __name__=="__main__":
+    sys.exit(main())

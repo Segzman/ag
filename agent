@@ -7,7 +7,7 @@ All commands accept --json for machine-readable output:
   {"ok": true, "cmd": "run", "data": {...}}
   {"ok": false, "cmd": "run", "error": "...", "hint": "..."}
 """
-import argparse, fnmatch, hashlib, json, os, re, shlex, subprocess, sys, time
+import argparse, fnmatch, hashlib, json, os, re, shlex, shutil, subprocess, sys, threading, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -256,16 +256,20 @@ def do_approvals(a):
     txt = "\n".join(f'{r["id"]} [{r["status"]}] {r["reason"]}: {r["cmd"]}' for r in rows) or "(none)"
     return emit(a,"approvals",{"_text":txt})
 
-def do_approve(a):
-    sdir = state_dir(a.dir); ensure_state(sdir)
+def approve_id(sdir, rid):
     try: rows = json.loads((sdir/"approvals.json").read_text())
     except Exception: rows = []
+    ok = False
     for r in rows:
-        if r["id"]==a.id: r["status"]="approved"; r["approved_at"]=time.time()
-    else:
-        if not any(r["id"]==a.id for r in rows):
-            return emit(a,"approve",error=f"no such id: {a.id}")
-    (sdir/"approvals.json").write_text(json.dumps(rows,indent=2))
+        if r["id"]==rid or r["id"].startswith(rid):
+            r["status"]="approved"; r["approved_at"]=time.time(); ok=True
+    if ok: (sdir/"approvals.json").write_text(json.dumps(rows,indent=2))
+    return ok
+
+def do_approve(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    if not approve_id(sdir, a.id):
+        return emit(a,"approve",error=f"no such id: {a.id}")
     return emit(a,"approve",{"_text":f"{a.id} approved 10min"})
 
 # ---- live pty sessions: non-blocking spawn, many readers, event pings ----
@@ -560,6 +564,173 @@ def do_shell(a):
         rc = main(parts+ (["--json"] if js and "--json" not in parts else []))
     return 0
 
+# ---- harness: sub-agents use YOUR setup, portable for others ----
+# ponytail: tar bundle + manifest, no new deps. Ceilings: redaction is
+# pattern-based (audit before sharing); ~/.claude.json + credentials NEVER exported.
+HARNESS_HOME_KEEP = ["agents","skills","commands"]
+HARNESS_HOME_FILES = ["settings.json","CLAUDE.md"]
+HARNESS_PROJ = ["CLAUDE.md",".claude",".mcp.json","opencode.json",".opencode"]
+REDACT_KEYS = re.compile(r"api.?key|token|secret|passwd|password|auth|bearer|cookie|session", re.I)
+REDACT_VALS = re.compile(r"sk-ant-[A-Za-z0-9\-_]{10,}|sk-[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{10,}|xox[bpas]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9\-_]{20,}")
+
+def _redact_json(obj, path=""):
+    red = []
+    if isinstance(obj, dict):
+        for k,v in obj.items():
+            p = f"{path}.{k}" if path else str(k)
+            if REDACT_KEYS.search(k or ""):
+                if isinstance(v,(dict,list)): red += _redact_json(v,p)
+                else: obj[k]="REDACTED"; red.append(p)
+            elif isinstance(v,str) and REDACT_VALS.search(v):
+                obj[k]="REDACTED"; red.append(p)
+            elif isinstance(v,(dict,list)): red += _redact_json(v,p)
+    elif isinstance(obj, list):
+        for i,v in enumerate(obj):
+            p = f"{path}[{i}]"
+            if isinstance(v,str) and REDACT_VALS.search(v):
+                obj[i]="REDACTED"; red.append(p)
+            elif isinstance(v,(dict,list)): red += _redact_json(v,p)
+    return red
+
+def harness_inventory(home, cwd):
+    inv = {"home":str(home),"cwd":str(cwd),"claude_home":[],"project":[],"env":{},"notes":[]}
+    ch = home/".claude"
+    if ch.is_dir():
+        for d in HARNESS_HOME_KEEP:
+            p = ch/d
+            if p.is_dir():
+                inv["claude_home"].append({"path":f"~/.claude/{d}",
+                    "files":sum(1 for _ in p.rglob("*") if _.is_file())})
+        for f in HARNESS_HOME_FILES:
+            p = ch/f
+            if p.is_file():
+                inv["claude_home"].append({"path":f"~/.claude/{f}","bytes":p.stat().st_size})
+    else: inv["notes"].append("no ~/.claude")
+    for f in HARNESS_PROJ:
+        p = cwd/f
+        if p.exists(): inv["project"].append({"path":f,"dir":p.is_dir()})
+    for k in ("ANTHROPIC_API_KEY","OPENAI_API_KEY","GEMINI_API_KEY","GOOGLE_API_KEY"):
+        if os.environ.get(k): inv["env"][k]="set"
+    inv["notes"].append("never exported: ~/.claude.json, *credentials*, *local.json")
+    return inv
+
+def harness_export(home, cwd, out):
+    import tarfile, io
+    manifest = {"version":1,"exported_at":now_iso(),"redacted":[],"files":[]}
+    def add(tar, full, arc):
+        if full.is_dir():
+            for f in sorted(full.rglob("*")):
+                if f.is_file(): add(tar,f,arc+"/"+f.relative_to(full).as_posix())
+            return
+        data = full.read_bytes()
+        if full.suffix==".json":
+            try:
+                o = json.loads(data.decode())
+                red = _redact_json(o)
+                if red: manifest["redacted"].append({"file":arc,"paths":red})
+                data = json.dumps(o,indent=2).encode()
+            except Exception: pass
+        ti = tarfile.TarInfo(arc); ti.size=len(data); ti.mtime=int(time.time())
+        tar.addfile(ti, io.BytesIO(data))
+        manifest["files"].append(arc)
+    with tarfile.open(out,"w:gz") as tar:
+        ch = home/".claude"
+        if ch.is_dir():
+            for d in HARNESS_HOME_KEEP:
+                if (ch/d).is_dir(): add(tar,ch/d,f"claude-home/{d}")
+            for f in HARNESS_HOME_FILES:
+                if (ch/f).is_file(): add(tar,ch/f,f"claude-home/{f}")
+        for f in HARNESS_PROJ:
+            p = cwd/f
+            if p.exists(): add(tar,p,f"project/{f}")
+        raw = json.dumps(manifest,indent=2).encode()
+        ti = tarfile.TarInfo("manifest.json"); ti.size=len(raw); ti.mtime=int(time.time())
+        tar.addfile(ti, io.BytesIO(raw))
+    return manifest
+
+def harness_import(bundle, home_to, proj_to, force=False):
+    import tarfile
+    wrote, skipped = [], []
+    with tarfile.open(bundle,"r:gz") as tar:
+        names = tar.getnames()
+        man = json.loads(tar.extractfile("manifest.json").read().decode()) if "manifest.json" in names else {}
+        for m in tar.getmembers():
+            if not m.isfile() or m.name=="manifest.json": continue
+            if ".." in m.name.split("/") or m.name.startswith("/"):
+                skipped.append(m.name); continue
+            if m.name.startswith("claude-home/"): dest = home_to/m.name[len("claude-home/"):]
+            elif m.name.startswith("project/"): dest = proj_to/m.name[len("project/"):]
+            else: skipped.append(m.name); continue
+            if dest.exists() and not force: skipped.append(m.name); continue
+            dest.parent.mkdir(parents=True,exist_ok=True)
+            dest.write_bytes(tar.extractfile(m).read())
+            wrote.append(str(dest))
+    return {"wrote":wrote,"skipped":skipped,"redacted":man.get("redacted",[]),
+        "hint":"fill REDACTED keys, then: agent harness link --to <project>"}
+
+def _copy_missing(src, dst):
+    n = 0
+    if src.is_dir():
+        for f in src.rglob("*"):
+            if not f.is_file(): continue
+            t = dst/f.relative_to(src)
+            if t.exists(): continue
+            t.parent.mkdir(parents=True,exist_ok=True)
+            t.write_bytes(f.read_bytes()); n += 1
+    elif not dst.exists():
+        dst.parent.mkdir(parents=True,exist_ok=True)
+        dst.write_bytes(src.read_bytes()); n += 1
+    return n
+
+def harness_link(home, cwd, dest):
+    linked, missing = [], []
+    for f in HARNESS_PROJ:
+        p = cwd/f
+        if not p.exists(): missing.append(f); continue
+        linked.append(f"{f} ({_copy_missing(p,dest/f)} new)")
+    ch = home/".claude"
+    for d in HARNESS_HOME_KEEP:
+        p = ch/d
+        if not p.is_dir(): missing.append(f"~/.claude/{d}"); continue
+        linked.append(f".claude/{d} ({_copy_missing(p,dest/'.claude'/d)} new)")
+    return {"linked":linked,"missing":missing,"dest":str(dest)}
+
+def do_harness(a):
+    home = Path(a.home).expanduser() if getattr(a,"home",None) else Path.home()
+    cwd = Path.cwd()
+    if a.sub=="show":
+        inv = harness_inventory(home,cwd)
+        if getattr(a,"json",False): return emit(a,"harness",inv)
+        t = ["== claude home =="]
+        t += [f'{e["path"]} ({e.get("files",e.get("bytes"))})' for e in inv["claude_home"]] or ["(none)"]
+        t += ["== project =="] + [e["path"] for e in inv["project"]] or ["(none)"]
+        t += ["== env keys set =="] + list(inv["env"]) or ["(none)"]
+        t += ["note: "+n for n in inv["notes"]]
+        return emit(a,"harness",{"_text":"\n".join(t)})
+    if a.sub=="export":
+        out = a.file or "harness.tgz"
+        man = harness_export(home,cwd,out)
+        data = {"bundle":out,"files":len(man["files"]),"redacted":man["redacted"]}
+        if getattr(a,"json",False): return emit(a,"harness",data)
+        r = len(man["redacted"])
+        return emit(a,"harness",{"_text":f"exported {len(man['files'])} files -> {out} ({r} redacted)",
+            **data})
+    if a.sub=="import":
+        if not a.file: return emit(a,"harness",error="no bundle given")
+        res = harness_import(Path(a.file),
+            Path(a.home_to).expanduser() if a.home_to else home/".claude",
+            Path(a.project_to).expanduser() if a.project_to else cwd, a.force)
+        if getattr(a,"json",False): return emit(a,"harness",res)
+        t = [f'wrote {len(res["wrote"])} files, skipped {len(res["skipped"])}']
+        t += ["fill REDACTED keys, then link into a project"] if res["redacted"] else []
+        return emit(a,"harness",{"_text":"\n".join(t),**res})
+    if a.sub=="link":
+        if not getattr(a,"to",None): return emit(a,"harness",error="no --to dir")
+        res = harness_link(home,cwd,Path(a.to).expanduser())
+        if getattr(a,"json",False): return emit(a,"harness",res)
+        t = ["linked:"]+res["linked"]+["missing:"]+res["missing"] or ["(empty setup)"]
+        return emit(a,"harness",{"_text":"\n".join(t),**res})
+
 def do_selfcheck(a):
     import tempfile
     td = Path(tempfile.mkdtemp(prefix="agent-check-"))
@@ -570,7 +741,8 @@ def do_selfcheck(a):
             "pattern":"*","root":".","path":".","include":"*","max":50,"tag":"","grep":None,"all":False,
             "sub":None,"id":0,"done_only":False,
             "name":"","cols":100,"rows":30,"on_exit":"","sess":"","key":None,"no_enter":False,
-            "since":None,"clean":False,"session":None,"sp":""})
+            "since":None,"clean":False,"session":None,"sp":"",
+            "home":None,"file":None,"home_to":None,"project_to":None,"to":None})
         o.__dict__.update(k); return o
     import io, contextlib
     buf=io.StringIO()
@@ -587,6 +759,23 @@ def do_selfcheck(a):
         # danger blocked
         rc = do_run(mk(cmd=["rm -rf /"]))
         assert rc==1, "danger should block"
+        # harness roundtrip on fake home/cwd (never touches real secrets)
+        fh=td/"fakehome"; fc=td/"fakecwd"
+        (fh/".claude"/"skills").mkdir(parents=True)
+        (fh/".claude"/"skills"/"s.md").write_text("hi")
+        (fh/".claude"/"settings.json").write_text(json.dumps({"api_key":"sk-ant-SECRET1234567890","model":"x"}))
+        (fc/".claude").mkdir(parents=True); (fc/"CLAUDE.md").write_text("rules")
+        man=harness_export(fh,fc,td/"h.tgz")
+        assert (td/"h.tgz").exists()
+        assert any(r["file"].endswith("settings.json") for r in man["redacted"])
+        r=harness_import(td/"h.tgz",td/"ihome",td/"iproj")
+        assert (td/"ihome"/"skills"/"s.md").exists() and (td/"iproj"/"CLAUDE.md").exists()
+        assert "REDACTED" in (td/"ihome"/"settings.json").read_text()
+        assert "sk-ant-SECRET" not in (td/"h.tgz").read_bytes().decode(errors="replace")
+        r2=harness_link(fh,fc,td/"linked")
+        assert (td/"linked"/"CLAUDE.md").exists()
+        assert (td/"linked"/".claude"/"skills"/"s.md").exists()
+        assert do_harness(mk(sub="show",home=str(fh)))==0
         # live pty sessions
         if os.name=="posix":
             import time as _t
@@ -663,6 +852,11 @@ def build():
     w8 = sub.add_parser("wait",help="block until session exits (opt-in only)"); w8.add_argument("sess"); w8.add_argument("--timeout",type=int,default=30)
     ev = sub.add_parser("events",help="pings: spawn/send/exit feed"); ev.add_argument("--limit",type=int,default=20); ev.add_argument("--session",default=None)
     dm = sub.add_parser("_daemon",help=argparse.SUPPRESS); dm.add_argument("sp")
+    h = sub.add_parser("harness",help="share your Claude setup with sub-agents"); hs=h.add_subparsers(dest="sub",required=True)
+    hshow=hs.add_parser("show"); hshow.add_argument("--home",default=None)
+    hexp=hs.add_parser("export"); hexp.add_argument("file",nargs="?",default=None); hexp.add_argument("--home",default=None)
+    himp=hs.add_parser("import"); himp.add_argument("file"); himp.add_argument("--home",default=None); himp.add_argument("--home-to",default=None); himp.add_argument("--project-to",default=None); himp.add_argument("--force",action="store_true")
+    hlink=hs.add_parser("link"); hlink.add_argument("--to",default=None); hlink.add_argument("--home",default=None)
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
     return p
@@ -683,7 +877,8 @@ def main(argv=None):
         "grep":do_grep,"note":do_note,"notes":do_notes,"todo":do_todo,"history":do_history,
         "approvals":do_approvals,"approve":do_approve,"shell":do_shell,"selfcheck":do_selfcheck,
         "spawn":do_spawn,"send":do_send,"snap":do_snap,"sessions":do_sessions,
-        "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon}[a.subcmd]
+        "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon,
+        "harness":do_harness}[a.subcmd]
     return fn(a)
 
 if __name__=="__main__":

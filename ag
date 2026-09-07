@@ -751,9 +751,10 @@ MODELS = {
     "gemini": ["default","gemini-2.5-pro","gemini-2.5-flash"],
     "codex": ["default"],
     "cursor": ["default","sonnet-4","sonnet-4-thinking","gpt-5"],
+    "echo": ["default"],
 }
 PROBES = {"claude":["claude","--version"],"opencode":["opencode","--version"],
-    "gemini":["gemini","--version"],"codex":["codex","--version"]}
+    "gemini":["gemini","--version"],"codex":["codex","--version"],"echo":["printf","ok"]}
 
 def cycle_model(backend, cur):
     opts = MODELS.get(backend,["default"])
@@ -786,6 +787,8 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt=""):
         if m: argv += ["--model",m]
         if sid: argv += ["--resume",sid]
         return argv + [prompt]
+    if backend=="echo":
+        return ["printf","%s\n",prompt]
     raise ValueError(f"unknown backend: {backend}")
 
 def _cursor_bin():
@@ -879,6 +882,7 @@ def do_agents(a):
                 hint = ""
                 if not ok and b=="codex": hint = "reinstall: npm i -g @openai/codex"
                 if b=="gemini" and ok: hint = "free tier retired; needs Antigravity or API key"
+                if b=="echo" and ok: hint = "local plumbing-test backend"
                 rows.append({"backend":b,"ok":ok,"version":ver,"hint":hint})
             except FileNotFoundError:
                 rows.append({"backend":b,"ok":False,"version":"","hint":"not on PATH"})
@@ -1227,7 +1231,7 @@ KEYS_HELP = """ag keys
  sessions: spawn -- <cmd> | send <id> text | send --key ctrl-c|esc|up|enter | snap [--since OFF] [--clean] | sessions | wait | kill [--force]
  attach <id>: jump into live terminal (auth etc). Ctrl-] detaches, session keeps running. resize follows your terminal.
  forget <id>: wipe session logs (do after typing secrets)
- agents: agents list/add/rm/set/doctor | chat send <name> msg | chat log <name> | status [--json] | tui
+ agents: agents list/add/rm/set/doctor | chat send <name> msg | chat log <name> | delegate <sub> task | status [--json] | tui
  tui: tab/1-9 target · enter/i input · esc normal · m cycle model · M custom · n new ag · a approve · ? this help · q quit
  approvals: blocked run -> approvals -> approve <id> (10min) or re-run --force
  memory: note/notes [--grep] · todo add/list/done/clear · history · events
@@ -1306,6 +1310,28 @@ def do_keys(a):
     if getattr(a,"json",False): return emit(a,"keys",{"keys":KEYS_HELP.splitlines()})
     return emit(a,"keys",{"_text":KEYS_HELP})
 
+def do_delegate(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    task = " ".join(a.text or []).strip()
+    if not task: return emit(a,"delegate",error="empty task")
+    agents = {x["name"]:x for x in load_agents(sdir)}
+    if a.agent not in agents: return emit(a,"delegate",error=f'no such agent: {a.agent}')
+    sub = agents[a.agent]
+    try:
+        harness_link(Path.home(), Path.cwd(),
+            Path(sub.get("dir",".") or ".").expanduser() or Path.cwd())
+    except Exception: pass
+    live = not getattr(a,"json",False)
+    r = run_turn(sdir,a.agent,task,
+        on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
+    if "error" in r: return emit(a,"delegate",error=r["error"])
+    orch = next((x["name"] for x in load_agents(sdir) if x.get("role")=="orchestrator"),None)
+    if orch: append_chat(sdir,orch,"delegate",f'{a.agent}: {task} -> {r["reply"][:2000]}')
+    _event(sdir,"delegate",a.agent,task=task[:120],exit=r["exit"])
+    if getattr(a,"json",False):
+        return emit(a,"delegate",{"reply":r["reply"],"exit":r["exit"],"agent":a.agent})
+    return emit(a,"delegate",{"_text":f'delegated to {a.agent} (exit={r["exit"]})'})
+
 def do_selfcheck(a):
     import tempfile
     td = Path(tempfile.mkdtemp(prefix="agent-check-"))
@@ -1318,7 +1344,7 @@ def do_selfcheck(a):
             "name":"","cols":100,"rows":30,"on_exit":"","sess":"","key":None,"no_enter":False,
             "since":None,"clean":False,"session":None,"sp":"",
             "home":None,"file":None,"home_to":None,"project_to":None,"to":None,
-            "backend":"claude","model":"default","role":"sub","adir":"."})
+            "backend":"claude","model":"default","role":"sub","adir":".","agent":None})
         o.__dict__.update(k); return o
     import io, contextlib
     buf=io.StringIO()
@@ -1366,6 +1392,9 @@ def do_selfcheck(a):
         assert backend_argv("cursor",model="",workdir=".",sid="",prompt="hi")[:3]==[_cursor_bin(),"-p","--output-format"]
         assert backend_argv("cursor",model="gpt-5",workdir=".",sid="c1",prompt="hi")==[_cursor_bin(),"-p","--output-format","stream-json","--model","gpt-5","--resume","c1","hi"]
         assert ("meta","abc12345") in _parse_generic('{"session_id":"abc12345","text":"yo"}')
+        assert do_agents(mk(sub="add",name="dl",backend="echo",model="default",adir=str(td),role="sub"))==0
+        assert do_delegate(mk(agent="dl",text=["say","hi"]))==0
+        assert any(r.get("role")=="delegate" for r in load_chat_log(td,"claude"))
         assert do_agents(mk(sub="add",name="t1",backend="opencode",model="default",adir=".",role="sub"))==0
         assert any(x["name"]=="t1" for x in load_agents(td))
         assert do_agents(mk(sub="set",name="t1",backend=None,model="opus",adir=None,role=None))==0
@@ -1476,9 +1505,9 @@ def build():
     hlink=hs.add_parser("link"); hlink.add_argument("--to",default=None); hlink.add_argument("--home",default=None)
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex","cursor"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"])
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"])
     agrm=ags.add_parser("rm"); agrm.add_argument("name")
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"])
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"])
     ags.add_parser("doctor")
     ch = sub.add_parser("chat",help="talk to an agent headless"); chs=ch.add_subparsers(dest="sub",required=True)
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
@@ -1488,6 +1517,7 @@ def build():
     ata=sub.add_parser("attach",help="jump into a live session terminal (Ctrl-] detaches)"); ata.add_argument("sess")
     fgt=sub.add_parser("forget",help="wipe a session's logs (auth traces)"); fgt.add_argument("sess")
     sub.add_parser("keys",help="control cheat-sheet")
+    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*")
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
     return p
@@ -1510,7 +1540,8 @@ def main(argv=None):
         "spawn":do_spawn,"send":do_send,"snap":do_snap,"sessions":do_sessions,
         "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon,
         "harness":do_harness,"agents":do_agents,"chat":do_chat,"status":do_status,
-        "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys}[a.subcmd]
+        "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
+        "delegate":do_delegate}[a.subcmd]
     return fn(a)
 
 if __name__=="__main__":

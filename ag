@@ -750,6 +750,7 @@ MODELS = {
     "opencode": ["default"],
     "gemini": ["default","gemini-2.5-pro","gemini-2.5-flash"],
     "codex": ["default"],
+    "cursor": ["default","sonnet-4","sonnet-4-thinking","gpt-5"],
 }
 PROBES = {"claude":["claude","--version"],"opencode":["opencode","--version"],
     "gemini":["gemini","--version"],"codex":["codex","--version"]}
@@ -780,7 +781,15 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt=""):
         if m: argv += ["-m",m]
         if sid: argv += ["resume",sid]
         return argv + [prompt]
+    if backend=="cursor":
+        argv = [_cursor_bin(),"-p","--output-format","stream-json"]
+        if m: argv += ["--model",m]
+        if sid: argv += ["--resume",sid]
+        return argv + [prompt]
     raise ValueError(f"unknown backend: {backend}")
+
+def _cursor_bin():
+    return shutil.which("agent") or str(Path.home()/".local/bin/agent")
 
 def _parse_claude(line):
     try: o = json.loads(line)
@@ -833,7 +842,7 @@ def _parse_generic(line):
     walk(o)
     out = [("tool",t) for t in tools[:5]]
     if texts: out.append(("text","\n".join(texts)[:4000]))
-    for mt in re.finditer(r"(?i)(?:session_?id|conversation_?id)[\s:=/]+([A-Za-z0-9_\-]{6,})|\b(ses_[A-Za-z0-9]{6,})\b", line):
+    for mt in re.finditer(r"(?i)(?:session_?id|conversation_?id)[\s\":=,/]+([A-Za-z0-9_\-]{6,})|\b(ses_[A-Za-z0-9]{6,})\b", line):
         sid = mt.group(1) or mt.group(2)
         if sid: out.insert(0,("meta",sid)); break
     return out or [("text",line[:300])]
@@ -860,8 +869,9 @@ def save_agents(sdir, rows):
 def do_agents(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     if a.sub=="doctor":
+        probes = dict(PROBES); probes["cursor"] = [_cursor_bin(),"--version"]
         rows = []
-        for b,probe in PROBES.items():
+        for b,probe in probes.items():
             try:
                 p = subprocess.run(probe,capture_output=True,text=True,timeout=15)
                 ok = p.returncode==0
@@ -951,7 +961,7 @@ def run_turn(sdir,name,text,on_event=None):
     workdir = a.get("dir",".") or "."
     meta = load_chat_meta(sdir,name,agent=a)
     sid = meta.get("sid","")
-    hist = "" if (sid and backend in ("claude","opencode")) else recent_history(sdir,name)
+    hist = "" if (sid and backend in ("claude","opencode","cursor")) else recent_history(sdir,name)
     prompt = (hist+"\n\n---\n"+text) if hist else text
     try: argv = backend_argv(backend,model=model,workdir=workdir,sid=sid,prompt=prompt)
     except ValueError as e: return {"error":str(e)}
@@ -1187,7 +1197,7 @@ def _tui_main(stdscr, sdir):
                         save_agents(sdir,chats)
                         logs[pending_name] = []; stream[pending_name] = ""
                         active = len(chats)-1; msg = f"added {pending_name} ({b})"
-                    else: msg = f"unknown backend (claude|opencode|gemini|codex)"
+                    else: msg = f"unknown backend (claude|opencode|gemini|codex|cursor)"
                     mode = "input"
                 inp = ""; mode = "input" if mode!="input" else mode
                 if mode in ("setmodel","newname"): mode = "input"
@@ -1353,6 +1363,9 @@ def do_selfcheck(a):
         assert backend_argv("claude",model="sonnet",workdir=".",sid="s1",prompt="hi")==["claude","-p","--verbose","--output-format","stream-json","--model","sonnet","--resume","s1","hi"]
         assert "--session" in backend_argv("opencode",model="",workdir=".",sid="ses_9",prompt="hi")
         assert cycle_model("claude","sonnet")=="opus"
+        assert backend_argv("cursor",model="",workdir=".",sid="",prompt="hi")[:3]==[_cursor_bin(),"-p","--output-format"]
+        assert backend_argv("cursor",model="gpt-5",workdir=".",sid="c1",prompt="hi")==[_cursor_bin(),"-p","--output-format","stream-json","--model","gpt-5","--resume","c1","hi"]
+        assert ("meta","abc12345") in _parse_generic('{"session_id":"abc12345","text":"yo"}')
         assert do_agents(mk(sub="add",name="t1",backend="opencode",model="default",adir=".",role="sub"))==0
         assert any(x["name"]=="t1" for x in load_agents(td))
         assert do_agents(mk(sub="set",name="t1",backend=None,model="opus",adir=None,role=None))==0
@@ -1463,9 +1476,9 @@ def build():
     hlink=hs.add_parser("link"); hlink.add_argument("--to",default=None); hlink.add_argument("--home",default=None)
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"])
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex","cursor"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"])
     agrm=ags.add_parser("rm"); agrm.add_argument("name")
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"])
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"])
     ags.add_parser("doctor")
     ch = sub.add_parser("chat",help="talk to an agent headless"); chs=ch.add_subparsers(dest="sub",required=True)
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")

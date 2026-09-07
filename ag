@@ -1108,7 +1108,8 @@ def _tui_main(stdscr, sdir):
     for e in orch_snapshot(sdir)["events"][-6:]:
         activity.append((e.get("session") or "",e.get("type",""),
             str(e.get("cmd",e.get("tool",e.get("exit",""))))[:60]))
-    inp, mode, msg = "", "input", "tab switch · m model · n new · a approve · ? keys · q quit"
+    inp, mode, msg = "", "input", "tab switch · m model · d delegate · n new · a approve · ? keys · q quit"
+    scroll = 0
     lock = threading.Lock()
     def onevent(n,k,t):
         with lock:
@@ -1158,7 +1159,9 @@ def _tui_main(stdscr, sdir):
             for ln in (r.get("text","") or "").splitlines() or [""]:
                 rows.append((role,ln))
         if snap_stream.get(name): rows.append(("agent…",snap_stream[name][-200:]))
-        for i,(role,ln) in enumerate(rows[-(h-5):]):
+        scroll = min(scroll, max(0,len(rows)-(h-5)))
+        vis = rows[:len(rows)-scroll if scroll else None]
+        for i,(role,ln) in enumerate(vis[-(h-5):]):
             at = 0
             if role=="user": at = curses.color_pair(2)
             elif role=="tool": at = curses.color_pair(3)
@@ -1183,7 +1186,7 @@ def _tui_main(stdscr, sdir):
         try: ch = stdscr.getch()
         except Exception: ch = -1
         if ch==-1: continue
-        if mode in ("input","setmodel","newname","newbackend"):
+        if mode in ("input","setmodel","newname","newbackend","dagent","dtext"):
             if ch in (10,13):
                 if mode=="input":
                     if inp.strip(): send_active(inp.strip())
@@ -1203,6 +1206,16 @@ def _tui_main(stdscr, sdir):
                         active = len(chats)-1; msg = f"added {pending_name} ({b})"
                     else: msg = f"unknown backend (claude|opencode|gemini|codex|cursor)"
                     mode = "input"
+                elif mode=="dagent":
+                    pending_dagent = inp.strip()
+                    if pending_dagent and any(c["name"]==pending_dagent for c in chats):
+                        mode = "dtext"; inp = ""; continue
+                    msg = "no such agent"; mode = "input"
+                elif mode=="dtext":
+                    if inp.strip():
+                        tgt = pending_dagent
+                        th = threading.Thread(target=delegate_task,args=(sdir,tgt,inp.strip(),onevent),daemon=True)
+                        th.start(); msg = f"delegated to {tgt}"
                 inp = ""; mode = "input" if mode!="input" else mode
                 if mode in ("setmodel","newname"): mode = "input"
                 continue
@@ -1211,17 +1224,22 @@ def _tui_main(stdscr, sdir):
             if 32<=ch<=126: inp += chr(ch)
             continue
         if ch in (ord("q"),27): break
-        elif ch==ord("\t") and chats: active = (active+1)%len(chats)
+        elif ch==ord("\t") and chats: active = (active+1)%len(chats); scroll = 0
         elif ord("1")<=ch<=ord("9") and chats:
             i = ch-ord("1")
-            if i<len(chats): active = i
+            if i<len(chats): active = i; scroll = 0
         elif ch==ord("i"): mode = "input"
         elif ch==ord("m") and chats:
             chats[active]["model"] = cycle_model(chats[active]["backend"],chats[active].get("model","default"))
             save_agents(sdir,chats); msg = f'{chats[active]["name"]} model -> {chats[active]["model"]}'
         elif ch==ord("M"): mode = "setmodel"; inp = chats[active].get("model","") if chats else ""
         elif ch==ord("n"): mode = "newname"; inp = ""
+        elif ch==ord("d"):
+            subs = [c["name"] for c in chats if c.get("role")!="orchestrator"] or [c["name"] for c in chats]
+            mode = "dagent"; inp = subs[0] if subs else ""
         elif ch==ord("?"): mode = "help"
+        elif ch in (ord("["),curses.KEY_PPAGE): scroll += 5
+        elif ch in (ord("]"),curses.KEY_NPAGE): scroll = max(0,scroll-5)
         elif ch==ord("a"):
             try: pend = [r for r in json.loads((sdir/"approvals.json").read_text()) if r.get("status")=="pending"]
             except Exception: pend = []
@@ -1232,7 +1250,7 @@ KEYS_HELP = """ag keys
  attach <id>: jump into live terminal (auth etc). Ctrl-] detaches, session keeps running. resize follows your terminal.
  forget <id>: wipe session logs (do after typing secrets)
  agents: agents list/add/rm/set/doctor | chat send <name> msg | chat log <name> | delegate <sub> task | status [--json] | tui
- tui: tab/1-9 target · enter/i input · esc normal · m cycle model · M custom · n new ag · a approve · ? this help · q quit
+ tui: tab/1-9 target · enter/i input · esc normal · m cycle model · M custom · n new agent · d delegate · a approve · ? this help · q quit
  approvals: blocked run -> approvals -> approve <id> (10min) or re-run --force
  memory: note/notes [--grep] · todo add/list/done/clear · history · events
  harness: show | export [file] | import <file> [--force] | link --to DIR"""
@@ -1310,24 +1328,29 @@ def do_keys(a):
     if getattr(a,"json",False): return emit(a,"keys",{"keys":KEYS_HELP.splitlines()})
     return emit(a,"keys",{"_text":KEYS_HELP})
 
-def do_delegate(a):
-    sdir = state_dir(a.dir); ensure_state(sdir)
-    task = " ".join(a.text or []).strip()
-    if not task: return emit(a,"delegate",error="empty task")
+def delegate_task(sdir, agent_name, task, on_event=None):
     agents = {x["name"]:x for x in load_agents(sdir)}
-    if a.agent not in agents: return emit(a,"delegate",error=f'no such agent: {a.agent}')
-    sub = agents[a.agent]
+    if agent_name not in agents: return {"error":f"no such agent: {agent_name}"}
+    sub = agents[agent_name]
     try:
         harness_link(Path.home(), Path.cwd(),
             Path(sub.get("dir",".") or ".").expanduser() or Path.cwd())
     except Exception: pass
+    r = run_turn(sdir,agent_name,task,on_event=on_event)
+    if "error" in r: return r
+    orch = next((x["name"] for x in load_agents(sdir) if x.get("role")=="orchestrator"),None)
+    if orch: append_chat(sdir,orch,"delegate",f'{agent_name}: {task} -> {r["reply"][:2000]}')
+    _event(sdir,"delegate",agent_name,task=task[:120],exit=r["exit"])
+    return r
+
+def do_delegate(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    task = " ".join(a.text or []).strip()
+    if not task: return emit(a,"delegate",error="empty task")
     live = not getattr(a,"json",False)
-    r = run_turn(sdir,a.agent,task,
+    r = delegate_task(sdir,a.agent,task,
         on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
     if "error" in r: return emit(a,"delegate",error=r["error"])
-    orch = next((x["name"] for x in load_agents(sdir) if x.get("role")=="orchestrator"),None)
-    if orch: append_chat(sdir,orch,"delegate",f'{a.agent}: {task} -> {r["reply"][:2000]}')
-    _event(sdir,"delegate",a.agent,task=task[:120],exit=r["exit"])
     if getattr(a,"json",False):
         return emit(a,"delegate",{"reply":r["reply"],"exit":r["exit"],"agent":a.agent})
     return emit(a,"delegate",{"_text":f'delegated to {a.agent} (exit={r["exit"]})'})

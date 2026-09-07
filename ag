@@ -1219,11 +1219,12 @@ def _tui_main(stdscr, sdir):
                 inp = ""; mode = "input" if mode!="input" else mode
                 if mode in ("setmodel","newname"): mode = "input"
                 continue
-            if ch==27: inp = ""; mode = "input"; continue
+            if ch==27: inp = ""; mode = "normal"; continue
             if ch in (curses.KEY_BACKSPACE,127,8): inp = inp[:-1]; continue
             if 32<=ch<=126: inp += chr(ch)
             continue
-        if ch in (ord("q"),27): break
+        if ch in (10,13): mode = "input"
+        elif ch in (ord("q"),27): break
         elif ch==ord("\t") and chats: active = (active+1)%len(chats); scroll = 0
         elif ord("1")<=ch<=ord("9") and chats:
             i = ch-ord("1")

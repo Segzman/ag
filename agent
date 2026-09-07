@@ -2,6 +2,7 @@
 """agent - CLI helper for autonomous agents. Single file, stdlib only.
 
 State: ./.agent/ in cwd (override with --dir or $AGENT_CLI_DIR).
+Live sessions (spawn/send/snap) are non-blocking; pings land in events.jsonl.
 All commands accept --json for machine-readable output:
   {"ok": true, "cmd": "run", "data": {...}}
   {"ok": false, "cmd": "run", "error": "...", "hint": "..."}
@@ -267,6 +268,283 @@ def do_approve(a):
     (sdir/"approvals.json").write_text(json.dumps(rows,indent=2))
     return emit(a,"approve",{"_text":f"{a.id} approved 10min"})
 
+# ---- live pty sessions: non-blocking spawn, many readers, event pings ----
+# ponytail: stdlib pty only, no tmux. Ceilings: single host, logs unbounded, POSIX only.
+KEYS = {"enter":"\r","tab":"\t","esc":"\x1b","escape":"\x1b","up":"\x1b[A",
+    "down":"\x1b[B","left":"\x1b[D","right":"\x1b[C","ctrl-c":"\x03",
+    "ctrl-d":"\x04","ctrl-z":"\x1a","backspace":"\x7f"}
+ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Z]")
+
+def _event(sdir, typ, sid=None, **kw):
+    try:
+        with open(sdir/"events.jsonl","a") as f:
+            f.write(json.dumps({"ts":now_iso(),"type":typ,"session":sid,**kw})+"\n")
+    except Exception: pass
+
+def _sroot(sdir):
+    r = sdir/"sessions"; r.mkdir(parents=True, exist_ok=True); return r
+
+def _sstatus(sp):
+    try: return json.loads((sp/"status.json").read_text())
+    except Exception: return {}
+
+def _swrite(sp, st):
+    t = sp/"status.json.tmp"; t.write_text(json.dumps(st,indent=2)); t.rename(sp/"status.json")
+
+def resolve_sess(sdir, ident):
+    hits = []
+    for d in _sroot(sdir).iterdir():
+        if not d.is_dir(): continue
+        st = _sstatus(d)
+        if not st: continue
+        if d.name==ident or d.name.startswith(ident) or st.get("name")==ident:
+            hits.append((d,st))
+    if not hits: return None, f"no session: {ident}"
+    if len(hits)>1: return None, f"ambiguous: {ident} matches {len(hits)}"
+    return hits[0], None
+
+def daemon_main(sp):
+    import pty, select, signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    sp = Path(sp)
+    st = _sstatus(sp)
+    st["daemon_pid"] = os.getpid()
+    _swrite(sp, st)
+    logf = open(sp/"output.log","ab",buffering=0)
+    fifo = str(sp/"stdin.fifo")
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            if st.get("cwd"): os.chdir(st["cwd"])
+        except Exception: pass
+        for k,v in (st.get("env") or {}).items(): os.environ[k]=v
+        os.execv("/bin/sh",["sh","-c",st["cmd"]])
+    st["child_pid"] = pid
+    _swrite(sp, st)
+    try:
+        import fcntl, termios, struct
+        fcntl.ioctl(fd, termios.TIOCSWINSZ,
+            struct.pack("HHHH", st.get("rows",30), st.get("cols",100), 0, 0))
+    except Exception: pass
+    ff = os.open(fifo, os.O_RDONLY|os.O_NONBLOCK)
+    code, drain = None, 0
+    try:
+        while True:
+            try:
+                dead, s = os.waitpid(pid, os.WNOHANG)
+                if dead: code = os.waitstatus_to_exitcode(s)
+            except ChildProcessError:
+                if code is None: code = -1
+            try: r,_,_ = select.select([fd,ff],[],[],0.5)
+            except Exception: break
+            eof = False
+            if fd in r:
+                try: data = os.read(fd, 65536)
+                except OSError: data = b""
+                if data: logf.write(data)
+                else: eof = True
+            if ff in r:
+                try: chunk = os.read(ff, 65536)
+                except OSError: chunk = b""
+                if chunk:
+                    try: os.write(fd, chunk)
+                    except OSError: pass
+                    with open(sp/"input.log","ab") as inf: inf.write(chunk)
+                else:
+                    os.close(ff); ff = os.open(fifo, os.O_RDONLY|os.O_NONBLOCK)
+            if code is not None: drain += 1
+            if (eof and code is not None) or drain > 20: break
+    finally:
+        try: os.close(ff)
+        except Exception: pass
+        try: os.close(fd)
+        except Exception: pass
+        logf.close()
+        if code is None:
+            try: _, s = os.waitpid(pid, 0); code = os.waitstatus_to_exitcode(s)
+            except Exception: code = -1
+        st = _sstatus(sp)
+        st.update({"running":False,"exit":code,"ended_at":now_iso()})
+        _swrite(sp, st)
+        _event(sp.parent.parent,"exit",sp.name,exit=code,cmd=st.get("cmd"))
+        if st.get("on_exit"):
+            try:
+                env = dict(os.environ,AGENT_SESSION=sp.name,AGENT_EXIT=str(code))
+                subprocess.Popen(st["on_exit"],shell=True,env=env,start_new_session=True,
+                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            except Exception: pass
+
+def do_spawn(a):
+    if os.name != "posix":
+        return emit(a,"spawn",error="pty sessions need POSIX",hint="use run instead")
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    if not a.cmd:
+        return emit(a,"spawn",error="no command given",hint="agent spawn -- bash")
+    if a.cmd[0]=="--": a.cmd=a.cmd[1:]
+    cmd_str = " ".join(a.cmd)
+    env = {}
+    for kv in (a.env or []):
+        if "=" in kv: k,v=kv.split("=",1); env[k]=v
+    sid = hashlib.sha256(f"{time.time()}{cmd_str}{os.getpid()}".encode()).hexdigest()[:6]
+    sp = _sroot(sdir)/sid; sp.mkdir()
+    os.mkfifo(sp/"stdin.fifo")
+    _swrite(sp, {"id":sid,"name":a.name or "","cmd":cmd_str,"cwd":a.cwd or os.getcwd(),
+        "env":env,"cols":a.cols,"rows":a.rows,"on_exit":a.on_exit or "",
+        "running":True,"exit":None,"started_at":now_iso(),"daemon_pid":None,"child_pid":None})
+    _event(sdir,"spawn",sid,cmd=cmd_str,name=a.name or "")
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setsid()
+            dn = os.open(os.devnull, os.O_RDWR)
+            os.dup2(dn,0); os.dup2(dn,1); os.dup2(dn,2)
+            if dn>2: os.close(dn)
+            if os.fork()==0:
+                try: daemon_main(str(sp))
+                finally: os._exit(0)
+        finally: os._exit(0)
+    os.waitpid(pid,0)
+    for _ in range(20):
+        if _sstatus(sp).get("child_pid"): break
+        time.sleep(0.05)
+    if getattr(a,"json",False):
+        return emit(a,"spawn",{"id":sid,"name":a.name or "","cmd":cmd_str,
+            "poll":f"agent snap --since 0 {sid}"})
+    return emit(a,"spawn",{"_text":f"spawned {sid} (poll: agent snap {sid})","id":sid})
+
+def do_send(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    hit, err = resolve_sess(sdir, a.sess)
+    if err: return emit(a,"send",error=err,hint="agent sessions")
+    sp, st = hit
+    if not st.get("running"):
+        return emit(a,"send",error=f'session {st["id"]} exited ({st.get("exit")})',
+            hint=f'agent snap {st["id"]}')
+    if a.key:
+        if a.key not in KEYS:
+            return emit(a,"send",error=f"unknown key: {a.key}",hint=str(sorted(KEYS)))
+        payload = KEYS[a.key].encode()
+    else:
+        text = " ".join(a.text or [])
+        if not text: return emit(a,"send",error="empty input")
+        payload = text.encode() + (b"" if a.no_enter else b"\r")
+    dp = st.get("daemon_pid")
+    if dp:
+        try: os.kill(dp,0)
+        except ProcessLookupError:
+            return emit(a,"send",error="daemon gone",hint=f'agent snap {st["id"]}')
+        except PermissionError: pass
+    try: fd = os.open(sp/"stdin.fifo", os.O_WRONLY|os.O_NONBLOCK)
+    except OSError as e: return emit(a,"send",error=f"fifo: {e}")
+    try: os.write(fd, payload)
+    finally: os.close(fd)
+    _event(sdir,"send",st["id"],bytes=len(payload))
+    return emit(a,"send",{"_text":f'sent {len(payload)}B -> {st["id"]}',"id":st["id"],"bytes":len(payload)})
+
+def do_snap(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    hit, err = resolve_sess(sdir, a.sess)
+    if err: return emit(a,"snap",error=err,hint="agent sessions")
+    sp, st = hit
+    try: raw = (sp/"output.log").read_bytes()
+    except Exception: raw = b""
+    size = len(raw)
+    if a.since is not None:
+        off = a.since if a.since>=0 else max(0,size+a.since)
+        text = raw[off:].decode(errors="replace") if off<size else ""
+    else:
+        tail = raw[-200000:] if size>200000 else raw
+        text = "\n".join(tail.decode(errors="replace").splitlines()[-(a.lines or 40):])
+    if a.clean: text = ANSI.sub("",text)
+    data = {"id":st["id"],"running":st.get("running"),"exit":st.get("exit"),
+        "offset":size,"bytes":size,"output":text}
+    if getattr(a,"json",False): return emit(a,"snap",data)
+    head = f'[{st["id"]} running={st.get("running")} exit={st.get("exit")} offset={size}]\n'
+    return emit(a,"snap",{"_text":head+(text if text else "(no output yet)")})
+
+def do_sessions(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    rows = []
+    for d in sorted(_sroot(sdir).iterdir()):
+        if not d.is_dir(): continue
+        st = _sstatus(d)
+        if not st: continue
+        try: lb = (d/"output.log").stat().st_size
+        except Exception: lb = 0
+        rows.append({"id":st["id"],"name":st.get("name",""),"cmd":st.get("cmd"),
+            "running":st.get("running"),"exit":st.get("exit"),"log_bytes":lb})
+    if getattr(a,"json",False): return emit(a,"sessions",{"sessions":rows})
+    txt = "\n".join(f'{r["id"]} {"run" if r["running"] else "dead"} '
+        f'{r["name"]+" " if r["name"] else ""}{r["cmd"]}' for r in rows) or "(none)"
+    return emit(a,"sessions",{"_text":txt})
+
+def do_kill(a):
+    import signal
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    hit, err = resolve_sess(sdir, a.sess)
+    if err: return emit(a,"kill",error=err,hint="agent sessions")
+    sp, st = hit
+    if not st.get("running"):
+        return emit(a,"kill",{"_text":f'{st["id"]} already exited ({st.get("exit")})',"id":st["id"]})
+    cp = st.get("child_pid")
+    try:
+        if cp: os.killpg(cp, signal.SIGKILL if a.force else signal.SIGTERM)
+    except Exception: pass
+    if not a.force:
+        for _ in range(10):
+            time.sleep(0.2)
+            if not _sstatus(sp).get("running"): break
+        else:
+            try:
+                if cp: os.killpg(cp, signal.SIGKILL)
+            except Exception: pass
+    for _ in range(15):
+        time.sleep(0.2)
+        if not _sstatus(sp).get("running"): break
+    final = _sstatus(sp)
+    if final.get("running"):
+        final.update({"running":False,"exit":-9,"ended_at":now_iso()})
+        _swrite(sp, final)
+        _event(sdir,"exit",st["id"],exit=-9,forced=True)
+    final = _sstatus(sp)
+    return emit(a,"kill",{"_text":f'{st["id"]} done (exit={final.get("exit")})',
+        "id":st["id"],"exit":final.get("exit")})
+
+def do_wait(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    hit, err = resolve_sess(sdir, a.sess)
+    if err: return emit(a,"wait",error=err,hint="agent sessions")
+    sp, cur = hit
+    t0 = time.time()
+    while cur.get("running"):
+        if time.time()-t0 > a.timeout:
+            return emit(a,"wait",error=f"timeout after {a.timeout}s",
+                hint=f'agent snap {cur["id"]}')
+        time.sleep(0.2); cur = _sstatus(sp)
+    try: raw = (sp/"output.log").read_bytes().decode(errors="replace")
+    except Exception: raw = ""
+    data = {"id":cur["id"],"exit":cur.get("exit"),
+        "tail":"\n".join(raw.splitlines()[-20:])}
+    if getattr(a,"json",False): return emit(a,"wait",data)
+    return emit(a,"wait",{**data,"_text":f'exit={cur.get("exit")}\n'+data["tail"]})
+
+def do_events(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    try: rows = [json.loads(l) for l in (sdir/"events.jsonl").read_text().splitlines() if l.strip()]
+    except Exception: rows = []
+    if a.session:
+        rows = [r for r in rows if (r.get("session") or "")==a.session
+            or (r.get("session") or "").startswith(a.session)]
+    rows = rows[-(a.limit or 20):]
+    if getattr(a,"json",False): return emit(a,"events",{"events":rows})
+    txt = "\n".join(f'{r.get("ts","")} {r.get("type")} {r.get("session") or ""} '
+        f'{r.get("cmd",r.get("exit",r.get("bytes","")))}' for r in rows) or "(none)"
+    return emit(a,"events",{"_text":txt})
+
+def do_daemon(a):
+    daemon_main(a.sp)
+    return 0
+
 def do_shell(a):
     print(f"agent shell v{VERSION} (type exit, --json for machine mode)")
     js = False
@@ -290,7 +568,9 @@ def do_selfcheck(a):
         o=A(); o.__dict__.update({"dir":str(td),"json":True,"timeout":5,"cwd":None,"env":[],"force":False,
             "offset":1,"limit":200,"mkdir":False,"text":None,"old":None,"new":None,"replace_all":False,
             "pattern":"*","root":".","path":".","include":"*","max":50,"tag":"","grep":None,"all":False,
-            "sub":None,"id":0,"done_only":False})
+            "sub":None,"id":0,"done_only":False,
+            "name":"","cols":100,"rows":30,"on_exit":"","sess":"","key":None,"no_enter":False,
+            "since":None,"clean":False,"session":None,"sp":""})
         o.__dict__.update(k); return o
     import io, contextlib
     buf=io.StringIO()
@@ -307,6 +587,43 @@ def do_selfcheck(a):
         # danger blocked
         rc = do_run(mk(cmd=["rm -rf /"]))
         assert rc==1, "danger should block"
+        # live pty sessions
+        if os.name=="posix":
+            import time as _t
+            sroot = td/"sessions"
+            had = set(d.name for d in sroot.iterdir()) if sroot.exists() else set()
+            assert do_spawn(mk(cmd=["echo hello-pty"],name="c1",cwd=str(td)))==0
+            s1 = [d.name for d in sroot.iterdir() if d.name not in had]
+            assert len(s1)==1; s1=s1[0]
+            t0=_t.time()
+            while _sstatus(sroot/s1).get("running") and _t.time()-t0<10: _t.sleep(0.2)
+            assert not _sstatus(sroot/s1).get("running")
+            assert "hello-pty" in (sroot/s1/"output.log").read_bytes().decode(errors="replace")
+            assert do_wait(mk(sess=s1,timeout=5))==0
+            assert do_spawn(mk(cmd=["cat"],name="c2",cwd=str(td)))==0
+            s2 = [d.name for d in sroot.iterdir() if d.name not in had and d.name!=s1]
+            assert len(s2)==1; s2=s2[0]
+            try:
+                t0=_t.time()
+                while not _sstatus(sroot/s2).get("child_pid") and _t.time()-t0<5: _t.sleep(0.1)
+                assert do_send(mk(sess=s2,text=["ping123"]))==0
+                ok=False; t0=_t.time()
+                while _t.time()-t0<8:
+                    if "ping123" in (sroot/s2/"output.log").read_bytes().decode(errors="replace"):
+                        ok=True; break
+                    _t.sleep(0.2)
+                assert ok, "send roundtrip"
+                a_sn=mk(sess=s2); a_sn.since=0; a_sn.clean=True
+                assert do_snap(a_sn)==0
+                assert do_sessions(mk())==0
+                assert do_kill(mk(sess=s2,force=True))==0
+                t0=_t.time()
+                while _sstatus(sroot/s2).get("running") and _t.time()-t0<8: _t.sleep(0.2)
+                assert not _sstatus(sroot/s2).get("running")
+            finally:
+                try: do_kill(mk(sess=s2,force=True))
+                except Exception: pass
+            assert (td/"events.jsonl").exists()
     print(f"selfcheck ok ({td})")
     return 0
 
@@ -338,6 +655,14 @@ def build():
     h = sub.add_parser("history",help="run log"); h.add_argument("--limit",type=int,default=20)
     sub.add_parser("approvals",help="list approval requests")
     ap=sub.add_parser("approve",help="approve blocked cmd"); ap.add_argument("id")
+    s = sub.add_parser("spawn",help="spawn live pty session, returns instantly"); s.add_argument("--name",default=""); s.add_argument("--cols",type=int,default=100); s.add_argument("--rows",type=int,default=30); s.add_argument("--cwd",default=None); s.add_argument("--env",action="append",default=[]); s.add_argument("--on-exit",default=""); s.add_argument("cmd",nargs=argparse.REMAINDER)
+    se = sub.add_parser("send",help="send keystrokes to session"); se.add_argument("sess"); se.add_argument("text",nargs="*"); se.add_argument("--key",default=None,help="enter|tab|up|down|left|right|esc|ctrl-c|ctrl-d"); se.add_argument("--no-enter",action="store_true")
+    sn = sub.add_parser("snap",help="snapshot live output (many readers OK)"); sn.add_argument("sess"); sn.add_argument("--lines",type=int,default=40); sn.add_argument("--since",type=int,default=None,help="byte offset from prior snap"); sn.add_argument("--clean",action="store_true",help="strip ANSI codes")
+    sub.add_parser("sessions",help="list sessions")
+    k = sub.add_parser("kill",help="kill session"); k.add_argument("sess"); k.add_argument("--force",action="store_true")
+    w8 = sub.add_parser("wait",help="block until session exits (opt-in only)"); w8.add_argument("sess"); w8.add_argument("--timeout",type=int,default=30)
+    ev = sub.add_parser("events",help="pings: spawn/send/exit feed"); ev.add_argument("--limit",type=int,default=20); ev.add_argument("--session",default=None)
+    dm = sub.add_parser("_daemon",help=argparse.SUPPRESS); dm.add_argument("sp")
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
     return p
@@ -352,11 +677,13 @@ def main(argv=None):
     if want_json: a.json = True
     if getattr(a, "version", False): print(VERSION); return 0
     if not getattr(a, "subcmd", None): p.print_help(); return 1
-    # strip leading -- from run
-    if a.subcmd=="run" and a.cmd and a.cmd[0]=="--": a.cmd=a.cmd[1:]
+    # strip leading -- from run/spawn
+    if a.subcmd in ("run","spawn") and getattr(a,"cmd",None) and a.cmd[0]=="--": a.cmd=a.cmd[1:]
     fn = {"run":do_run,"read":do_read,"write":do_write,"edit":do_edit,"ls":do_ls,
         "grep":do_grep,"note":do_note,"notes":do_notes,"todo":do_todo,"history":do_history,
-        "approvals":do_approvals,"approve":do_approve,"shell":do_shell,"selfcheck":do_selfcheck}[a.subcmd]
+        "approvals":do_approvals,"approve":do_approve,"shell":do_shell,"selfcheck":do_selfcheck,
+        "spawn":do_spawn,"send":do_send,"snap":do_snap,"sessions":do_sessions,
+        "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon}[a.subcmd]
     return fn(a)
 
 if __name__=="__main__":

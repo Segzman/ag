@@ -731,6 +731,463 @@ def do_harness(a):
         t = ["linked:"]+res["linked"]+["missing:"]+res["missing"] or ["(empty setup)"]
         return emit(a,"harness",{"_text":"\n".join(t),**res})
 
+# ---- multi-backend agents: claude orchestrates, subs via opencode/gemini/codex ----
+# ponytail: headless CLIs as backends, no API keys here. Ceilings: gemini free-tier
+# dead (needs Antigravity/API key), codex vendor binary broken on this box (see doctor),
+# gemini/codex turns are stateless + history replay (no reliable resume id).
+MODELS = {
+    "claude": ["default","sonnet","opus","haiku"],
+    "opencode": ["default"],
+    "gemini": ["default","gemini-2.5-pro","gemini-2.5-flash"],
+    "codex": ["default"],
+}
+PROBES = {"claude":["claude","--version"],"opencode":["opencode","--version"],
+    "gemini":["gemini","--version"],"codex":["codex","--version"]}
+
+def cycle_model(backend, cur):
+    opts = MODELS.get(backend,["default"])
+    return opts[(opts.index(cur)+1)%len(opts)] if cur in opts else opts[0]
+
+def backend_argv(backend, *, model="", workdir=".", sid="", prompt=""):
+    m = model if model and model!="default" else ""
+    if backend=="claude":
+        argv = ["claude","-p","--verbose","--output-format","stream-json"]
+        if m: argv += ["--model",m]
+        if sid: argv += ["--resume",sid]
+        return argv + [prompt]
+    if backend=="opencode":
+        argv = ["opencode","run","--format","json"]
+        if m: argv += ["-m",m]
+        argv += ["--dir",workdir]
+        if sid: argv += ["--session",sid]
+        return argv + [prompt]
+    if backend=="gemini":
+        argv = ["gemini","-p",prompt,"-o","stream-json","--approval-mode","default"]
+        if m: argv += ["-m",m]
+        return argv
+    if backend=="codex":
+        return ["codex","exec",prompt]
+    raise ValueError(f"unknown backend: {backend}")
+
+def _parse_claude(line):
+    try: o = json.loads(line)
+    except Exception: return [("text",line[:500])] if line.strip() else []
+    t = o.get("type")
+    if t=="system" and o.get("subtype")=="init":
+        return [("meta",o["session_id"])] if o.get("session_id") else []
+    if t=="assistant":
+        out = []
+        try: blocks = o["message"]["content"]
+        except Exception: blocks = []
+        for b in blocks or []:
+            if b.get("type")=="text" and b.get("text"): out.append(("text",b["text"]))
+            elif b.get("type")=="tool_use":
+                out.append(("tool",f'{b.get("name","tool")} {json.dumps(b.get("input",{}))[:160]}'))
+        return out
+    if t=="result":
+        return [("done",f'{o.get("subtype","")} cost=${o.get("total_cost_usd",0):.3f}')]
+    return []
+
+def _parse_opencode(line):
+    try: o = json.loads(line)
+    except Exception: return [("text",line[:500])] if line.strip() else []
+    evs = []
+    if o.get("sessionID"): evs.append(("meta",o["sessionID"]))
+    t, p = o.get("type"), o.get("part",{}) or {}
+    if t=="text" and p.get("text"): evs.append(("text",p["text"]))
+    elif t=="tool_use":
+        st = p.get("state",{}) or {}
+        title = st.get("title") or json.dumps(st.get("input",{}))[:160]
+        evs.append(("tool",f'{p.get("tool","tool")} {title}'))
+    elif t=="step_finish" and p.get("reason")=="stop": evs.append(("done","stop"))
+    return evs
+
+def _parse_generic(line):
+    try: o = json.loads(line)
+    except Exception: return [("text",line[:500])] if line.strip() else []
+    texts, tools = [], []
+    def walk(x):
+        if isinstance(x,dict):
+            for k,v in x.items():
+                kl = str(k).lower()
+                if isinstance(v,str) and kl in ("text","content","output","message","response") and v.strip():
+                    texts.append(v[:2000])
+                elif isinstance(v,str) and kl in ("tool","tool_name","function","command") and v.strip():
+                    tools.append(v[:200])
+                elif isinstance(v,(dict,list)): walk(v)
+        elif isinstance(x,list):
+            for v in x: walk(v)
+    walk(o)
+    out = [("tool",t) for t in tools[:5]]
+    if texts: out.append(("text","\n".join(texts)[:4000]))
+    return out or [("text",line[:300])]
+
+def parse_events(backend, line):
+    """-> [(kind, text)]; kinds: text|tool|done|meta. Pure, no I/O."""
+    line = line.strip()
+    if not line: return []
+    if backend=="claude": return _parse_claude(line)
+    if backend=="opencode": return _parse_opencode(line)
+    return _parse_generic(line)
+
+def load_agents(sdir):
+    try: rows = json.loads((sdir/"agents.json").read_text())
+    except Exception: rows = []
+    if not rows:
+        rows = [{"name":"claude","backend":"claude","model":"default","dir":".","role":"orchestrator"},
+                {"name":"oc","backend":"opencode","model":"default","dir":".","role":"sub"}]
+    return rows
+
+def save_agents(sdir, rows):
+    (sdir/"agents.json").write_text(json.dumps(rows,indent=2))
+
+def do_agents(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    if a.sub=="doctor":
+        rows = []
+        for b,probe in PROBES.items():
+            try:
+                p = subprocess.run(probe,capture_output=True,text=True,timeout=15)
+                ok = p.returncode==0
+                ver = (p.stdout or p.stderr or "").strip().splitlines()[0][:60] if ok else (p.stderr or "")[:120]
+                hint = ""
+                if not ok and b=="codex": hint = "reinstall: npm i -g @openai/codex"
+                if b=="gemini" and ok: hint = "free tier retired; needs Antigravity or API key"
+                rows.append({"backend":b,"ok":ok,"version":ver,"hint":hint})
+            except FileNotFoundError:
+                rows.append({"backend":b,"ok":False,"version":"","hint":"not on PATH"})
+            except Exception as e:
+                rows.append({"backend":b,"ok":False,"version":"","hint":str(e)[:100]})
+        if getattr(a,"json",False): return emit(a,"agents",{"backends":rows})
+        txt = "\n".join(f'{"ok " if r["ok"] else "BAD"} {r["backend"]:9} {r["version"]} {r["hint"]}' for r in rows)
+        return emit(a,"agents",{"_text":txt})
+    rows = load_agents(sdir)
+    if a.sub=="list":
+        if getattr(a,"json",False): return emit(a,"agents",{"agents":rows})
+        txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("dir",".")}' for r in rows) or "(none)"
+        return emit(a,"agents",{"_text":txt})
+    if a.sub=="add":
+        if any(r["name"]==a.name for r in rows):
+            return emit(a,"agents",error=f"exists: {a.name}")
+        rows.append({"name":a.name,"backend":a.backend,"model":a.model or "default",
+            "dir":a.adir or ".","role":a.role})
+        save_agents(sdir,rows)
+        return emit(a,"agents",{"_text":f"added {a.name}"})
+    if a.sub=="rm":
+        rows = [r for r in rows if r["name"]!=a.name]
+        save_agents(sdir,rows)
+        return emit(a,"agents",{"_text":f"removed {a.name}"})
+    if a.sub=="set":
+        hit = [r for r in rows if r["name"]==a.name]
+        if not hit: return emit(a,"agents",error=f"no such agent: {a.name}")
+        r = hit[0]
+        if a.backend: r["backend"]=a.backend
+        if a.model: r["model"]=a.model
+        if a.adir: r["dir"]=a.adir
+        if a.role: r["role"]=a.role
+        save_agents(sdir,rows)
+        return emit(a,"agents",{"_text":f"updated {a.name}"})
+
+def chat_dir(sdir):
+    d = sdir/"chats"; d.mkdir(parents=True,exist_ok=True); return d
+
+def chat_log_path(sdir,name): return chat_dir(sdir)/f"{name}.jsonl"
+
+def load_chat_meta(sdir,name,agent=None):
+    p = chat_dir(sdir)/f"{name}.meta.json"
+    try: m = json.loads(p.read_text())
+    except Exception: m = {}
+    if agent:
+        for k in ("backend","model","dir","role"): m.setdefault(k,agent.get(k))
+    m.setdefault("sid","")
+    return m
+
+def save_chat_meta(sdir,name,meta):
+    (chat_dir(sdir)/f"{name}.meta.json").write_text(json.dumps(meta,indent=2))
+
+def append_chat(sdir,name,role,text):
+    with open(chat_log_path(sdir,name),"a") as f:
+        f.write(json.dumps({"ts":now_iso(),"role":role,"text":text[:8000]})+"\n")
+
+def load_chat_log(sdir,name):
+    try: return [json.loads(l) for l in chat_log_path(sdir,name).read_text().splitlines() if l.strip()]
+    except Exception: return []
+
+def recent_history(sdir,name,limit=4000):
+    rows = [r for r in load_chat_log(sdir,name) if r.get("role") in ("user","agent")][-10:]
+    return "\n".join(f'{r["role"]}: {r.get("text","")}' for r in rows)[-limit:]
+
+_RUNNING, _RUN_LOCK = {}, threading.Lock()
+def mark_running(name,on):
+    with _RUN_LOCK:
+        if on: _RUNNING[name]=True
+        else: _RUNNING.pop(name,None)
+def is_running(name):
+    with _RUN_LOCK: return name in _RUNNING
+
+def run_turn(sdir,name,text,on_event=None):
+    """One prompt turn. on_event(name,kind,text). Returns {sid,exit,reply} or {error}."""
+    agents = {x["name"]:x for x in load_agents(sdir)}
+    if name not in agents: return {"error":f"no such agent: {name} (agent agents list)"}
+    a = agents[name]
+    backend = a.get("backend","claude")
+    model = a.get("model","default") or "default"
+    workdir = a.get("dir",".") or "."
+    meta = load_chat_meta(sdir,name,agent=a)
+    sid = meta.get("sid","")
+    hist = "" if (sid and backend in ("claude","opencode")) else recent_history(sdir,name)
+    prompt = (hist+"\n\n---\n"+text) if hist else text
+    try: argv = backend_argv(backend,model=model,workdir=workdir,sid=sid,prompt=prompt)
+    except ValueError as e: return {"error":str(e)}
+    append_chat(sdir,name,"user",text)
+    mark_running(name,True)
+    chunks, sid_new, rc, err = [], "", 0, ""
+    try:
+        p = subprocess.Popen(argv,cwd=workdir,stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,text=True,bufsize=1)
+        for line in p.stdout:
+            for kind,txt in parse_events(backend,line):
+                if kind=="meta":
+                    if txt and not sid_new:
+                        sid_new=txt; meta["sid"]=txt; save_chat_meta(sdir,name,meta)
+                elif kind=="text":
+                    if txt: chunks.append(txt)
+                    if on_event: on_event(name,"text",txt)
+                elif kind=="tool":
+                    append_chat(sdir,name,"tool",txt)
+                    _event(sdir,"tool",name,tool=txt[:200])
+                    if on_event: on_event(name,"tool",txt)
+                elif kind=="done" and on_event: on_event(name,"done",txt)
+        err = p.stderr.read() or ""
+        rc = p.wait()
+    except FileNotFoundError:
+        rc = 127
+        chunks = [f"backend binary missing (agent agents doctor)"]
+    except Exception as e:
+        rc = 1; chunks = [f"error: {e}"]
+    finally:
+        mark_running(name,False)
+    full = "\n".join(c for c in chunks if c).strip()
+    if not full and rc!=0:
+        full = (err.strip().splitlines()[-3:] or ["(failed)"])[-1][:500]
+        full = f"(exit {rc}) {full}"
+    full = full or "(no output)"
+    append_chat(sdir,name,"agent",full)
+    _event(sdir,"chat",name,exit=rc)
+    if on_event: on_event(name,"exit",str(rc))
+    return {"sid":sid_new or sid,"exit":rc,"reply":full}
+
+def do_chat(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    if a.sub=="send":
+        text = " ".join(a.text or []).strip()
+        if not text: return emit(a,"chat",error="empty message")
+        live = not getattr(a,"json",False)
+        r = run_turn(sdir,a.name,text,
+            on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
+        if "error" in r: return emit(a,"chat",error=r["error"])
+        if getattr(a,"json",False):
+            return emit(a,"chat",{"reply":r["reply"],"exit":r["exit"],"sid":r["sid"]})
+        return emit(a,"chat",{"_text":f'[exit={r["exit"]}]'})
+    if a.sub=="log":
+        rows = load_chat_log(sdir,a.name)[-(a.limit or 20):]
+        if getattr(a,"json",False): return emit(a,"chat",{"log":rows})
+        txt = "\n".join(f'{r.get("role","")}: {(r.get("text","") or "")[:500]}' for r in rows) or "(none)"
+        return emit(a,"chat",{"_text":txt})
+
+def orch_snapshot(sdir):
+    ensure_state(sdir)
+    sess = []
+    for d in sorted(_sroot(sdir).iterdir()):
+        if not d.is_dir(): continue
+        st = _sstatus(d)
+        if not st: continue
+        try: raw = (d/"output.log").read_bytes()
+        except Exception: raw = b""
+        tail = ANSI.sub("",raw[-400:].decode(errors="replace")).splitlines()
+        last = next((l.strip()[:100] for l in reversed(tail) if l.strip()),"")
+        try: idle = int(time.time()-(d/"output.log").stat().st_mtime)
+        except Exception: idle = -1
+        sess.append({"id":st["id"],"name":st.get("name",""),"cmd":st.get("cmd"),
+            "running":st.get("running"),"exit":st.get("exit"),"log_bytes":len(raw),
+            "idle_s":idle,"last":last})
+    try: events = [json.loads(l) for l in (sdir/"events.jsonl").read_text().splitlines() if l.strip()][-8:]
+    except Exception: events = []
+    todos = [t for t in load_todos(sdir) if not t.get("done")]
+    try: approvals = [r for r in json.loads((sdir/"approvals.json").read_text()) if r.get("status")=="pending"]
+    except Exception: approvals = []
+    chats = []
+    for ag in load_agents(sdir):
+        log = load_chat_log(sdir,ag["name"])
+        lastm = next((r for r in reversed(log) if r.get("role")=="agent"),{})
+        chats.append({"name":ag["name"],"backend":ag.get("backend","?"),
+            "model":ag.get("model","default"),"role":ag.get("role","sub"),
+            "running":is_running(ag["name"]),
+            "turns":len([r for r in log if r.get("role")=="user"]),
+            "last":(lastm.get("text","") or "")[:100]})
+    return {"sessions":sess,"events":events,"todos":todos,"approvals":approvals,"chats":chats}
+
+def render_snapshot(s, width=100):
+    L = ["== agents =="]
+    for c in s["chats"]:
+        flag = "*" if c["running"] else " "
+        L.append(f'{flag} {c["name"][:12]:12} {c["backend"][:8]:8} {c["model"][:14]:14} {c["role"][:11]:11} {c["last"]}'[:width])
+    L.append("== live sessions ==")
+    L += [f'{"run" if x["running"] else "dead":4} {(x["name"] or x["id"])[:14]:14} {(x["cmd"] or "")[:30]:30} idle={x["idle_s"]}s {x["last"]}'[:width] for x in s["sessions"]] or ["(none)"]
+    L.append("== activity ==")
+    L += [f'{e.get("ts","")[11:19]} {e.get("type","")[:6]:6} {e.get("session") or ""} {e.get("cmd",e.get("tool",e.get("exit","")))}'[:width] for e in s["events"]] or ["(none)"]
+    L.append("== todos ==")
+    L += [f'[ ] #{t["id"]} {t["text"]}'[:width] for t in s["todos"]] or ["(none)"]
+    L.append("== approvals ==")
+    L += [f'! {r["id"]} {r.get("reason","")}: {(r.get("cmd","") or "")[:60]}'[:width] for r in s["approvals"]] or ["(none)"]
+    return "\n".join(L)
+
+def do_status(a):
+    sdir = state_dir(a.dir)
+    snap = orch_snapshot(sdir)
+    if getattr(a,"json",False): return emit(a,"status",snap)
+    w = shutil.get_terminal_size((100,30)).columns
+    return emit(a,"status",{"_text":render_snapshot(snap,w)})
+
+def do_tui(a):
+    try: import curses
+    except Exception: return emit(a,"tui",error="curses unavailable (POSIX terminal needed)")
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    curses.wrapper(_tui_main, sdir)
+    return 0
+
+def _tui_main(stdscr, sdir):
+    import curses
+    try: curses.curs_set(0)
+    except Exception: pass
+    if curses.has_colors():
+        curses.start_color()
+        try: curses.use_default_colors()
+        except Exception: pass
+        for i,c in enumerate([curses.COLOR_CYAN,curses.COLOR_GREEN,curses.COLOR_YELLOW],1):
+            try: curses.init_pair(i,c,-1)
+            except Exception: pass
+    chats = load_agents(sdir)
+    if not chats:
+        chats = [{"name":"claude","backend":"claude","model":"default","dir":".","role":"orchestrator"}]
+        save_agents(sdir,chats)
+    active = 0
+    logs = {c["name"]:load_chat_log(sdir,c["name"])[-60:] for c in chats}
+    stream = {c["name"]:"" for c in chats}
+    activity = []
+    for e in orch_snapshot(sdir)["events"][-6:]:
+        activity.append((e.get("session") or "",e.get("type",""),
+            str(e.get("cmd",e.get("tool",e.get("exit",""))))[:60]))
+    inp, mode, msg = "", "input", "tab switch · m model · n new · a approve · q quit"
+    lock = threading.Lock()
+    def onevent(n,k,t):
+        with lock:
+            if k=="text": stream[n] = (stream[n]+t)[-3000:]
+            elif k in ("tool","done","exit"):
+                activity.append((n,k,(t or "")[:70])); del activity[:-30]
+            if k=="exit":
+                logs[n] = load_chat_log(sdir,n)[-60:]; stream[n] = ""
+    def send_active(text):
+        if not chats: return
+        th = threading.Thread(target=run_turn,args=(sdir,chats[active]["name"],text,onevent),daemon=True)
+        th.start()
+    def put(y,x,s,attr=0,w=0):
+        try: stdscr.addstr(y,x,s[:max(0,(w or len(s)))],attr)
+        except Exception: pass
+    stdscr.timeout(120)
+    while True:
+        h,w = stdscr.getmaxyx()
+        lw, rw = min(24,w//4), min(34,w//3)
+        with lock:
+            snap_logs = {k:list(v) for k,v in logs.items()}
+            snap_stream = dict(stream); snap_act = list(activity)
+        stdscr.erase()
+        put(0,0,f' agent tui · {Path.cwd().name} · {now_iso()[11:19]} · {msg}'[:w-1],curses.color_pair(1))
+        # left: agents
+        put(1,0," agents "[:lw],curses.A_BOLD)
+        for i,c in enumerate(chats[:h-6]):
+            flag = "*" if is_running(c["name"]) else " "
+            sel = ">" if i==active else " "
+            put(2+i,0,f'{sel}{flag}{c["name"][:12]:12} {c["model"][:lw-16]}'[:lw-1],
+                curses.A_REVERSE if i==active else 0)
+        # main: active chat
+        mx = lw+1
+        name = chats[active]["name"] if chats else ""
+        put(1,mx,f' chat: {name} [{chats[active]["backend"] if chats else ""}]'[:w-mx-rw-2] if chats else "",curses.A_BOLD)
+        rows = []
+        for r in snap_logs.get(name,[])[-(h-5):]:
+            role = r.get("role","")
+            for ln in (r.get("text","") or "").splitlines() or [""]:
+                rows.append((role,ln))
+        if snap_stream.get(name): rows.append(("agent…",snap_stream[name][-200:]))
+        for i,(role,ln) in enumerate(rows[-(h-5):]):
+            at = 0
+            if role=="user": at = curses.color_pair(2)
+            elif role=="tool": at = curses.color_pair(3)
+            put(2+i,mx,f'{role[:6]:6} {ln}'[:w-mx-rw-2],at)
+        # right: activity + approvals
+        rx = w-rw
+        put(1,rx," activity "[:rw],curses.A_BOLD)
+        for i,(n,k,t) in enumerate(snap_act[-(h//2):]):
+            put(2+i,rx,f'{n[:8]:8} {k[:5]:5} {t}'[:rw-1])
+        ay = 2+min(len(snap_act),h//2)+1
+        if ay<h-3:
+            put(ay,rx," approvals "[:rw],curses.A_BOLD)
+            try: pend = [r for r in json.loads((sdir/"approvals.json").read_text()) if r.get("status")=="pending"][:h-ay-3]
+            except Exception: pend = []
+            for i,r in enumerate(pend):
+                put(ay+1+i,rx,f'! {r["id"][:8]} {(r.get("cmd","") or "")[:rw-12]}'[:rw-1],curses.color_pair(3))
+        put(h-2,0,f'> {inp}'[-(w-1):],0,w)
+        put(h-1,0,f'[{mode}] {len(chats)} agents · enter send · esc normal'[:w-1])
+        try: stdscr.move(h-2,min(2+len(inp),w-1))
+        except Exception: pass
+        stdscr.refresh()
+        try: ch = stdscr.getch()
+        except Exception: ch = -1
+        if ch==-1: continue
+        if mode in ("input","setmodel","newname","newbackend"):
+            if ch in (10,13):
+                if mode=="input":
+                    if inp.strip(): send_active(inp.strip())
+                elif mode=="setmodel" and chats:
+                    chats[active]["model"] = inp.strip() or "default"
+                    save_agents(sdir,chats); msg = f'model -> {chats[active]["model"]}'
+                elif mode=="newname":
+                    pending_name = inp.strip()
+                    if pending_name: mode = "newbackend"; inp = "opencode"; continue
+                    else: mode = "input"; continue
+                elif mode=="newbackend":
+                    b = inp.strip() or "opencode"
+                    if b in MODELS:
+                        chats.append({"name":pending_name,"backend":b,"model":"default","dir":".","role":"sub"})
+                        save_agents(sdir,chats)
+                        logs[pending_name] = []; stream[pending_name] = ""
+                        active = len(chats)-1; msg = f"added {pending_name} ({b})"
+                    else: msg = f"unknown backend (claude|opencode|gemini|codex)"
+                    mode = "input"
+                inp = ""; mode = "input" if mode!="input" else mode
+                if mode in ("setmodel","newname"): mode = "input"
+                continue
+            if ch==27: inp = ""; mode = "input"; continue
+            if ch in (curses.KEY_BACKSPACE,127,8): inp = inp[:-1]; continue
+            if 32<=ch<=126: inp += chr(ch)
+            continue
+        if ch in (ord("q"),27): break
+        elif ch==ord("\t") and chats: active = (active+1)%len(chats)
+        elif ord("1")<=ch<=ord("9") and chats:
+            i = ch-ord("1")
+            if i<len(chats): active = i
+        elif ch==ord("i"): mode = "input"
+        elif ch==ord("m") and chats:
+            chats[active]["model"] = cycle_model(chats[active]["backend"],chats[active].get("model","default"))
+            save_agents(sdir,chats); msg = f'{chats[active]["name"]} model -> {chats[active]["model"]}'
+        elif ch==ord("M"): mode = "setmodel"; inp = chats[active].get("model","") if chats else ""
+        elif ch==ord("n"): mode = "newname"; inp = ""
+        elif ch==ord("a"):
+            try: pend = [r for r in json.loads((sdir/"approvals.json").read_text()) if r.get("status")=="pending"]
+            except Exception: pend = []
+            msg = f'approved {pend[0]["id"]}' if pend and approve_id(sdir,pend[0]["id"]) else "no pending approvals"
+
 def do_selfcheck(a):
     import tempfile
     td = Path(tempfile.mkdtemp(prefix="agent-check-"))
@@ -742,7 +1199,8 @@ def do_selfcheck(a):
             "sub":None,"id":0,"done_only":False,
             "name":"","cols":100,"rows":30,"on_exit":"","sess":"","key":None,"no_enter":False,
             "since":None,"clean":False,"session":None,"sp":"",
-            "home":None,"file":None,"home_to":None,"project_to":None,"to":None})
+            "home":None,"file":None,"home_to":None,"project_to":None,"to":None,
+            "backend":"claude","model":"default","role":"sub","adir":"."})
         o.__dict__.update(k); return o
     import io, contextlib
     buf=io.StringIO()
@@ -776,6 +1234,25 @@ def do_selfcheck(a):
         assert (td/"linked"/"CLAUDE.md").exists()
         assert (td/"linked"/".claude"/"skills"/"s.md").exists()
         assert do_harness(mk(sub="show",home=str(fh)))==0
+        # backends: parsers + argv, no network
+        assert _parse_claude('{"type":"system","subtype":"init","session_id":"abc"}')==[("meta","abc")]
+        ev=_parse_claude('{"type":"assistant","message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Read","input":{"file":"x"}}]}}')
+        assert ("text","hi") in ev and any(k=="tool" and "Read" in t for k,t in ev)
+        assert _parse_claude('{"type":"result","subtype":"success","total_cost_usd":0.01}')[0][0]=="done"
+        assert _parse_opencode('{"type":"text","sessionID":"ses_1","part":{"type":"text","text":"yo"}}')==[("meta","ses_1"),("text","yo")]
+        ev=_parse_opencode('{"type":"tool_use","sessionID":"s","part":{"type":"tool","tool":"bash","state":{"title":"ls","status":"completed"}}}')
+        assert ev[1]==("tool","bash ls")
+        assert backend_argv("claude",model="sonnet",workdir=".",sid="s1",prompt="hi")==["claude","-p","--verbose","--output-format","stream-json","--model","sonnet","--resume","s1","hi"]
+        assert "--session" in backend_argv("opencode",model="",workdir=".",sid="ses_9",prompt="hi")
+        assert cycle_model("claude","sonnet")=="opus"
+        assert do_agents(mk(sub="add",name="t1",backend="opencode",model="default",adir=".",role="sub"))==0
+        assert any(x["name"]=="t1" for x in load_agents(td))
+        assert do_agents(mk(sub="set",name="t1",backend=None,model="opus",adir=None,role=None))==0
+        assert do_chat(mk(sub="log",name="t1",limit=5))==0
+        assert do_agents(mk(sub="rm",name="t1",backend=None,model=None,adir=None,role=None))==0
+        append_chat(td,"t1","user","hello")
+        assert "user: hello" in recent_history(td,"t1")
+        assert do_status(mk())==0
         # live pty sessions
         if os.name=="posix":
             import time as _t
@@ -857,6 +1334,17 @@ def build():
     hexp=hs.add_parser("export"); hexp.add_argument("file",nargs="?",default=None); hexp.add_argument("--home",default=None)
     himp=hs.add_parser("import"); himp.add_argument("file"); himp.add_argument("--home",default=None); himp.add_argument("--home-to",default=None); himp.add_argument("--project-to",default=None); himp.add_argument("--force",action="store_true")
     hlink=hs.add_parser("link"); hlink.add_argument("--to",default=None); hlink.add_argument("--home",default=None)
+    ag = sub.add_parser("agents",help="agent roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
+    ags.add_parser("list")
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"])
+    agrm=ags.add_parser("rm"); agrm.add_argument("name")
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"])
+    ags.add_parser("doctor")
+    ch = sub.add_parser("chat",help="talk to an agent headless"); chs=ch.add_subparsers(dest="sub",required=True)
+    chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
+    chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--limit",type=int,default=20)
+    sub.add_parser("status",help="orchestration overview")
+    sub.add_parser("tui",help="interactive orchestration console")
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
     return p
@@ -878,7 +1366,8 @@ def main(argv=None):
         "approvals":do_approvals,"approve":do_approve,"shell":do_shell,"selfcheck":do_selfcheck,
         "spawn":do_spawn,"send":do_send,"snap":do_snap,"sessions":do_sessions,
         "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon,
-        "harness":do_harness}[a.subcmd]
+        "harness":do_harness,"agents":do_agents,"chat":do_chat,"status":do_status,
+        "tui":do_tui}[a.subcmd]
     return fn(a)
 
 if __name__=="__main__":

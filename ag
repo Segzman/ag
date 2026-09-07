@@ -760,6 +760,13 @@ def cycle_model(backend, cur):
     opts = MODELS.get(backend,["default"])
     return opts[(opts.index(cur)+1)%len(opts)] if cur in opts else opts[0]
 
+def _model_opts(backend): return MODELS.get(backend,["default"])+["[custom…]"]
+
+def _model_idx(c):
+    opts = _model_opts(c["backend"])
+    try: return opts.index(c.get("model","default"))
+    except ValueError: return 0
+
 def backend_argv(backend, *, model="", workdir=".", sid="", prompt=""):
     m = model if model and model!="default" else ""
     if backend=="claude":
@@ -809,6 +816,19 @@ def _parse_claude(line):
             elif b.get("type")=="tool_use":
                 out.append(("tool",f'{b.get("name","tool")} {json.dumps(b.get("input",{}))[:160]}'))
         return out
+    if t=="user":
+        out = []
+        try: blocks = o["message"]["content"]
+        except Exception: blocks = []
+        for b in blocks or []:
+            if b.get("type")=="tool_result":
+                c = b.get("content")
+                if isinstance(c,list):
+                    txt = " ".join(x.get("text","") for x in c if isinstance(x,dict) and x.get("type")=="text")
+                else: txt = str(c or "")
+                txt = txt.strip()
+                out.append(("toolout",txt[:600] if txt else ("(error)" if b.get("is_error") else "(ok)")))
+        return out
     if t=="result":
         return [("done",f'{o.get("subtype","")} cost=${o.get("total_cost_usd",0):.3f}')]
     return []
@@ -824,6 +844,7 @@ def _parse_opencode(line):
         st = p.get("state",{}) or {}
         title = st.get("title") or json.dumps(st.get("input",{}))[:160]
         evs.append(("tool",f'{p.get("tool","tool")} {title}'))
+        if st.get("output"): evs.append(("toolout",str(st["output"])[:600]))
     elif t=="step_finish" and p.get("reason")=="stop": evs.append(("done","stop"))
     return evs
 
@@ -987,6 +1008,10 @@ def run_turn(sdir,name,text,on_event=None):
                     append_chat(sdir,name,"tool",txt)
                     _event(sdir,"tool",name,tool=txt[:200])
                     if on_event: on_event(name,"tool",txt)
+                elif kind=="toolout":
+                    append_chat(sdir,name,"toolout",txt[:1000])
+                    _event(sdir,"toolout",name,out=txt[:200])
+                    if on_event: on_event(name,"toolout",txt)
                 elif kind=="done" and on_event: on_event(name,"done",txt)
         err = p.stderr.read() or ""
         rc = p.wait()
@@ -1094,7 +1119,7 @@ def _tui_main(stdscr, sdir):
         curses.start_color()
         try: curses.use_default_colors()
         except Exception: pass
-        for i,c in enumerate([curses.COLOR_CYAN,curses.COLOR_GREEN,curses.COLOR_YELLOW],1):
+        for i,c in enumerate([curses.COLOR_CYAN,curses.COLOR_GREEN,curses.COLOR_YELLOW,curses.COLOR_RED],1):
             try: curses.init_pair(i,c,-1)
             except Exception: pass
     chats = load_agents(sdir)
@@ -1108,13 +1133,14 @@ def _tui_main(stdscr, sdir):
     for e in orch_snapshot(sdir)["events"][-6:]:
         activity.append((e.get("session") or "",e.get("type",""),
             str(e.get("cmd",e.get("tool",e.get("exit",""))))[:60]))
-    inp, mode, msg = "", "input", "tab switch · m model · d delegate · n new · a approve · ? keys · q quit"
+    inp, mode, msg = "", "input", "tab switch · m models · d delegate · n new · a approve · ? keys · q quit"
     scroll = 0
+    pick_idx = 0
     lock = threading.Lock()
     def onevent(n,k,t):
         with lock:
             if k=="text": stream[n] = (stream[n]+t)[-3000:]
-            elif k in ("tool","done","exit"):
+            elif k in ("tool","toolout","done","exit"):
                 activity.append((n,k,(t or "")[:70])); del activity[:-30]
             if k=="exit":
                 logs[n] = load_chat_log(sdir,n)[-60:]; stream[n] = ""
@@ -1136,12 +1162,47 @@ def _tui_main(stdscr, sdir):
             except Exception: c2 = -1
             if c2!=-1: mode = "input"
             continue
+        if mode=="modelpick" and chats:
+            opts = _model_opts(chats[active]["backend"])
+            bw, bh = min(44,w-4), len(opts)+4
+            bx, by = (w-bw)//2, (h-bh)//2
+            for _y in range(by,by+bh): put(_y,bx," "*bw,curses.A_REVERSE)
+            put(by,bx+2,f'model: {chats[active]["name"]}',curses.A_REVERSE|curses.A_BOLD)
+            for i,o in enumerate(opts):
+                mark = ">" if i==pick_idx else " "
+                cur = "*" if o==chats[active].get("model") else " "
+                put(by+2+i,bx+2,f'{mark}{cur} {o}'[:bw-4],curses.A_REVERSE|(curses.A_BOLD if i==pick_idx else 0))
+            put(by+bh-1,bx+2,"up/down+enter, esc cancel"[:bw-4],curses.A_REVERSE)
+            stdscr.refresh()
+            try: c3 = stdscr.getch()
+            except Exception: c3 = -1
+            if c3==-1: continue
+            if c3==27:
+                stdscr.nodelay(True)
+                try: c4 = stdscr.getch()
+                except Exception: c4 = -1
+                try: c5 = stdscr.getch() if c4!=-1 else -1
+                except Exception: c5 = -1
+                stdscr.nodelay(False); stdscr.timeout(120)
+                if c4==-1: mode = "input"
+                elif c4==91 and c5==65: pick_idx = (pick_idx-1)%len(opts)
+                elif c4==91 and c5==66: pick_idx = (pick_idx+1)%len(opts)
+            elif c3 in (curses.KEY_UP,ord("k")): pick_idx = (pick_idx-1)%len(opts)
+            elif c3 in (curses.KEY_DOWN,ord("j"),9): pick_idx = (pick_idx+1)%len(opts)
+            elif c3 in (10,13):
+                if opts[pick_idx]=="[custom…]": mode = "setmodel"; inp = ""
+                else:
+                    chats[active]["model"] = opts[pick_idx]
+                    save_agents(sdir,chats); msg = f'model -> {opts[pick_idx]}'; mode = "input"
+            continue
         lw, rw = min(24,w//4), min(34,w//3)
         with lock:
             snap_logs = {k:list(v) for k,v in logs.items()}
             snap_stream = dict(stream); snap_act = list(activity)
         stdscr.erase()
-        put(0,0,f' ag tui · {Path.cwd().name} · {now_iso()[11:19]} · {msg}'[:w-1],curses.color_pair(1))
+        put(0,0,f' ag tui · {Path.cwd().name} · {now_iso()[11:19]} · {msg}'[:w-1],curses.color_pair(1)|curses.A_BOLD)
+        for _y in range(1,h-2):
+            put(_y,lw,"│"); put(_y,max(w-rw,lw+2),"│")
         # left: agents
         put(1,0," agents "[:lw],curses.A_BOLD)
         for i,c in enumerate(chats[:h-6]):
@@ -1164,20 +1225,22 @@ def _tui_main(stdscr, sdir):
         for i,(role,ln) in enumerate(vis[-(h-5):]):
             at = 0
             if role=="user": at = curses.color_pair(2)
-            elif role=="tool": at = curses.color_pair(3)
+            elif role in ("tool","toolout"): at = curses.color_pair(3)
             put(2+i,mx,f'{role[:6]:6} {ln}'[:w-mx-rw-2],at)
         # right: activity + approvals
         rx = w-rw
         put(1,rx," activity "[:rw],curses.A_BOLD)
         for i,(n,k,t) in enumerate(snap_act[-(h//2):]):
-            put(2+i,rx,f'{n[:8]:8} {k[:5]:5} {t}'[:rw-1])
+            tag = "└out" if k=="toolout" else k[:5]
+            at = curses.color_pair(3) if k in ("tool","toolout") else 0
+            put(2+i,rx,f'{n[:8]:8} {tag:5} {t}'[:rw-1],at)
         ay = 2+min(len(snap_act),h//2)+1
         if ay<h-3:
             put(ay,rx," approvals "[:rw],curses.A_BOLD)
             try: pend = [r for r in json.loads((sdir/"approvals.json").read_text()) if r.get("status")=="pending"][:h-ay-3]
             except Exception: pend = []
             for i,r in enumerate(pend):
-                put(ay+1+i,rx,f'! {r["id"][:8]} {(r.get("cmd","") or "")[:rw-12]}'[:rw-1],curses.color_pair(3))
+                put(ay+1+i,rx,f'! {r["id"][:8]} {(r.get("cmd","") or "")[:rw-12]}'[:rw-1],curses.color_pair(4))
         put(h-2,0,f'> {inp}'[-(w-1):],0,w)
         put(h-1,0,f'[{mode}] {len(chats)} agents · enter send · esc normal'[:w-1])
         try: stdscr.move(h-2,min(2+len(inp),w-1))
@@ -1231,8 +1294,7 @@ def _tui_main(stdscr, sdir):
             if i<len(chats): active = i; scroll = 0
         elif ch==ord("i"): mode = "input"
         elif ch==ord("m") and chats:
-            chats[active]["model"] = cycle_model(chats[active]["backend"],chats[active].get("model","default"))
-            save_agents(sdir,chats); msg = f'{chats[active]["name"]} model -> {chats[active]["model"]}'
+            mode = "modelpick"; pick_idx = _model_idx(chats[active])
         elif ch==ord("M"): mode = "setmodel"; inp = chats[active].get("model","") if chats else ""
         elif ch==ord("n"): mode = "newname"; inp = ""
         elif ch==ord("d"):
@@ -1251,7 +1313,7 @@ KEYS_HELP = """ag keys
  attach <id>: jump into live terminal (auth etc). Ctrl-] detaches, session keeps running. resize follows your terminal.
  forget <id>: wipe session logs (do after typing secrets)
  agents: agents list/add/rm/set/doctor | chat send <name> msg | chat log <name> | delegate <sub> task | status [--json] | tui
- tui: tab/1-9 target · enter/i input · esc normal · m cycle model · M custom · n new agent · d delegate · a approve · ? this help · q quit
+ tui: tab/1-9 target · enter/i input · esc normal · m model picker · M custom · n new agent · d delegate · a approve · ? this help · q quit
  approvals: blocked run -> approvals -> approve <id> (10min) or re-run --force
  memory: note/notes [--grep] · todo add/list/done/clear · history · events
  harness: show | export [file] | import <file> [--force] | link --to DIR"""
@@ -1419,6 +1481,12 @@ def do_selfcheck(a):
         assert do_agents(mk(sub="add",name="dl",backend="echo",model="default",adir=str(td),role="sub"))==0
         assert do_delegate(mk(agent="dl",text=["say","hi"]))==0
         assert any(r.get("role")=="delegate" for r in load_chat_log(td,"claude"))
+        ev=_parse_claude('{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"file data"}]}]}}')
+        assert ev==[("toolout","file data")]
+        ev=_parse_opencode('{"type":"tool_use","sessionID":"s","part":{"type":"tool","tool":"read","state":{"title":"f","output":"hello out"}}}')
+        assert ("toolout","hello out") in ev
+        assert _model_opts("opencode")==["default","[custom…]"]
+        assert _model_idx({"backend":"claude","model":"opus"})==2
         assert do_agents(mk(sub="add",name="t1",backend="opencode",model="default",adir=".",role="sub"))==0
         assert any(x["name"]=="t1" for x in load_agents(td))
         assert do_agents(mk(sub="set",name="t1",backend=None,model="opus",adir=None,role=None))==0

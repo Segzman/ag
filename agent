@@ -308,7 +308,7 @@ def resolve_sess(sdir, ident):
     return hits[0], None
 
 def daemon_main(sp):
-    import pty, select, signal
+    import pty, select, signal, fcntl, termios, struct
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     sp = Path(sp)
     st = _sstatus(sp)
@@ -326,10 +326,10 @@ def daemon_main(sp):
     st["child_pid"] = pid
     _swrite(sp, st)
     try:
-        import fcntl, termios, struct
         fcntl.ioctl(fd, termios.TIOCSWINSZ,
             struct.pack("HHHH", st.get("rows",30), st.get("cols",100), 0, 0))
     except Exception: pass
+    lastwz = 0
     ff = os.open(fifo, os.O_RDONLY|os.O_NONBLOCK)
     code, drain = None, 0
     try:
@@ -356,6 +356,16 @@ def daemon_main(sp):
                     with open(sp/"input.log","ab") as inf: inf.write(chunk)
                 else:
                     os.close(ff); ff = os.open(fifo, os.O_RDONLY|os.O_NONBLOCK)
+            try:
+                wj = sp/"winsize.json"
+                if wj.exists() and wj.stat().st_mtime != lastwz:
+                    lastwz = wj.stat().st_mtime
+                    wjdat = json.loads(wj.read_text())
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH",
+                        wjdat.get("rows",30), wjdat.get("cols",100), 0, 0))
+                    try: os.kill(pid, signal.SIGWINCH)
+                    except Exception: pass
+            except Exception: pass
             if code is not None: drain += 1
             if (eof and code is not None) or drain > 20: break
     finally:
@@ -766,7 +776,10 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt=""):
         if m: argv += ["-m",m]
         return argv
     if backend=="codex":
-        return ["codex","exec",prompt]
+        argv = ["codex","exec"]
+        if m: argv += ["-m",m]
+        if sid: argv += ["resume",sid]
+        return argv + [prompt]
     raise ValueError(f"unknown backend: {backend}")
 
 def _parse_claude(line):
@@ -820,6 +833,9 @@ def _parse_generic(line):
     walk(o)
     out = [("tool",t) for t in tools[:5]]
     if texts: out.append(("text","\n".join(texts)[:4000]))
+    for mt in re.finditer(r"(?i)(?:session_?id|conversation_?id)[\s:=/]+([A-Za-z0-9_\-]{6,})|\b(ses_[A-Za-z0-9]{6,})\b", line):
+        sid = mt.group(1) or mt.group(2)
+        if sid: out.insert(0,("meta",sid)); break
     return out or [("text",line[:300])]
 
 def parse_events(backend, line):
@@ -1078,7 +1094,7 @@ def _tui_main(stdscr, sdir):
     for e in orch_snapshot(sdir)["events"][-6:]:
         activity.append((e.get("session") or "",e.get("type",""),
             str(e.get("cmd",e.get("tool",e.get("exit",""))))[:60]))
-    inp, mode, msg = "", "input", "tab switch · m model · n new · a approve · q quit"
+    inp, mode, msg = "", "input", "tab switch · m model · n new · a approve · ? keys · q quit"
     lock = threading.Lock()
     def onevent(n,k,t):
         with lock:
@@ -1097,6 +1113,14 @@ def _tui_main(stdscr, sdir):
     stdscr.timeout(120)
     while True:
         h,w = stdscr.getmaxyx()
+        if mode=="help":
+            stdscr.erase()
+            for i,ln in enumerate(KEYS_HELP.splitlines()[:h-1]): put(i,0,ln[:w-1])
+            stdscr.refresh()
+            try: c2 = stdscr.getch()
+            except Exception: c2 = -1
+            if c2!=-1: mode = "input"
+            continue
         lw, rw = min(24,w//4), min(34,w//3)
         with lock:
             snap_logs = {k:list(v) for k,v in logs.items()}
@@ -1183,10 +1207,94 @@ def _tui_main(stdscr, sdir):
             save_agents(sdir,chats); msg = f'{chats[active]["name"]} model -> {chats[active]["model"]}'
         elif ch==ord("M"): mode = "setmodel"; inp = chats[active].get("model","") if chats else ""
         elif ch==ord("n"): mode = "newname"; inp = ""
+        elif ch==ord("?"): mode = "help"
         elif ch==ord("a"):
             try: pend = [r for r in json.loads((sdir/"approvals.json").read_text()) if r.get("status")=="pending"]
             except Exception: pend = []
             msg = f'approved {pend[0]["id"]}' if pend and approve_id(sdir,pend[0]["id"]) else "no pending approvals"
+
+KEYS_HELP = """agent keys
+ sessions: spawn -- <cmd> | send <id> text | send --key ctrl-c|esc|up|enter | snap [--since OFF] [--clean] | sessions | wait | kill [--force]
+ attach <id>: jump into live terminal (auth etc). Ctrl-] detaches, session keeps running. resize follows your terminal.
+ forget <id>: wipe session logs (do after typing secrets)
+ agents: agents list/add/rm/set/doctor | chat send <name> msg | chat log <name> | status [--json] | tui
+ tui: tab/1-9 target · enter/i input · esc normal · m cycle model · M custom · n new agent · a approve · ? this help · q quit
+ approvals: blocked run -> approvals -> approve <id> (10min) or re-run --force
+ memory: note/notes [--grep] · todo add/list/done/clear · history · events
+ harness: show | export [file] | import <file> [--force] | link --to DIR"""
+
+def _push_winsize(sp):
+    try: cols, rows = shutil.get_terminal_size((100,30))
+    except Exception: cols, rows = 100, 30
+    try: (sp/"winsize.json").write_text(json.dumps({"cols":cols,"rows":rows}))
+    except Exception: pass
+
+def do_attach(a):
+    import termios, tty, select, signal
+    if os.name != "posix" or not sys.stdin.isatty():
+        return emit(a,"attach",error="needs a POSIX tty",hint="run in a terminal")
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    hit, err = resolve_sess(sdir, a.sess)
+    if err: return emit(a,"attach",error=err,hint="agent sessions")
+    sp, st = hit
+    if not st.get("running"):
+        return emit(a,"attach",error=f'session {st["id"]} exited',hint=f'agent snap {st["id"]}')
+    try: fifo = os.open(sp/"stdin.fifo", os.O_WRONLY|os.O_NONBLOCK)
+    except OSError as e: return emit(a,"attach",error=f"fifo: {e}")
+    _push_winsize(sp)
+    old = termios.tcgetattr(sys.stdin.fileno())
+    try: lg = (sp/"output.log").stat().st_size
+    except Exception: lg = 0
+    print(f'attached {st["id"]} — Ctrl-] detaches, session keeps running',file=sys.stderr)
+    signal.signal(signal.SIGWINCH, lambda sig,frm: _push_winsize(sp))
+    try:
+        tty.setraw(sys.stdin.fileno())
+        while True:
+            r,_,_ = select.select([sys.stdin.fileno()],[],[],0.1)
+            if r:
+                try: data = os.read(sys.stdin.fileno(),1024)
+                except OSError: break
+                if not data or b"\x1d" in data: break
+                try: os.write(fifo, data)
+                except OSError: break
+            try: sz = (sp/"output.log").stat().st_size
+            except Exception: sz = lg
+            if sz < lg: lg = sz
+            elif sz > lg:
+                with open(sp/"output.log","rb") as f:
+                    f.seek(lg); chunk = f.read(sz-lg)
+                lg = sz
+                os.write(sys.stdout.fileno(), chunk)
+            if not _sstatus(sp).get("running"):
+                try:
+                    with open(sp/"output.log","rb") as f:
+                        f.seek(lg); tail = f.read()
+                    if tail: os.write(sys.stdout.fileno(), tail)
+                except Exception: pass
+                os.write(sys.stderr.fileno(), b"\r\n[session exited]\r\n")
+                break
+    finally:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+        try: os.close(fifo)
+        except Exception: pass
+        print(f'detached {st["id"]}',file=sys.stderr)
+    return 0
+
+def do_forget(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    hit, err = resolve_sess(sdir, a.sess)
+    if err: return emit(a,"forget",error=err,hint="agent sessions")
+    sp, st = hit
+    n = 0
+    for f in ("output.log","input.log"):
+        p = sp/f
+        if p.exists(): n += p.stat().st_size; p.write_bytes(b"")
+    _event(sdir,"forget",st["id"],bytes=n)
+    return emit(a,"forget",{"_text":f'wiped {n}B of logs for {st["id"]}',"id":st["id"],"bytes":n})
+
+def do_keys(a):
+    if getattr(a,"json",False): return emit(a,"keys",{"keys":KEYS_HELP.splitlines()})
+    return emit(a,"keys",{"_text":KEYS_HELP})
 
 def do_selfcheck(a):
     import tempfile
@@ -1253,6 +1361,25 @@ def do_selfcheck(a):
         append_chat(td,"t1","user","hello")
         assert "user: hello" in recent_history(td,"t1")
         assert do_status(mk())==0
+        # attach plumbing without tty: winsize push + forget wipe
+        if os.name=="posix":
+            import time as _t2
+            have = set(d.name for d in (td/"sessions").iterdir())
+            assert do_spawn(mk(cmd=["cat"],name="c3",cwd=str(td)))==0
+            s3 = [d.name for d in (td/"sessions").iterdir() if d.name not in have][0]
+            t0 = _t2.time()
+            while not _sstatus(td/"sessions"/s3).get("child_pid") and _t2.time()-t0<5: _t2.sleep(0.1)
+            _push_winsize(td/"sessions"/s3)
+            assert (td/"sessions"/s3/"winsize.json").exists()
+            assert do_send(mk(sess=s3,text=["tok123"]))==0
+            t0 = _t2.time()
+            while _t2.time()-t0<8:
+                if "tok123" in (td/"sessions"/s3/"output.log").read_bytes().decode(errors="replace"): break
+                _t2.sleep(0.2)
+            assert do_forget(mk(sess=s3))==0
+            assert (td/"sessions"/s3/"output.log").stat().st_size==0
+            assert do_kill(mk(sess=s3,force=True))==0
+            assert do_keys(mk())==0
         # live pty sessions
         if os.name=="posix":
             import time as _t
@@ -1345,6 +1472,9 @@ def build():
     chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--limit",type=int,default=20)
     sub.add_parser("status",help="orchestration overview")
     sub.add_parser("tui",help="interactive orchestration console")
+    ata=sub.add_parser("attach",help="jump into a live session terminal (Ctrl-] detaches)"); ata.add_argument("sess")
+    fgt=sub.add_parser("forget",help="wipe a session's logs (auth traces)"); fgt.add_argument("sess")
+    sub.add_parser("keys",help="control cheat-sheet")
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
     return p
@@ -1367,7 +1497,7 @@ def main(argv=None):
         "spawn":do_spawn,"send":do_send,"snap":do_snap,"sessions":do_sessions,
         "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon,
         "harness":do_harness,"agents":do_agents,"chat":do_chat,"status":do_status,
-        "tui":do_tui}[a.subcmd]
+        "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys}[a.subcmd]
     return fn(a)
 
 if __name__=="__main__":

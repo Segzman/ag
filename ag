@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""agent - CLI helper for autonomous agents. Single file, stdlib only.
+"""ag - CLI helper for autonomous agents. Single file, stdlib only.
 
 State: ./.agent/ in cwd (override with --dir or $AGENT_CLI_DIR).
 Live sessions (spawn/send/snap) are non-blocking; pings land in events.jsonl.
@@ -81,7 +81,7 @@ def check_dangerous(cmd_str, sdir):
 def do_run(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     if not a.cmd:
-        return emit(a, "run", error="no command given", hint='agent run -- echo hi')
+        return emit(a, "run", error="no command given", hint='ag run -- echo hi')
     cmd_str = " ".join(a.cmd) if len(a.cmd)>1 or " " in a.cmd[0] else a.cmd[0]
     # approval gate
     reason = check_dangerous(cmd_str, sdir)
@@ -95,7 +95,7 @@ def do_run(a):
                 "status":"pending","ts":now_iso()})
             (sdir/"approvals.json").write_text(json.dumps(approvals, indent=2))
         return emit(a, "run", error=f"blocked: {reason}",
-            hint=f"review then: agent approve {rid} && agent run --force -- {cmd_str}")
+            hint=f"review then: ag approve {rid} && ag run --force -- {cmd_str}")
     env = dict(os.environ)
     for kv in (a.env or []):
         if "=" in kv: k,v = kv.split("=",1); env[k]=v
@@ -393,7 +393,7 @@ def do_spawn(a):
         return emit(a,"spawn",error="pty sessions need POSIX",hint="use run instead")
     sdir = state_dir(a.dir); ensure_state(sdir)
     if not a.cmd:
-        return emit(a,"spawn",error="no command given",hint="agent spawn -- bash")
+        return emit(a,"spawn",error="no command given",hint="ag spawn -- bash")
     if a.cmd[0]=="--": a.cmd=a.cmd[1:]
     cmd_str = " ".join(a.cmd)
     env = {}
@@ -423,17 +423,17 @@ def do_spawn(a):
         time.sleep(0.05)
     if getattr(a,"json",False):
         return emit(a,"spawn",{"id":sid,"name":a.name or "","cmd":cmd_str,
-            "poll":f"agent snap --since 0 {sid}"})
-    return emit(a,"spawn",{"_text":f"spawned {sid} (poll: agent snap {sid})","id":sid})
+            "poll":f"ag snap --since 0 {sid}"})
+    return emit(a,"spawn",{"_text":f"spawned {sid} (poll: ag snap {sid})","id":sid})
 
 def do_send(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     hit, err = resolve_sess(sdir, a.sess)
-    if err: return emit(a,"send",error=err,hint="agent sessions")
+    if err: return emit(a,"send",error=err,hint="ag sessions")
     sp, st = hit
     if not st.get("running"):
         return emit(a,"send",error=f'session {st["id"]} exited ({st.get("exit")})',
-            hint=f'agent snap {st["id"]}')
+            hint=f'ag snap {st["id"]}')
     if a.key:
         if a.key not in KEYS:
             return emit(a,"send",error=f"unknown key: {a.key}",hint=str(sorted(KEYS)))
@@ -446,7 +446,7 @@ def do_send(a):
     if dp:
         try: os.kill(dp,0)
         except ProcessLookupError:
-            return emit(a,"send",error="daemon gone",hint=f'agent snap {st["id"]}')
+            return emit(a,"send",error="daemon gone",hint=f'ag snap {st["id"]}')
         except PermissionError: pass
     try: fd = os.open(sp/"stdin.fifo", os.O_WRONLY|os.O_NONBLOCK)
     except OSError as e: return emit(a,"send",error=f"fifo: {e}")
@@ -458,7 +458,7 @@ def do_send(a):
 def do_snap(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     hit, err = resolve_sess(sdir, a.sess)
-    if err: return emit(a,"snap",error=err,hint="agent sessions")
+    if err: return emit(a,"snap",error=err,hint="ag sessions")
     sp, st = hit
     try: raw = (sp/"output.log").read_bytes()
     except Exception: raw = b""
@@ -496,7 +496,7 @@ def do_kill(a):
     import signal
     sdir = state_dir(a.dir); ensure_state(sdir)
     hit, err = resolve_sess(sdir, a.sess)
-    if err: return emit(a,"kill",error=err,hint="agent sessions")
+    if err: return emit(a,"kill",error=err,hint="ag sessions")
     sp, st = hit
     if not st.get("running"):
         return emit(a,"kill",{"_text":f'{st["id"]} already exited ({st.get("exit")})',"id":st["id"]})
@@ -527,13 +527,13 @@ def do_kill(a):
 def do_wait(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     hit, err = resolve_sess(sdir, a.sess)
-    if err: return emit(a,"wait",error=err,hint="agent sessions")
+    if err: return emit(a,"wait",error=err,hint="ag sessions")
     sp, cur = hit
     t0 = time.time()
     while cur.get("running"):
         if time.time()-t0 > a.timeout:
             return emit(a,"wait",error=f"timeout after {a.timeout}s",
-                hint=f'agent snap {cur["id"]}')
+                hint=f'ag snap {cur["id"]}')
         time.sleep(0.2); cur = _sstatus(sp)
     try: raw = (sp/"output.log").read_bytes().decode(errors="replace")
     except Exception: raw = ""
@@ -560,10 +560,10 @@ def do_daemon(a):
     return 0
 
 def do_shell(a):
-    print(f"agent shell v{VERSION} (type exit, --json for machine mode)")
+    print(f"ag shell v{VERSION} (type exit, --json for machine mode)")
     js = False
     while True:
-        try: line = input("agent> ").strip()
+        try: line = input("ag> ").strip()
         except (EOFError,KeyboardInterrupt): break
         if not line: continue
         if line in ("exit","quit"): break
@@ -676,7 +676,7 @@ def harness_import(bundle, home_to, proj_to, force=False):
             dest.write_bytes(tar.extractfile(m).read())
             wrote.append(str(dest))
     return {"wrote":wrote,"skipped":skipped,"redacted":man.get("redacted",[]),
-        "hint":"fill REDACTED keys, then: agent harness link --to <project>"}
+        "hint":"fill REDACTED keys, then: ag harness link --to <project>"}
 
 def _copy_missing(src, dst):
     n = 0
@@ -944,7 +944,7 @@ def is_running(name):
 def run_turn(sdir,name,text,on_event=None):
     """One prompt turn. on_event(name,kind,text). Returns {sid,exit,reply} or {error}."""
     agents = {x["name"]:x for x in load_agents(sdir)}
-    if name not in agents: return {"error":f"no such agent: {name} (agent agents list)"}
+    if name not in agents: return {"error":f"no such agent: {name} (ag agents list)"}
     a = agents[name]
     backend = a.get("backend","claude")
     model = a.get("model","default") or "default"
@@ -978,7 +978,7 @@ def run_turn(sdir,name,text,on_event=None):
         rc = p.wait()
     except FileNotFoundError:
         rc = 127
-        chunks = [f"backend binary missing (agent agents doctor)"]
+        chunks = [f"backend binary missing (ag agents doctor)"]
     except Exception as e:
         rc = 1; chunks = [f"error: {e}"]
     finally:
@@ -1126,7 +1126,7 @@ def _tui_main(stdscr, sdir):
             snap_logs = {k:list(v) for k,v in logs.items()}
             snap_stream = dict(stream); snap_act = list(activity)
         stdscr.erase()
-        put(0,0,f' agent tui · {Path.cwd().name} · {now_iso()[11:19]} · {msg}'[:w-1],curses.color_pair(1))
+        put(0,0,f' ag tui · {Path.cwd().name} · {now_iso()[11:19]} · {msg}'[:w-1],curses.color_pair(1))
         # left: agents
         put(1,0," agents "[:lw],curses.A_BOLD)
         for i,c in enumerate(chats[:h-6]):
@@ -1213,12 +1213,12 @@ def _tui_main(stdscr, sdir):
             except Exception: pend = []
             msg = f'approved {pend[0]["id"]}' if pend and approve_id(sdir,pend[0]["id"]) else "no pending approvals"
 
-KEYS_HELP = """agent keys
+KEYS_HELP = """ag keys
  sessions: spawn -- <cmd> | send <id> text | send --key ctrl-c|esc|up|enter | snap [--since OFF] [--clean] | sessions | wait | kill [--force]
  attach <id>: jump into live terminal (auth etc). Ctrl-] detaches, session keeps running. resize follows your terminal.
  forget <id>: wipe session logs (do after typing secrets)
  agents: agents list/add/rm/set/doctor | chat send <name> msg | chat log <name> | status [--json] | tui
- tui: tab/1-9 target · enter/i input · esc normal · m cycle model · M custom · n new agent · a approve · ? this help · q quit
+ tui: tab/1-9 target · enter/i input · esc normal · m cycle model · M custom · n new ag · a approve · ? this help · q quit
  approvals: blocked run -> approvals -> approve <id> (10min) or re-run --force
  memory: note/notes [--grep] · todo add/list/done/clear · history · events
  harness: show | export [file] | import <file> [--force] | link --to DIR"""
@@ -1235,10 +1235,10 @@ def do_attach(a):
         return emit(a,"attach",error="needs a POSIX tty",hint="run in a terminal")
     sdir = state_dir(a.dir); ensure_state(sdir)
     hit, err = resolve_sess(sdir, a.sess)
-    if err: return emit(a,"attach",error=err,hint="agent sessions")
+    if err: return emit(a,"attach",error=err,hint="ag sessions")
     sp, st = hit
     if not st.get("running"):
-        return emit(a,"attach",error=f'session {st["id"]} exited',hint=f'agent snap {st["id"]}')
+        return emit(a,"attach",error=f'session {st["id"]} exited',hint=f'ag snap {st["id"]}')
     try: fifo = os.open(sp/"stdin.fifo", os.O_WRONLY|os.O_NONBLOCK)
     except OSError as e: return emit(a,"attach",error=f"fifo: {e}")
     _push_winsize(sp)
@@ -1283,7 +1283,7 @@ def do_attach(a):
 def do_forget(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     hit, err = resolve_sess(sdir, a.sess)
-    if err: return emit(a,"forget",error=err,hint="agent sessions")
+    if err: return emit(a,"forget",error=err,hint="ag sessions")
     sp, st = hit
     n = 0
     for f in ("output.log","input.log"):
@@ -1421,7 +1421,7 @@ def do_selfcheck(a):
     return 0
 
 def build():
-    p = argparse.ArgumentParser(prog="agent", description="CLI helper for autonomous agents")
+    p = argparse.ArgumentParser(prog="ag", description="CLI helper for autonomous agents")
     p.add_argument("--dir", default=None, help="state dir (default ./.agent)")
     p.add_argument("--json", action="store_true", help="machine-readable JSON output")
     p.add_argument("--version", action="store_true")
@@ -1461,7 +1461,7 @@ def build():
     hexp=hs.add_parser("export"); hexp.add_argument("file",nargs="?",default=None); hexp.add_argument("--home",default=None)
     himp=hs.add_parser("import"); himp.add_argument("file"); himp.add_argument("--home",default=None); himp.add_argument("--home-to",default=None); himp.add_argument("--project-to",default=None); himp.add_argument("--force",action="store_true")
     hlink=hs.add_parser("link"); hlink.add_argument("--to",default=None); hlink.add_argument("--home",default=None)
-    ag = sub.add_parser("agents",help="agent roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
+    ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
     aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"])
     agrm=ags.add_parser("rm"); agrm.add_argument("name")
@@ -1481,7 +1481,7 @@ def build():
 
 def main(argv=None):
     if argv is None: argv = sys.argv[1:]
-    # --json anywhere (agents type `agent run --json -- ...`)
+    # --json anywhere (agents type `ag run --json -- ...`)
     want_json = "--json" in argv
     argv = [x for x in argv if x != "--json"]
     p = build()

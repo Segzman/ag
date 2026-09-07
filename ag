@@ -767,6 +767,39 @@ def _model_idx(c):
     try: return opts.index(c.get("model","default"))
     except ValueError: return 0
 
+THEMES = {
+    "abyss": {"header":("cyan",1),"user":("green",0),"tool":("yellow",0),"alert":("red",1),
+              "border":("white","dim"),"active":("cyan",1),"dim":("white","dim"),"rounded":True},
+    "mono": {"header":("white",1),"user":("white",0),"tool":("white",1),"alert":("white",1),
+             "border":("white","dim"),"active":("white",1),"dim":("white","dim"),"rounded":False},
+    "ember": {"header":("magenta",1),"user":("yellow",0),"tool":("cyan",0),"alert":("red",1),
+              "border":("white","dim"),"active":("magenta",1),"dim":("white","dim"),"rounded":True},
+}
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+def theme_pairs(name):
+    import curses
+    cols = {"black":0,"red":1,"green":2,"yellow":3,"blue":4,"magenta":5,"cyan":6,"white":7}
+    spec = THEMES.get(name,THEMES["abyss"])
+    th = {}
+    for i,r in enumerate(["header","user","tool","alert","border","active","dim"],1):
+        fg,b = spec[r]
+        try:
+            curses.init_pair(i,cols.get(fg,7),-1)
+            a = curses.color_pair(i)
+        except Exception:
+            a = 0
+        if b==1: a |= curses.A_BOLD
+        elif b=="dim": a |= getattr(curses,"A_DIM",0)
+        th[r] = a
+    th["rounded"] = spec.get("rounded",True)
+    return th
+def load_ui(sdir):
+    try: return json.loads((sdir/"ui.json").read_text()).get("theme","abyss")
+    except Exception: return "abyss"
+def save_ui(sdir,name):
+    try: (sdir/"ui.json").write_text(json.dumps({"theme":name}))
+    except Exception: pass
+
 def backend_argv(backend, *, model="", workdir=".", sid="", prompt=""):
     m = model if model and model!="default" else ""
     if backend=="claude":
@@ -1108,8 +1141,34 @@ def do_tui(a):
     try: import curses
     except Exception: return emit(a,"tui",error="curses unavailable (POSIX terminal needed)")
     sdir = state_dir(a.dir); ensure_state(sdir)
+    if getattr(a,"theme",None):
+        if a.theme in THEMES: save_ui(sdir,a.theme)
+        else: return emit(a,"tui",error=f'unknown theme: {a.theme}',hint=str(list(THEMES)))
     curses.wrapper(_tui_main, sdir)
     return 0
+
+def _readkey(stdscr):
+    """One key, escape-sequences assembled. Arrows -> KEY_UP/DOWN/LEFT/RIGHT."""
+    import curses
+    try: c = stdscr.getch()
+    except Exception: return -1
+    if c != 27: return c
+    stdscr.nodelay(True)
+    rest = []
+    t0 = time.time()
+    try:
+        while time.time()-t0 < 0.06 and len(rest) < 2:
+            try: d = stdscr.getch()
+            except Exception: d = -1
+            if d == -1: time.sleep(0.005)
+            else: rest.append(d)
+    finally:
+        stdscr.nodelay(False); stdscr.timeout(120)
+    if rest == [91,65]: return curses.KEY_UP
+    if rest == [91,66]: return curses.KEY_DOWN
+    if rest == [91,67]: return curses.KEY_RIGHT
+    if rest == [91,68]: return curses.KEY_LEFT
+    return 27 if not rest else -2
 
 def _tui_main(stdscr, sdir):
     import curses
@@ -1127,6 +1186,8 @@ def _tui_main(stdscr, sdir):
         chats = [{"name":"claude","backend":"claude","model":"default","dir":".","role":"orchestrator"}]
         save_agents(sdir,chats)
     active = 0
+    theme = load_ui(sdir)
+    th = theme_pairs(theme)
     logs = {c["name"]:load_chat_log(sdir,c["name"])[-60:] for c in chats}
     stream = {c["name"]:"" for c in chats}
     activity = []
@@ -1151,6 +1212,16 @@ def _tui_main(stdscr, sdir):
     def put(y,x,s,attr=0,w=0):
         try: stdscr.addstr(y,x,s[:max(0,(w or len(s)))],attr)
         except Exception: pass
+    def box(y,x,h,w,title="",active=False):
+        if h<2 or w<6 or y<0 or x<0: return
+        ba = th["active"] if active else th["border"]
+        if th["rounded"]: tl,tr,bl,br,hz,vt = "╭","╮","╰","╯","─","│"
+        else: tl,tr,bl,br,hz,vt = "+","+","+","+","-","|"
+        t = f'{tl}{hz} {title} ' if title else tl
+        put(y,x,(t+hz*max(0,w-len(t)-1)+tr)[:w],ba)
+        for yy in range(y+1,y+h-1):
+            put(yy,x,vt,ba); put(yy,x+w-1,vt,ba)
+        put(y+h-1,x,(bl+hz*max(0,w-2)+br)[:w],ba)
     stdscr.timeout(120)
     while True:
         h,w = stdscr.getmaxyx()
@@ -1158,9 +1229,8 @@ def _tui_main(stdscr, sdir):
             stdscr.erase()
             for i,ln in enumerate(KEYS_HELP.splitlines()[:h-1]): put(i,0,ln[:w-1])
             stdscr.refresh()
-            try: c2 = stdscr.getch()
-            except Exception: c2 = -1
-            if c2!=-1: mode = "input"
+            c2 = _readkey(stdscr)
+            if c2 not in (-1,-2): mode = "input"
             continue
         if mode=="modelpick" and chats:
             opts = _model_opts(chats[active]["backend"])
@@ -1174,19 +1244,9 @@ def _tui_main(stdscr, sdir):
                 put(by+2+i,bx+2,f'{mark}{cur} {o}'[:bw-4],curses.A_REVERSE|(curses.A_BOLD if i==pick_idx else 0))
             put(by+bh-1,bx+2,"up/down+enter, esc cancel"[:bw-4],curses.A_REVERSE)
             stdscr.refresh()
-            try: c3 = stdscr.getch()
-            except Exception: c3 = -1
-            if c3==-1: continue
-            if c3==27:
-                stdscr.nodelay(True)
-                try: c4 = stdscr.getch()
-                except Exception: c4 = -1
-                try: c5 = stdscr.getch() if c4!=-1 else -1
-                except Exception: c5 = -1
-                stdscr.nodelay(False); stdscr.timeout(120)
-                if c4==-1: mode = "input"
-                elif c4==91 and c5==65: pick_idx = (pick_idx-1)%len(opts)
-                elif c4==91 and c5==66: pick_idx = (pick_idx+1)%len(opts)
+            c3 = _readkey(stdscr)
+            if c3 in (-1,-2): continue
+            if c3==27: mode = "input"
             elif c3 in (curses.KEY_UP,ord("k")): pick_idx = (pick_idx-1)%len(opts)
             elif c3 in (curses.KEY_DOWN,ord("j"),9): pick_idx = (pick_idx+1)%len(opts)
             elif c3 in (10,13):
@@ -1195,60 +1255,74 @@ def _tui_main(stdscr, sdir):
                     chats[active]["model"] = opts[pick_idx]
                     save_agents(sdir,chats); msg = f'model -> {opts[pick_idx]}'; mode = "input"
             continue
-        lw, rw = min(24,w//4), min(34,w//3)
+        lw, rw = min(26,max(18,w//4)), min(36,max(24,w//3))
         with lock:
             snap_logs = {k:list(v) for k,v in logs.items()}
             snap_stream = dict(stream); snap_act = list(activity)
         stdscr.erase()
-        put(0,0,f' ag tui · {Path.cwd().name} · {now_iso()[11:19]} · {msg}'[:w-1],curses.color_pair(1)|curses.A_BOLD)
-        for _y in range(1,h-2):
-            put(_y,lw,"│"); put(_y,max(w-rw,lw+2),"│")
-        # left: agents
-        put(1,0," agents "[:lw],curses.A_BOLD)
-        for i,c in enumerate(chats[:h-6]):
-            flag = "*" if is_running(c["name"]) else " "
-            sel = ">" if i==active else " "
-            put(2+i,0,f'{sel}{flag}{c["name"][:12]:12} {c["model"][:lw-16]}'[:lw-1],
-                curses.A_REVERSE if i==active else 0)
-        # main: active chat
-        mx = lw+1
+        put(0,0,f' ag · {Path.cwd().name} · {now_iso()[11:19]} · {msg}'[:w-1],th["dim"])
         name = chats[active]["name"] if chats else ""
-        put(1,mx,f' chat: {name} [{chats[active]["backend"] if chats else ""}]'[:w-mx-rw-2] if chats else "",curses.A_BOLD)
+        H = h-5
+        spin = SPIN[int(time.time()*6)%len(SPIN)]
+        box(1,0,H,lw+1,"agents")
+        for i,c in enumerate(chats[:max(0,H-2)]):
+            run = is_running(c["name"])
+            pre = spin if run else " "
+            sel = ">" if i==active else " "
+            put(2+i,2,f'{sel}{pre} {c["name"][:12]:12} {c["model"][:max(4,lw-21)]}'[:lw-2],
+                curses.A_REVERSE if i==active else (th["active"] if run else 0))
+        mx, mw = lw+1, w-rw-lw-1
+        ag0 = chats[active] if chats else {}
+        ctitle = f'{name} · {ag0.get("backend","")} · {ag0.get("model","")}'
+        if chats and is_running(name): ctitle += f' {spin}'
+        if scroll: ctitle += f' ↑{scroll}'
+        box(1,mx,H,mw,ctitle,active=True)
         rows = []
-        for r in snap_logs.get(name,[])[-(h-5):]:
-            role = r.get("role","")
+        for r in snap_logs.get(name,[]):
             for ln in (r.get("text","") or "").splitlines() or [""]:
-                rows.append((role,ln))
-        if snap_stream.get(name): rows.append(("agent…",snap_stream[name][-200:]))
-        scroll = min(scroll, max(0,len(rows)-(h-5)))
-        vis = rows[:len(rows)-scroll if scroll else None]
-        for i,(role,ln) in enumerate(vis[-(h-5):]):
-            at = 0
-            if role=="user": at = curses.color_pair(2)
-            elif role in ("tool","toolout"): at = curses.color_pair(3)
-            put(2+i,mx,f'{role[:6]:6} {ln}'[:w-mx-rw-2],at)
-        # right: activity + approvals
+                rows.append((r.get("role",""),ln))
+        if snap_stream.get(name): rows.append(("agent…",snap_stream[name][-300:]))
+        rows = rows[-max(1,H*3):]
+        scroll = min(scroll, max(0,len(rows)-max(1,H-2)))
+        vis = rows[:len(rows)-scroll if scroll else None][-max(1,H-2):]
+        R, prev = [], ""
+        for role,ln in vis:
+            if role=="user":
+                if prev!="user": R.append((th["user"],f'● {name}'))
+                R.append((0,f'  {ln}'))
+            elif role=="delegate": R.append((th["header"],f'◆ {ln}'))
+            elif role=="tool": R.append((th["tool"],f'└─ {ln}'))
+            elif role=="toolout":
+                for ol in ln.splitlines()[:2]: R.append((th["dim"],f'   {ol}'))
+            elif "…" in role: R.append((th["active"],f'◌ {ln[:160]}'))
+            else:
+                if role=="agent" and prev!="agent": R.append((th["active"],f'● {name}'))
+                R.append((0,f'  {ln}' if role=="agent" else ln))
+            prev = role
+        for j,(at,tx) in enumerate(R[-(H-2):] if H>2 else []):
+            put(2+j,mx+2,tx[:mw-4],at)
         rx = w-rw
-        put(1,rx," activity "[:rw],curses.A_BOLD)
-        for i,(n,k,t) in enumerate(snap_act[-(h//2):]):
-            tag = "└out" if k=="toolout" else k[:5]
-            at = curses.color_pair(3) if k in ("tool","toolout") else 0
-            put(2+i,rx,f'{n[:8]:8} {tag:5} {t}'[:rw-1],at)
-        ay = 2+min(len(snap_act),h//2)+1
-        if ay<h-3:
-            put(ay,rx," approvals "[:rw],curses.A_BOLD)
-            try: pend = [r for r in json.loads((sdir/"approvals.json").read_text()) if r.get("status")=="pending"][:h-ay-3]
-            except Exception: pend = []
-            for i,r in enumerate(pend):
-                put(ay+1+i,rx,f'! {r["id"][:8]} {(r.get("cmd","") or "")[:rw-12]}'[:rw-1],curses.color_pair(4))
-        put(h-2,0,f'> {inp}'[-(w-1):],0,w)
-        put(h-1,0,f'[{mode}] {len(chats)} agents · enter send · esc normal'[:w-1])
-        try: stdscr.move(h-2,min(2+len(inp),w-1))
+        ah = 1+(H-2)//2
+        box(1,rx,ah,rw,"activity")
+        for i,(n,k,t) in enumerate(snap_act[-max(0,ah-2):]):
+            tag = "◌" if k=="toolout" else ("⚙" if k=="tool" else "•")
+            put(2+i,rx+2,f'{tag} {n[:10]:10} {t}'[:rw-4],
+                th["tool"] if k in ("tool","toolout") else (th["dim"] if k=="exit" else 0))
+        try: pend = [r for r in json.loads((sdir/"approvals.json").read_text()) if r.get("status")=="pending"]
+        except Exception: pend = []
+        ay, ah2 = 1+ah, H-ah
+        if ah2 >= 3:
+            box(ay,rx,ah2,rw,f'approvals ({len(pend)})')
+            for i,r in enumerate(pend[:ah2-2]):
+                put(ay+1+i,rx+2,f'! {(r.get("cmd","") or "")[:rw-8]}'[:rw-4],th["alert"])
+        box(h-4,0,3,w,f'> {name}' if mode=="input" else f'> {mode}')
+        put(h-3,2,inp[-(w-4):] if w>4 else "")
+        put(h-1,0,f' {len(chats)} agents · tab target · m models · d delegate · t theme:{theme} · ? help · q quit'[:w-1],th["dim"])
+        try: stdscr.move(h-3,min(2+len(inp),max(0,w-2)))
         except Exception: pass
         stdscr.refresh()
-        try: ch = stdscr.getch()
-        except Exception: ch = -1
-        if ch==-1: continue
+        ch = _readkey(stdscr)
+        if ch in (-1,-2): continue
         if mode in ("input","setmodel","newname","newbackend","dagent","dtext"):
             if ch in (10,13):
                 if mode=="input":
@@ -1301,8 +1375,12 @@ def _tui_main(stdscr, sdir):
             subs = [c["name"] for c in chats if c.get("role")!="orchestrator"] or [c["name"] for c in chats]
             mode = "dagent"; inp = subs[0] if subs else ""
         elif ch==ord("?"): mode = "help"
-        elif ch in (ord("["),curses.KEY_PPAGE): scroll += 5
-        elif ch in (ord("]"),curses.KEY_NPAGE): scroll = max(0,scroll-5)
+        elif ch in (ord("["),curses.KEY_PPAGE,curses.KEY_UP): scroll += 5
+        elif ch in (ord("]"),curses.KEY_NPAGE,curses.KEY_DOWN): scroll = max(0,scroll-5)
+        elif ch==ord("t"):
+            names = list(THEMES)
+            theme = names[(names.index(theme)+1)%len(names)] if theme in names else names[0]
+            save_ui(sdir,theme); th = theme_pairs(theme); msg = f"theme -> {theme}"
         elif ch==ord("a"):
             try: pend = [r for r in json.loads((sdir/"approvals.json").read_text()) if r.get("status")=="pending"]
             except Exception: pend = []
@@ -1487,6 +1565,8 @@ def do_selfcheck(a):
         assert ("toolout","hello out") in ev
         assert _model_opts("opencode")==["default","[custom…]"]
         assert _model_idx({"backend":"claude","model":"opus"})==2
+        th0=theme_pairs("mono"); assert set(("header","border","rounded"))<=set(th0)
+        save_ui(td,"ember"); assert load_ui(td)=="ember"; save_ui(td,"abyss")
         assert do_agents(mk(sub="add",name="t1",backend="opencode",model="default",adir=".",role="sub"))==0
         assert any(x["name"]=="t1" for x in load_agents(td))
         assert do_agents(mk(sub="set",name="t1",backend=None,model="opus",adir=None,role=None))==0
@@ -1605,7 +1685,7 @@ def build():
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
     chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--limit",type=int,default=20)
     sub.add_parser("status",help="orchestration overview")
-    sub.add_parser("tui",help="interactive orchestration console")
+    tut=sub.add_parser("tui",help="interactive orchestration console"); tut.add_argument("--theme",default=None)
     ata=sub.add_parser("attach",help="jump into a live session terminal (Ctrl-] detaches)"); ata.add_argument("sess")
     fgt=sub.add_parser("forget",help="wipe a session's logs (auth traces)"); fgt.add_argument("sess")
     sub.add_parser("keys",help="control cheat-sheet")

@@ -800,11 +800,12 @@ def save_ui(sdir,name):
     try: (sdir/"ui.json").write_text(json.dumps({"theme":name}))
     except Exception: pass
 
-def backend_argv(backend, *, model="", workdir=".", sid="", prompt=""):
+def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system=""):
     m = model if model and model!="default" else ""
     if backend=="claude":
         argv = ["claude","-p","--verbose","--output-format","stream-json"]
         if m: argv += ["--model",m]
+        if system: argv += ["--append-system-prompt",system]
         if sid: argv += ["--resume",sid]
         return argv + [prompt]
     if backend=="opencode":
@@ -923,6 +924,36 @@ def load_agents(sdir):
 def save_agents(sdir, rows):
     (sdir/"agents.json").write_text(json.dumps(rows,indent=2))
 
+DEFAULT_ROLES = [
+    {"name":"reviewer","system":"You are a senior code reviewer. Be terse. Report bugs, security holes, and scope creep with file:line. Suggest minimal fixes. Never rewrite unasked."},
+    {"name":"planner","system":"You are a planning assistant. Break work into small verifiable steps. State assumptions up front. Ask when ambiguous. Write no code unless asked."},
+    {"name":"implementer","system":"You are an implementation engineer. Minimal diffs, match existing style, verify by running code or tests. No speculative features."},
+]
+def load_roles(sdir):
+    p = sdir/"roles.json"
+    try: rows = json.loads(p.read_text())
+    except Exception: rows = None
+    if not isinstance(rows,list):
+        rows = [dict(r) for r in DEFAULT_ROLES]
+        try: p.write_text(json.dumps(rows,indent=2))
+        except Exception: pass
+    return rows
+def save_roles(sdir, rows):
+    (sdir/"roles.json").write_text(json.dumps(rows,indent=2))
+def eff_system(sdir, agent):
+    """Effective system prompt: agent.system override, else its persona role. @file loads text."""
+    sys_txt = ((agent or {}).get("system") or "").strip()
+    if not sys_txt and (agent or {}).get("persona"):
+        m = {r["name"]:r for r in load_roles(sdir)}
+        sys_txt = (m.get(agent["persona"],{}).get("system") or "").strip()
+    if sys_txt.startswith("@"):
+        p = Path(sys_txt[1:]).expanduser()
+        if not p.is_absolute():
+            p = Path((agent or {}).get("dir",".") or ".")/p
+        try: sys_txt = p.read_text(errors="replace")[:8000].strip()
+        except Exception: sys_txt = ""
+    return sys_txt
+
 def do_agents(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     if a.sub=="doctor":
@@ -948,13 +979,16 @@ def do_agents(a):
     rows = load_agents(sdir)
     if a.sub=="list":
         if getattr(a,"json",False): return emit(a,"agents",{"agents":rows})
-        txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("dir",".")}' for r in rows) or "(none)"
+        txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("persona","") or "-":12} {r.get("dir",".")}' for r in rows) or "(none)"
         return emit(a,"agents",{"_text":txt})
     if a.sub=="add":
         if any(r["name"]==a.name for r in rows):
             return emit(a,"agents",error=f"exists: {a.name}")
+        pers = getattr(a,"persona",None) or ""
+        if pers and pers not in [r["name"] for r in load_roles(sdir)]:
+            return emit(a,"agents",error=f"no such role: {pers}",hint="ag roles list")
         rows.append({"name":a.name,"backend":a.backend,"model":a.model or "default",
-            "dir":a.adir or ".","role":a.role})
+            "dir":a.adir or ".","role":a.role,"persona":pers,"system":getattr(a,"system",None) or ""})
         save_agents(sdir,rows)
         return emit(a,"agents",{"_text":f"added {a.name}"})
     if a.sub=="rm":
@@ -969,8 +1003,45 @@ def do_agents(a):
         if a.model: r["model"]=a.model
         if a.adir: r["dir"]=a.adir
         if a.role: r["role"]=a.role
+        if getattr(a,"persona",None) is not None:
+            if a.persona and a.persona not in [x["name"] for x in load_roles(sdir)]:
+                return emit(a,"agents",error=f"no such role: {a.persona}",hint="ag roles list")
+            r["persona"]=a.persona
+        if getattr(a,"system",None) is not None: r["system"]=a.system
         save_agents(sdir,rows)
         return emit(a,"agents",{"_text":f"updated {a.name}"})
+
+def do_roles(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    rows = load_roles(sdir)
+    if a.sub=="list":
+        if getattr(a,"json",False): return emit(a,"roles",{"roles":rows})
+        txt = "\n".join(f'{r["name"]:12} {(r.get("system","") or "").splitlines()[0][:72] if (r.get("system","") or "").splitlines() else ""}' for r in rows) or "(none)"
+        return emit(a,"roles",{"_text":txt})
+    if a.sub=="show":
+        hit = [r for r in rows if r["name"]==getattr(a,"name","")]
+        if not hit: return emit(a,"roles",error=f"no such role: {getattr(a,'name','')}")
+        return emit(a,"roles",{"_text":hit[0].get("system","")})
+    if a.sub=="rm":
+        rows = [r for r in rows if r["name"]!=getattr(a,"name","")]
+        save_roles(sdir,rows)
+        return emit(a,"roles",{"_text":f"removed {getattr(a,'name','')}"})
+    if a.sub in ("add","set"):
+        sys_txt = (getattr(a,"system",None) or "").strip()
+        fp = getattr(a,"file",None)
+        if fp:
+            try: sys_txt = Path(fp).expanduser().read_text(errors="replace")[:8000].strip()
+            except Exception as e: return emit(a,"roles",error=f"can't read {fp}: {e}")
+        if a.sub=="add":
+            if any(r["name"]==a.name for r in rows): return emit(a,"roles",error=f"exists: {a.name}")
+            if not sys_txt: return emit(a,"roles",error="empty system",hint='roles add <name> --system "..." [--file path]')
+            rows.append({"name":a.name,"system":sys_txt}); save_roles(sdir,rows)
+            return emit(a,"roles",{"_text":f"added role {a.name}"})
+        hit = [r for r in rows if r["name"]==a.name]
+        if not hit: return emit(a,"roles",error=f"no such role: {a.name}")
+        if sys_txt: hit[0]["system"]=sys_txt
+        save_roles(sdir,rows)
+        return emit(a,"roles",{"_text":f"updated role {a.name}"})
 
 def chat_dir(sdir):
     d = sdir/"chats"; d.mkdir(parents=True,exist_ok=True); return d
@@ -1021,7 +1092,12 @@ def run_turn(sdir,name,text,on_event=None):
     sid = meta.get("sid","")
     hist = "" if (sid and backend in ("claude","opencode","cursor")) else recent_history(sdir,name)
     prompt = (hist+"\n\n---\n"+text) if hist else text
-    try: argv = backend_argv(backend,model=model,workdir=workdir,sid=sid,prompt=prompt)
+    sys_txt = eff_system(sdir, a)
+    if sys_txt and backend!="claude" and not sid:
+        # backends without a native system flag: lead the first turn with the role block
+        prompt = f'[system role: {a.get("persona") or "custom"}]\n{sys_txt}\n\n---\n{prompt}'
+    try: argv = backend_argv(backend,model=model,workdir=workdir,sid=sid,prompt=prompt,
+        system=sys_txt if backend=="claude" else "")
     except ValueError as e: return {"error":str(e)}
     append_chat(sdir,name,"user",text)
     mark_running(name,True)
@@ -1194,7 +1270,7 @@ def _tui_main(stdscr, sdir):
     for e in orch_snapshot(sdir)["events"][-6:]:
         activity.append((e.get("session") or "",e.get("type",""),
             str(e.get("cmd",e.get("tool",e.get("exit",""))))[:60]))
-    inp, mode, msg = "", "input", "tab switch · m models · d delegate · n new · a approve · ? keys · q quit"
+    inp, mode, msg = "", "input", "tab switch · m models · R role · d delegate · n new · ! shell · a approve · ? keys · q quit"
     scroll = 0
     pick_idx = 0
     lock = threading.Lock()
@@ -1209,6 +1285,32 @@ def _tui_main(stdscr, sdir):
         if not chats: return
         th = threading.Thread(target=run_turn,args=(sdir,chats[active]["name"],text,onevent),daemon=True)
         th.start()
+    def run_shell(cmd):
+        """!cmd in input: run shell now, show output as tool lines. Dangerous cmds need `a` first."""
+        nm = chats[active]["name"] if chats else ""
+        def show(out):
+            if nm:
+                with lock:
+                    logs[nm].append({"ts":now_iso(),"role":"tool","text":f"$ {cmd}"})
+                    logs[nm].append({"ts":now_iso(),"role":"toolout","text":out[:3000]})
+                try: append_chat(sdir,nm,"tool",f"$ {cmd}"); append_chat(sdir,nm,"toolout",out[:3000])
+                except Exception: pass
+        reason = check_dangerous(cmd, sdir)
+        if reason:
+            h = hashlib.sha256(cmd.encode()).hexdigest()[:16]; rid = h[:8]
+            try: approvals = json.loads((sdir/"approvals.json").read_text())
+            except Exception: approvals = []
+            if not any(x.get("id")==rid and x.get("status")=="pending" for x in approvals):
+                approvals.append({"id":rid,"cmd_hash":h,"cmd":cmd,"reason":reason,
+                    "status":"pending","ts":now_iso()})
+                (sdir/"approvals.json").write_text(json.dumps(approvals, indent=2))
+            show(f"blocked: {reason} (press a to approve, then re-run !cmd)")
+            return
+        try:
+            p = subprocess.run(cmd,shell=True,capture_output=True,text=True,timeout=60,env=dict(os.environ))
+            out = ((p.stdout or "")+(p.stderr or "")).strip() or f"(exit {p.returncode})"
+        except Exception as e: out = f"error: {e}"
+        show(out)
     def put(y,x,s,attr=0,w=0):
         try: stdscr.addstr(y,x,s[:max(0,(w or len(s)))],attr)
         except Exception: pass
@@ -1254,6 +1356,27 @@ def _tui_main(stdscr, sdir):
                 else:
                     chats[active]["model"] = opts[pick_idx]
                     save_agents(sdir,chats); msg = f'model -> {opts[pick_idx]}'; mode = "input"
+            continue
+        if mode=="rolepick" and chats:
+            opts = ["(none)"]+[r["name"] for r in load_roles(sdir)]
+            bw, bh = min(44,w-4), len(opts)+4
+            bx, by = (w-bw)//2, (h-bh)//2
+            for _y in range(by,by+bh): put(_y,bx," "*bw,curses.A_REVERSE)
+            put(by,bx+2,f'role: {chats[active]["name"]}',curses.A_REVERSE|curses.A_BOLD)
+            for i,o in enumerate(opts):
+                mark = ">" if i==pick_idx else " "
+                cur = "*" if (o=="(none)" and not chats[active].get("persona")) or o==chats[active].get("persona") else " "
+                put(by+2+i,bx+2,f'{mark}{cur} {o}'[:bw-4],curses.A_REVERSE|(curses.A_BOLD if i==pick_idx else 0))
+            put(by+bh-1,bx+2,"up/down+enter, esc cancel"[:bw-4],curses.A_REVERSE)
+            stdscr.refresh()
+            c4 = _readkey(stdscr)
+            if c4 in (-1,-2): continue
+            if c4==27: mode = "input"
+            elif c4 in (curses.KEY_UP,ord("k")): pick_idx = (pick_idx-1)%len(opts)
+            elif c4 in (curses.KEY_DOWN,ord("j"),9): pick_idx = (pick_idx+1)%len(opts)
+            elif c4 in (10,13):
+                chats[active]["persona"] = "" if opts[pick_idx]=="(none)" else opts[pick_idx]
+                save_agents(sdir,chats); msg = f'role -> {opts[pick_idx]}'; mode = "input"
             continue
         lw, rw = min(26,max(18,w//4)), min(36,max(24,w//3))
         with lock:
@@ -1317,7 +1440,7 @@ def _tui_main(stdscr, sdir):
                 put(ay+1+i,rx+2,f'! {(r.get("cmd","") or "")[:rw-8]}'[:rw-4],th["alert"])
         box(h-4,0,3,w,f'> {name}' if mode=="input" else f'> {mode}')
         put(h-3,2,inp[-(w-4):] if w>4 else "")
-        put(h-1,0,f' {len(chats)} agents · tab target · m models · d delegate · t theme:{theme} · ? help · q quit'[:w-1],th["dim"])
+        put(h-1,0,f' {len(chats)} agents · tab target · m models · R role · d delegate · ! shell · t theme:{theme} · ? help · q quit'[:w-1],th["dim"])
         try: stdscr.move(h-3,min(2+len(inp),max(0,w-2)))
         except Exception: pass
         stdscr.refresh()
@@ -1326,7 +1449,9 @@ def _tui_main(stdscr, sdir):
         if mode in ("input","setmodel","newname","newbackend","dagent","dtext"):
             if ch in (10,13):
                 if mode=="input":
-                    if inp.strip(): send_active(inp.strip())
+                    t = inp.strip()
+                    if t.startswith("!") and len(t)>1: run_shell(t[1:].strip())
+                    elif t: send_active(t)
                 elif mode=="setmodel" and chats:
                     chats[active]["model"] = inp.strip() or "default"
                     save_agents(sdir,chats); msg = f'model -> {chats[active]["model"]}'
@@ -1359,6 +1484,10 @@ def _tui_main(stdscr, sdir):
             if ch==27: inp = ""; mode = "normal"; continue
             if ch in (curses.KEY_BACKSPACE,127,8): inp = inp[:-1]; continue
             if 32<=ch<=126: inp += chr(ch)
+            elif 128<=ch<=0x10FFFF:
+                try:
+                    if chr(ch).isprintable(): inp += chr(ch)
+                except Exception: pass
             continue
         if ch in (10,13): mode = "input"
         elif ch in (ord("q"),27): break
@@ -1369,7 +1498,12 @@ def _tui_main(stdscr, sdir):
         elif ch==ord("i"): mode = "input"
         elif ch==ord("m") and chats:
             mode = "modelpick"; pick_idx = _model_idx(chats[active])
-        elif ch==ord("M"): mode = "setmodel"; inp = chats[active].get("model","") if chats else ""
+        elif ch==ord("M") and chats: mode = "setmodel"; inp = chats[active].get("model","") if chats else ""
+        elif ch==ord("R") and chats:
+            rr = ["(none)"]+[r["name"] for r in load_roles(sdir)]
+            cur = chats[active].get("persona") or "(none)"
+            pick_idx = rr.index(cur) if cur in rr else 0
+            mode = "rolepick"
         elif ch==ord("n"): mode = "newname"; inp = ""
         elif ch==ord("d"):
             subs = [c["name"] for c in chats if c.get("role")!="orchestrator"] or [c["name"] for c in chats]
@@ -1390,8 +1524,8 @@ KEYS_HELP = """ag keys
  sessions: spawn -- <cmd> | send <id> text | send --key ctrl-c|esc|up|enter | snap [--since OFF] [--clean] | sessions | wait | kill [--force]
  attach <id>: jump into live terminal (auth etc). Ctrl-] detaches, session keeps running. resize follows your terminal.
  forget <id>: wipe session logs (do after typing secrets)
- agents: agents list/add/rm/set/doctor | chat send <name> msg | chat log <name> | delegate <sub> task | status [--json] | tui
- tui: tab/1-9 target · enter/i input · esc normal · m model picker · M custom · n new agent · d delegate · a approve · ? this help · q quit
+  agents: agents list/add/rm/set/doctor [--persona/--system] | roles list/add/set/show/rm | chat send <name> msg | chat log <name> | delegate <sub> task | status [--json] | tui
+  tui: tab/1-9 target · enter/i input · esc normal · m model picker · M custom · R role · n new agent · d delegate · ! shell cmd · a approve · ? this help · q quit
  approvals: blocked run -> approvals -> approve <id> (10min) or re-run --force
  memory: note/notes [--grep] · todo add/list/done/clear · history · events
  harness: show | export [file] | import <file> [--force] | link --to DIR"""
@@ -1508,7 +1642,8 @@ def do_selfcheck(a):
             "name":"","cols":100,"rows":30,"on_exit":"","sess":"","key":None,"no_enter":False,
             "since":None,"clean":False,"session":None,"sp":"",
             "home":None,"file":None,"home_to":None,"project_to":None,"to":None,
-            "backend":"claude","model":"default","role":"sub","adir":".","agent":None})
+            "backend":"claude","model":"default","role":"sub","adir":".","agent":None,
+            "persona":None,"system":None,"file":None})
         o.__dict__.update(k); return o
     import io, contextlib
     buf=io.StringIO()
@@ -1569,9 +1704,28 @@ def do_selfcheck(a):
         save_ui(td,"ember"); assert load_ui(td)=="ember"; save_ui(td,"abyss")
         assert do_agents(mk(sub="add",name="t1",backend="opencode",model="default",adir=".",role="sub"))==0
         assert any(x["name"]=="t1" for x in load_agents(td))
-        assert do_agents(mk(sub="set",name="t1",backend=None,model="opus",adir=None,role=None))==0
+        assert do_agents(mk(sub="set",name="t1",backend=None,model="opus",adir=None,role=None,persona="reviewer",system=None))==0
+        assert [x for x in load_agents(td) if x["name"]=="t1"][0]["persona"]=="reviewer"
+        assert do_agents(mk(sub="set",name="t1",backend=None,model=None,adir=None,role=None,persona="",system=None))==0
+        assert do_roles(mk(sub="add",name="rev",system="Be terse."))==0
+        assert do_roles(mk(sub="list"))==0
+        assert do_roles(mk(sub="show",name="rev"))==0
+        assert do_roles(mk(sub="set",name="rev",system="Be brief."))==0
+        assert [r for r in load_roles(td) if r["name"]=="rev"][0]["system"]=="Be brief."
+        assert load_roles(td)[0]["name"]=="reviewer"  # seeded defaults
+        (td/"sys.md").write_text("Custom sys")
+        assert eff_system(td,{"system":"@sys.md","dir":str(td),"persona":""})=="Custom sys"
+        assert eff_system(td,{"system":"override","dir":".","persona":"reviewer"})=="override"
+        assert eff_system(td,{"system":"","dir":".","persona":"reviewer"}).startswith("You are a senior")
+        assert "--append-system-prompt" in backend_argv("claude",model="",workdir=".",sid="",prompt="hi",system="Be terse.")
+        assert backend_argv("claude",model="sonnet",workdir=".",sid="s1",prompt="hi")==["claude","-p","--verbose","--output-format","stream-json","--model","sonnet","--resume","s1","hi"]
+        assert do_agents(mk(sub="add",name="e1",backend="echo",model="default",adir=".",role="sub",persona="reviewer",system=None))==0
+        r = run_turn(td,"e1","hi")
+        assert "[system role: reviewer]" in r["reply"] and "senior code reviewer" in r["reply"]
+        assert do_agents(mk(sub="rm",name="e1",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
+        assert do_roles(mk(sub="rm",name="rev"))==0
         assert do_chat(mk(sub="log",name="t1",limit=5))==0
-        assert do_agents(mk(sub="rm",name="t1",backend=None,model=None,adir=None,role=None))==0
+        assert do_agents(mk(sub="rm",name="t1",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
         append_chat(td,"t1","user","hello")
         assert "user: hello" in recent_history(td,"t1")
         assert do_status(mk())==0
@@ -1677,10 +1831,16 @@ def build():
     hlink=hs.add_parser("link"); hlink.add_argument("--to",default=None); hlink.add_argument("--home",default=None)
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"])
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)")
     agrm=ags.add_parser("rm"); agrm.add_argument("name")
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"])
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)')
     ags.add_parser("doctor")
+    ro = sub.add_parser("roles",help="behavior presets (system prompts) for agents"); ros=ro.add_subparsers(dest="sub",required=True)
+    ros.add_parser("list")
+    roa=ros.add_parser("add"); roa.add_argument("name"); roa.add_argument("--system",default=None); roa.add_argument("--file",default=None)
+    rse=ros.add_parser("set"); rse.add_argument("name"); rse.add_argument("--system",default=None); rse.add_argument("--file",default=None)
+    rsh=ros.add_parser("show"); rsh.add_argument("name")
+    rrm=ros.add_parser("rm"); rrm.add_argument("name")
     ch = sub.add_parser("chat",help="talk to an agent headless"); chs=ch.add_subparsers(dest="sub",required=True)
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
     chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--limit",type=int,default=20)
@@ -1711,7 +1871,7 @@ def main(argv=None):
         "approvals":do_approvals,"approve":do_approve,"shell":do_shell,"selfcheck":do_selfcheck,
         "spawn":do_spawn,"send":do_send,"snap":do_snap,"sessions":do_sessions,
         "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon,
-        "harness":do_harness,"agents":do_agents,"chat":do_chat,"status":do_status,
+        "harness":do_harness,"agents":do_agents,"roles":do_roles,"chat":do_chat,"status":do_status,
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
         "delegate":do_delegate}[a.subcmd]
     return fn(a)

@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840.0" height="510.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="840.0" height="510.0" fill="#14161c"/>
+<title>config-100x30</title>
+<text x="361.2" y="64.0" fill="#8787af" font-weight="bold" xml:space="preserve">  __ _  __ _ </text>
+<text x="361.2" y="81.0" fill="#8787af" font-weight="bold" xml:space="preserve"> / _` |/ _` |</text>
+<text x="361.2" y="98.0" fill="#8787af" font-weight="bold" xml:space="preserve"> | (_| | (_| |</text>
+<text x="361.2" y="115.0" fill="#8787af" font-weight="bold" xml:space="preserve">  \__,_|\__, |</text>
+<rect x="151.20000000000002" y="119.0" width="537.6" height="17.0" fill="#303030"/>
+<text x="168.0" y="132.0" fill="#8a8a8a" xml:space="preserve">configure · claude</text>
+<rect x="151.20000000000002" y="136.0" width="537.6" height="17.0" fill="#303030"/>
+<rect x="67.2" y="153.0" width="100.80000000000001" height="17.0" fill="#303030"/>
+<rect x="168.0" y="153.0" width="210.0" height="17.0" fill="#005f87"/>
+<rect x="378.0" y="153.0" width="394.8" height="17.0" fill="#303030"/>
+<text x="67.2" y="166.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="84.0" y="166.0" fill="#8a8a8a" xml:space="preserve">Ask anyt</text>
+<text x="168.0" y="166.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">&gt; Agent provider     echo</text>
+<rect x="67.2" y="170.0" width="705.6" height="17.0" fill="#303030"/>
+<text x="67.2" y="183.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="84.0" y="183.0" fill="#8a8a8a" xml:space="preserve">Build · </text>
+<text x="151.20000000000002" y="183.0" fill="#d0d0d0" xml:space="preserve">    Model              default                                                    </text>
+<rect x="151.20000000000002" y="187.0" width="537.6" height="17.0" fill="#303030"/>
+<text x="67.2" y="200.0" fill="#8a8a8a" xml:space="preserve">type a mes</text>
+<text x="151.20000000000002" y="200.0" fill="#d0d0d0" xml:space="preserve">    Custom model ID    default                                                    </text>
+<rect x="151.20000000000002" y="204.0" width="537.6" height="17.0" fill="#303030"/>
+<text x="0.0" y="217.0" fill="#d0d0d0" xml:space="preserve">                      Shared instructions (none)                                                    </text>
+<rect x="151.20000000000002" y="221.0" width="537.6" height="17.0" fill="#303030"/>
+<text x="67.2" y="234.0" fill="#8a8a8a" xml:space="preserve">agent-cli</text>
+<text x="142.8" y="234.0" fill="#d0d0d0" xml:space="preserve">     Agent behavior     (none)                                                     </text>
+<rect x="67.2" y="238.0" width="84.0" height="17.0" fill="#005f87"/>
+<rect x="151.20000000000002" y="238.0" width="537.6" height="17.0" fill="#303030"/>
+<rect x="688.8000000000001" y="238.0" width="84.0" height="17.0" fill="#005f87"/>
+<text x="67.2" y="251.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">› ○ claude</text>
+<text x="151.20000000000002" y="251.0" fill="#d0d0d0" xml:space="preserve">    Conversation length                                         </text>
+<rect x="151.20000000000002" y="255.0" width="537.6" height="17.0" fill="#303030"/>
+<text x="67.2" y="268.0" fill="#8a8a8a" xml:space="preserve">  Added te</text>
+<text x="151.20000000000002" y="268.0" fill="#d0d0d0" xml:space="preserve">    Guidance &amp; memory                                                             </text>
+<rect x="151.20000000000002" y="272.0" width="537.6" height="17.0" fill="#303030"/>
+<text x="0.0" y="285.0" fill="#d0d0d0" xml:space="preserve">                      Appearance         abyss                                                      </text>
+<rect x="151.20000000000002" y="289.0" width="537.6" height="17.0" fill="#303030"/>
+<text x="0.0" y="302.0" fill="#d0d0d0" xml:space="preserve">          ○ oc · M  </text>
+<text x="168.0" y="302.0" fill="#8a8a8a" xml:space="preserve">  Working folder     .</text>
+<rect x="151.20000000000002" y="306.0" width="537.6" height="17.0" fill="#303030"/>
+<text x="67.2" y="319.0" fill="#8a8a8a" xml:space="preserve">  oc here </text>
+<text x="151.20000000000002" y="319.0" fill="#d0d0d0" xml:space="preserve">    Back                                                                          </text>
+<rect x="151.20000000000002" y="323.0" width="537.6" height="17.0" fill="#303030"/>
+<rect x="151.20000000000002" y="340.0" width="537.6" height="17.0" fill="#303030"/>
+<text x="0.0" y="353.0" fill="#d0d0d0" xml:space="preserve">          ○ tl · d  </text>
+<text x="168.0" y="353.0" fill="#8a8a8a" xml:space="preserve">Choose which coding agent runs this chat.</text>
+<rect x="151.20000000000002" y="357.0" width="537.6" height="17.0" fill="#303030"/>
+<text x="67.2" y="370.0" fill="#8a8a8a" xml:space="preserve">  no turns</text>
+<text x="168.0" y="370.0" fill="#8a8a8a" xml:space="preserve">↑↓ select · enter open · esc back</text>
+<text x="67.2" y="404.0" fill="#8a8a8a" xml:space="preserve">site</text>
+<text x="0.0" y="421.0" fill="#d0d0d0" xml:space="preserve">          ○ web · default · 0t                                                                      </text>
+<text x="67.2" y="438.0" fill="#8a8a8a" xml:space="preserve">  no turns yet</text>
+<text x="67.2" y="506.0" fill="#8a8a8a" xml:space="preserve">/Users/sekun/agent-cli · ready</text>
+</svg>

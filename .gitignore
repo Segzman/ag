@@ -1,2 +1,9 @@
 .agent/
 __pycache__/
+*.pyc
+.DS_Store
+approvals.json
+history.jsonl
+notes.jsonl
+todos.json
+harness.tgz

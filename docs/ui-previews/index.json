@@ -1,0 +1,254 @@
+{
+  "home-120x36": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/home-120x36.png",
+    "frames": 2,
+    "size": [
+      120,
+      36
+    ],
+    "marker": "Ask anything"
+  },
+  "home-100x30": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/home-100x30.png",
+    "frames": 2,
+    "size": [
+      100,
+      30
+    ],
+    "marker": "Ask anything"
+  },
+  "home-80x24": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/home-80x24.png",
+    "frames": 2,
+    "size": [
+      80,
+      24
+    ],
+    "marker": "Ask anything"
+  },
+  "home-60x24": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/home-60x24.png",
+    "frames": 2,
+    "size": [
+      60,
+      24
+    ],
+    "marker": "Ask anything"
+  },
+  "home-40x16": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/home-40x16.png",
+    "frames": 2,
+    "size": [
+      40,
+      16
+    ],
+    "marker": "Ask anything"
+  },
+  "session-120x36": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/session-120x36.png",
+    "frames": 5,
+    "size": [
+      120,
+      36
+    ],
+    "marker": "\u25cf you"
+  },
+  "session-40x16": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/session-40x16.png",
+    "frames": 5,
+    "size": [
+      40,
+      16
+    ],
+    "marker": "\u25cf you"
+  },
+  "session-timeline-120x36": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/session-timeline-120x36.png",
+    "frames": 7,
+    "size": [
+      120,
+      36
+    ],
+    "marker": "Thinking"
+  },
+  "session-timeline-80x24": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/session-timeline-80x24.png",
+    "frames": 7,
+    "size": [
+      80,
+      24
+    ],
+    "marker": "Thinking"
+  },
+  "session-timeline-60x24": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/session-timeline-60x24.png",
+    "frames": 9,
+    "size": [
+      60,
+      24
+    ],
+    "marker": "Thinking"
+  },
+  "session-timeline-40x16": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/session-timeline-40x16.png",
+    "frames": 10,
+    "size": [
+      40,
+      16
+    ],
+    "marker": "Thinking"
+  },
+  "session-timeline-nocolor-80x24": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/session-timeline-nocolor-80x24.png",
+    "frames": 7,
+    "size": [
+      80,
+      24
+    ],
+    "marker": "Thinking"
+  },
+  "session-ascii-80x24": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/session-ascii-80x24.png",
+    "frames": 5,
+    "size": [
+      80,
+      24
+    ],
+    "marker": "* you"
+  },
+  "slash-100x30": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/slash-100x30.png",
+    "frames": 4,
+    "size": [
+      100,
+      30
+    ],
+    "marker": "commands 1/"
+  },
+  "slash-filter-80x24": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/slash-filter-80x24.png",
+    "frames": 7,
+    "size": [
+      80,
+      24
+    ],
+    "marker": "commands 1/"
+  },
+  "palette-100x30": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/palette-100x30.png",
+    "frames": 4,
+    "size": [
+      100,
+      30
+    ],
+    "marker": "commands"
+  },
+  "palette-filter-100x30": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/palette-filter-100x30.png",
+    "frames": 10,
+    "size": [
+      100,
+      30
+    ],
+    "marker": "Configure"
+  },
+  "config-100x30": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/config-100x30.png",
+    "frames": 4,
+    "size": [
+      100,
+      30
+    ],
+    "marker": "configure \u00b7"
+  },
+  "config-40x16": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/config-40x16.png",
+    "frames": 4,
+    "size": [
+      40,
+      16
+    ],
+    "marker": "configure \u00b7"
+  },
+  "length-overview-100x30": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/length-overview-100x30.png",
+    "frames": 23,
+    "size": [
+      100,
+      30
+    ],
+    "marker": "Conversation length"
+  },
+  "length-overview-80x24": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/length-overview-80x24.png",
+    "frames": 23,
+    "size": [
+      80,
+      24
+    ],
+    "marker": "Conversation length"
+  },
+  "length-overview-40x16": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/length-overview-40x16.png",
+    "frames": 25,
+    "size": [
+      40,
+      16
+    ],
+    "marker": "Conversation length"
+  },
+  "length-scope-100x30": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/length-scope-100x30.png",
+    "frames": 26,
+    "size": [
+      100,
+      30
+    ],
+    "marker": "Applies to all subagents"
+  },
+  "length-onoff-80x24": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/length-onoff-80x24.png",
+    "frames": 28,
+    "size": [
+      80,
+      24
+    ],
+    "marker": "On: older messages"
+  },
+  "length-preset-100x30": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/length-preset-100x30.png",
+    "frames": 29,
+    "size": [
+      100,
+      30
+    ],
+    "marker": "More often"
+  },
+  "length-preset-40x16": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/length-preset-40x16.png",
+    "frames": 30,
+    "size": [
+      40,
+      16
+    ],
+    "marker": "More often"
+  },
+  "length-advanced-80x24": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/length-advanced-80x24.png",
+    "frames": 30,
+    "size": [
+      80,
+      24
+    ],
+    "marker": "Messages before summary"
+  },
+  "context-100x30": {
+    "png": "/Users/sekun/agent-cli/docs/ui-previews/context-100x30.png",
+    "frames": 18,
+    "size": [
+      100,
+      30
+    ],
+    "marker": "context \u00b7 oc"
+  }
+}

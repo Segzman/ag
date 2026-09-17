@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840.0" height="510.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="840.0" height="510.0" fill="#14161c"/>
+<title>length-overview-100x30</title>
+<rect x="134.4" y="153.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="166.0" fill="#8a8a8a" xml:space="preserve">Conversation length</text>
+<rect x="134.4" y="170.0" width="571.2" height="17.0" fill="#303030"/>
+<rect x="134.4" y="187.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="200.0" fill="#8a8a8a" xml:space="preserve">Summarize older messages so agents can keep working. Full</text>
+<rect x="134.4" y="204.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="217.0" fill="#8a8a8a" xml:space="preserve">chat stays saved.</text>
+<rect x="134.4" y="221.0" width="16.8" height="17.0" fill="#303030"/>
+<rect x="151.20000000000002" y="221.0" width="159.6" height="17.0" fill="#005f87"/>
+<rect x="310.8" y="221.0" width="394.8" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="234.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">&gt; Orchestrator  off</text>
+<rect x="134.4" y="238.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="251.0" fill="#d0d0d0" xml:space="preserve">                    Subagents  off                                                                  </text>
+<rect x="134.4" y="255.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="268.0" fill="#d0d0d0" xml:space="preserve">                    This agent: claude  off · Using orchestrator settings                           </text>
+<rect x="134.4" y="272.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="285.0" fill="#d0d0d0" xml:space="preserve">                    Summarize this chat now                                                         </text>
+<rect x="134.4" y="289.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="302.0" fill="#d0d0d0" xml:space="preserve">                    Back                                                                            </text>
+<rect x="134.4" y="306.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="319.0" fill="#8a8a8a" xml:space="preserve">Changes orchestrators using these defaults.</text>
+<rect x="134.4" y="323.0" width="571.2" height="17.0" fill="#303030"/>
+<rect x="134.4" y="340.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="353.0" fill="#8a8a8a" xml:space="preserve">↑↓ select · enter open · esc back</text>
+</svg>

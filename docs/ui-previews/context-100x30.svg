@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840.0" height="510.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="840.0" height="510.0" fill="#14161c"/>
+<title>context-100x30</title>
+<rect x="126.0" y="17.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="30.0" fill="#8a8a8a" xml:space="preserve">context · oc</text>
+<rect x="126.0" y="34.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="47.0" fill="#8a8a8a" xml:space="preserve">sources (5)</text>
+<rect x="126.0" y="51.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="64.0" fill="#8a8a8a" xml:space="preserve">ok           custom-md  /Users/sekun/agent-cli/custom.md</text>
+<rect x="126.0" y="68.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="81.0" fill="#8a8a8a" xml:space="preserve">missing      shared    </text>
+<rect x="126.0" y="85.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="98.0" fill="#8a8a8a" xml:space="preserve">/var/folders/qm/c8f0glj90hjfjsl75rx82nrr0000gn/T/ag-prev-skpa_</text>
+<rect x="126.0" y="102.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="115.0" fill="#8a8a8a" xml:space="preserve">s3l/context/p/8472c1556b79/SHARED.md</text>
+<rect x="126.0" y="119.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="132.0" fill="#8a8a8a" xml:space="preserve">missing      handoff   </text>
+<rect x="126.0" y="136.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="149.0" fill="#8a8a8a" xml:space="preserve">/var/folders/qm/c8f0glj90hjfjsl75rx82nrr0000gn/T/ag-prev-skpa_</text>
+<rect x="67.2" y="153.0" width="705.6" height="17.0" fill="#303030"/>
+<text x="67.2" y="166.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="84.0" y="166.0" fill="#8a8a8a" xml:space="preserve">Ask a</text>
+<text x="142.8" y="166.0" fill="#8a8a8a" xml:space="preserve">s3l/context/p/8472c1556b79/HANDOFF.md</text>
+<rect x="67.2" y="170.0" width="705.6" height="17.0" fill="#303030"/>
+<text x="67.2" y="183.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="84.0" y="183.0" fill="#8a8a8a" xml:space="preserve">Build</text>
+<text x="142.8" y="183.0" fill="#8a8a8a" xml:space="preserve">missing      brief     </text>
+<rect x="126.0" y="187.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="67.2" y="200.0" fill="#8a8a8a" xml:space="preserve">type a </text>
+<text x="142.8" y="200.0" fill="#8a8a8a" xml:space="preserve">/var/folders/qm/c8f0glj90hjfjsl75rx82nrr0000gn/T/ag-prev-skpa_</text>
+<rect x="126.0" y="204.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="217.0" fill="#8a8a8a" xml:space="preserve">s3l/context/p/8472c1556b79/agents/oc-2a09998d72/BRIEF.md</text>
+<rect x="126.0" y="221.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="67.2" y="234.0" fill="#8a8a8a" xml:space="preserve">agent-c</text>
+<text x="142.8" y="234.0" fill="#8a8a8a" xml:space="preserve">missing      checkpoint</text>
+<rect x="67.2" y="238.0" width="58.800000000000004" height="17.0" fill="#005f87"/>
+<rect x="126.0" y="238.0" width="588.0" height="17.0" fill="#303030"/>
+<rect x="714.0" y="238.0" width="58.800000000000004" height="17.0" fill="#005f87"/>
+<text x="67.2" y="251.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">› ○ cla</text>
+<text x="142.8" y="251.0" fill="#8a8a8a" xml:space="preserve">/var/folders/qm/c8f0glj90hjfjsl75rx82nrr0000gn/T/ag-prev-skpa_</text>
+<rect x="126.0" y="255.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="67.2" y="268.0" fill="#8a8a8a" xml:space="preserve">  Added</text>
+<text x="142.8" y="268.0" fill="#8a8a8a" xml:space="preserve">s3l/context/p/8472c1556b79/agents/oc-2a09998d72/CHECKPOINT.md</text>
+<rect x="126.0" y="272.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="285.0" fill="#ff5f5f" xml:space="preserve">! unassigned, using workdir defaults (ag context assign oc</text>
+<rect x="126.0" y="289.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="0.0" y="302.0" fill="#d0d0d0" xml:space="preserve">          ○ oc   </text>
+<text x="142.8" y="302.0" fill="#ff5f5f" xml:space="preserve">--scope ...)</text>
+<rect x="126.0" y="306.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="67.2" y="319.0" fill="#8a8a8a" xml:space="preserve">  oc he</text>
+<text x="142.8" y="319.0" fill="#8a8a8a" xml:space="preserve">content</text>
+<rect x="126.0" y="323.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="0.0" y="336.0" fill="#d0d0d0" xml:space="preserve">                 [context: custom.md]                                                               </text>
+<rect x="126.0" y="340.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="0.0" y="353.0" fill="#d0d0d0" xml:space="preserve">          ○ tl   # custom.md — agent-cli repo guidance (root scope)                                 </text>
+<rect x="126.0" y="357.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="67.2" y="370.0" fill="#8a8a8a" xml:space="preserve">  no tu</text>
+<rect x="126.0" y="374.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="0.0" y="387.0" fill="#d0d0d0" xml:space="preserve">                 Single-file Python CLI (`ag`, stdlib only, no install) for                         </text>
+<rect x="126.0" y="391.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="67.2" y="404.0" fill="#8a8a8a" xml:space="preserve">site</text>
+<text x="100.80000000000001" y="404.0" fill="#d0d0d0" xml:space="preserve">     agent                                                                              </text>
+<rect x="126.0" y="408.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="0.0" y="421.0" fill="#d0d0d0" xml:space="preserve">          ○ web  orchestration. State in `./.agent/` (`--dir` /                                     </text>
+<rect x="126.0" y="425.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="67.2" y="438.0" fill="#8a8a8a" xml:space="preserve">  no tu</text>
+<text x="126.0" y="438.0" fill="#d0d0d0" xml:space="preserve">  `$AGENT_CLI_DIR` override).                                                        </text>
+<rect x="126.0" y="442.0" width="588.0" height="17.0" fill="#303030"/>
+<rect x="126.0" y="459.0" width="588.0" height="17.0" fill="#303030"/>
+<rect x="126.0" y="476.0" width="588.0" height="17.0" fill="#303030"/>
+<text x="142.8" y="489.0" fill="#8a8a8a" xml:space="preserve">↑↓/PgUp/PgDn scroll · esc back</text>
+<text x="67.2" y="506.0" fill="#8a8a8a" xml:space="preserve">/Users/sekun/agent-cli · ready</text>
+</svg>

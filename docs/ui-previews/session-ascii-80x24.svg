@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="672.0" height="408.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="672.0" height="408.0" fill="#14161c"/>
+<title>session-ascii-80x24</title>
+<text x="16.8" y="13.0" fill="#8a8a8a" xml:space="preserve">claude - echo - default</text>
+<rect x="16.8" y="17.0" width="8.4" height="17.0" fill="#303030"/>
+<rect x="25.200000000000003" y="17.0" width="630.0" height="17.0" fill="#262626"/>
+<text x="16.8" y="30.0" fill="#5fafff" font-weight="bold" xml:space="preserve">|</text>
+<text x="25.200000000000003" y="30.0" fill="#d0d0d0" xml:space="preserve">* you                                                                        </text>
+<rect x="16.8" y="34.0" width="8.4" height="17.0" fill="#303030"/>
+<rect x="25.200000000000003" y="34.0" width="630.0" height="17.0" fill="#262626"/>
+<text x="16.8" y="47.0" fill="#5fafff" font-weight="bold" xml:space="preserve">|</text>
+<text x="25.200000000000003" y="47.0" fill="#d0d0d0" xml:space="preserve">  Find the auth bug in login.py                                              </text>
+<text x="25.200000000000003" y="64.0" fill="#00ffff" font-weight="bold" xml:space="preserve">* claude</text>
+<text x="0.0" y="81.0" fill="#d0d0d0" xml:space="preserve">     Looking at the login flow now.                                             </text>
+<text x="25.200000000000003" y="98.0" fill="#ffd75f" xml:space="preserve">`-─ * Grep pattern 'def login' in src</text>
+<text x="25.200000000000003" y="115.0" fill="#8a8a8a" xml:space="preserve">   src/auth/login.py:42: def login(user, pw)</text>
+<text x="25.200000000000003" y="132.0" fill="#00ffff" font-weight="bold" xml:space="preserve">* claude</text>
+<text x="0.0" y="149.0" fill="#d0d0d0" xml:space="preserve">     Found it — token expiry is never checked. Patching.                        </text>
+<rect x="16.8" y="153.0" width="8.4" height="17.0" fill="#303030"/>
+<rect x="25.200000000000003" y="153.0" width="630.0" height="17.0" fill="#262626"/>
+<text x="16.8" y="166.0" fill="#5fafff" font-weight="bold" xml:space="preserve">|</text>
+<text x="25.200000000000003" y="166.0" fill="#d0d0d0" xml:space="preserve">* you                                                                        </text>
+<rect x="16.8" y="170.0" width="8.4" height="17.0" fill="#303030"/>
+<rect x="25.200000000000003" y="170.0" width="630.0" height="17.0" fill="#262626"/>
+<text x="16.8" y="183.0" fill="#5fafff" font-weight="bold" xml:space="preserve">|</text>
+<text x="25.200000000000003" y="183.0" fill="#d0d0d0" xml:space="preserve">  Also add a regression test                                                 </text>
+<text x="25.200000000000003" y="200.0" fill="#00ffff" font-weight="bold" xml:space="preserve">* claude</text>
+<text x="0.0" y="217.0" fill="#d0d0d0" xml:space="preserve">     Added tests/test_login_expiry.py — green.                                  </text>
+<rect x="16.8" y="357.0" width="638.4" height="17.0" fill="#303030"/>
+<text x="16.8" y="370.0" fill="#5fafff" font-weight="bold" xml:space="preserve">|</text>
+<text x="33.6" y="370.0" fill="#8a8a8a" xml:space="preserve">Type a message or / for commands</text>
+<rect x="16.8" y="374.0" width="638.4" height="17.0" fill="#303030"/>
+<text x="16.8" y="387.0" fill="#5fafff" font-weight="bold" xml:space="preserve">|</text>
+<text x="33.6" y="387.0" fill="#8a8a8a" xml:space="preserve">Build - default - claude</text>
+<text x="16.8" y="404.0" fill="#8a8a8a" xml:space="preserve">/Users/sekun/agent-cli - enter send · / commands · esc back · ? help</text>
+</svg>

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="336.0" height="272.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="336.0" height="272.0" fill="#14161c"/>
+<title>config-40x16</title>
+<rect x="16.8" y="17.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="30.0" fill="#8a8a8a" xml:space="preserve">configure · claude</text>
+<rect x="16.8" y="34.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<rect x="16.8" y="51.0" width="16.8" height="17.0" fill="#303030"/>
+<rect x="33.6" y="51.0" width="210.0" height="17.0" fill="#005f87"/>
+<rect x="243.60000000000002" y="51.0" width="75.60000000000001" height="17.0" fill="#303030"/>
+<text x="33.6" y="64.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">&gt; Agent provider     echo</text>
+<rect x="16.8" y="68.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="81.0" fill="#d0d0d0" xml:space="preserve">      Model              default        </text>
+<rect x="16.8" y="85.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="98.0" fill="#d0d0d0" xml:space="preserve">      Custom model ID    default        </text>
+<rect x="16.8" y="102.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="115.0" fill="#d0d0d0" xml:space="preserve">      Shared instructions (none)        </text>
+<rect x="16.8" y="119.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="132.0" fill="#d0d0d0" xml:space="preserve">      Agent behavior     (none)         </text>
+<rect x="16.8" y="136.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="149.0" fill="#d0d0d0" xml:space="preserve">      Conversation length               </text>
+<rect x="16.8" y="153.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="166.0" fill="#d0d0d0" xml:space="preserve">      Guidance &amp; memory                 </text>
+<rect x="16.8" y="170.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="183.0" fill="#d0d0d0" xml:space="preserve">      Appearance         abyss          </text>
+<rect x="16.8" y="187.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="200.0" fill="#8a8a8a" xml:space="preserve">  Working folder     .</text>
+<rect x="16.8" y="204.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<rect x="16.8" y="221.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="234.0" fill="#8a8a8a" xml:space="preserve">Choose which coding agent runs …</text>
+<rect x="16.8" y="238.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="251.0" fill="#8a8a8a" xml:space="preserve">↑↓ choose · Enter · Esc back</text>
+<text x="16.8" y="268.0" fill="#8a8a8a" xml:space="preserve">/Users/sekun/agent-cli · ready</text>
+</svg>

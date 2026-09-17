@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="336.0" height="272.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="336.0" height="272.0" fill="#14161c"/>
+<title>session-40x16</title>
+<text x="16.8" y="13.0" fill="#8a8a8a" xml:space="preserve">claude · echo · default</text>
+<text x="25.200000000000003" y="30.0" fill="#8a8a8a" xml:space="preserve">   src/auth/login.py:42: def</text>
+<text x="25.200000000000003" y="47.0" fill="#8a8a8a" xml:space="preserve">   login(user, pw)</text>
+<text x="25.200000000000003" y="64.0" fill="#00ffff" font-weight="bold" xml:space="preserve">● claude</text>
+<text x="0.0" y="81.0" fill="#d0d0d0" xml:space="preserve">     Found it — token expiry is         </text>
+<text x="0.0" y="98.0" fill="#d0d0d0" xml:space="preserve">     never checked. Patching.           </text>
+<rect x="16.8" y="102.0" width="8.4" height="17.0" fill="#303030"/>
+<rect x="25.200000000000003" y="102.0" width="294.0" height="17.0" fill="#262626"/>
+<text x="16.8" y="115.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="25.200000000000003" y="115.0" fill="#d0d0d0" xml:space="preserve">● you                                </text>
+<rect x="16.8" y="119.0" width="8.4" height="17.0" fill="#303030"/>
+<rect x="25.200000000000003" y="119.0" width="294.0" height="17.0" fill="#262626"/>
+<text x="16.8" y="132.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="25.200000000000003" y="132.0" fill="#d0d0d0" xml:space="preserve">  Also add a regression test         </text>
+<text x="25.200000000000003" y="149.0" fill="#00ffff" font-weight="bold" xml:space="preserve">● claude</text>
+<text x="0.0" y="166.0" fill="#d0d0d0" xml:space="preserve">     Added                              </text>
+<text x="0.0" y="183.0" fill="#d0d0d0" xml:space="preserve">     tests/test_login_expiry.py —       </text>
+<text x="0.0" y="200.0" fill="#d0d0d0" xml:space="preserve">     green.                             </text>
+<rect x="16.8" y="221.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="16.8" y="234.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="33.6" y="234.0" fill="#8a8a8a" xml:space="preserve">Type a message or / for commands</text>
+<rect x="16.8" y="238.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="16.8" y="251.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="33.6" y="251.0" fill="#8a8a8a" xml:space="preserve">Build · default · claude</text>
+<text x="16.8" y="268.0" fill="#8a8a8a" xml:space="preserve">/Users/sekun/agent-cli · enter send…</text>
+</svg>

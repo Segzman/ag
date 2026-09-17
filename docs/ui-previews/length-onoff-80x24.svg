@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="672.0" height="408.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="672.0" height="408.0" fill="#14161c"/>
+<title>length-onoff-80x24</title>
+<rect x="50.400000000000006" y="102.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="67.2" y="115.0" fill="#8a8a8a" xml:space="preserve">Automatic summaries</text>
+<rect x="50.400000000000006" y="119.0" width="571.2" height="17.0" fill="#303030"/>
+<rect x="50.400000000000006" y="136.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="67.2" y="149.0" fill="#8a8a8a" xml:space="preserve">Automatic summaries</text>
+<rect x="50.400000000000006" y="153.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="67.2" y="166.0" fill="#8a8a8a" xml:space="preserve">On: older messages are summarized on their own. Off: no</text>
+<rect x="50.400000000000006" y="170.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="67.2" y="183.0" fill="#8a8a8a" xml:space="preserve">automatic summaries (you can still summarize this chat</text>
+<rect x="50.400000000000006" y="187.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="67.2" y="200.0" fill="#8a8a8a" xml:space="preserve">manually).</text>
+<rect x="50.400000000000006" y="204.0" width="16.8" height="17.0" fill="#303030"/>
+<rect x="67.2" y="204.0" width="33.6" height="17.0" fill="#005f87"/>
+<rect x="100.80000000000001" y="204.0" width="520.8000000000001" height="17.0" fill="#303030"/>
+<text x="67.2" y="217.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">&gt; On</text>
+<rect x="50.400000000000006" y="221.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="234.0" fill="#d0d0d0" xml:space="preserve">          Off  off                                                              </text>
+<rect x="50.400000000000006" y="238.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="251.0" fill="#d0d0d0" xml:space="preserve">          Back                                                                  </text>
+<rect x="50.400000000000006" y="255.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="67.2" y="268.0" fill="#8a8a8a" xml:space="preserve">Automatic summaries happen only when On.</text>
+<rect x="50.400000000000006" y="272.0" width="571.2" height="17.0" fill="#303030"/>
+<rect x="50.400000000000006" y="289.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="67.2" y="302.0" fill="#8a8a8a" xml:space="preserve">↑↓ select · enter open · esc back</text>
+</svg>

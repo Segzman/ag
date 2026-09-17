@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="336.0" height="272.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="336.0" height="272.0" fill="#14161c"/>
+<title>length-overview-40x16</title>
+<rect x="16.8" y="17.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="30.0" fill="#8a8a8a" xml:space="preserve">Conversation length</text>
+<rect x="16.8" y="34.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<rect x="16.8" y="51.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="64.0" fill="#8a8a8a" xml:space="preserve">Summarize older messages so</text>
+<rect x="16.8" y="68.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="81.0" fill="#8a8a8a" xml:space="preserve">agents can keep working. Full</text>
+<rect x="16.8" y="85.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="98.0" fill="#8a8a8a" xml:space="preserve">chat stays saved.</text>
+<rect x="16.8" y="102.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="115.0" fill="#d0d0d0" xml:space="preserve">      Orchestrator  off                 </text>
+<rect x="16.8" y="119.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="132.0" fill="#d0d0d0" xml:space="preserve">      Subagents  off                    </text>
+<rect x="16.8" y="136.0" width="16.8" height="17.0" fill="#303030"/>
+<rect x="33.6" y="136.0" width="226.8" height="17.0" fill="#005f87"/>
+<rect x="260.40000000000003" y="136.0" width="58.800000000000004" height="17.0" fill="#303030"/>
+<text x="33.6" y="149.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">&gt; This agent: claude  off ·</text>
+<rect x="16.8" y="153.0" width="16.8" height="17.0" fill="#303030"/>
+<rect x="33.6" y="153.0" width="243.60000000000002" height="17.0" fill="#005f87"/>
+<rect x="277.2" y="153.0" width="42.0" height="17.0" fill="#303030"/>
+<text x="33.6" y="166.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">  Using orchestrator settings</text>
+<rect x="16.8" y="170.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="183.0" fill="#d0d0d0" xml:space="preserve">      Summarize this chat now           </text>
+<rect x="16.8" y="187.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="0.0" y="200.0" fill="#d0d0d0" xml:space="preserve">      Back                              </text>
+<rect x="16.8" y="204.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="217.0" fill="#8a8a8a" xml:space="preserve">Changes claude only (using</text>
+<rect x="16.8" y="221.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="234.0" fill="#8a8a8a" xml:space="preserve">orchestrator settings).</text>
+<rect x="16.8" y="238.0" width="302.40000000000003" height="17.0" fill="#303030"/>
+<text x="33.6" y="251.0" fill="#8a8a8a" xml:space="preserve">↑↓ choose · Enter · Esc back</text>
+</svg>

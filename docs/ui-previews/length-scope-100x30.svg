@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840.0" height="510.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="840.0" height="510.0" fill="#14161c"/>
+<title>length-scope-100x30</title>
+<rect x="134.4" y="153.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="166.0" fill="#8a8a8a" xml:space="preserve">Conversation length · Subagents</text>
+<rect x="134.4" y="170.0" width="571.2" height="17.0" fill="#303030"/>
+<rect x="134.4" y="187.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="200.0" fill="#8a8a8a" xml:space="preserve">Subagents</text>
+<rect x="134.4" y="204.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="217.0" fill="#8a8a8a" xml:space="preserve">Applies to all subagents using these defaults</text>
+<rect x="134.4" y="221.0" width="16.8" height="17.0" fill="#303030"/>
+<rect x="151.20000000000002" y="221.0" width="218.4" height="17.0" fill="#005f87"/>
+<rect x="369.6" y="221.0" width="336.0" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="234.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">&gt; Automatic summaries  off</text>
+<rect x="134.4" y="238.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="251.0" fill="#d0d0d0" xml:space="preserve">                    When to summarize  Standard                                                     </text>
+<rect x="134.4" y="255.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="268.0" fill="#d0d0d0" xml:space="preserve">                    Advanced settings                                                               </text>
+<rect x="134.4" y="272.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="285.0" fill="#d0d0d0" xml:space="preserve">                    Back                                                                            </text>
+<rect x="134.4" y="289.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="302.0" fill="#8a8a8a" xml:space="preserve">On: summaries happen on their own. Off: only manual summaries.</text>
+<rect x="134.4" y="306.0" width="571.2" height="17.0" fill="#303030"/>
+<rect x="134.4" y="323.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="336.0" fill="#8a8a8a" xml:space="preserve">↑↓ select · enter open · esc back</text>
+</svg>

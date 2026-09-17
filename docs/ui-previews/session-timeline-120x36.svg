@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1008.0" height="612.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="1008.0" height="612.0" fill="#14161c"/>
+<title>session-timeline-120x36</title>
+<text x="151.20000000000002" y="13.0" fill="#8a8a8a" xml:space="preserve">tl · echo · default</text>
+<rect x="151.20000000000002" y="17.0" width="8.4" height="17.0" fill="#303030"/>
+<rect x="159.6" y="17.0" width="453.6" height="17.0" fill="#262626"/>
+<text x="151.20000000000002" y="30.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="159.6" y="30.0" fill="#d0d0d0" xml:space="preserve">● you                                                  </text>
+<text x="621.6" y="30.0" fill="#8a8a8a" xml:space="preserve">agents</text>
+<rect x="151.20000000000002" y="34.0" width="8.4" height="17.0" fill="#303030"/>
+<rect x="159.6" y="34.0" width="453.6" height="17.0" fill="#262626"/>
+<text x="151.20000000000002" y="47.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="159.6" y="47.0" fill="#d0d0d0" xml:space="preserve">  Find the auth bug in login.py                         ○ claude · default                           </text>
+<text x="159.6" y="64.0" fill="#00ffff" font-weight="bold" xml:space="preserve">● tl</text>
+<text x="193.20000000000002" y="64.0" fill="#d0d0d0" xml:space="preserve">                                                    ○ oc · Muse Spark 1.3                        </text>
+<text x="0.0" y="81.0" fill="#d0d0d0" xml:space="preserve">                     Looking at the login flow now.                        ○ web · default                              </text>
+<rect x="621.6" y="85.0" width="126.0" height="17.0" fill="#005f87"/>
+<text x="159.6" y="98.0" fill="#8a8a8a" xml:space="preserve">▸ Thinking</text>
+<text x="621.6" y="98.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">›○ tl · default</text>
+<text x="159.6" y="115.0" fill="#8a8a8a" xml:space="preserve">  Token expiry is checked on refresh but never on</text>
+<text x="159.6" y="132.0" fill="#8a8a8a" xml:space="preserve">  the login path itself.</text>
+<text x="159.6" y="149.0" fill="#ffd75f" xml:space="preserve">◆ Grep src/auth · Done</text>
+<text x="159.6" y="166.0" fill="#8a8a8a" xml:space="preserve">   src/auth/login.py:42: def login(user, pw)</text>
+<text x="159.6" y="183.0" fill="#00ffff" font-weight="bold" xml:space="preserve">● tl</text>
+<text x="0.0" y="200.0" fill="#d0d0d0" xml:space="preserve">                     Found it — token expiry is never checked. Patching.                                                </text>
+<text x="159.6" y="217.0" fill="#8a8a8a" xml:space="preserve">── login.py</text>
+<text x="159.6" y="234.0" fill="#8a8a8a" xml:space="preserve">--- a/login.py</text>
+<text x="159.6" y="251.0" fill="#8a8a8a" xml:space="preserve">+++ b/login.py</text>
+<text x="159.6" y="268.0" fill="#8a8a8a" xml:space="preserve">@@ -40,7 +40,7 @@</text>
+<text x="0.0" y="285.0" fill="#d0d0d0" xml:space="preserve">                        if token:                                                                                       </text>
+<text x="159.6" y="302.0" fill="#ff5f5f" xml:space="preserve">-        login(user)</text>
+<text x="159.6" y="319.0" fill="#87d787" xml:space="preserve">+        if not expired(token):</text>
+<text x="159.6" y="336.0" fill="#87d787" xml:space="preserve">+            login(user)</text>
+<text x="159.6" y="353.0" fill="#ff5f5f" font-weight="bold" xml:space="preserve">! lint: line too long in login.py:44 (non-blocking)</text>
+<rect x="151.20000000000002" y="357.0" width="8.4" height="17.0" fill="#303030"/>
+<rect x="159.6" y="357.0" width="453.6" height="17.0" fill="#262626"/>
+<text x="151.20000000000002" y="370.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="159.6" y="370.0" fill="#d0d0d0" xml:space="preserve">● you                                                                                                </text>
+<rect x="151.20000000000002" y="374.0" width="8.4" height="17.0" fill="#303030"/>
+<rect x="159.6" y="374.0" width="453.6" height="17.0" fill="#262626"/>
+<text x="151.20000000000002" y="387.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="159.6" y="387.0" fill="#d0d0d0" xml:space="preserve">  Also add a regression test                                                                         </text>
+<text x="159.6" y="404.0" fill="#00ffff" font-weight="bold" xml:space="preserve">● tl</text>
+<text x="0.0" y="421.0" fill="#d0d0d0" xml:space="preserve">                     Added tests/test_login_expiry.py — green.                                                          </text>
+<rect x="151.20000000000002" y="561.0" width="705.6" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="574.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="168.0" y="574.0" fill="#8a8a8a" xml:space="preserve">Type a message or / for commands</text>
+<rect x="151.20000000000002" y="578.0" width="705.6" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="591.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="168.0" y="591.0" fill="#8a8a8a" xml:space="preserve">Build · default · tl</text>
+<text x="151.20000000000002" y="608.0" fill="#8a8a8a" xml:space="preserve">/Users/sekun/agent-cli · enter send · / commands · esc back · ? help</text>
+</svg>

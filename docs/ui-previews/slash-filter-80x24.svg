@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="672.0" height="408.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="672.0" height="408.0" fill="#14161c"/>
+<title>slash-filter-80x24</title>
+<rect x="16.8" y="17.0" width="638.4" height="17.0" fill="#303030"/>
+<text x="33.6" y="30.0" fill="#8a8a8a" xml:space="preserve">commands 1/3</text>
+<rect x="16.8" y="34.0" width="16.8" height="17.0" fill="#303030"/>
+<rect x="33.6" y="34.0" width="604.8000000000001" height="17.0" fill="#005f87"/>
+<rect x="638.4" y="34.0" width="16.8" height="17.0" fill="#303030"/>
+<text x="33.6" y="47.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">› /config · selected-agent settings                                     </text>
+<rect x="16.8" y="51.0" width="638.4" height="17.0" fill="#303030"/>
+<text x="0.0" y="64.0" fill="#d0d0d0" xml:space="preserve">      /context · assignment + memory (read-only)                                </text>
+<rect x="16.8" y="68.0" width="638.4" height="17.0" fill="#303030"/>
+<text x="0.0" y="81.0" fill="#d0d0d0" xml:space="preserve">      /compact · Manage conversation length                                     </text>
+<rect x="16.8" y="85.0" width="638.4" height="17.0" fill="#303030"/>
+<text x="33.6" y="98.0" fill="#8a8a8a" xml:space="preserve">↑↓ move · tab complete · enter run · esc keeps draft</text>
+<rect x="16.8" y="102.0" width="638.4" height="17.0" fill="#303030"/>
+<text x="16.8" y="115.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="25.200000000000003" y="115.0" fill="#d0d0d0" xml:space="preserve"> /con                                                                        </text>
+<rect x="16.8" y="119.0" width="638.4" height="17.0" fill="#303030"/>
+<text x="16.8" y="132.0" fill="#5fafff" font-weight="bold" xml:space="preserve">▍</text>
+<text x="33.6" y="132.0" fill="#8a8a8a" xml:space="preserve">Build · default · claude</text>
+<text x="16.8" y="149.0" fill="#8a8a8a" xml:space="preserve">type a message or / for commands · enter send · esc select</text>
+<text x="16.8" y="183.0" fill="#8a8a8a" xml:space="preserve">agent-cli</text>
+<rect x="16.8" y="187.0" width="638.4" height="17.0" fill="#005f87"/>
+<text x="16.8" y="200.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">› ○ claude · default · 2t                                                   </text>
+<text x="16.8" y="217.0" fill="#8a8a8a" xml:space="preserve">  Added tests/test_login_expiry.py — green.</text>
+<text x="0.0" y="251.0" fill="#d0d0d0" xml:space="preserve">    ○ oc · Muse Spark 1.3 · 1t                                                  </text>
+<text x="16.8" y="268.0" fill="#8a8a8a" xml:space="preserve">  oc here — Muse Spark ready</text>
+<text x="0.0" y="302.0" fill="#d0d0d0" xml:space="preserve">    ○ tl · default · 2t                                                         </text>
+<text x="16.8" y="319.0" fill="#8a8a8a" xml:space="preserve">  no turns yet</text>
+<text x="16.8" y="353.0" fill="#8a8a8a" xml:space="preserve">site</text>
+<text x="0.0" y="370.0" fill="#d0d0d0" xml:space="preserve">    ○ web · default · 0t                                                        </text>
+<text x="16.8" y="387.0" fill="#8a8a8a" xml:space="preserve">  no turns yet</text>
+<text x="16.8" y="404.0" fill="#8a8a8a" xml:space="preserve">/Users/sekun/agent-cli · ready</text>
+</svg>

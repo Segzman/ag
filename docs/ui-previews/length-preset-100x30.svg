@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840.0" height="510.0" font-family="Menlo, monospace" font-size="13.5" xml:space="preserve">
+<rect width="840.0" height="510.0" fill="#14161c"/>
+<title>length-preset-100x30</title>
+<rect x="134.4" y="119.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="132.0" fill="#8a8a8a" xml:space="preserve">When to summarize</text>
+<rect x="134.4" y="136.0" width="571.2" height="17.0" fill="#303030"/>
+<rect x="134.4" y="153.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="166.0" fill="#8a8a8a" xml:space="preserve">When to summarize</text>
+<rect x="134.4" y="170.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="183.0" fill="#8a8a8a" xml:space="preserve">Summarize when either limit is reached. The newest messages</text>
+<rect x="134.4" y="187.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="200.0" fill="#8a8a8a" xml:space="preserve">are always kept. Choosing here never turns summaries on or</text>
+<rect x="134.4" y="204.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="217.0" fill="#8a8a8a" xml:space="preserve">off.</text>
+<rect x="134.4" y="221.0" width="16.8" height="17.0" fill="#303030"/>
+<rect x="151.20000000000002" y="221.0" width="520.8000000000001" height="17.0" fill="#005f87"/>
+<rect x="672.0" y="221.0" width="33.6" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="234.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">&gt; Standard  Every 20 user turns or ~20,000 tokens, keep last 5</text>
+<rect x="134.4" y="238.0" width="16.8" height="17.0" fill="#303030"/>
+<rect x="151.20000000000002" y="238.0" width="92.4" height="17.0" fill="#005f87"/>
+<rect x="243.60000000000002" y="238.0" width="462.0" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="251.0" fill="#eeeeee" font-weight="bold" xml:space="preserve">  (current)</text>
+<rect x="134.4" y="255.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="268.0" fill="#d0d0d0" xml:space="preserve">                    More often  Every 10 user turns or ~10,000 tokens, keep last 3                  </text>
+<rect x="134.4" y="272.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="285.0" fill="#d0d0d0" xml:space="preserve">                    Less often  Every 40 user turns or ~40,000 tokens, keep last                    </text>
+<rect x="134.4" y="289.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="302.0" fill="#d0d0d0" xml:space="preserve">                    10                                                                              </text>
+<rect x="134.4" y="306.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="0.0" y="319.0" fill="#d0d0d0" xml:space="preserve">                    Back                                                                            </text>
+<rect x="134.4" y="323.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="336.0" fill="#8a8a8a" xml:space="preserve">Uses the exact limits shown; On/Off stays as it is.</text>
+<rect x="134.4" y="340.0" width="571.2" height="17.0" fill="#303030"/>
+<rect x="134.4" y="357.0" width="571.2" height="17.0" fill="#303030"/>
+<text x="151.20000000000002" y="370.0" fill="#8a8a8a" xml:space="preserve">↑↓ select · enter open · esc back</text>
+</svg>

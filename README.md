@@ -1,24 +1,68 @@
 # ag — CLI helper for autonomous agents
 
-Single file, stdlib only. No dependencies, no install: `./ag`.
+`ag` drives coding-CLI subagents from the terminal: headless turns
+(`chat send`, `delegate`), background wake-ups (`wake`), live PTY
+sessions (`spawn`/`snap`/`send`), and shared skills/MCP/memory via
+harness profiles. Single Python file, stdlib only. State lives in
+`./.agent/` (override with `--dir` or `$AGENT_CLI_DIR`). All commands
+accept `--json` for machine-readable output.
 
-State lives in `./.agent/` (override with `--dir` or `$AGENT_CLI_DIR`).
-All commands accept `--json` for machine-readable output.
+## Contents
 
-## Setup
+- [Install](#install)
+- [Setup for coding agents](#setup-for-coding-agents)
+- [Getting started](#getting-started)
+- [TUI controls](#tui-controls)
+- [Backends](#backends)
+- [Native slash commands](#native-slash-commands)
+- [Model selection](#model-selection)
+- [Native limits](#native-limits-verified-from---help-no-remote-calls)
+- [Harness profiles](#harness-profiles-shared-named-backendsskillsmemorymcp)
+- [Wake](#wake-background-agents-wake-agents-on-completion)
+- [Limitations](#limitations-honest)
 
-Requirements: Python 3.8+, POSIX (macOS/Linux; no Windows), git. Coding-CLI backends (`claude`, `opencode`, `codex`, `gemini`, `agent`) are optional — `ag agents doctor` reports what is installed. Local `echo` backend always works (plumbing tests, no API keys).
+## Install
+
+Requirements: Python 3.9+, POSIX (macOS/Linux; no Windows), git.
+No Python packages. Full guide: [docs/INSTALL.md](docs/INSTALL.md).
 
 ```sh
 git clone https://github.com/Segzman/ag.git
 cd ag
-chmod +x ag
-./ag selfcheck              # built-in regression checks
-./ag agents doctor          # check backends
-./ag agents list            # roster (default: claude orchestrator + oc sub)
+./install.sh                  # installs standalone ag to ~/.local/bin/ag
 ```
 
-State dir: every `ag` invocation resolves state as `--dir` → `$AGENT_CLI_DIR` → `$PWD/.agent` (no upward search). Running from the wrong cwd silently creates a fresh roster that looks wiped but isn't. **Always pass `--dir` explicitly** (or export `AGENT_CLI_DIR` once per session), and never commit state contents (`.agent/`, `approvals.json`, `history.jsonl`, `notes.jsonl`, `todos.json` are git-ignored).
+Alternatives: `./install.sh --prefix DIR` installs to `DIR/bin/ag`;
+`./install.sh --force` updates an existing install.
+
+The installer copies only the single `ag` file: no sudo, no network or
+backend setup, no shell-rc edits. Put the install dir on `PATH` for the
+session (`export PATH="$HOME/.local/bin:$PATH"`) — details, custom
+prefixes, updates, remote use over SSH, and uninstall in [docs/INSTALL.md](docs/INSTALL.md).
+
+Backends are optional and installed/authenticated separately —
+`ag agents doctor` reports what is present. The local `echo` backend
+always works (no keys) for plumbing tests. Running from the checkout
+(`./ag`) keeps working with or without installing; skills
+(`.claude/skills/`) and docs stay in the clone.
+
+Verify with a no-key smoke test (fresh state dir; agent state stays
+inside it, while `selfcheck` uses its own temp dir):
+
+```sh
+STATE="$(mktemp -d)"                                        # fresh state dir, no collisions
+./ag --dir "$STATE" selfcheck                               # built-in regression checks
+./ag --dir "$STATE" agents add smoke --backend echo --role sub
+./ag --dir "$STATE" chat send smoke "hi"                    # one headless turn, no keys
+JOB="$(./ag --dir "$STATE" --json wake smoke "summarize this" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["job"])')"
+./ag --dir "$STATE" wakes --wait "$JOB" --timeout 30        # wake is async: wait for done
+./ag --dir "$STATE" chat log smoke                          # follow-up reply lands here
+```
+
+No cleanup step: the daemon may still finalize the session after the
+job reports done, so leave the temp dir to the OS.
+
+State dir: every `ag` invocation resolves state as `--dir` → `$AGENT_CLI_DIR` → `$PWD/.agent` (no upward search). Running from the wrong cwd silently creates a fresh roster that looks wiped but isn't. **Always pass `--dir` explicitly** (or export `AGENT_CLI_DIR` once per session); examples below use `./ag` from the checkout — add `--dir <state>` (or the export) to each command. Never commit state contents (`.agent/`, `approvals.json`, `history.jsonl`, `notes.jsonl`, `todos.json` are git-ignored).
 
 Skills for coding agents live in `.claude/skills/`:
 
@@ -33,8 +77,6 @@ Share one setup across agents without touching home/global config:
   --skills ./.claude/skills --mcp ./.mcp.json
 ./ag harness profile set oc --profile docs
 ```
-
-Personal Linear work-queue skills (`work-on`, `work-sync`, `work-status`, …) from the author's `~/.claude` are intentionally not shipped — they depend on a private `queue.sh` + Linear MCP. `ag-delegate` covers the same delegation patterns with stock `ag`.
 
 ## Setup for coding agents
 
@@ -140,7 +182,7 @@ Keys arrive via `get_wch` when available: arrows/keys stay keys (never typed as 
 
 ## Backends
 
-`claude` orchestrates; subs via `opencode`/`gemini`/`codex`/`cursor`. `echo` is a local plumbing-test backend. Stateless backends replay recent history; `claude`/`opencode`/`cursor` resume by session id. Roles (`roles list/add/set/show/rm`) set system prompts; per-agent `--persona` or `--system` (`@file` loads text) overrides.
+`claude` orchestrates; subs via `opencode`/`gemini`/`codex`/`cursor`. `echo` is a local plumbing-test backend. Stateless backends replay recent history; `claude`/`opencode`/`cursor` resume by session id. Each backend CLI is installed and authenticated separately — `ag` never does that; `agents doctor` only reports what it finds. Roles (`roles list/add/set/show/rm`) set system prompts; per-agent `--persona` or `--system` (`@file` loads text) overrides.
 
 ## Native slash commands
 
@@ -149,11 +191,11 @@ Work in the TUI composer and headless chat (`./ag chat send claude "/help"`). Le
 ```sh
 ./ag chat send claude "/help"               # list
 ./ag chat send claude "/harness list"       # backends (* = current)
-/ag chat send claude "/harness use opencode"  # switch (alias: /backend ...)
-/ag chat send claude "/model opus"         # switch model
+./ag chat send claude "/harness use opencode"  # switch (alias: /backend ...)
+./ag chat send claude "/model"                  # list models for claude's backend
 ./ag chat send claude "/handoff"            # interactive native session
 ./ag chat send claude "/profile list"       # shared profiles (* = this agent)
-/ag chat send claude "/profile show docs"  # sources + effective files + unsupported
+./ag chat send claude "/profile show docs"  # sources + effective files + unsupported
 ./ag chat send claude "/profile use docs"   # select (clears session); --none clears
 # in TUI: type / for the popup (Tab completes, Enter runs, Esc keeps draft):
 # /projects /agents /config /model [name] /backend [name] /profile [...] /
@@ -170,7 +212,7 @@ Switching preserves name/workdir/role/persona/system, keeps one native session i
 
 ```sh
 ./ag agents list                       # roster with backend/model/role
-./ag agents set oc --model opus        # change a sub's model
+./ag agents set oc --model default        # reset to the ag-level default
 ./ag chat send oc "/model"             # list models for oc's backend
 # in TUI: m = picker, M = custom model string, R = role picker
 ```

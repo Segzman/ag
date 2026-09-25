@@ -467,7 +467,7 @@ def test_opencode_argv_and_handoff_carry_spark():
                          sid="", prompt="hi")
     assert "-m" not in av and "--model" not in av, av
     argv, cwd = ag.native_handoff_argv("opencode", sid="s1", model="default")
-    assert argv == ["opencode", "-m", S], argv
+    assert os.path.basename(argv[0]) == "opencode" and argv[1:] == ["-m", S], argv
     argv, _ = ag.native_handoff_argv("claude", sid="abc")
     assert argv == ["claude", "--resume", "abc"], argv
     print("ok test_opencode_argv_and_handoff_carry_spark")

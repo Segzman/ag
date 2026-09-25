@@ -426,13 +426,16 @@ def _spawn_tracked(sdir, name, cmd_str, cwd, extra=None):
 
 def _spawn_wake_session(sdir, agent, jid):
     """Tracked private worker running `_wake_run <jid>`. Absolute paths, no shell
-    injection (shlex.quote), no --wake/on-exit so no callback recursion."""
+    injection (shlex.quote), no --wake/on-exit so no callback recursion.
+    Worker cwd is the caller's cwd (not the state dir) so a relative agent
+    dir resolves exactly as in the foreground turn that enqueued it."""
     sdir_abs = str(Path(sdir).resolve())
     ag_abs = str(Path(ag_script_path()).resolve())
     cmd_list = [sys.executable, ag_abs, "--dir", sdir_abs, "_wake_run", jid]
     cmd_str = " ".join(shlex.quote(x) for x in cmd_list)
     name = f"{WAKE_WORKER_PREFIX}{agent}-{jid[:6]}"[:48]
-    sid, _ = _spawn_tracked(sdir, name, cmd_str, sdir_abs,
+    launch_cwd = os.getcwd()
+    sid, _ = _spawn_tracked(sdir, name, cmd_str, launch_cwd,
         extra={"wake_agent": "", "wake_job": jid, "wake_worker_for": agent})
     return sid
 
@@ -2064,7 +2067,7 @@ def native_handoff_argv(backend, *, sid="", workdir=".", model=""):
         return (["claude"] + (["--resume", sid] if sid else []), workdir or ".")
     if backend == "opencode":
         m = eff_model("opencode", model)
-        return (["opencode"] + (["-m", m] if m else []), workdir or ".")
+        return ([_opencode_bin()] + (["-m", m] if m else []), workdir or ".")
     if backend == "gemini":
         return (["gemini"], workdir or ".")
     if backend == "codex":
@@ -3547,7 +3550,7 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system=""
         if sid: argv += ["--resume",sid]
         return argv + [prompt]
     if backend=="opencode":
-        argv = ["opencode","run","--format","json","--thinking"]
+        argv = [_opencode_bin(),"run","--format","json","--thinking"]
         if command: argv += ["--command",command]
         if m: argv += ["-m",m]
         argv += ["--dir",workdir]
@@ -3574,6 +3577,23 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system=""
 
 def _cursor_bin():
     return shutil.which("agent") or str(Path.home()/".local/bin/agent")
+
+def _opencode_bin():
+    exe = shutil.which("opencode")
+    if exe:
+        # Absolute: the backend Popen runs under the agent workdir, so a
+        # relative PATH entry must not leak through as a relative argv[0].
+        return os.path.abspath(exe)
+    for fallback in [
+        Path.home() / ".opencode" / "bin" / "opencode",
+        Path.home() / ".local" / "bin" / "opencode",
+        Path.home() / ".bun" / "bin" / "opencode",
+        Path("/opt/homebrew/bin/opencode"),
+        Path("/usr/local/bin/opencode"),
+    ]:
+        if fallback.is_file() and os.access(str(fallback), os.X_OK):
+            return str(fallback)
+    return "opencode"
 
 def _parse_claude(line):
     try: o = json.loads(line)
@@ -5248,7 +5268,7 @@ def eff_system(sdir, agent):
 def do_agents(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     if a.sub=="doctor":
-        probes = dict(PROBES); probes["cursor"] = [_cursor_bin(),"--version"]
+        probes = dict(PROBES); probes["cursor"] = [_cursor_bin(),"--version"]; probes["opencode"] = [_opencode_bin(),"--version"]
         rows = []
         for b,probe in probes.items():
             try:
@@ -5572,7 +5592,7 @@ def run_turn(sdir,name,text,on_event=None,command=None):
         return {"sid":meta2.get("sid",""),"exit":0 if ok else 1,"reply":reply,"slash":cmd}
     backend = a.get("backend","claude")
     model = a.get("model","default") or "default"
-    workdir = a.get("dir",".") or "."
+    workdir = os.path.abspath(a.get("dir",".") or ".")
     if command and backend != "opencode":
         return {"error":f"--command is opencode-only (agent {name} runs {backend})"}
     # Single shared guard: block here while another process runs this agent,
@@ -5587,7 +5607,7 @@ def run_turn(sdir,name,text,on_event=None,command=None):
         a = agents[name]
         backend = a.get("backend","claude")
         model = a.get("model","default") or "default"
-        workdir = a.get("dir",".") or "."
+        workdir = os.path.abspath(a.get("dir",".") or ".")
         if command and backend != "opencode":
             _release_agent_turn(_turn_lock); _turn_lock = None
             return {"error":f"--command is opencode-only (agent {name} runs {backend})"}
@@ -8224,7 +8244,8 @@ def do_selfcheck(a):
         assert _r["exit"]==0 and OPENCODE_MODEL_DEFAULT in _r["reply"], _r
         ok,_m = switch_backend(td,"sl","echo")
         assert ok and [x for x in load_agents(td) if x["name"]=="sl"][0]["backend"]=="echo"
-        assert backend_argv("opencode",model="",workdir=".",sid="",prompt="hi",command="rev")==["opencode","run","--format","json","--thinking","--command","rev","-m",OPENCODE_MODEL_DEFAULT,"--dir",".","hi"]
+        oc_argv = backend_argv("opencode",model="",workdir=".",sid="",prompt="hi",command="rev")
+        assert oc_argv[1:] == ["run","--format","json","--thinking","--command","rev","-m",OPENCODE_MODEL_DEFAULT,"--dir",".","hi"] and (oc_argv[0]=="opencode" or oc_argv[0].endswith("/opencode"))
         assert "--command" not in backend_argv("opencode",model="",workdir=".",sid="",prompt="hi")
         _r = run_turn(td,"sl","hi",command="x")
         assert "error" in _r and "opencode-only" in _r["error"], _r
@@ -8283,7 +8304,7 @@ def do_selfcheck(a):
         assert opencode_switch_model("opus")==OPENCODE_MODEL_DEFAULT
         assert opencode_switch_model("custom/keep")=="custom/keep"
         _av,_cw = native_handoff_argv("opencode",sid="s1",model="default")
-        assert _av==["opencode","-m",OPENCODE_MODEL_DEFAULT], _av
+        assert _av[1:]==["-m",OPENCODE_MODEL_DEFAULT] and (_av[0]=="opencode" or _av[0].endswith("/opencode")), _av
         assert native_handoff_argv("claude",sid="abc")==(["claude","--resume","abc"],".")
         # home dashboard pure helpers: grouping, titles, rows, configurator
         _groups = group_agents_by_workdir([

@@ -162,7 +162,7 @@ def test_handoff_has_no_bypass_flags():
     check("handoff-claude-resume", argv == ["claude", "--resume", "abc"], argv)
     argv, _ = ag.native_handoff_argv("opencode", sid="s1", model="default")
     check("handoff-opencode-spark",
-          argv == ["opencode", "-m", ag.OPENCODE_MODEL_DEFAULT], argv)
+          argv[1:] == ["-m", ag.OPENCODE_MODEL_DEFAULT] and (argv[0]=="opencode" or argv[0].endswith("/opencode")), argv)
     ok, txt = ag.handle_slash(td, "sl", "handoff", "")
     check("handoff-text", ok and "claude" in txt and "--resume" in txt and "abc" in txt, txt)
     ok, txt = ag.handle_slash(td, "sl", "handoff", "opencode")
@@ -177,8 +177,8 @@ def test_backend_opts_stable():
 def test_opencode_command_argv_only():
     S = ag.OPENCODE_MODEL_DEFAULT
     av = ag.backend_argv("opencode", model="", workdir=".", sid="", prompt="hi", command="rev")
-    check("command-argv", av == ["opencode", "run", "--format", "json", "--thinking",
-        "--command", "rev", "-m", S, "--dir", ".", "hi"], av)
+    check("command-argv", av[1:] == ["run", "--format", "json", "--thinking",
+        "--command", "rev", "-m", S, "--dir", ".", "hi"] and (av[0]=="opencode" or av[0].endswith("/opencode")), av)
     av = ag.backend_argv("opencode", model="", workdir=".", sid="", prompt="hi")
     check("no-command-clean", "--command" not in av, av)
     check("default-resolves-spark", "-m" in av and S in av, av)

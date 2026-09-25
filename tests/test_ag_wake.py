@@ -17,13 +17,16 @@ _REPO_AG = str(Path(__file__).resolve().parent.parent / "ag")
 AG = Path(os.environ.get("AG_WAKE_BIN", _REPO_AG))
 assert AG.exists(), f"missing ag binary: {AG}"
 
-def run(state, *args, timeout=20):
+def run(state, *args, timeout=20, env=None):
+    full_env = dict(os.environ)
+    if env:
+        full_env.update(env)
     p = subprocess.run([sys.executable, str(AG), "--dir", str(state)] + list(args),
-        capture_output=True, text=True, timeout=timeout)
+        capture_output=True, text=True, timeout=timeout, env=full_env)
     return p
 
-def run_json(state, *args, timeout=20):
-    p = run(state, "--json", *args, timeout=timeout)
+def run_json(state, *args, timeout=20, env=None):
+    p = run(state, "--json", *args, timeout=timeout, env=env)
     try: obj = json.loads(p.stdout or "{}")
     except Exception: obj = {}
     return p, obj
@@ -347,6 +350,123 @@ def test_timeout_marks_stalled():
     assert ok, wakes(td)
     print("ok test_timeout_marks_stalled")
 
+
+def test_opencode_bin_fallback_priority():
+    """Wake should prefer PATH's opencode over the HOME fallback."""
+    td = Path(tempfile.mkdtemp(prefix="agwoc-priority-"))
+    home = Path(tempfile.mkdtemp(prefix="agwoc-home-priority-"))
+    path_dir = Path(tempfile.mkdtemp(prefix="agwoc-path-"))
+    run(td, "agents", "add", "oc1", "--backend", "opencode", "--role", "sub")
+
+    def make_opencode(path, text):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '#!/bin/sh\n'
+            f'echo \'{{"type":"text","part":{{"text":"{text}"}}}}\'\n'
+            'echo \'{"type":"step_finish","part":{"reason":"stop"}}\'\n'
+        )
+        path.chmod(0o755)
+
+    make_opencode(path_dir / "opencode", "from-path")
+    make_opencode(home / ".opencode" / "bin" / "opencode", "from-fallback")
+    env = dict(os.environ, PATH=str(path_dir), HOME=str(home))
+    p, o = run_json(td, "wake", "oc1", "msg", env=env)
+    assert p.returncode == 0 and o.get("ok"), (p.returncode, o, p.stderr)
+    jid = o["data"].get("job")
+    ok = wait_for(td, lambda: _job(td, jid).get("status") == "done", timeout=15)
+    assert ok, wakes(td, "oc1")
+    replies = [r["text"] for r in chat_log(td, "oc1") if r.get("role") == "agent"]
+    assert any("from-path" in text for text in replies), replies
+    assert not any("from-fallback" in text for text in replies), replies
+    print("ok test_opencode_bin_fallback_priority")
+
+def test_wake_opencode_with_fallback_binary():
+    """End-to-end: wake finds opencode via fallback when PATH restricted."""
+    td = Path(tempfile.mkdtemp(prefix="agwoc-e2e-"))
+    home = Path(tempfile.mkdtemp(prefix="agwoc-home-"))
+    run(td, "agents", "add", "ocfb", "--backend", "opencode", "--role", "sub")
+
+    opencode_bin = home / ".opencode" / "bin" / "opencode"
+    opencode_bin.parent.mkdir(parents=True, exist_ok=True)
+    opencode_bin.write_text(
+        '#!/bin/sh\n'
+        'echo \'{"type":"text","part":{"text":"via-fallback"}}\'\n'
+        'echo \'{"type":"step_finish","part":{"reason":"stop"}}\'\n'
+    )
+    opencode_bin.chmod(0o755)
+    env = dict(os.environ, PATH="/usr/bin:/bin", HOME=str(home))
+
+    p, o = run_json(td, "wake", "ocfb", "msg", env=env)
+    assert p.returncode == 0, (p.returncode, p.stderr)
+    assert o.get("ok"), o
+    jid = o.get("data", {}).get("job")
+
+    ok = wait_for(td, lambda: any(j.get("id")==jid and j.get("status")=="done" for j in wakes(td, "ocfb")), timeout=15)
+    assert ok, wakes(td, "ocfb")
+    replies = [r["text"] for r in chat_log(td, "ocfb") if r.get("role") == "agent"]
+    assert any("via-fallback" in text for text in replies), replies
+    print("ok test_wake_opencode_with_fallback_binary")
+
+def test_opencode_non_executable_skipped():
+    """Skip a non-executable file and directory before using the next fallback."""
+    td = Path(tempfile.mkdtemp(prefix="agwoc-noex-"))
+    home = Path(tempfile.mkdtemp(prefix="agwoc-home-noex-"))
+    run(td, "agents", "add", "ocne", "--backend", "opencode", "--role", "sub")
+
+    non_exec = home / ".opencode" / "bin" / "opencode"
+    non_exec.parent.mkdir(parents=True, exist_ok=True)
+    non_exec.write_text("#!/bin/sh\necho hi\n")
+    non_exec.chmod(0o644)
+
+    # Replace the first fallback with a directory to exercise both rejected forms.
+    non_exec.unlink()
+    non_exec.mkdir()
+
+    fallback_exec = home / ".local" / "bin" / "opencode"
+    fallback_exec.parent.mkdir(parents=True, exist_ok=True)
+    fallback_exec.write_text(
+        '#!/bin/sh\n'
+        'echo \'{"type":"text","part":{"text":"via-second-fallback"}}\'\n'
+        'echo \'{"type":"step_finish","part":{"reason":"stop"}}\'\n'
+    )
+    fallback_exec.chmod(0o755)
+
+    # Exercise a regular non-executable file on a separate isolated HOME as well.
+    file_home = Path(tempfile.mkdtemp(prefix="agwoc-home-file-noex-"))
+    file_non_exec = file_home / ".opencode" / "bin" / "opencode"
+    file_non_exec.parent.mkdir(parents=True, exist_ok=True)
+    file_non_exec.write_text("#!/bin/sh\necho hi\n")
+    file_non_exec.chmod(0o644)
+    file_fallback = file_home / ".local" / "bin" / "opencode"
+    file_fallback.parent.mkdir(parents=True, exist_ok=True)
+    file_fallback.write_text(
+        '#!/bin/sh\n'
+        'echo \'{"type":"text","part":{"text":"via-file-fallback"}}\'\n'
+        'echo \'{"type":"step_finish","part":{"reason":"stop"}}\'\n'
+    )
+    file_fallback.chmod(0o755)
+
+    env = dict(os.environ, PATH="/usr/bin:/bin", HOME=str(home))
+    p, o = run_json(td, "wake", "ocne", "msg", env=env)
+    assert p.returncode == 0 and o.get("ok"), (p.returncode, o)
+    jid = o.get("data", {}).get("job")
+    ok = wait_for(td, lambda: _job(td, jid).get("status") == "done", timeout=15)
+    assert ok, "should skip directory and use fallback_exec"
+    replies = [r["text"] for r in chat_log(td, "ocne") if r.get("role") == "agent"]
+    assert any("via-second-fallback" in text for text in replies), replies
+
+    file_state = Path(tempfile.mkdtemp(prefix="agwoc-file-noex-"))
+    run(file_state, "agents", "add", "ocfile", "--backend", "opencode", "--role", "sub")
+    file_env = dict(os.environ, PATH="/usr/bin:/bin", HOME=str(file_home))
+    p, o = run_json(file_state, "wake", "ocfile", "msg", env=file_env)
+    assert p.returncode == 0 and o.get("ok"), (p.returncode, o)
+    file_jid = o["data"].get("job")
+    ok = wait_for(file_state, lambda: _job(file_state, file_jid).get("status") == "done", timeout=15)
+    assert ok, "should skip non-executable file and use fallback"
+    file_replies = [r["text"] for r in chat_log(file_state, "ocfile") if r.get("role") == "agent"]
+    assert any("via-file-fallback" in text for text in file_replies), file_replies
+    print("ok test_opencode_non_executable_skipped")
+
 if __name__ == "__main__":
     test_wake_explicit()
     test_spawn_wake_completion_context()
@@ -366,4 +486,7 @@ if __name__ == "__main__":
     test_wake_on_done_hook()
     test_dead_worker_marked_failed()
     test_timeout_marks_stalled()
+    test_opencode_bin_fallback_priority()
+    test_wake_opencode_with_fallback_binary()
+    test_opencode_non_executable_skipped()
     print("all wake tests passed")

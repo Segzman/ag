@@ -43,14 +43,15 @@ Per-task depth via roles, not model switches: `planner` = think hard (assumption
 | Need | Command |
 |---|---|
 | Health / roster | `ag agents doctor` · `ag agents list` · `ag agents add w --backend echo --role sub` |
-| Roles | `ag roles list` (system-prompt presets; `--persona` / `--system @file` overrides per turn) |
+| Roles | `ag roles list` (system-prompt presets; `--persona` / `--system @file` overrides per turn) · `ag roles reset reviewer` restores one builtin |
+| Harness | `ag harness use oc codex` · `ag harness current oc` (headless backend select; details: `docs/HARNESS_ROLES.md`) |
 | One headless turn | `ag chat send oc "task"` · read back with `ag chat log oc` |
 | Orchestrator assign | `ag delegate oc "task"` (logs into orchestrator chat) |
 | Background turn | `ag wake oc "task"` (returns now) · `ag wakes` · `ag events --limit 20` |
 | Opencode native cmd | `ag chat send oc --command review "path"` (opencode-only; others reject) |
 | Slash (local, never to model) | `ag chat send oc "/model"`, `/harness use opencode`, `/profile use docs`, `/help` |
 
-`chat send` / `run_turn` has **no timeout**. Hung backend hangs the call until killed externally. `wake` is at-most-once *launch*, no retry — verify via `events` + `wakes`. One shared per-agent flock guard excludes concurrent turns (no order guarantee); backend/profile/model switches refuse while busy.
+`chat send` / `delegate` take `--timeout` (default 1800s, `0` = unlimited): hard backend budget starting after the per-agent guard is acquired — lock wait is unbounded, then the turn gets the full budget. `wake` is at-most-once *launch*, no retry — verify via `events` + `wakes`. `wake --max-runtime` is the same hard budget for background turns; `wake --timeout` only marks `stalled`, worker keeps running. `wakes --cancel <job>` cancels one job (records `failed`, `cancelled=true`). `queued` = worker hasn't acquired the guard yet (honest, never phantom-active). One shared per-agent flock guard excludes concurrent turns (no order guarantee); backend/profile/model switches refuse while busy.
 
 ## Live sessions (non-blocking)
 
@@ -127,7 +128,7 @@ ag --dir <state> events --limit 20
 ag --dir <state> chat log oc
 ```
 
-At-most-once launch, no retry — re-`wake` manually. `kill <worker-sid>` stops a wake worker (job marked failed).
+At-most-once launch, no retry — re-`wake` manually. `wakes --cancel <job>` cancels a queued/running job (`failed`, `cancelled=true`); `kill <worker-sid>` stops a wake worker (job marked failed).
 
 ### 4. Context handoff (multi-agent chain)
 
@@ -189,4 +190,4 @@ Rules: at most one wake fires per session (atomic claim, exit/kill/force-kill al
 
 `ag selfcheck` · `ag keys` (cheat-sheet).
 
-Deeper: `<repo>/README.md` (setup, capability matrix, TUI keys, limitations) + `docs/AGENT_CONTEXT.md` (scoped context) before touching `harness profile` or debugging what a backend actually received.
+Deeper: `<repo>/README.md` (setup, capability matrix, TUI keys, limitations) + `docs/AGENT_CONTEXT.md` (scoped context) before touching `harness profile` or debugging what a backend actually received. Outbound multi-host sync: `docs/MULTI_HOST.md` (explicit stop-source-first handoff, no automatic failover).

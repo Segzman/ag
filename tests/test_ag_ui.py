@@ -484,13 +484,13 @@ def test_switch_and_add_materialize_spark():
     ok, out = ag.switch_backend(td, "sl", "claude")
     assert ok, out
     got = [x for x in ag.load_agents(td) if x["name"] == "sl"][0]
-    assert got["model"] == "default", got  # leaving opencode resets as before
+    assert got["model"] == "opus", got  # returning restores Claude preference
     td2 = fresh_td([{"name": "cu", "backend": "echo",
                      "model": "custom/keep", "dir": ".", "role": "sub"}])
     ok, out = ag.switch_backend(td2, "cu", "opencode")
     assert ok, out
     got = [x for x in ag.load_agents(td2) if x["name"] == "cu"][0]
-    assert got["model"] == "custom/keep", got  # explicit custom survives
+    assert got["model"] == S, got  # custom IDs belong to their source backend
     print("ok test_switch_and_add_materialize_spark")
 
 

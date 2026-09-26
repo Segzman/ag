@@ -19,6 +19,7 @@ accept `--json` for machine-readable output.
 - [Native limits](#native-limits-verified-from---help-no-remote-calls)
 - [Harness profiles](#harness-profiles-shared-named-backendsskillsmemorymcp)
 - [Wake](#wake-background-agents-wake-agents-on-completion)
+- [Docs](#docs)
 - [Limitations](#limitations-honest)
 
 ## Install
@@ -206,7 +207,7 @@ Work in the TUI composer and headless chat (`./ag chat send claude "/help"`). Le
 # (other backslash text like C:\path stays a normal message).
 ```
 
-Switching preserves name/workdir/role/persona/system, keeps one native session id per backend (never resumes a Claude SID in OpenCode), resets an incompatible model to `default`, and refuses while a turn is running. `harness show|export|import|link` subcommands are unchanged.
+Switching preserves name/workdir/role/persona/system, remembers one model and one native session id per backend (never resumes a foreign SID or carries a custom model across backends), and refuses while a turn is running. `harness show|export|import|link` subcommands are unchanged.
 
 ## Model selection
 
@@ -224,8 +225,8 @@ ag — headless `chat send`/`delegate`/wake turns (`opencode run -m …`),
 native handoff (`opencode -m …`, verified root flag), new agents
 (`agents add`, TUI `n`), backend switches onto opencode, the `m` picker and
 `/model list`. Explicit custom models always win (stored and passed
-through); switching onto opencode keeps a custom string and only resets
-`default`/missing or other-backend models. Other backends are untouched:
+through); each backend remembers its own last model (custom IDs included)
+and restores it on return (details: [docs/HARNESS_ROLES.md](docs/HARNESS_ROLES.md)). Other backends are untouched:
 `default` still means "no `-m` flag".
 
 ## Native limits (verified from `--help`, no remote calls)
@@ -360,11 +361,18 @@ use fake fixture credentials.
 
 Each wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session (`__wake-<agent>-<id>`, visible in `sessions`/`status --json`). Turns on the same agent (`chat send`, `delegate`, wake workers) are mutually excluded via one shared per-agent flock guard held inside `run_turn` (no FIFO or arrival-order guarantee; the wake worker takes no second lock); different agents run in parallel. Backend/profile/model switches probe the same guard and refuse while the agent runs anywhere. `spawn --wake` launches at most once (atomic claim, not guaranteed completion or delivery); worker completion never re-fires (no callback loops). Argv is shell-free, so `; touch evil` in messages stays inert text. `--on-exit` still runs first and is unchanged.
 
+## Docs
+
+- [Harness selection + behavior presets](docs/HARNESS_ROLES.md): `harness use/current`, per-backend models, editable/reset roles.
+- [Wake control: timeout, cancel, kill](docs/WAKE_CONTROL.md): `chat send`/`delegate --timeout`, wake `--max-runtime`, per-job flock, CLI 124.
+- [Multi-host portable snapshots](docs/MULTI_HOST.md): `hosts`, `sync pull/_export` over outbound SSH, no automatic failover.
+- [Muse feedback on brief 1–8](docs/MUSE_FEEDBACK.md): what is covered vs deferred (queue/dependencies, ephemeral agents, post-turn hooks; no concurrency cap).
+
 ## Limitations (honest)
 
 - Wake is at-most-once *launch*, not completion: a crash between claim and enqueue, or a `kill -9` of a worker, can lose/stall a wake. Check `events` for a missing `wake` after `exit`, `wakes` for jobs whose session is dead. No retry scheduler.
 - Daemon crash (`kill -9` daemon): session is marked `stale` (`exit=-1`, one `stale` event, prompt `wait`/`snap` return) and the pending wake does **not** fire — `wake_fired:false` stays visible in `status`. Re-wake manually if needed.
-- `run_turn` has no timeout; a hung backend hangs `chat send` and the detached wake worker until killed externally. While it hangs, the agent's guard is held: backend/profile/model switches (any process) refuse, and other turns on the same agent block behind it.
+- `chat send`/`delegate --timeout` (default 1800, `0` = unlimited) bounds backend runtime; expiry kills the backend group and exits 124. Wake jobs bound it separately via `--max-runtime` (budget starts at guard acquisition). While a turn runs, the agent's guard is held: backend/profile/model switches (any process) refuse, and other turns on the same agent block behind it.
 - No queue fairness/priority/FIFO; concurrent turns on one agent are mutually excluded with no arrival-order guarantee.
 - Message cap 4000 chars (truncated). `wake/jobs` history is never pruned by `forget`; delete files manually.
 - POSIX only for `spawn`/workers (`wake` enqueue works anywhere, workers need the pty daemon). TUI needs POSIX curses; no Windows support.

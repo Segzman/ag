@@ -315,7 +315,7 @@ def test_dead_worker_marked_failed():
         _, o = run_json(td, "wake", "dw", "doomed")
         jid, wsid = o["data"].get("job"), o["data"].get("session")
         assert jid and wsid, o
-        ok = wait_for(td, lambda: _job(td, jid).get("status") == "running", timeout=10)
+        ok = wait_for(td, lambda: _job(td, jid).get("status") == "queued", timeout=10)
         assert ok, wakes(td)
         assert run(td, "kill", wsid, "--force").returncode == 0
         ok = wait_for(td, lambda: _job(td, jid).get("status") == "failed", timeout=10)
@@ -328,7 +328,10 @@ def test_dead_worker_marked_failed():
         lockf.close()
     print("ok test_dead_worker_marked_failed")
 
-def test_timeout_marks_stalled():
+def test_timeout_ignores_queued_waits():
+    """Queued jobs waiting for the turn guard never report backend-stalled:
+    hold the guard past the timeout, see queued + no wake_stall, release to
+    done. Running-state stalls are covered in test_ag_wake_status.py."""
     td = Path(tempfile.mkdtemp(prefix="agw-"))
     run(td, "agents", "add", "to", "--backend", "echo", "--role", "sub")
     lockdir = td / "wake" / "locks"
@@ -339,16 +342,19 @@ def test_timeout_marks_stalled():
         _, o = run_json(td, "wake", "to", "slow-one", "--timeout", "1")
         jid = o["data"].get("job")
         assert jid, o
-        ok = wait_for(td, lambda: _job(td, jid).get("stalled") is True, timeout=10)
-        assert ok, wakes(td)
-        assert any(e["type"] == "wake_stall" and e.get("job") == jid
+        assert wait_for(td, lambda: _job(td, jid).get("status") == "queued", timeout=10), wakes(td)
+        time.sleep(3)  # past the 1s timeout while still queued
+        j = _job(td, jid)
+        assert j.get("status") == "queued" and not j.get("stalled"), j
+        assert not any(e["type"] == "wake_stall" and e.get("job") == jid
             for e in events(td)), events(td)
     finally:
         fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
         lockf.close()
     ok = wait_for(td, lambda: _job(td, jid).get("status") == "done", timeout=15)
     assert ok, wakes(td)
-    print("ok test_timeout_marks_stalled")
+    assert not _job(td, jid).get("stalled"), wakes(td)
+    print("ok test_timeout_ignores_queued_waits")
 
 
 def test_opencode_bin_fallback_priority():
@@ -485,7 +491,7 @@ if __name__ == "__main__":
     test_wake_notify_push()
     test_wake_on_done_hook()
     test_dead_worker_marked_failed()
-    test_timeout_marks_stalled()
+    test_timeout_ignores_queued_waits()
     test_opencode_bin_fallback_priority()
     test_wake_opencode_with_fallback_binary()
     test_opencode_non_executable_skipped()

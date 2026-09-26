@@ -51,6 +51,7 @@ def emit(args, cmd, data=None, error=None, hint=None):
         else:
             obj["error"] = error
             if hint: obj["hint"] = hint
+            if data is not None: obj["data"] = data
         print(json.dumps(obj))
     else:
         if error is not None:
@@ -390,6 +391,43 @@ def _wake_write_job(sdir, job):
     t.write_text(json.dumps(job, indent=2))
     t.rename(p)
 
+def _wake_job_lock_path(sdir, jid):
+    _, _, locks = _wake_dirs(sdir)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", jid or "x")[:64]
+    return locks / f"job-{safe}.lock"
+
+def _acquire_wake_job(sdir, jid):
+    """Blocking per-job terminal guard (crash-releases via flock).
+
+    Leaf lock: never acquire the per-agent turn guard while holding it,
+    and never hold it across backend turns or notify/hook work."""
+    if os.name != "posix":
+        return None
+    import fcntl
+    lp = _wake_job_lock_path(sdir, jid)
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lp, "a+b")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    except Exception:
+        try: f.close()
+        except Exception: pass
+        raise
+    return f
+
+def _release_wake_job(f):
+    if f is None:
+        return
+    try:
+        import fcntl
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        f.close()
+    except Exception:
+        pass
+
 def _fork_tracked_daemon(sp):
     pid = os.fork()
     if pid == 0:
@@ -407,8 +445,13 @@ def _fork_tracked_daemon(sp):
         if _sstatus(sp).get("child_pid"): break
         time.sleep(0.05)
 
-def _spawn_tracked(sdir, name, cmd_str, cwd, extra=None):
-    sid = hashlib.sha256(f"{time.time()}{cmd_str}{os.getpid()}".encode()).hexdigest()[:6]
+def _prepare_tracked(sdir, name, cmd_str, cwd, extra=None, sid=None):
+    """Create the tracked session dir + status, without forking the daemon.
+
+    Lets the caller publish dependent state (e.g. the wake job pointing at
+    this session) after the status exists but before the worker can run."""
+    if not sid:
+        sid = hashlib.sha256(f"{time.time()}{cmd_str}{os.getpid()}".encode()).hexdigest()[:6]
     sp = _sroot(sdir) / sid
     sp.mkdir()
     os.mkfifo(sp / "stdin.fifo")
@@ -421,26 +464,42 @@ def _spawn_tracked(sdir, name, cmd_str, cwd, extra=None):
         st.update(extra)
     _swrite(sp, st)
     _event(sdir, "spawn", sid, cmd=cmd_str, name=name or "")
+    return sid, sp
+
+def _spawn_tracked(sdir, name, cmd_str, cwd, extra=None, sid=None, pre_fork=None):
+    sid, sp = _prepare_tracked(sdir, name, cmd_str, cwd, extra=extra, sid=sid)
+    if pre_fork is not None:
+        pre_fork(sid, sp)
     _fork_tracked_daemon(sp)
     return sid, sp
 
-def _spawn_wake_session(sdir, agent, jid):
+def _spawn_wake_session(sdir, agent, jid, sid=None, pre_fork=None):
     """Tracked private worker running `_wake_run <jid>`. Absolute paths, no shell
     injection (shlex.quote), no --wake/on-exit so no callback recursion.
     Worker cwd is the caller's cwd (not the state dir) so a relative agent
-    dir resolves exactly as in the foreground turn that enqueued it."""
+    dir resolves exactly as in the foreground turn that enqueued it.
+    pre_fork(sid, sp) runs after the session status exists but before the
+    daemon forks, so the job can be published with no startup gap."""
     sdir_abs = str(Path(sdir).resolve())
     ag_abs = str(Path(ag_script_path()).resolve())
     cmd_list = [sys.executable, ag_abs, "--dir", sdir_abs, "_wake_run", jid]
     cmd_str = " ".join(shlex.quote(x) for x in cmd_list)
     name = f"{WAKE_WORKER_PREFIX}{agent}-{jid[:6]}"[:48]
     launch_cwd = os.getcwd()
-    sid, _ = _spawn_tracked(sdir, name, cmd_str, launch_cwd,
-        extra={"wake_agent": "", "wake_job": jid, "wake_worker_for": agent})
-    return sid
+    wsid, _ = _spawn_tracked(sdir, name, cmd_str, launch_cwd,
+        extra={"wake_agent": "", "wake_job": jid, "wake_worker_for": agent},
+        sid=sid, pre_fork=pre_fork)
+    return wsid
+
+def _valid_runtime(v):
+    """Finite float >= 0, else None. 0 = unlimited."""
+    try: f = float(v or 0)
+    except Exception: return None
+    if f != f or f in (float("inf"), float("-inf")) or f < 0: return None
+    return f
 
 def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
-        notify="", on_done="", timeout_s=0):
+        notify="", on_done="", timeout_s=0, max_runtime_s=0):
     """Enqueue one wake job + spawn tracked worker. Returns {job,session} or {error}."""
     try: rows = load_agents(sdir)
     except Exception: rows = []
@@ -453,35 +512,32 @@ def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
     try: timeout_s = float(timeout_s or 0)
     except Exception: timeout_s = 0
     if timeout_s < 0: timeout_s = 0
+    max_runtime_s = _valid_runtime(max_runtime_s)
+    if max_runtime_s is None:
+        _event(sdir, "wake_fail", trigger, agent=agent, exit=exit_code, reason="invalid max-runtime")
+        return {"error": "invalid --max-runtime: need finite seconds >= 0"}
     jid = hashlib.sha256(f"{time.time()}{agent}{message}{os.getpid()}{trigger}".encode()).hexdigest()[:8]
+    sid = hashlib.sha256(f"{time.time()}{agent}{jid}{os.getpid()}".encode()).hexdigest()[:6]
+    try:
+        while (_sroot(sdir) / sid).exists():
+            sid = hashlib.sha256(f"{time.time()}{agent}{jid}{os.getpid()}".encode()).hexdigest()[:6]
+    except Exception:
+        pass
     job = {"id": jid, "agent": agent, "message": message[:WAKE_MSG_MAX],
         "trigger": trigger, "exit": exit_code, "status": "queued",
-        "ts": now_iso(), "session": None,
+        "ts": now_iso(), "session": sid,
         "notify": (notify or "").strip(), "on_done": (on_done or ""),
-        "timeout_s": timeout_s}
-    try:
+        "timeout_s": timeout_s, "max_runtime_s": max_runtime_s}
+    def _publish(wsid, sp):
         _wake_write_job(sdir, job)
-    except Exception as e:
-        _event(sdir, "wake_fail", trigger, agent=agent, exit=exit_code, reason=str(e)[:120])
-        return {"error": str(e)[:200]}
-    _event(sdir, "wake", trigger, agent=agent, exit=exit_code, job=jid)
+        _event(sdir, "wake", trigger, agent=agent, exit=exit_code, job=jid)
     try:
-        sid = _spawn_wake_session(sdir, agent, jid)
+        wsid = _spawn_wake_session(sdir, agent, jid, sid=sid, pre_fork=_publish)
     except Exception as e:
-        job["status"] = "failed"
-        job["error"] = str(e)[:200]
-        job["ended_at"] = now_iso()
-        try: _wake_write_job(sdir, job)
-        except Exception: pass
-        _event(sdir, "wake_fail", trigger, agent=agent, exit=exit_code,
-            reason=str(e)[:120], job=jid)
-        try: _wake_notify(sdir, job, "failed")
+        try: _wake_finish(sdir, jid, "failed", error=str(e)[:200], exit_code=1)
         except Exception: pass
         return {"error": str(e)[:200]}
-    job["session"] = sid
-    try: _wake_write_job(sdir, job)
-    except Exception: pass
-    return {"job": jid, "session": sid}
+    return {"job": jid, "session": wsid}
 
 def _wake_notify(sdir, job, status):
     """Push a completion/stall notice. Best-effort, never raises.
@@ -518,27 +574,53 @@ def _wake_notify(sdir, job, status):
             except Exception: pass
     except Exception: pass
 
-def _wake_finish(sdir, jid, status, reply="", error="", exit_code=0):
+def _wake_finish(sdir, jid, status, reply="", error="", exit_code=0,
+        fields=None, transitioned=None):
     """Terminal transition queued/running -> done/failed, exactly once.
 
-    Writes the job, emits wake_done/wake_fail, fires notify + hook.
-    Already-terminal jobs return untouched (no duplicate events)."""
-    try:
-        cur = _wake_read_job(sdir, jid)
-    except Exception:
-        return {}
-    if not cur or cur.get("status") not in ("queued", "running"):
-        return cur or {}
-    cur["status"] = status
-    cur["ended_at"] = now_iso()
-    if status == "done":
-        cur["backend_exit"] = 0
-        cur["reply"] = str(reply or "")[:500]
+    The read-check-write runs under a per-job flock guard (crash-releases),
+    so concurrent callers serialize: the loser sees a terminal job and
+    returns untouched (no duplicate events). If the guard cannot be acquired
+    the job is returned untouched (no unlocked transition). If the terminal
+    write fails to persist, no terminal events/hooks fire. Events +
+    notify/hook fire after the guard is released; the guard is a leaf
+    (never take the per-agent turn guard while holding it)."""
+    if os.name == "posix":
+        try:
+            lock = _acquire_wake_job(sdir, jid)
+        except Exception:
+            lock = None
+        if lock is None:
+            try: return _wake_read_job(sdir, jid) or {}
+            except Exception: return {}
     else:
-        cur["error"] = str(error or "")[:200]
-        cur["backend_exit"] = exit_code
-    try: _wake_write_job(sdir, cur)
-    except Exception: pass
+        lock = None
+    try:
+        try:
+            cur = _wake_read_job(sdir, jid)
+        except Exception:
+            return {}
+        if not cur or cur.get("status") not in ("queued", "running"):
+            return cur or {}
+        if fields: cur.update(fields)
+        cur.pop("wait_reason", None)
+        cur["status"] = status
+        cur["ended_at"] = now_iso()
+        if status == "done":
+            cur["backend_exit"] = 0
+            cur["reply"] = str(reply or "")[:500]
+        else:
+            cur["error"] = str(error or "")[:200]
+            cur["backend_exit"] = exit_code
+        try:
+            _wake_write_job(sdir, cur)
+            if transitioned is not None: transitioned.append(True)
+        except Exception:
+            try: return _wake_read_job(sdir, jid) or cur
+            except Exception: return cur
+    finally:
+        try: _release_wake_job(lock)
+        except Exception: pass
     try:
         if status == "done":
             _event(sdir, "wake_done", cur.get("trigger"), agent=cur.get("agent"),
@@ -551,6 +633,52 @@ def _wake_finish(sdir, jid, status, reply="", error="", exit_code=0):
     except Exception: pass
     return cur
 
+def _wake_kill_session(sdir, sid, job):
+    """Signal only a live tracked worker, never an unrelated reused PID."""
+    import signal as _sig
+    if not sid: return
+    sp = _sroot(sdir) / sid
+    st = _sstatus(sp)
+    if not st.get("running") or st.get("wake_job") != job.get("id"): return
+    cp = st.get("child_pid")
+    if not cp: return
+    try:
+        ps = subprocess.run(["ps", "-p", str(cp), "-o", "command="],
+            capture_output=True, text=True, timeout=5)
+        if ps.returncode or "_wake_run" not in ps.stdout or job["id"] not in ps.stdout:
+            return
+        if os.getpgid(int(cp)) != int(cp): return
+        os.killpg(int(cp), _sig.SIGTERM)
+        # Worker cleanup gets its full backend TERM/KILL grace first.
+        until = time.monotonic() + 6.0
+        while time.monotonic() < until:
+            if not _sstatus(sp).get("running"): return
+            time.sleep(0.05)
+        if _sstatus(sp).get("running"):
+            os.killpg(int(cp), _sig.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+def agent_cancel(sdir, jid, reason="cancelled"):
+    """Claim cancellation under the terminal-transition lock, then stop only
+    its worker. Publishing terminal state first prevents a queued worker
+    from launching and makes all competing finishes harmless."""
+    jid = (jid or "").strip()
+    if not _wake_read_job(sdir, jid):
+        return {"error": f"no such job: {jid}"}
+    changed = []
+    cur = _wake_finish(sdir, jid, "failed", error=reason, exit_code=130,
+        fields={"cancel_requested": True, "cancelled": True}, transitioned=changed)
+    if not changed:
+        if not cur or cur.get("status") in ("queued", "running"):
+            return {"error": f"could not persist cancellation for job: {jid}"}
+        return {"job": cur, "already_terminal": True, "cancelled": False}
+    _wake_kill_session(sdir, cur.get("session"), cur)
+    return {"job": cur, "cancelled": True, "already_terminal": False}
+
+def _wake_cancel(sdir, jid, reason="cancelled"):
+    return agent_cancel(sdir, jid, reason)
+
 def _wake_reconcile(sdir, job):
     """Surface stalls for queued/running jobs. Idempotent; returns fresh job.
 
@@ -558,8 +686,10 @@ def _wake_reconcile(sdir, job):
     never finished -> failed + wake_fail + notify/hook. A healthy worker
     always marks done/failed before its session exits, so this only fires
     on genuine loss. Jobs younger than 5s with no session yet are starting
-    up, left alone. Over timeout_s -> stalled flag + wake_stall event +
-    notify/hook once; the worker keeps running."""
+    up, left alone. Over timeout_s (running jobs only) -> stalled flag +
+    wake_stall event + notify/hook once; the worker keeps running. Queued
+    jobs waiting for the turn guard are serialization, not stuck backends,
+    so they never stall no matter how long they wait."""
     try:
         if not isinstance(job, dict) or job.get("status") not in ("queued", "running"):
             return job
@@ -579,6 +709,13 @@ def _wake_reconcile(sdir, job):
             try: st = _sstatus(_sroot(sdir) / sid)
             except Exception: st = {}
             if not st:
+                try:
+                    age0 = time.time() - datetime.fromisoformat(
+                        job.get("ts") or "").timestamp()
+                except Exception:
+                    age0 = 999
+                if age0 < 5:
+                    return job  # startup in progress: session not visible yet
                 sess_missing = True
             else:
                 sess_exit = st.get("exit")
@@ -593,32 +730,41 @@ def _wake_reconcile(sdir, job):
         try: timeout_s = float(job.get("timeout_s") or 0)
         except Exception: timeout_s = 0
         if timeout_s > 0 and not job.get("stalled"):
-            base = job.get("running_at") or job.get("ts") or ""
+            if (job.get("status") or "") != "running" or not job.get("running_at"):
+                # queued waiting for the turn guard: age from ts must not
+                # report it backend-stalled.
+                return _wake_read_job(sdir, jid) or job
+            base = job.get("running_at") or ""
             try: age = time.time() - datetime.fromisoformat(base).timestamp()
             except Exception: age = 0
             if age > timeout_s:
+                lock = _acquire_wake_job(sdir, jid)
+                if lock is None: return _wake_read_job(sdir, jid) or job
+                stalled = None
                 try:
                     cur = _wake_read_job(sdir, jid)
-                    if cur and cur.get("status") in ("queued", "running") \
-                            and not cur.get("stalled"):
+                    if cur and cur.get("status") == "running" and not cur.get("stalled"):
                         cur["stalled"] = True
                         cur["stalled_at"] = now_iso()
                         _wake_write_job(sdir, cur)
-                        try:
-                            _event(sdir, "wake_stall", cur.get("trigger"),
-                                agent=cur.get("agent"), exit=cur.get("exit"),
-                                job=jid, age_s=int(age))
-                        except Exception: pass
-                        try: _wake_notify(sdir, cur, "stalled")
-                        except Exception: pass
-                        return cur
-                except Exception: pass
+                        stalled = cur
+                finally:
+                    _release_wake_job(lock)
+                if stalled:
+                    _event(sdir, "wake_stall", stalled.get("trigger"),
+                        agent=stalled.get("agent"), exit=stalled.get("exit"),
+                        job=jid, age_s=int(age))
+                    _wake_notify(sdir, stalled, "stalled")
+                    return stalled
         return _wake_read_job(sdir, jid) or job
     except Exception:
         return job
 
 def do__wake_run(a):
-    """Worker body (runs inside tracked spawn pty): flock per-agent, run_turn, mark job."""
+    """Worker body (runs inside tracked spawn pty): run_turn owns the single
+    per-agent turn guard. The job stays queued until run_turn fires on_start
+    after acquiring it, so pending same-agent jobs never look active and can
+    never be misreported as backend-stalled."""
     import signal as _sig
     sdir = state_dir(a.dir)
     jid = getattr(a, "jid", "")
@@ -633,6 +779,14 @@ def do__wake_run(a):
         except Exception: pass
 
     def _on_term(signum, frame):
+        try: _kill_active_backend()
+        except Exception: pass
+        try:
+            cur = _wake_read_job(sdir, jid)
+            if cur.get("cancel_requested"):
+                _mark_failed("cancelled", 130)
+                os._exit(130)
+        except Exception: pass
         _mark_failed(f"killed by signal {signum}", 143 if signum == _sig.SIGTERM else 130)
         os._exit(143 if signum == _sig.SIGTERM else 130)
     try:
@@ -643,28 +797,75 @@ def do__wake_run(a):
     # (blocking acquire), so wake/wake and wake/chat turns serialize there
     # and backend/profile/model mutations probe the same guard. Taking the
     # wake lock here too would double-lock the same file and deadlock.
-    job["status"] = "running"
-    job["pid"] = os.getpid()
-    job["running_at"] = now_iso()
-    try: _wake_write_job(sdir, job)
-    except Exception: pass
+    # Every state update shares the terminal transition guard. Cancellation
+    # can win while we wait for the agent, and must then abort backend launch.
     try:
-        r = run_turn(sdir, agent, message)
+        if parse_slash(message) is None and agent_busy(sdir, agent):
+            lock = _acquire_wake_job(sdir, jid)
+            if lock is None: raise RuntimeError("cannot lock wake job")
+            try:
+                cur = _wake_read_job(sdir, jid)
+                if cur and cur.get("status") == "queued":
+                    cur["wait_reason"] = "waiting for agent turn guard"
+                    _wake_write_job(sdir, cur)
+            finally:
+                _release_wake_job(lock)
+    except Exception as e:
+        _mark_failed(f"wake state error: {e}")
+        return 1
+    def _on_start():
+        lock = _acquire_wake_job(sdir, jid)
+        if lock is None: raise RuntimeError("cannot lock wake job")
+        try:
+            cur = _wake_read_job(sdir, jid)
+            if not cur or cur.get("status") != "queued" or cur.get("cancel_requested"):
+                raise RuntimeError("wake already finished or cancelled")
+            cur["status"] = "running"
+            cur["pid"] = os.getpid()
+            cur["running_at"] = cur["guard_acquired_at"] = now_iso()
+            cur.pop("wait_reason", None)
+            _wake_write_job(sdir, cur)
+        finally:
+            _release_wake_job(lock)
+    max_runtime_s = _valid_runtime(job.get("max_runtime_s")) or 0
+    try:
+        r = run_turn(sdir, agent, message, on_start=_on_start, timeout_s=max_runtime_s)
     except Exception as e:
         _mark_failed(f"turn error: {e}", 1)
+        return 1
+    if r.get("timed_out"):
+        _wake_finish(sdir, jid, "failed", error=r.get("error", "max-runtime exceeded"),
+            exit_code=124, fields={"timed_out": True})
         return 1
     if "error" in r:
         _mark_failed(r["error"], 1)
         return 1
     code = r.get("exit", 0)
     if code != 0:
-        _mark_failed(f"backend exit {code}", code)
+        excerpt = " ".join(str(r.get("reply") or "").split())[:160]
+        _mark_failed(f"backend exit {code}" + (f": {excerpt}" if excerpt else ""), code)
         return 1
     _wake_finish(sdir, jid, "done", reply=r.get("reply", ""))
     return 0
 
 def do_wakes(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
+    if getattr(a, "cancel", None) and getattr(a, "wait", None):
+        return emit(a, "wakes", error="--cancel and --wait are incompatible",
+            hint="ag wakes --cancel JOB  or  ag wakes --wait JOB")
+    if getattr(a, "cancel", None):
+        r = agent_cancel(sdir, getattr(a, "cancel"))
+        if "error" in r:
+            return emit(a, "wakes", error=r["error"], hint="ag wakes")
+        j = r.get("job", {})
+        if getattr(a, "json", False):
+            return emit(a, "wakes", {**j, "cancelled": bool(r.get("cancelled")),
+                "already_terminal": bool(r.get("already_terminal"))})
+        if r.get("already_terminal"):
+            return emit(a, "wakes", {"_text": f'{j.get("id","")} already {j.get("status","")} (no-op)',
+                **j, "already_terminal": True})
+        return emit(a, "wakes", {"_text": f'{j.get("id","")} cancelled',
+            **j, "cancelled": True})
     if getattr(a, "wait", None):
         return do_wakes_wait(a, sdir)
     _, jobs, _ = _wake_dirs(sdir)
@@ -794,7 +995,15 @@ def daemon_main(sp):
     if pid == 0:
         try:
             if st.get("cwd"): os.chdir(st["cwd"])
-        except Exception: pass
+        except Exception as e:
+            # Never execute in a fallback directory: fail visibly in the
+            # tracked output and nonzero so waiters terminate (no hang).
+            try:
+                msg = (f"ag: cannot chdir to {st.get('cwd')!r}: {e} "
+                    f"(not executing {st.get('cmd')!r} in fallback directory)\n")
+                os.write(1, msg.encode(errors="replace"))
+            except Exception: pass
+            os._exit(127)
         for k,v in (st.get("env") or {}).items(): os.environ[k]=v
         os.execv("/bin/sh",["sh","-c",st["cmd"]])
     st["child_pid"] = pid
@@ -1218,6 +1427,18 @@ def harness_link(home, cwd, dest):
     return {"linked":linked,"missing":missing,"dest":str(dest)}
 
 def do_harness(a):
+    if a.sub in ("use", "current"):
+        sdir = state_dir(a.dir); ensure_state(sdir)
+        message = ""
+        if a.sub == "use":
+            ok, message = switch_backend(sdir, a.agent, a.backend, a.model)
+            if not ok: return emit(a, "harness", error=message)
+        data = harness_current(sdir, a.agent)
+        if "error" in data: return emit(a, "harness", error=data["error"])
+        data["_text"] = message or (f'{a.agent}: backend {data["backend"]} '
+            f'· model {data["model"]} · persona {data["persona"] or "none"} '
+            f'· profile {data["profile"] or "none"} · session {"set" if data["sid"] else "none"}')
+        return emit(a, "harness", data)
     home = Path(a.home).expanduser() if getattr(a,"home",None) else Path.home()
     cwd = Path.cwd()
     if a.sub=="show":
@@ -1935,15 +2156,6 @@ def eff_model(backend, model):
     if m in ("", "default"):
         return OPENCODE_MODEL_DEFAULT if backend == "opencode" else ""
     return m
-def opencode_switch_model(cur):
-    """Model to store when switching TO opencode. Pure. Default/missing and
-    models known from other backends reset to the ag default; explicit custom
-    strings (in no backend list) are kept."""
-    m = (cur or "default").strip() or "default"
-    if m in ("default", OPENCODE_MODEL_DEFAULT): return OPENCODE_MODEL_DEFAULT
-    for b, opts in MODELS.items():
-        if b != "opencode" and m in opts: return OPENCODE_MODEL_DEFAULT
-    return m
 PROBES = {"claude":["claude","--version"],"opencode":["opencode","--version"],
     "gemini":["gemini","--version"],"codex":["codex","--version"],"echo":["printf","ok"]}
 
@@ -2164,46 +2376,77 @@ def native_handoff_text(sdir, name, backend=""):
         f"  headless fallback: ag spawn -- {cmd}  then: ag attach <id>{extra}{prof_line}\n"
         "no auto-approve flags are ever passed.")
 
-def switch_backend(sdir, name, new_backend):
-    """Switch an agent's coding backend, preserving identity/workdir/role/system.
-    Segregates native SIDs per backend (never resumes a foreign SID), resets an
-    incompatible model to default, refuses while a turn is running.
-    Returns (ok, message). Writes agents.json + chat meta + one event."""
-    new = (new_backend or "").strip().lower()
-    rows = load_agents(sdir)
-    hit = [r for r in rows if r["name"] == name]
-    if not hit: return (False, f"no such agent: {name} (ag agents list)")
-    if new not in MODELS:
+def harness_current(sdir, name):
+    """Selected backend and behavior, suitable for scripts as well as display."""
+    a = next((r for r in load_agents(sdir) if r["name"] == name), None)
+    if a is None: return {"error": f"no such agent: {name} (ag agents list)"}
+    backend = a.get("backend", "claude")
+    return {"agent": name, "backend": backend, "model": a.get("model", "default"),
+        "effective_model": eff_model(backend, a.get("model")),
+        "dir": a.get("dir", "."), "role": a.get("role", "sub"),
+        "persona": a.get("persona", ""), "profile": a.get("profile", ""),
+        "sid": _slash_sid(sdir, name, a, backend)}
+
+def update_agent_settings(sdir, name, updates):
+    """Apply settings under the same guard as turns, refusing rather than waiting.
+    Models and native SIDs belong to their backend, including custom model IDs.
+    Validate before writing so an invalid persona cannot partially switch."""
+    new = updates.get("backend")
+    if new is not None and new not in MODELS:
         return (False, f"unknown backend: {new} ({'/'.join(NATIVE_ORDER)})")
-    if agent_busy(sdir, name):
-        return (False, f"{name} is busy (turn or handoff running); retry when idle.")
-    a = hit[0]
-    old = a.get("backend", "claude")
-    if new == old: return (True, f"already on {old} ({a.get('model', 'default')}).")
-    meta = load_chat_meta(sdir, name, agent=a)
-    sids = dict(meta.get("sids") or {})
-    if meta.get("sid"):
-        sids.setdefault(meta.get("backend", old) or old, meta["sid"])
-    sids[old] = meta.get("sid", "") or sids.get(old, "")
-    a["backend"] = new
-    note = ""
-    if new == "opencode":
-        # default/missing or foreign-backend models land on the ag default;
-        # explicit custom strings survive the switch.
-        want = opencode_switch_model(a.get("model", "default"))
-        if want != a.get("model", "default"):
-            a["model"] = want
-            note = " model -> ag default (was default/incompatible)."
-    elif a.get("model", "default") not in MODELS.get(new, ["default"]):
-        a["model"] = "default"
-        note = " model reset to default (was incompatible)."
-    save_agents(sdir, rows)
-    meta.update({"backend": new, "model": a.get("model", "default"),
-        "sid": sids.get(new, ""), "sids": sids})
-    save_chat_meta(sdir, name, meta)
-    _event(sdir, "harness", name, backend=new, model=a.get("model", "default"))
-    sid_note = f"resumes {sids[new]}" if sids.get(new) else "fresh session"
-    return (True, f"backend {old} -> {new} ({a.get('model', 'default')}, {sid_note}).{note}")
+    persona = updates.get("persona")
+    if persona and persona not in [r["name"] for r in load_roles(sdir)]:
+        return (False, f"no such role: {persona} (ag roles list)")
+    busy = f"{name} is busy (turn or handoff running); retry when idle."
+    try:
+        guard = _acquire_agent_turn(sdir, name, blocking=False)
+    except BlockingIOError:
+        return (False, busy)
+    except OSError as e:
+        # Unreadable/unwritable lock dir (EACCES/ENOSPC/ESTALE...): clean
+        # error, never a traceback. Treated as busy-or-error; retry when idle.
+        detail = e.strerror or e
+        return (False, f"cannot acquire turn guard for {name}: {detail} ({busy})")
+    try:
+        if is_running(name) or _handoff_live(sdir, name): return (False, busy)
+        rows = load_agents(sdir)
+        a = next((r for r in rows if r["name"] == name), None)
+        if a is None: return (False, f"no such agent: {name} (ag agents list)")
+        old = a.get("backend", "claude")
+        new = new or old
+        meta = load_chat_meta(sdir, name, agent=a)
+        models = dict(a.get("models") or {})
+        models[old] = a.get("model", "default") or "default"
+        model = updates.get("model")
+        if model is None:
+            model = models.get(new, "default")
+        model = eff_model(new, model) or "default"
+        sids = dict(meta.get("sids") or {})
+        if meta.get("sid"):
+            # A stale meta backend may differ from the roster: the SID still
+            # belongs to its recorded owner, never implicitly to `old`.
+            sids[meta.get("backend") or old] = meta["sid"]
+        a.update(updates)
+        a.update({"backend": new, "model": model})
+        models[new] = model
+        a["models"] = models
+        save_agents(sdir, rows)
+        meta.update({"backend": new, "model": model,
+            "sid": sids.get(new, ""), "sids": sids})
+        save_chat_meta(sdir, name, meta)
+        if new != old:
+            _event(sdir, "harness", name, backend=new, model=model)
+            sid_note = f"resumes {sids[new]}" if sids.get(new) else "fresh session"
+            return (True, f"backend {old} -> {new} ({model}, {sid_note}).")
+        return (True, f"updated {name} [{new}] ({model}).")
+    finally:
+        _release_agent_turn(guard)
+
+def switch_backend(sdir, name, new_backend, model=None):
+    """Shared CLI/slash/TUI switch: preserve identity, backend models and SIDs."""
+    updates = {"backend": (new_backend or "").strip().lower()}
+    if model is not None: updates["model"] = model
+    return update_agent_settings(sdir, name, updates)
 
 def slash_help_text(sdir, name):
     agents = {x["name"]: x for x in load_agents(sdir)}
@@ -2249,15 +2492,8 @@ def handle_slash(sdir, name, cmd, args):
         target = toks[0][:120]
         if backend == "opencode" and target in ("default", ""):
             target = OPENCODE_MODEL_DEFAULT
-        if agent_busy(sdir, name):
-            return (False, f"{name} is busy (turn or handoff running); retry when idle.")
-        rows = load_agents(sdir)
-        hit = [r for r in rows if r["name"] == name][0]
-        hit["model"] = target
-        save_agents(sdir, rows)
-        meta = load_chat_meta(sdir, name, agent=hit)
-        meta["model"] = target
-        save_chat_meta(sdir, name, meta)
+        ok, message = update_agent_settings(sdir, name, {"model": target})
+        if not ok: return (False, message)
         _event(sdir, "model", name, model=target)
         known = " (custom)" if target not in MODELS.get(backend, ["default"]) else ""
         return (True, f"model -> {target}{known} for {name} [{backend}].")
@@ -5321,44 +5557,18 @@ def do_agents(a):
             _ctx_unlock(lk)
         return emit(a,"agents",{"_text":f"removed {a.name}"})
     if a.sub=="set":
-        hit = [r for r in rows if r["name"]==a.name]
-        if not hit: return emit(a,"agents",error=f"no such agent: {a.name}")
-        r = hit[0]
-        if (a.backend and a.backend != r.get("backend")) or (a.model and a.model != r.get("model")):
-            if agent_busy(sdir, a.name):
-                return emit(a,"agents",error=f"{a.name} is busy (turn or handoff running); retry when idle.")
-        _old_backend = r.get("backend", "claude")
-        if a.backend: r["backend"]=a.backend
-        if a.model: r["model"]=a.model
-        if a.adir: r["dir"]=a.adir
-        if a.role: r["role"]=a.role
-        if getattr(a,"persona",None) is not None:
-            if a.persona and a.persona not in [x["name"] for x in load_roles(sdir)]:
-                return emit(a,"agents",error=f"no such role: {a.persona}",hint="ag roles list")
-            r["persona"]=a.persona
-        if getattr(a,"system",None) is not None: r["system"]=a.system
-        if getattr(a,"instructions",None) is not None:
-            ins = getattr(a,"instructions",None) or []
-            if len(ins)==1 and (ins[0] or "")=="": ins = []
-            r["instructions"]=[s for s in ins if (s or "").strip()]
-        if (a.backend or a.model) and r.get("backend")=="opencode" \
-                and (r.get("model") or "default") in ("","default"):
-            # explicit backend/model touch on opencode: default resolves now
-            r["model"]=OPENCODE_MODEL_DEFAULT
-        save_agents(sdir,rows)
-        if a.backend and a.backend != _old_backend:
-            # same SID segregation as /harness use: never resume a foreign SID
-            try:
-                meta = load_chat_meta(sdir, a.name, agent=r)
-                sids = dict(meta.get("sids") or {})
-                if meta.get("sid"):
-                    sids.setdefault(meta.get("backend", _old_backend) or _old_backend, meta["sid"])
-                sids[_old_backend] = meta.get("sid", "") or sids.get(_old_backend, "")
-                meta.update({"backend": r["backend"], "model": r.get("model", "default"),
-                    "sid": sids.get(r["backend"], ""), "sids": sids})
-                save_chat_meta(sdir, a.name, meta)
-            except Exception: pass
-        return emit(a,"agents",{"_text":f"updated {a.name}"})
+        updates = {}
+        for arg, key in (("backend", "backend"), ("model", "model"),
+                ("adir", "dir"), ("role", "role"), ("persona", "persona"),
+                ("system", "system")):
+            val = getattr(a, arg, None)
+            if val is not None: updates[key] = val
+        if getattr(a, "instructions", None) is not None:
+            updates["instructions"] = [s for s in a.instructions if (s or "").strip()]
+        ok, message = update_agent_settings(sdir, a.name, updates)
+        if not ok: return emit(a, "agents", error=message,
+            hint="ag roles list" if "no such role" in message else None)
+        return emit(a, "agents", {"_text": f"updated {a.name}"})
 
 def do_roles(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
@@ -5370,7 +5580,19 @@ def do_roles(a):
     if a.sub=="show":
         hit = [r for r in rows if r["name"]==getattr(a,"name","")]
         if not hit: return emit(a,"roles",error=f"no such role: {getattr(a,'name','')}")
-        return emit(a,"roles",{"_text":hit[0].get("system","")})
+        builtin = next((r for r in DEFAULT_ROLES if r["name"] == a.name), None)
+        role = dict(hit[0], builtin=builtin is not None,
+            customized=builtin is not None and hit[0].get("system") != builtin["system"])
+        return emit(a,"roles",{"_text":hit[0].get("system",""), "role": role})
+    if a.sub=="reset":
+        builtin = next((r for r in DEFAULT_ROLES if r["name"] == a.name), None)
+        if builtin is None:
+            return emit(a, "roles", error=f"not a built-in role: {a.name}",
+                hint="roles reset reviewer|planner|implementer")
+        rows = [dict(builtin) if r["name"] == a.name else r for r in rows]
+        if not any(r["name"] == a.name for r in rows): rows.append(dict(builtin))
+        save_roles(sdir, rows)
+        return emit(a, "roles", {"_text": f"reset role {a.name}", "role": dict(builtin)})
     if a.sub=="rm":
         rows = [r for r in rows if r["name"]!=getattr(a,"name","")]
         save_roles(sdir,rows)
@@ -5550,15 +5772,19 @@ def agent_busy(sdir, agent):
     except Exception:
         return False
 
-def _acquire_agent_turn(sdir, agent):
-    """Blocking acquire of the shared turn guard. Caller must _release."""
+def _acquire_agent_turn(sdir, agent, blocking=True):
+    """Acquire the shared turn guard. Caller must _release; busy can raise."""
     if os.name != "posix":
         return None
     import fcntl
     lp = _agent_lock_path(sdir, agent)
     lp.parent.mkdir(parents=True, exist_ok=True)
     f = open(lp, "a+b")
-    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+    except Exception:
+        f.close()
+        raise
     return f
 
 def _release_agent_turn(f):
@@ -5570,10 +5796,61 @@ def _release_agent_turn(f):
     try: f.close()
     except Exception: pass
 
-def run_turn(sdir,name,text,on_event=None,command=None):
+def _describe_backend_launch(argv, workdir, agent_name, exc):
+    """Actionable launch failure. Popen raises FileNotFoundError for a missing
+    cwd too, so check the project directory before blaming the executable.
+    Bounded output, no env content."""
+    try:
+        if not os.path.isdir(workdir or "."):
+            return (f"missing project directory: {workdir} for agent {agent_name} "
+                "(not executing; ag agents list)")
+    except Exception: pass
+    try:
+        prog = (argv or [""])[0]
+        if prog and shutil.which(prog) is None:
+            return f"backend binary missing: {prog} (ag agents doctor)"
+    except Exception: pass
+    return f"backend launch failed: {exc}"[:300]
+
+_ACTIVE_BACKEND = threading.local()
+
+def _backend_note(pid):
+    _ACTIVE_BACKEND.pid = pid
+
+def _backend_clear():
+    _ACTIVE_BACKEND.pid = None
+
+def _kill_backend_group(pid, grace_s=2.0):
+    """Only pgid created by this turn. A dead leader may leave live children
+    holding pipes; never fall back to signalling a possibly reused PID."""
+    if not pid or os.name != "posix": return
+    import signal as _sig
+    try: os.killpg(int(pid), _sig.SIGTERM)
+    except (ProcessLookupError, PermissionError): return
+    until = time.monotonic() + grace_s
+    while time.monotonic() < until:
+        try: os.killpg(int(pid), 0)
+        except (ProcessLookupError, PermissionError): return
+        time.sleep(0.05)
+    try: os.killpg(int(pid), _sig.SIGKILL)
+    except (ProcessLookupError, PermissionError): pass
+
+def _kill_active_backend(grace_s=2.0):
+    _kill_backend_group(getattr(_ACTIVE_BACKEND, "pid", None), grace_s)
+
+def _kill_tree(p, grace_s=2.0):
+    if p is None: return
+    _kill_backend_group(p.pid, grace_s)
+    try: p.wait(timeout=5)
+    except subprocess.TimeoutExpired: pass
+
+def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0):
     """One prompt turn. on_event(name,kind,text). Returns {sid,exit,reply} or {error}.
     command: opencode-only native custom command (opencode run --command);
-    message text becomes its args (bare, no history/role prepend). Others reject."""
+    message text becomes its args (bare, no history/role prepend). Others reject.
+    on_start(): fired once right after the per-agent turn guard is acquired
+    (wake workers promote queued->running there). Local slash turns never
+    take the guard, so on_start stays silent for them."""
     agents = {x["name"]:x for x in load_agents(sdir)}
     if name not in agents: return {"error":f"no such agent: {name} (ag agents list)"}
     a = agents[name]
@@ -5600,6 +5877,10 @@ def run_turn(sdir,name,text,on_event=None,command=None):
     # between our snapshot and the backend launch.
     _turn_lock = _acquire_agent_turn(sdir, name)
     try:
+        _t_guard = time.monotonic()
+        timeout_s = _valid_runtime(timeout_s) or 0
+        if on_start is not None:
+            on_start()
         agents = {x["name"]:x for x in load_agents(sdir)}
         if name not in agents:
             _release_agent_turn(_turn_lock); _turn_lock = None
@@ -5690,11 +5971,30 @@ def run_turn(sdir,name,text,on_event=None,command=None):
         chunks, sid_new, rc, err = [], "", 0, ""
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
         penv = backend_env_for_profile(sdir, a, prof_name) if prof_name else {}
+        _timed_out = {"hit": False}
+        _watch_stop = threading.Event()
+        _watcher = None
         try:
             import os as _os
             env = dict(_os.environ, **penv) if penv else None
             p = subprocess.Popen(argv,cwd=workdir,stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,text=True,bufsize=1,env=env)
+                stderr=subprocess.PIPE,text=True,bufsize=1,env=env,
+                start_new_session=(os.name == "posix"))
+            _backend_note(p.pid)
+            if timeout_s > 0 and _t_guard is not None:
+                _deadline = _t_guard + timeout_s
+                def _watch():
+                    while not _watch_stop.is_set():
+                        try: remaining = _deadline - time.monotonic()
+                        except Exception: return
+                        if remaining <= 0: break
+                        _watch_stop.wait(min(remaining, 0.05))
+                    if _watch_stop.is_set(): return
+                    # stdout/stderr may remain open after the leader exits.
+                    _timed_out["hit"] = True
+                    _kill_tree(p)
+                _watcher = threading.Thread(target=_watch, daemon=True)
+                _watcher.start()
             # drain stderr concurrently: reading stdout to EOF first deadlocks
             # once the child fills the stderr pipe buffer (~64K).
             err_chunks = []
@@ -5758,13 +6058,22 @@ def run_turn(sdir,name,text,on_event=None,command=None):
             if rest: err_chunks.append(rest)
             err = "".join(err_chunks)
             rc = p.wait()
-        except FileNotFoundError:
+        except OSError as e:
             rc = 127
-            chunks = [f"backend binary missing (ag agents doctor)"]
+            chunks = [_describe_backend_launch(argv, workdir, name, e)]
         except Exception as e:
             rc = 1; chunks = [f"error: {e}"]
         finally:
+            try: _watch_stop.set()
+            except Exception: pass
+            try:
+                if _watcher is not None: _watcher.join(timeout=5)
+            except Exception: pass
+            _backend_clear()
             mark_running(name,False)
+        if _timed_out["hit"]:
+            rc = 124
+            err = (err + f"\nmax-runtime {timeout_s:g}s exceeded (backend killed)").strip()
         full = "\n".join(c for c in chunks if c).strip()
         if rc != 0:
             # record failure even when prose already streamed; never fake ok.
@@ -5802,6 +6111,9 @@ def run_turn(sdir,name,text,on_event=None,command=None):
         _event(sdir,"chat",name,exit=rc)
         if on_event: on_event(name,"exit",str(rc))
         out = {"sid":sid_new or sid,"exit":rc,"reply":full}
+        if _timed_out["hit"]:
+            out["timed_out"] = True
+            out["error"] = f"max-runtime {timeout_s:g}s exceeded (backend killed)"
         if buf.persist_failed or not agent_persist_ok:
             out["persist_error"] = True
         return out
@@ -5882,15 +6194,31 @@ def do_chat(a):
         text = " ".join(a.text or []).strip()
         cmd = (getattr(a,"command",None) or "").strip() or None
         if not text and not cmd: return emit(a,"chat",error="empty message")
+        timeout_s = _valid_runtime(getattr(a, "timeout", 1800))
+        if timeout_s is None:
+            return emit(a,"chat",error="invalid --timeout: need finite seconds >= 0 (0 = unlimited)",
+                hint="ag chat send NAME --timeout 300 TEXT")
         live = not getattr(a,"json",False)
-        r = run_turn(sdir,a.name,text,command=cmd,
+        r = run_turn(sdir,a.name,text,command=cmd,timeout_s=timeout_s,
             on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
-        if "error" in r: return emit(a,"chat",error=r["error"])
+        if "error" in r and not r.get("timed_out"):
+            return emit(a,"chat",error=r["error"])
         if r.get("slash") and r.get("exit") and getattr(a,"json",False):
             return emit(a,"chat",error=f'/{r["slash"]} failed (exit {r["exit"]})',
                 hint=r["reply"][:300])
         if getattr(a,"json",False):
-            return emit(a,"chat",{"reply":r["reply"],"exit":r["exit"],"sid":r["sid"]})
+            data = {"reply":r["reply"],"exit":r["exit"],"sid":r["sid"]}
+            if r.get("timed_out"):
+                data["timed_out"] = True
+                data["error"] = r.get("error", "")
+            if r.get("timed_out"):
+                emit(a,"chat",data,error=r.get("error") or "max-runtime exceeded")
+                return 124
+            return emit(a,"chat",data)
+        if r.get("timed_out"):
+            emit(a,"chat",error=r.get("error") or "max-runtime exceeded",
+                hint=f'ag chat log {a.name}')
+            return 124
         return emit(a,"chat",{"_text":f'[exit={r["exit"]}]'})
     if a.sub=="log":
         rows = load_chat_log(sdir,a.name)[-(a.limit or 20):]
@@ -5907,6 +6235,10 @@ def do_wake(a):
     try: timeout_s = float(getattr(a,"timeout",0) or 0)
     except Exception: timeout_s = 0
     if timeout_s < 0: timeout_s = 0
+    max_runtime_s = _valid_runtime(getattr(a, "max_runtime", 0))
+    if max_runtime_s is None:
+        return emit(a,"wake",error="invalid --max-runtime: need finite seconds >= 0",
+            hint="ag wake <agent> --max-runtime 60 <message>")
     if not agent: return emit(a,"wake",error="no agent given",hint="ag wake <agent> <message>")
     if not text: return emit(a,"wake",error="empty message",hint="ag wake <agent> <message>")
     if notify:
@@ -5914,7 +6246,8 @@ def do_wake(a):
         except Exception: names = []
         if notify not in names:
             return emit(a,"wake",error=f"no such agent: {notify}",hint="ag agents list")
-    r = launch_wake_chat(sdir,agent,text,notify=notify,on_done=on_done,timeout_s=timeout_s)
+    r = launch_wake_chat(sdir,agent,text,notify=notify,on_done=on_done,timeout_s=timeout_s,
+        max_runtime_s=max_runtime_s)
     if "error" in r: return emit(a,"wake",error=r["error"],hint="ag agents list")
     if getattr(a,"json",False):
         return emit(a,"wake",{"agent":agent,"launched":True,
@@ -6071,8 +6404,9 @@ def _tui_handoff_exec(stdscr, sdir, nm, r, show_slash):
             out = (f"native {r['backend']} exited ({rc}). "
                 f"profile {r.get('profile') or 'none'} env applied, globals untouched.")
             ok = rc == 0
-        except FileNotFoundError:
-            out = f"backend binary missing: {r['argv'][0]} (ag agents doctor)"
+        except OSError as e:
+            out = _describe_backend_launch(r.get("argv") or [], r.get("cwd") or ".",
+                nm, e)
             ok = False
         except Exception as e:
             out = f"handoff failed: {e}"
@@ -8028,7 +8362,7 @@ KEYS_HELP = """ag keys
   sessions: spawn -- <cmd> | send <id> text | send --key ctrl-c|esc|up|enter | snap [--since OFF] [--clean] | sessions | wait | kill [--force]
   attach <id>: jump into live terminal (auth etc). Ctrl-] detaches, session keeps running. resize follows your terminal.
   forget <id>: wipe session logs (do after typing secrets)
-    agents: agents list/add/rm/set/doctor [--persona/--system] | roles list/add/set/show/rm | chat send <name> msg | chat log <name> | delegate <sub> task | wake <agent> msg | wakes [--agent n] | spawn --wake <agent> [--wake-message t] | status [--json] | tui
+    agents: agents list/add/rm/set/doctor [--persona/--system] | roles list/add/set/show/reset/rm | harness use/current | chat send <name> msg | chat log <name> | delegate <sub> task | wake <agent> msg | wakes [--agent n] | spawn --wake <agent> [--wake-message t] | status [--json] | tui
     tui: composer-first — just type, no insert mode. home: type a message (Enter sends to the selected agent and opens chat) or / for commands · Enter opens the selected chat · Esc moves to selection (arrows/tab/1-9 move, Enter opens, q quits, any text returns to the composer) · session: type, Enter sends, Esc back home (draft kept) · mouse clicks rows/popup/composer, wheel scrolls (keyboard does it all too)
     slash popup: / at the start of the composer opens commands (letters filter · ↑↓ move · Tab completes without running · Enter runs · Esc keeps draft · delete / to dismiss; / mid-sentence stays text)
     slash: /projects /agents /config /model [name] /backend [name] /profile [list|show|use] /new /delegate /context /compact /compact-now /theme /handoff [backend] /approve /help /quit (/harness = legacy /backend; \\ prefix is an alias; !cmd runs shell)
@@ -8111,7 +8445,7 @@ def do_keys(a):
     if getattr(a,"json",False): return emit(a,"keys",{"keys":KEYS_HELP.splitlines()})
     return emit(a,"keys",{"_text":KEYS_HELP})
 
-def delegate_task(sdir, agent_name, task, on_event=None):
+def delegate_task(sdir, agent_name, task, on_event=None, timeout_s=0):
     agents = {x["name"]:x for x in load_agents(sdir)}
     if agent_name not in agents: return {"error":f"no such agent: {agent_name}"}
     sub = agents[agent_name]
@@ -8119,7 +8453,7 @@ def delegate_task(sdir, agent_name, task, on_event=None):
         harness_link(Path.home(), Path.cwd(),
             Path(sub.get("dir",".") or ".").expanduser() or Path.cwd())
     except Exception: pass
-    r = run_turn(sdir,agent_name,task,on_event=on_event)
+    r = run_turn(sdir,agent_name,task,on_event=on_event,timeout_s=timeout_s)
     if "error" in r: return r
     orch = next((x["name"] for x in load_agents(sdir) if x.get("role")=="orchestrator"),None)
     if orch: append_chat(sdir,orch,"delegate",f'{agent_name}: {task} -> {r["reply"][:2000]}')
@@ -8130,12 +8464,28 @@ def do_delegate(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     task = " ".join(a.text or []).strip()
     if not task: return emit(a,"delegate",error="empty task")
+    timeout_s = _valid_runtime(getattr(a, "timeout", 1800))
+    if timeout_s is None:
+        return emit(a,"delegate",error="invalid --timeout: need finite seconds >= 0 (0 = unlimited)",
+            hint="ag delegate AGENT --timeout 300 TASK")
     live = not getattr(a,"json",False)
-    r = delegate_task(sdir,a.agent,task,
+    r = delegate_task(sdir,a.agent,task,timeout_s=timeout_s,
         on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
-    if "error" in r: return emit(a,"delegate",error=r["error"])
+    if "error" in r and not r.get("timed_out"):
+        return emit(a,"delegate",error=r["error"])
     if getattr(a,"json",False):
-        return emit(a,"delegate",{"reply":r["reply"],"exit":r["exit"],"agent":a.agent})
+        data = {"reply":r["reply"],"exit":r["exit"],"agent":a.agent}
+        if r.get("timed_out"):
+            data["timed_out"] = True
+            data["error"] = r.get("error", "")
+        if r.get("timed_out"):
+            emit(a,"delegate",data,error=r.get("error") or "max-runtime exceeded")
+            return 124
+        return emit(a,"delegate",data)
+    if r.get("timed_out"):
+        emit(a,"delegate",error=r.get("error") or "max-runtime exceeded",
+            hint=f'ag chat log {a.agent}')
+        return 124
     return emit(a,"delegate",{"_text":f'delegated to {a.agent} (exit={r["exit"]})'})
 
 def do_selfcheck(a):
@@ -8301,8 +8651,6 @@ def do_selfcheck(a):
         assert eff_model("opencode","")==OPENCODE_MODEL_DEFAULT
         assert eff_model("opencode","custom/x")=="custom/x"
         assert eff_model("claude","default")=="" and eff_model("claude","opus")=="opus"
-        assert opencode_switch_model("opus")==OPENCODE_MODEL_DEFAULT
-        assert opencode_switch_model("custom/keep")=="custom/keep"
         _av,_cw = native_handoff_argv("opencode",sid="s1",model="default")
         assert _av[1:]==["-m",OPENCODE_MODEL_DEFAULT] and (_av[0]=="opencode" or _av[0].endswith("/opencode")), _av
         assert native_handoff_argv("claude",sid="abc")==(["claude","--resume","abc"],".")
@@ -8630,7 +8978,9 @@ def build():
     w8 = sub.add_parser("wait",help="block until session exits (opt-in only)"); w8.add_argument("sess"); w8.add_argument("--timeout",type=int,default=30)
     ev = sub.add_parser("events",help="pings: spawn/send/exit feed"); ev.add_argument("--limit",type=int,default=20); ev.add_argument("--session",default=None)
     dm = sub.add_parser("_daemon",help=argparse.SUPPRESS); dm.add_argument("sp")
-    h = sub.add_parser("harness",help="share your Claude setup with sub-agents"); hs=h.add_subparsers(dest="sub",required=True)
+    h = sub.add_parser("harness",help="select agent backends and share harness configuration"); hs=h.add_subparsers(dest="sub",required=True)
+    huse=hs.add_parser("use",help="switch an agent backend, remembering its model"); huse.add_argument("agent"); huse.add_argument("backend"); huse.add_argument("--model",default=None)
+    hcur=hs.add_parser("current",help="show an agent's backend, model and persona"); hcur.add_argument("agent")
     hshow=hs.add_parser("show"); hshow.add_argument("--home",default=None)
     hexp=hs.add_parser("export"); hexp.add_argument("file",nargs="?",default=None); hexp.add_argument("--home",default=None)
     himp=hs.add_parser("import"); himp.add_argument("file"); himp.add_argument("--home",default=None); himp.add_argument("--home-to",default=None); himp.add_argument("--project-to",default=None); himp.add_argument("--force",action="store_true")
@@ -8655,9 +9005,11 @@ def build():
     rse=ros.add_parser("set"); rse.add_argument("name"); rse.add_argument("--system",default=None); rse.add_argument("--file",default=None)
     rsh=ros.add_parser("show"); rsh.add_argument("name")
     rrm=ros.add_parser("rm"); rrm.add_argument("name")
+    rrst=ros.add_parser("reset",help="restore one built-in role's original prompt"); rrst.add_argument("name")
     ch = sub.add_parser("chat",help="talk to an agent headless"); chs=ch.add_subparsers(dest="sub",required=True)
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
     chs2.add_argument("--command",default=None,help="opencode native custom command (message becomes its args)")
+    chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded")
     chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--limit",type=int,default=20)
     ho=sub.add_parser("handoff",help="native interactive TUI argv + profile env (no global writes)"); ho.add_argument("agent"); ho.add_argument("backend",nargs="?",default=""); ho.add_argument("--spawn",action="store_true",help="start tracked pty session, print id + attach"); ho.add_argument("--exec",action="store_true",help="exec native TUI now (TTY only)")
     sub.add_parser("status",help="orchestration overview")
@@ -8665,7 +9017,7 @@ def build():
     ata=sub.add_parser("attach",help="jump into a live session terminal (Ctrl-] detaches)"); ata.add_argument("sess")
     fgt=sub.add_parser("forget",help="wipe a session's logs (auth traces)"); fgt.add_argument("sess")
     sub.add_parser("keys",help="control cheat-sheet")
-    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*")
+    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded")
     cx=sub.add_parser("context",help="scoped guidance + persistent memory"); cxs=cx.add_subparsers(dest="ctxsub",required=False)
     cxs.add_parser("init",help="non-destructive scaffold of context state")
     cxa=cxs.add_parser("assign",help="assign agent to project scope + brief"); cxa.add_argument("cname"); cxa.add_argument("--scope",default=""); cxa.add_argument("--project-root",default=None); cxa.add_argument("--task",default=None); cxa.add_argument("--acceptance",default=None); cxa.add_argument("--file",dest="cfile",action="append",default=[]); cxa.add_argument("--brief",default=None); cxa.add_argument("--brief-file",default=None)
@@ -8675,12 +9027,412 @@ def build():
     cmc=cms.add_parser("config",help="role defaults / per-agent override"); cmc.add_argument("--role",dest="cprole",default=None,choices=["orchestrator","sub"]); cmc.add_argument("--agent",dest="cpagent",default=None); cmc.add_argument("--enable",dest="cpenable",action="store_true",default=None); cmc.add_argument("--disable",dest="cpdisable",action="store_true"); cmc.add_argument("--max-turns",dest="cpmax",type=int,default=None); cmc.add_argument("--tokens",dest="cptokens",type=int,default=None); cmc.add_argument("--keep",dest="cpkeep",type=int,default=None); cmc.add_argument("--timeout",dest="cptimeout",type=int,default=None); cmc.add_argument("--clear",dest="cpclear",action="store_true")
     cmsh=cms.add_parser("show",help="effective settings + stats"); cmsh.add_argument("cpname",nargs="?",default="")
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
-    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0)
-    ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50); ws.add_argument("--wait",default=None); ws.add_argument("--timeout",type=int,default=30)
+    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired")
+    ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50); ws.add_argument("--wait",default=None); ws.add_argument("--timeout",type=int,default=30); ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)")
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
+    hosts=sub.add_parser("hosts",help="outbound SSH host and project mappings"); hsub=hosts.add_subparsers(dest="hostsub",required=True)
+    hsub.add_parser("list")
+    ha=hsub.add_parser("add"); ha.add_argument("host"); ha.add_argument("--ssh-json",required=True); ha.add_argument("--remote-ag",required=True); ha.add_argument("--remote-state",required=True); ha.add_argument("--remote-project",required=True); ha.add_argument("--local-project",required=True)
+    hc=hsub.add_parser("check"); hc.add_argument("host"); hc.add_argument("--timeout",type=float,default=30)
+    sy=sub.add_parser("sync",help="portable task snapshots; no automatic failover"); sysub=sy.add_subparsers(dest="syncsub",required=True)
+    sysub.add_parser("list")
+    for verb in ("pull", "_export"):
+        sp=sysub.add_parser(verb); sp.add_argument("agent" if verb == "_export" else "host")
+        if verb == "pull": sp.add_argument("agent"); sp.add_argument("--watch",type=float,default=None); sp.add_argument("--timeout",type=float,default=30)
+        else: sp.add_argument("--project",required=True)
+        sp.add_argument("--file",action="append",default=[]); sp.add_argument("--message",default=None)
+    pr=sysub.add_parser("_probe",help=argparse.SUPPRESS); pr.add_argument("agent",nargs="?"); pr.add_argument("--project",required=True)
+    sr=sysub.add_parser("resume"); sr.add_argument("snapshot"); sr.add_argument("--name",required=True); sr.add_argument("--project",required=True); sr.add_argument("--source-stopped",action="store_true"); sr.add_argument("--run",action="store_true"); sr.add_argument("--timeout",type=float,default=30); sr.add_argument("--max-runtime",dest="max_runtime",type=float,default=1800,help="hard runtime limit for --run backend turn in seconds (0=unlimited); budget starts at guard acquisition"); sr.add_argument("--backend",choices=["claude","opencode","gemini","codex","cursor","echo"]); sr.add_argument("--model")
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
     return p
+
+# ---- portable task snapshots (outbound SSH, no native runtime migration) ----
+SYNC_WIRE_MAX = 8 * 1024 * 1024
+SYNC_FILE_MAX = 1024 * 1024
+SYNC_TOTAL_MAX = 4 * 1024 * 1024
+SYNC_TEXT_MAX = 24000
+
+class SyncTransportError(ValueError): pass
+
+def _sync_json(obj): return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+def _sync_hash(obj): return hashlib.sha256(_sync_json(obj).encode()).hexdigest()
+def _sync_name(name):
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
+        raise ValueError("name must be 1-64 letters, digits, dots, underscores or hyphens")
+    return name
+
+def _sync_same_path(a, b):
+    """Same path modulo symlinks/normalization (e.g. /var -> /private/var on macOS).
+
+    Remote paths are configured as strings but the source reports resolved
+    paths; require equality after normalization or resolution. Resolution is
+    best-effort only and never widens identity: agent name is still exact."""
+    if a == b: return True
+    if not isinstance(a, str) or not isinstance(b, str): return False
+    try:
+        if os.path.normpath(a) == os.path.normpath(b): return True
+        return Path(a).expanduser().resolve(strict=False) == Path(b).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError): return False
+
+def _sync_read(path, cap=SYNC_WIRE_MAX):
+    with open(path, "rb") as f: raw = f.read(cap + 1)
+    if len(raw) > cap: raise ValueError(f"file exceeds size limit: {path}")
+    return raw
+
+def _sync_write(path, value, root):
+    """Private, unique temporary file + fsync + atomic replace, confined to root."""
+    import tempfile
+    path, root = Path(path), Path(root)
+    if _ctx_escape(path, root): raise ValueError(f"unsafe state path: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".sync-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(value if isinstance(value, bytes) else value.encode())
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(path.parent, os.O_RDONLY)
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+def _sync_hosts(sdir):
+    p = sdir/"sync"/"hosts.json"
+    if not p.exists(): return {}
+    if _ctx_escape(p, sdir): raise ValueError("unsafe hosts path")
+    result = json.loads(_sync_read(p, 65536))
+    if not isinstance(result, dict): raise ValueError("invalid hosts registry")
+    return result
+
+def _sync_host(sdir, name):
+    hosts = _sync_hosts(sdir)
+    if name not in hosts: raise ValueError(f"unknown host: {name}")
+    return hosts[name]
+
+def _sync_remote(host, args, timeout=30):
+    """SSH argv is local configuration; quote every remote-shell argument once.
+    Bound both streams and wall time; an SSH failure never proves source death."""
+    import selectors
+    remote = [host["remote_ag"], "--dir", host["remote_state"], "--json"] + args
+    cmd = list(host["ssh"]) + [shlex.join(remote)]
+    buffers = {"out": bytearray(), "err": bytearray()}
+    deadline = time.monotonic() + timeout
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e: raise SyncTransportError(f"cannot start SSH: {e}") from e
+    try:
+        with selectors.DefaultSelector() as sel:
+            sel.register(p.stdout, selectors.EVENT_READ, "out")
+            sel.register(p.stderr, selectors.EVENT_READ, "err")
+            while sel.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0: raise SyncTransportError("SSH timed out; source may still be running")
+                for key, _ in sel.select(min(remaining, 1)):
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if not chunk: sel.unregister(key.fileobj); continue
+                    buffers[key.data].extend(chunk)
+                    if len(buffers[key.data]) > (SYNC_WIRE_MAX if key.data == "out" else 65536):
+                        raise ValueError("remote response exceeds size limit")
+            try: rc = p.wait(timeout=max(.01, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired: raise SyncTransportError("SSH timed out; source may still be running")
+        if rc == 255: raise SyncTransportError("SSH unavailable; source may still be running")
+        if rc: raise ValueError(f"remote command failed (exit {rc}): {buffers['out'].decode(errors='replace')[:400]}")
+        try: response = json.loads(buffers["out"])
+        except (ValueError, UnicodeError): raise ValueError("incomplete or invalid remote response")
+        if not isinstance(response, dict) or response.get("ok") is not True or not isinstance(response.get("data"), dict):
+            raise ValueError("remote command did not return successful JSON")
+        return response["data"]
+    finally:
+        if p.poll() is None: p.kill()
+        p.wait()
+        p.stdout.close(); p.stderr.close()
+
+def _sync_file_name(value):
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        raise ValueError("invalid project file path")
+    parts = value.split("/")
+    if any(p in ("", ".", "..") for p in parts): raise ValueError("project files must be relative without dot segments")
+    # Reject known credential/runtime/config stores even when selected explicitly.
+    denied = {".git", ".agent", ".ssh", ".aws", ".azure", ".config", ".codex", ".claude", ".opencode", ".gnupg", "node_modules"}
+    if any(p in denied or p == '.env' or p.startswith('.env.') or p.lower().endswith(('.pem', '.key')) or p in ('auth.json', 'credentials.json', 'id_ed25519', 'id_rsa', '.npmrc', '.netrc') for p in parts):
+        raise ValueError(f"credential/config/runtime path is not portable: {value}")
+    return value
+
+def _sync_source_agent(sdir, name, project):
+    rows = {r['name']: r for r in load_agents(sdir)}
+    if name not in rows: raise ValueError(f"unknown agent: {name}")
+    agent = rows[name]
+    adir = agent.get('dir', '.') or '.'
+    if not Path(adir).is_absolute():
+        raise ValueError(f"agent '{name}' has a relative --dir ('{adir}'); sync cannot infer the remote working directory over SSH (sshd starts at $HOME). Register an absolute dir: ag agents set {name} --dir <absolute path>")
+    root = Path(project).resolve()
+    if not root.is_dir() or Path(adir).resolve() != root:
+        raise ValueError("agent/project mismatch")
+    assignment = ctx_load_assignments(sdir).get(name, {})
+    if assignment and assignment.get('project') != str(root): raise ValueError("context/project mismatch")
+    return agent, root, assignment
+
+def _sync_request(sdir, name):
+    """Bounded chat tail and newest queued/running wake, no transcript export."""
+    latest, stamp = '', ''
+    path = chat_log_path(sdir, name)
+    if path.is_file() and not _ctx_escape(path, sdir):
+        with open(path, 'rb') as f:
+            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 256 * 1024))
+            raw = f.read(256 * 1024)
+        lines = raw.splitlines()
+        if size > 256 * 1024: lines = lines[1:]
+        for line in lines:
+            try: row = json.loads(line)
+            except (ValueError, UnicodeError): continue
+            if row.get('role') == 'user': latest, stamp = row.get('text', '')[:SYNC_TEXT_MAX], row.get('ts', '')
+    jobs = sdir/'wake'/'jobs'
+    if jobs.is_dir() and not _ctx_escape(jobs, sdir):
+        for path in jobs.glob('*.json'):
+            if _ctx_escape(path, sdir): continue
+            try: row = json.loads(_sync_read(path, 65536))
+            except (ValueError, OSError): continue
+            if row.get('agent') == name and row.get('status') in ('queued', 'running') and row.get('ts', '') >= stamp:
+                latest, stamp = row.get('message', '')[:SYNC_TEXT_MAX], row.get('ts', '')
+    return latest
+
+def _sync_export(sdir, name, project, selected, message=None):
+    import base64
+    agent, root, assignment = _sync_source_agent(sdir, name, project)
+    if len(selected) > 64: raise ValueError('at most 64 selected files')
+    files, total = [], 0
+    for rel in sorted(set(selected)):
+        _sync_file_name(rel)
+        p = root/rel
+        if _ctx_escape(p, root) or not p.is_file(): raise ValueError(f'unsafe or missing project file: {rel}')
+        if sdir == p or sdir in p.parents: raise ValueError('state files are not portable')
+        raw = _sync_read(p, SYNC_FILE_MAX); total += len(raw)
+        if total > SYNC_TOTAL_MAX: raise ValueError('selected files exceed total size limit')
+        files.append(dict(path=rel, data=base64.b64encode(raw).decode(), sha256=hashlib.sha256(raw).hexdigest()))
+    ctx = get_agent_context(sdir, name)
+    scope = assignment.get('scope', '')
+    memdir = ctx_agent_dir(_ctx_root(sdir)/'p'/ctx_projkey(root), scope, name)
+    memories = {}
+    for key, filename in [('brief', 'BRIEF.md'), ('checkpoint', 'CHECKPOINT.md')]:
+        memories[key] = _ctx_read_one(memdir/filename, key, CTX_PER_FILE, stop=sdir)[0]
+    payload = dict(schema=1, source=dict(agent=name, project=str(root), state=str(sdir)),
+        agent={key: agent.get(key, '') for key in ('backend', 'model', 'role')},
+        assignment={key: assignment.get(key, '') for key in ('scope', 'task', 'acceptance')},
+        context=ctx['text'], memories=memories,
+        message=message if message is not None else _sync_request(sdir, name), files=files)
+    _sync_validate(payload)
+    return dict(snapshot=_sync_hash(payload), payload=payload, captured_at=now_iso(),
+        busy=agent_busy(sdir, name), warnings=ctx['warnings'], requested_project=project)
+
+def _sync_validate(payload):
+    import base64
+    if not isinstance(payload, dict) or payload.get('schema') != 1: raise ValueError('unsupported snapshot schema')
+    if set(payload) != {'schema','source','agent','assignment','context','memories','message','files'}: raise ValueError('unexpected snapshot fields')
+    for key, fields in [('source', {'agent','project','state'}), ('agent', {'backend','model','role'}), ('assignment', {'scope','task','acceptance'}), ('memories', {'brief','checkpoint'})]:
+        obj = payload.get(key)
+        if not isinstance(obj, dict) or set(obj) != fields or any(not isinstance(v, str) or len(v) > SYNC_TEXT_MAX for v in obj.values()):
+            raise ValueError(f'invalid snapshot {key}')
+    for key in ('context', 'message'):
+        if not isinstance(payload.get(key), str) or len(payload[key]) > SYNC_TEXT_MAX: raise ValueError(f'invalid snapshot {key}')
+    if payload['agent']['backend'] not in ('claude','opencode','gemini','codex','cursor','echo'): raise ValueError('unsupported backend')
+    if ctx_validate_scope(payload['assignment']['scope']) is None: raise ValueError('invalid scope')
+    files, seen, total = payload['files'], set(), 0
+    if not isinstance(files, list) or len(files) > 64: raise ValueError('invalid file manifest')
+    for f in files:
+        if not isinstance(f, dict) or set(f) != {'path','data','sha256'}: raise ValueError('invalid file entry')
+        rel = _sync_file_name(f['path'])
+        if rel in seen: raise ValueError('duplicate project file')
+        seen.add(rel)
+        if not isinstance(f['data'], str) or len(f['data']) > 4 * ((SYNC_FILE_MAX + 2)//3): raise ValueError('file exceeds size limit')
+        try: raw = base64.b64decode(f['data'], validate=True)
+        except (ValueError, TypeError): raise ValueError('invalid file encoding')
+        if len(raw) > SYNC_FILE_MAX or hashlib.sha256(raw).hexdigest() != f['sha256']: raise ValueError('file size/hash mismatch')
+        total += len(raw)
+    if total > SYNC_TOTAL_MAX: raise ValueError('selected files exceed total size limit')
+
+def do_hosts(a):
+    sdir = state_dir(a.dir).resolve(); ensure_state(sdir)
+    try:
+        hosts = _sync_hosts(sdir)
+        if a.hostsub == 'list': return emit(a, 'hosts', {'hosts': hosts})
+        if a.hostsub == 'check':
+            host = _sync_host(sdir, a.host)
+            result = _sync_remote(host, ['sync', '_probe', '--project', host['remote_project']], a.timeout)
+            return emit(a, 'hosts', {'reachable': True, **result})
+        _sync_name(a.host)
+        ssh = json.loads(a.ssh_json)
+        if not isinstance(ssh, list) or len(ssh) < 2 or any(not isinstance(x, str) or not x or '\x00' in x or '\n' in x for x in ssh):
+            raise ValueError('--ssh-json must be an argv array including executable, options and destination')
+        for value in (a.remote_ag, a.remote_state, a.remote_project):
+            if not Path(value).is_absolute() or '\x00' in value: raise ValueError('remote paths must be absolute')
+        local = Path(a.local_project).expanduser().resolve()
+        if not local.is_dir(): raise ValueError('local project must exist')
+        lk = _ctx_lock(sdir)
+        try:
+            hosts = _sync_hosts(sdir)
+            if a.host in hosts: raise ValueError('host already exists; use a new name to preserve snapshot identity')
+            hosts[a.host] = dict(ssh=ssh, remote_ag=a.remote_ag, remote_state=a.remote_state, remote_project=a.remote_project, local_project=str(local))
+            _sync_write(sdir/'sync'/'hosts.json', _sync_json(hosts), sdir)
+        finally: _ctx_unlock(lk)
+        return emit(a, 'hosts', {'host': a.host, **hosts[a.host]})
+    except (ValueError, OSError, KeyError, TypeError) as e: return emit(a, 'hosts', error=str(e))
+
+def _sync_pull(sdir, a):
+    host = _sync_host(sdir, a.host)
+    args = ['sync', '_export', a.agent, '--project', host['remote_project']]
+    for rel in a.file: args += ['--file', rel]
+    if a.message is not None: args += ['--message', a.message]
+    data = _sync_remote(host, args, a.timeout)
+    payload = data.get('payload'); _sync_validate(payload)
+    source = payload.get('source', {})
+    if source.get('agent') != a.agent: raise ValueError('source identity/project mismatch')
+    if data.get('requested_project') != host['remote_project']:
+        if 'requested_project' in (data or {}): raise ValueError('source identity/project mismatch')
+        # Remotes predating the request echo: local-normalization fallback.
+        if not _sync_same_path(source.get('project', ''), host['remote_project']) or not _sync_same_path(source.get('state', ''), host['remote_state']):
+            raise ValueError('source identity/project mismatch')
+    # Remote-canonical cross-check: two independent remote commands must report
+    # the same resolved paths. The strings are compared to each other exactly;
+    # remote paths are never resolved on the local filesystem (per-OS symlinks
+    # such as /var vs /private/var differ across hosts).
+    try:
+        probe = _sync_remote(host, ['sync', '_probe', a.agent, '--project', host['remote_project']], a.timeout)
+    except SyncTransportError:
+        raise ValueError('source identity/project mismatch')
+    if probe.get('project') != source.get('project') or probe.get('state') != source.get('state'):
+        raise ValueError('source identity/project mismatch')
+    sid = _sync_hash(payload)
+    if data.get('snapshot') != sid: raise ValueError('snapshot checksum mismatch')
+    record = dict(schema=1, snapshot=sid, host=a.host, host_hash=_sync_hash(host), captured_at=data['captured_at'], payload=payload,
+        requested_project=host['remote_project'], requested_state=host['remote_state'])
+    dest = sdir/'sync'/'snapshots'/(sid+'.json')
+    if not dest.exists(): _sync_write(dest, _sync_json(record), sdir)
+    elif _ctx_escape(dest, sdir) or json.loads(_sync_read(dest)).get('payload') != payload: raise ValueError('existing snapshot is corrupt')
+    latest = dict(snapshot=sid, host=a.host, agent=a.agent, pulled_at=now_iso(), path=str(dest), source_busy=data.get('busy'), warnings=data.get('warnings', []))
+    _sync_write(sdir/'sync'/'latest'/(_sync_hash([a.host,a.agent])+'.json'), _sync_json(latest), sdir)
+    return latest
+
+def _sync_resume(sdir, a):
+    import base64
+    if not a.source_stopped: raise ValueError('--source-stopped is required: stop/fence the source and prevent restart before resuming')
+    _sync_name(a.name)
+    if not re.fullmatch(r'[a-f0-9]{64}', a.snapshot): raise ValueError('invalid snapshot ID')
+    path = sdir/'sync'/'snapshots'/(a.snapshot+'.json')
+    if _ctx_escape(path, sdir): raise ValueError('unsafe snapshot path')
+    record = json.loads(_sync_read(path)); payload = record.get('payload'); _sync_validate(payload)
+    if record.get('snapshot') != a.snapshot or _sync_hash(payload) != a.snapshot: raise ValueError('snapshot checksum mismatch')
+    host = _sync_host(sdir, record['host'])
+    if record.get('host_hash') != _sync_hash(host): raise ValueError('host mapping changed since snapshot')
+    project = Path(a.project).expanduser().resolve()
+    if str(project) != host['local_project'] or not project.is_dir(): raise ValueError('destination project/mapping mismatch')
+    source = payload['source']
+    if record.get('requested_project') is not None or record.get('requested_state') is not None:
+        # Exact match against the configured strings recorded at pull time.
+        # Remote paths are never resolved locally (per-OS symlinks differ);
+        # mapping drift is already refused via host_hash above.
+        if record.get('requested_project') != host['remote_project'] or record.get('requested_state') != host['remote_state']:
+            raise ValueError('snapshot source mismatch')
+    elif not _sync_same_path(source['project'], host['remote_project']) or not _sync_same_path(source['state'], host['remote_state']):
+        raise ValueError('snapshot source mismatch')
+    source_verified = False
+    try:
+        status = _sync_remote(host, ['sync', '_probe', source['agent'], '--project', host['remote_project']], a.timeout)
+        if status.get('busy') is not False: raise ValueError('source is busy or status is unknown; stop it and check terminal state first')
+        source_verified = True
+    except SyncTransportError:
+        # Explicit acknowledgement, never an automatic timeout-driven failover.
+        pass
+    run_budget = 0
+    if a.run:
+        # Fail fast on a bad flag: validation runs before any local write.
+        run_budget = _valid_runtime(getattr(a, 'max_runtime', 1800))
+        if run_budget is None: raise ValueError('invalid --max-runtime: need finite seconds >= 0 (0 = unlimited)')
+    lk = _ctx_lock(sdir)
+    try:
+        rows = load_agents(sdir)
+        if any(r['name'] == a.name for r in rows): raise ValueError('destination agent already exists; choose a fresh name')
+        # A removed roster entry may still own a conversation. Never reuse it.
+        if chat_log_path(sdir, a.name).exists() or (chat_dir(sdir)/(a.name + '.meta.json')).exists(): raise ValueError('destination name has existing native/chat state')
+        if agent_busy(sdir, a.name): raise ValueError('destination agent is busy')
+        for f in payload['files']:
+            dest = project/f['path']
+            if _ctx_escape(dest, project) or dest.exists(): raise ValueError(f'refusing existing or unsafe destination: {f["path"]}')
+            if sdir == dest or sdir in dest.parents: raise ValueError('cannot extract project files into state')
+        # Recheck source immediately before creating the fresh local assignment.
+        # User's acknowledgement is still responsible for fencing future launches.
+        # A model ID from the source harness must never leak into a different
+        # backend override (foreign provider IDs are invalid there). Stored
+        # 'default' resolves per backend (Muse Spark on opencode via
+        # eff_model); an explicit --model always wins.
+        _src = payload['agent']
+        _backend = a.backend or _src['backend']
+        if a.model: _model = a.model
+        elif a.backend and a.backend != _src['backend']: _model = 'default'
+        else: _model = _src['model'] or 'default'
+        agent = dict(name=a.name, backend=_backend, model=_model, role=_src['role'] or 'sub', dir=str(project), instructions=[], system='', persona='')
+        asg = dict(payload['assignment'], project=str(project), files=[], updated=now_iso())
+        memdir = ctx_agent_dir(_ctx_root(sdir)/'p'/ctx_projkey(project), asg['scope'], a.name)
+        for key, filename in [('brief','BRIEF.md'), ('checkpoint','CHECKPOINT.md')]:
+            _sync_write(memdir/filename, payload['memories'][key], sdir)
+        message = ('Continue this transferred task in a fresh backend session. The snapshot may be stale; verify files and external effects before repeating work.\n\n'
+            + payload['context'] + '\n\nLatest source request:\n' + (payload['message'] or payload['assignment']['task']))
+        msgpath = sdir/'sync'/'resumes'/(_ctx_safe_agent(a.name)+'.txt')
+        _sync_write(msgpath, message, sdir)
+        for f in payload['files']:
+            dest = project/f['path']; dest.parent.mkdir(parents=True, exist_ok=True)
+            # Exclusive create never overwrites a file appearing after preflight.
+            with open(dest, 'xb') as out: out.write(base64.b64decode(f['data']))
+        assignments = ctx_load_assignments(sdir); assignments[a.name] = asg
+        ctx_save_assignments(sdir, assignments)
+        rows.append(agent)
+        _sync_write(sdir/'agents.json', json.dumps(rows, indent=2), sdir)
+    finally: _ctx_unlock(lk)
+    result = dict(snapshot=a.snapshot, agent=a.name, project=str(project), source_verified=source_verified,
+        source_stopped_acknowledged=True, captured_at=record['captured_at'], message_path=str(msgpath), fresh_session=True)
+    if a.run:
+        result['turn'] = run_turn(sdir, a.name, message, timeout_s=run_budget)
+        t = result['turn']
+        # No rollback: the prepared agent and extracted files are valid and
+        # kept. Recover by sending the saved message to the prepared agent
+        # (do not rerun resume: the name is taken); both are named here.
+        if t.get('timed_out'):
+            raise ValueError(f"agent '{a.name}' prepared, but turn timed out: {t.get('error') or 'max-runtime exceeded'}; retry the saved message with: ag chat send {a.name} \"$(cat \"{msgpath}\")\"")
+        if t.get('error') or t.get('exit', 0) != 0:
+            excerpt = ' '.join(str(t.get('reply') or '').split())[:160]
+            raise ValueError(f"agent '{a.name}' prepared, but turn failed (exit {t.get('exit', 1)}): {t.get('error') or excerpt or 'backend failed'}; retry the saved message with: ag chat send {a.name} \"$(cat \"{msgpath}\")\"")
+    return result
+
+def do_sync(a):
+    sdir = state_dir(a.dir).resolve(); ensure_state(sdir)
+    try:
+        if a.syncsub == '_probe':
+            if not Path(a.project).is_dir(): raise ValueError('missing remote project')
+            result = dict(protocol=1, project=str(Path(a.project).resolve()), state=str(sdir))
+            if a.agent:
+                _sync_source_agent(sdir, a.agent, a.project)
+                result['busy'] = agent_busy(sdir, a.agent)
+            return emit(a, 'sync', result)
+        if a.syncsub == '_export':
+            return emit(a, 'sync', _sync_export(sdir, a.agent, a.project, a.file, a.message))
+        if a.syncsub == 'list':
+            root = sdir/'sync'/'latest'
+            if _ctx_escape(root, sdir): raise ValueError('unsafe snapshot index')
+            records = [json.loads(_sync_read(p, 65536)) for p in root.glob('*.json') if not _ctx_escape(p, sdir)]
+            return emit(a, 'sync', {'latest': records})
+        if a.syncsub == 'resume': return emit(a, 'sync', _sync_resume(sdir, a))
+        if a.watch is not None and a.watch < 1: raise ValueError('--watch interval must be at least 1 second')
+        while True:
+            try: code = emit(a, 'sync', _sync_pull(sdir, a))
+            except (ValueError, OSError, KeyError, TypeError) as e:
+                code = emit(a, 'sync', error=str(e))
+            sys.stdout.flush(); sys.stderr.flush()
+            if a.watch is None: return code
+            time.sleep(a.watch)
+    except KeyboardInterrupt: return 130
+    except (ValueError, OSError, KeyError, TypeError) as e: return emit(a, 'sync', error=str(e))
+
 
 def main(argv=None):
     if argv is None: argv = sys.argv[1:]
@@ -8709,7 +9461,7 @@ def main(argv=None):
         "spawn":do_spawn,"send":do_send,"snap":do_snap,"sessions":do_sessions,
         "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon,
         "harness":do_harness,"agents":do_agents,"roles":do_roles,"chat":do_chat,"status":do_status,
-        "handoff":do_handoff,
+        "handoff":do_handoff,"hosts":do_hosts,"sync":do_sync,
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
         "delegate":do_delegate,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run}[a.subcmd]

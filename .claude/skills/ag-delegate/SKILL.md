@@ -19,7 +19,7 @@ Below `ag` means `<repo>/ag --dir <STATE>` with explicit `--dir` every call.
 | Follow-up when a session ends | `ag spawn --wake <agent> --wake-message "<task>" -- <cmd>` (fires at most once) |
 | Chain with memory | `ag context assign/show/checkpoint` (see Handoff) |
 
-`chat send` / `run_turn` has **no timeout** — a hung backend hangs the call until killed externally. Prefer `wake` for anything slow. `wake` is at-most-once *launch*: a crash between claim and enqueue, or `kill -9` of a worker, can lose it. Verify via `events` + `wakes`, re-`wake` manually.
+`chat send` / `delegate` take `--timeout` (default 1800s, `0` = unlimited): hard backend budget starting after the per-agent guard is acquired — lock wait is unbounded. Prefer `wake` for anything slow. Background: `wake --max-runtime` is the same hard budget; `wake --timeout` only marks `stalled` (worker keeps running). `wakes --cancel <job>` cancels one job. `queued` means the worker hasn't acquired the guard yet. `wake` is at-most-once *launch*: a crash between claim and enqueue, or `kill -9` of a worker, can lose it. Verify via `events` + `wakes`, re-`wake` manually.
 
 ## 1. Headless turn (default)
 
@@ -29,7 +29,7 @@ ag --dir <state> chat send oc "implement X per <spec>, report files changed"
 ag --dir <state> chat log oc                        # read reply
 ```
 
-Same agent = serialized; switches (`agents set --backend/--model`, profile set, `/model`) refuse while busy — retry when idle. Keep tasks self-contained: what to do, what done looks like.
+Same agent = serialized; switches (`agents set --backend/--model`, profile set, `/model`) refuse while busy — retry when idle. Headless backend select: `ag harness use oc codex` / `ag harness current oc`; `ag roles reset reviewer` restores one builtin preset (details: `docs/HARNESS_ROLES.md`). Keep tasks self-contained: what to do, what done looks like.
 
 ## 2. Fan-out (parallel subagents)
 
@@ -52,6 +52,7 @@ ag --dir <state> wakes                              # queued|running|done|failed
 ag --dir <state> events --limit 20                  # wake / wake_done / wake_fail trail
 ag --dir <state> chat log oc                        # follow-up lands here
 ag --dir <state> kill <worker-sid>                  # stop a wake worker (job marked failed)
+ag --dir <state> wakes --cancel <job>               # cancel one job (failed, cancelled=true)
 ```
 
 ## 4. Session-bound follow-up
@@ -85,4 +86,4 @@ Same scope inherits prior `HANDOFF.md`; sibling scopes isolated. Native TUI gets
 - Never `tui` / `attach` / `shell` / `handoff --exec` from agent context (needs TTY). `spawn` + `snap` instead.
 - Slash (`/model`, `/profile use docs`, `/help`) runs locally, never reaches the model as prose. Unknown `/word` errors — don't retry as prose.
 - Dangerous `run` blocks → `approvals` → `approve <id>` (10 min) or `--force`. Audit via `history`, `events`.
-- Full command reference: `using-ag` skill. Capability matrix + limits: `<repo>/README.md`.
+- Full command reference: `using-ag` skill. Capability matrix + limits: `<repo>/README.md`. Outbound multi-host: `docs/MULTI_HOST.md` (explicit stop-source-first handoff, no automatic failover).

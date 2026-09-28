@@ -74,6 +74,16 @@ while alive). Worker SIGTERM/SIGINT first stops the active backend, honors
 wake-cancel path: a TERM-ignoring backend (and its children) may survive as
 an orphan. Use `ag wakes --cancel JOB` to stop wake work reliably.
 
+## Parallelism
+
+No global cap: distinct agents run concurrently; only same-agent turns
+serialize on the per-agent flock guard (`run_turn` owns it, crash-releases).
+Use different agent names for parallel work. Provider-side limits (e.g.
+free-tier 429) surface as backend failures. `ag` does not terminate sibling
+jobs when one fails; providers can independently reject multiple requests. Regression:
+`python3 tests/test_ag_parallel.py` (4-way fake-backend overlap,
+same-name serialize, one-timeout survivors).
+
 ## Tests
 
 `python3 tests/test_ag_wake_control.py` — fake `printf` backends on PATH

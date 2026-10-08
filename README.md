@@ -192,6 +192,18 @@ ag harness use w codex ; ag harness current w     # switch backend; remembers on
 
 Switches preserve name/workdir/role/persona, never resume a foreign session id, and refuse while a turn runs (one cross-process flock guard per agent, also covering live native handoffs).
 
+### Per-agent env and keys
+
+```sh
+ag agents set w --env K=V --env-unset K --env-clear          # repeatable; also on `agents add`
+ag agents set w --claude-config-dir ~/.claude-work           # CLAUDE_CONFIG_DIR (second account); clears the claude session on change
+ag agents set w --subscription-only on                       # strips ANTHROPIC_API_KEY/AUTH_TOKEN, OPENAI_API_KEY/BASE_URL, GEMINI_API_KEY, CURSOR_API_KEY
+ag harness profile add P ... --env K=V --env-unset K         # same, shared by profile users
+ag agents env w [--json]                                     # effective env diff vs os.environ, secret values REDACTED
+```
+
+Merge order: `os.environ` -> profile backend env -> profile env -> agent env -> subscription strip -> opencode mode overlay / askpass. Same per-agent part for headless turns, `ag handoff`/native and compaction. Keys matching `*KEY*|*TOKEN*|*SECRET*|*PASSWORD*` must be refs (`--env OPENAI_API_KEY='${MY_KEY}'` or `{env:MY_KEY}`), literals are rejected; an unresolved ref drops the var with one tool note, never the literal `${...}`. `HOME`/`USERPROFILE`/`PATH` are refused (prepend with `--env PATH+=dir`). `~` expands for `CLAUDE_CONFIG_DIR`/`CODEX_HOME`. codex agents get their system prompt via `-c developer_instructions=...` (verified: honored by `codex exec` and `exec resume`) instead of a first-turn prepend.
+
 ## Routing
 
 Pick a **job type**, then use the routed model. Fixed keys: `mechanical` (scripts, rote edits, boilerplate, lookups), `implement` (clear spec), `review` (review, verification), `debug` (failing tests, root cause), `plan` (design, architecture), `hardest` (ambiguous, high-stakes, security).

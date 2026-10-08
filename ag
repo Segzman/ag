@@ -1468,6 +1468,7 @@ def daemon_main(sp):
             except Exception: pass
             os._exit(127)
         for k,v in (st.get("env") or {}).items(): os.environ[k]=v
+        for k in st.get("env_unset") or []: os.environ.pop(k, None)
         secret_env(sp.parent.parent, os.environ, st.get("secret_popup", True))
         os.execv("/bin/sh",["sh","-c",st["cmd"]])
     st["child_pid"] = pid
@@ -2216,6 +2217,8 @@ def validate_profile(name, prof):
             if not found:
                 warns.append("skills: no SKILL.md under dir "
                     "(opencode discovers skills/*/SKILL.md)")
+    _ee = env_check(prof.get("env"), prof.get("env_unset"))
+    if _ee: errs.append(_ee)
     return {"ok": not errs, "errors": errs, "warnings": warns,
         "unsupported": unsup}
 
@@ -2544,6 +2547,10 @@ def do_harness_profile(a):
             "codex_config": getattr(a, "codex_config", None) or "",
             "claude_settings": getattr(a, "claude_settings", None) or "",
             "notes": getattr(a, "pnotes", None) or ""}
+        _penv, _perr = env_parse(getattr(a, "env", None))
+        if _perr: return emit(a, "harness", error=_perr)
+        if _penv: prof["env"] = _penv
+        if getattr(a, "env_unset", None): prof["env_unset"] = list(a.env_unset)
         prof = {k: v for k, v in prof.items() if v not in ("", [], None)}
         v = validate_profile(name, prof)
         if not v["ok"]:
@@ -2795,9 +2802,10 @@ def native_launch(sdir, name, backend=""):
         fake_agent = dict(a, backend=b)
         env = backend_env_for_profile(sdir, fake_agent, prof)
         extra = backend_argv_extra(b, sdir, prof)
+    env, env_unset = agent_env_overrides(sdir, a, prof, env)
     argv = list(argv) + list(extra)
     return {"ok": True, "backend": b, "argv": argv, "cwd": cwd,
-        "env": env, "profile": prof, "sid": sid}
+        "env": env, "env_unset": env_unset, "profile": prof, "sid": sid}
 
 def native_handoff_text(sdir, name, backend=""):
     """Explain + give the working interactive attach for a backend. Pure I/O-light.
@@ -2900,6 +2908,9 @@ def update_agent_settings(sdir, name, updates):
             # A stale meta backend may differ from the roster: the SID still
             # belongs to its recorded owner, never implicitly to `old`.
             sids[meta.get("backend") or old] = meta["sid"]
+        if updates.pop("_clear_claude_sid", False):
+            sids.pop("claude", None)
+            if (meta.get("backend") or old) == "claude": meta["sid"] = ""
         a.update(updates)
         a.update({"backend": new, "model": model})
         models[new] = model
@@ -6022,7 +6033,8 @@ def _compact_core(sdir, a, st, force):
         if prof: argv += backend_argv_extra(backend, sdir, prof)
         import os as _os
         penv = backend_env_for_profile(sdir, a, prof) if prof else {}
-        env = dict(_os.environ, **penv) if penv else None
+        penv, _unset = agent_env_overrides(sdir, a, prof, penv)
+        env = {k: v for k, v in dict(_os.environ, **penv).items() if k not in _unset} if (penv or _unset) else None
         p = subprocess.run(argv, cwd=workdir, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, timeout=max(5, int(st.get("timeout", 120) or 120)),
             env=env)
@@ -6405,6 +6417,13 @@ def do_agents(a):
         txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("persona","") or "-":12} {r.get("profile","") or "-":12} {(r.get("mode") or "-")+("+plan" if r.get("plan") else ""):9} {r.get("dir",".")}{"  ["+r["worktree"]["branch"]+"]" if r.get("worktree") else ""}' for r in rows) or "(none)"
         return emit(a,"agents",{"_text":txt})
     if a.sub=="caps": return do_caps(a)
+    if a.sub=="env":
+        cur = next((r for r in rows if r["name"]==a.name), None)
+        if cur is None: return emit(a,"agents",error=f"no such agent: {a.name}",hint="ag agents list")
+        rep_ = agent_env_report(sdir, cur)
+        if getattr(a,"json",False): return emit(a,"agents",rep_)
+        txt = "\n".join([f"set   {k}={v}" for k,v in sorted(rep_["set"].items())]+[f"unset {k}" for k in rep_["unset"]]+rep_["notes"]) or "(no env changes)"
+        return emit(a,"agents",{"_text":txt})
     if a.sub=="add":
         if any(r["name"]==a.name for r in rows):
             return emit(a,"agents",error=f"exists: {a.name}")
@@ -6418,6 +6437,8 @@ def do_agents(a):
             ra = routing_now()[0][job]["ag"]; be = ra["backend"]; mod = mod or ra["model"]
             if be not in NATIVE_ORDER: return emit(a,"agents",error=f"routing for {job} names unknown backend {be!r}",hint="ag route; ag setup")
         mod = mod or "default"
+        eup, eerr, _ = agent_env_updates(a, {})
+        if eerr: return emit(a,"agents",error=eerr)
         if be=="opencode" and mod in ("","default"): mod = OPENCODE_MODEL_DEFAULT
         wt, adir = None, a.adir or "."
         if getattr(a,"worktree",False):
@@ -6429,6 +6450,7 @@ def do_agents(a):
             "instructions":[s for s in (getattr(a,"instructions",None) or []) if (s or "").strip()],
             **({"mode":a.mode} if getattr(a,"mode",None) else {}),**({"plan":True} if getattr(a,"plan",None) else {}),
             **({"worktree":wt} if wt else {})})
+        rows[-1].update(eup)
         save_agents(sdir,rows)
         _mw = mode_warning(be, getattr(a,"mode",None) or "", bool(getattr(a,"plan",None)))
         if _mw and not wt: return emit(a,"agents",{"_text":f"added {a.name}\n{_mw}","warning":_mw})
@@ -6466,6 +6488,12 @@ def do_agents(a):
             if a.mode not in MODES + ("",): return emit(a, "agents", error=f"bad mode: {a.mode}", hint='|'.join(MODES)+' ("" clears)')
             updates["mode"] = a.mode
         if getattr(a, "plan", None) is not None: updates["plan"] = a.plan
+        _cur = next((r for r in rows if r["name"] == a.name), None)
+        if _cur is not None:
+            eup, eerr, cfg_changed = agent_env_updates(a, _cur)
+            if eerr: return emit(a, "agents", error=eerr)
+            updates.update(eup)
+            if cfg_changed: updates["_clear_claude_sid"] = True
         if getattr(a, "worktree", False):
             cur = next((r for r in rows if r["name"] == a.name), None)
             if cur is None: return emit(a, "agents", error=f"no such agent: {a.name}")
@@ -7267,6 +7295,116 @@ def _ckpt_selfcheck():
         try: shutil.rmtree(sd, ignore_errors=True)
         except NameError: pass
 
+# --- per-agent env + keys (agent/profile env, subscription-only, CLAUDE_CONFIG_DIR) ---
+ENV_SECRET_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD", re.I)
+ENV_DENY = ("HOME", "USERPROFILE", "PATH")
+SUBSCRIPTION_STRIP = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY",
+    "OPENAI_BASE_URL", "GEMINI_API_KEY", "CURSOR_API_KEY")
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?$")
+
+def env_parse(items):
+    """['K=V', 'PATH+=dir'] -> ({K: V}, err). Pure."""
+    out = {}
+    for it in items or []:
+        k, eq, v = str(it).partition("=")
+        if not eq: return {}, f"bad --env {it!r} (want KEY=VALUE)"
+        out[k.strip()] = v
+    return out, ""
+
+def env_check(env, unset):
+    """Validate per-agent/profile env. Returns an error string ('' when ok). Pure.
+    HOME/USERPROFILE/PATH refused (PATH only via PATH+=dir); secret-looking
+    keys (*KEY*/*TOKEN*/*SECRET*/*PASSWORD*) must be ${VAR}/{env:VAR} refs."""
+    for k, v in (env or {}).items():
+        if not _ENV_KEY_RE.match(str(k)): return f"bad env key: {k!r}"
+        if not isinstance(v, str): return f"env {k}: value must be a string"
+        base = k[:-1] if k.endswith("+") else k
+        if k.endswith("+") and base != "PATH": return f"env {k}: only PATH+=dir is supported"
+        if base in ENV_DENY and k != "PATH+": return f"env {base} is not settable (PATH only via --env PATH+=dir)"
+        if ENV_SECRET_RE.search(base) and _codex_env_ref(v) is None:
+            return f"env {k}: secret-looking key needs a reference, not a literal (use --env {k}='${{VAR}}')"
+    for k in unset or []:
+        if not _ENV_KEY_RE.match(str(k)) or str(k).endswith("+"): return f"bad env-unset key: {k!r}"
+        if k in ENV_DENY: return f"env {k} cannot be unset"
+    return ""
+
+def env_apply(env, setd, unset, notes=None):
+    """Apply one env layer to the full child env dict in place: unset, then set
+    (refs resolved from os.environ; unresolved -> var dropped + note, never the
+    literal ${...}; ~ expanded for CLAUDE_CONFIG_DIR/CODEX_HOME; PATH+ prepends)."""
+    for k in unset or []: env.pop(k, None)
+    for k, v in (setd or {}).items():
+        ref = _codex_env_ref(v)
+        if ref:
+            if ref not in os.environ:
+                if notes is not None: notes.append(f"[env] {k}: ${{{ref}}} is not set in the environment; variable dropped")
+                continue
+            v = os.environ[ref]
+        if k in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"): v = os.path.expanduser(v)
+        if k == "PATH+": env["PATH"] = os.path.expanduser(v) + os.pathsep + env.get("PATH", os.defpath)
+        else: env[k] = v
+    return env
+
+def merge_agent_env(sdir, a, prof, env, notes=None):
+    """Per-agent part of the child env on the FULL env dict, in place: profile
+    env/env_unset -> agent env/env_unset -> subscription-only strip."""
+    if prof:
+        pr = load_profiles(sdir).get(prof) or {}
+        env_apply(env, pr.get("env"), pr.get("env_unset"), notes)
+    env_apply(env, a.get("env"), a.get("env_unset"), notes)
+    if a.get("subscription_only"):
+        for k in SUBSCRIPTION_STRIP: env.pop(k, None)
+    return env
+
+def agent_env_overrides(sdir, a, prof, penv, notes=None):
+    """Override-dict flavour of merge_agent_env for callers that do
+    dict(os.environ, **ov) (native_launch, _compact_core). Returns (ov, unset):
+    unchanged callers see penv back untouched when nothing per-agent is set."""
+    pr = (load_profiles(sdir).get(prof) or {}) if prof else {}
+    if not (a.get("env") or a.get("env_unset") or a.get("subscription_only") or pr.get("env") or pr.get("env_unset")):
+        return penv, []
+    full = merge_agent_env(sdir, a, prof, dict(os.environ, **penv), notes)
+    ov = {k: v for k, v in full.items() if k in penv or os.environ.get(k) != v}
+    return ov, [k for k in os.environ if k not in full]
+
+def agent_env_report(sdir, a, redact=True):
+    """Effective env DIFF vs os.environ for `ag agents env`: {set:{}, unset:[], notes:[]}."""
+    prof = (a.get("profile") or "").strip()
+    pe = backend_env_for_profile(sdir, a, prof) if prof else {}
+    notes = []
+    full = merge_agent_env(sdir, a, prof, dict(os.environ, **pe), notes)
+    st = {k: v for k, v in full.items() if os.environ.get(k) != v}
+    if redact:
+        for k in st:
+            if REDACT_KEYS.search(k) or ENV_SECRET_RE.search(k): st[k] = "REDACTED"
+    return {"set": st, "unset": sorted(k for k in os.environ if k not in full), "notes": notes}
+
+def agent_env_updates(a, cur):
+    """agents add/set flags -> (updates, err, claude_cfg_changed). `cur` = existing row or {}."""
+    up = {}
+    env = dict(cur.get("env") or {}); uns = list(cur.get("env_unset") or [])
+    if getattr(a, "env_clear", False): env, uns = {}, []
+    new, err = env_parse(getattr(a, "env", None))
+    if err: return {}, err, False
+    for k in getattr(a, "env_unset", None) or []:
+        env.pop(k, None)
+        if k not in uns: uns.append(k)
+    for k, v in new.items():
+        env[k] = v
+        if k in uns: uns.remove(k)
+    cfg = getattr(a, "claude_config_dir", None)
+    if cfg is not None:
+        if cfg: env["CLAUDE_CONFIG_DIR"] = cfg
+        else: env.pop("CLAUDE_CONFIG_DIR", None)
+    err = env_check(env, uns)
+    if err: return {}, err, False
+    if env != (cur.get("env") or {}) or uns != (cur.get("env_unset") or []) or getattr(a, "env_clear", False):
+        up["env"] = env; up["env_unset"] = uns
+    so = getattr(a, "subscription_only", None)
+    if so is not None: up["subscription_only"] = (so == "on")
+    old_cfg = (cur.get("env") or {}).get("CLAUDE_CONFIG_DIR", "")
+    return up, "", bool(cfg is not None and env.get("CLAUDE_CONFIG_DIR", "") != old_cfg)
+
 # --- run_turn seams: each turn feature edits ONE helper ---
 def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
     """Prompt for one turn. Returns (prompt, sys_txt, prof_name): history replay
@@ -7298,7 +7436,7 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
     if backend in RTK_NOHOOK and not command and rtk_on():
         sys_txt = (sys_txt + "\n\n" + RTK_HINT) if sys_txt else RTK_HINT
     if not command and secret_enabled(): sys_txt = (sys_txt + "\n\n" + SECRET_HINT) if sys_txt else SECRET_HINT
-    if sys_txt and backend!="claude" and not sid and not command:
+    if sys_txt and backend not in ("claude","codex") and not sid and not command:
         # backends without a native system flag: lead the first turn with the role block
         prompt = f'[system role: {a.get("persona") or "custom"}]\n{sys_txt}\n\n---\n{prompt}'
     return prompt, sys_txt, prof_name
@@ -7309,13 +7447,18 @@ def _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, 
         system=sys_txt if backend=="claude" else "",command=command or "",
         **({"mode":a.get("mode") or "","plan":bool(a.get("plan"))} if a.get("mode") or a.get("plan") else {}))
     if prof_name: argv = list(argv) + backend_argv_extra(backend, sdir, prof_name)
+    if backend=="codex" and sys_txt and not command:
+        # verified: `codex exec` and `exec resume` honor -c developer_instructions=<toml string>; no first-turn prepend
+        argv = list(argv); argv[3:3] = ["-c", "developer_instructions=" + json.dumps(sys_txt.replace("\x7f",""), ensure_ascii=False)]
     return argv
 
-def _turn_env(sdir, a, backend, prof):
+def _turn_env(sdir, a, backend, prof, notes=None):
     """Full child env: os.environ + scoped profile env (OPENCODE_CONFIG/DIR,
-    CODEX_HOME) + opencode mode overlay + secret askpass wiring."""
-    penv = mode_env(sdir, a, backend_env_for_profile(sdir, a, prof) if prof else {})
-    return secret_env(sdir, dict(os.environ, **penv))
+    CODEX_HOME) + profile/agent env + subscription strip + opencode mode
+    overlay + secret askpass wiring. `notes` collects unresolved-ref notes."""
+    env = dict(os.environ, **(backend_env_for_profile(sdir, a, prof) if prof else {}))
+    merge_agent_env(sdir, a, prof, env, notes)
+    return secret_env(sdir, mode_env(sdir, a, env))
 
 def _turn_source(p):
     """Iterator of backend stdout lines."""
@@ -7427,7 +7570,10 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         chunks, sid_new, rc, err = [], "", 0, ""
         _usage, _fresh = {}, not sid
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
-        env = _turn_env(sdir, a, backend, prof_name)
+        _en = []
+        env = _turn_env(sdir, a, backend, prof_name, _en)
+        for _n in _en:
+            if on_event: on_event(name, "tool", _n)
         _timed_out = {"hit": False}
         _watch_stop = threading.Event()
         _watcher = None
@@ -7657,7 +7803,7 @@ def do_handoff(a):
     if not r.get("ok"): return emit(a, "handoff", error=r.get("error", "handoff failed"))
     argv, cwd, penv = r["argv"], r["cwd"], r.get("env") or {}
     cmd = " ".join(shlex.quote(t) for t in argv)
-    env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(penv.items()))
+    env_prefix = " ".join(f"{k}={shlex.quote('<redacted>' if ENV_SECRET_RE.search(k) or REDACT_KEYS.search(k) else v)}" for k, v in sorted(penv.items()))
     run_line = f"{env_prefix} {cmd}".strip()
     if getattr(a, "exec", False):
         if not sys.stdin.isatty():
@@ -7687,7 +7833,7 @@ def do_handoff(a):
             return emit(a, "handoff", error=f"{agent} is busy (turn or handoff running); retry when idle.")
         env = {k: v for k, v in penv.items()}
         sid, _sp = _spawn_tracked(sdir, f"handoff-{agent}", _shell_cmd(argv), cwd,
-            extra={"env": env})
+            extra={"env": env, "env_unset": r.get("env_unset") or []})
         try:
             mp = _handoff_marker_path(sdir, agent)
             mp.parent.mkdir(parents=True, exist_ok=True)
@@ -7951,7 +8097,7 @@ def _tui_handoff_exec(stdscr, sdir, nm, r, show_slash):
                 "profile": r.get("profile", ""), "ts": now_iso()}))
         except Exception: pass
         try:
-            env = dict(os.environ, **(r.get("env") or {}))
+            env = {k: v for k, v in dict(os.environ, **(r.get("env") or {})).items() if k not in (r.get("env_unset") or [])}
             rc = subprocess.call(r["argv"], cwd=r["cwd"], env=env)
             out = (f"native {r['backend']} exited ({rc}). "
                 f"profile {r.get('profile') or 'none'} env applied, globals untouched.")
@@ -10533,6 +10679,8 @@ def do_selfcheck(a):
         assert "cached=5" in _parse_codex('{"type":"turn.completed","usage":{"input_tokens":9,"cached_input_tokens":5,"output_tokens":1}}')[0][1]
         assert [o["op"] for o in parse_timeline("codex",'{"type":"item.completed","item":{"id":"i","type":"command_execution","command":"ls","aggregated_output":"x","exit_code":1}}')]==["tool","toolout"]
         assert backend_argv("codex",sid="t-1",prompt="hi")==["codex","exec","--json","resume","t-1","hi"]
+        assert env_check({"HOME":"/x"},[]) and env_check({"A_TOKEN":"lit"},[]) and env_check({"PATH":"/x"},[]) and not env_check({"A_TOKEN":"${X}","PATH+":"/d"},["Y"])
+        _e = env_apply({"PATH":"/b","Z":"1"}, {"PATH+":"/d","K":"${NOPE_AG_SC}"}, ["Z"], _n:=[]); assert _e=={"PATH":"/d"+os.pathsep+"/b"} and len(_n)==1, (_e,_n)
         assert backend_argv("claude",prompt="hi",mode="ro")[-3:]==["--permission-mode","dontAsk","hi"] and mode_flags("gemini")==["--approval-mode","default"]
         assert mode_flags("codex","full")==["-s","danger-full-access"] and opencode_permission("full")=={"*":"allow"} and mode_warning("echo","ro") and not mode_warning("claude","ro")
         # unknown /word: explicit real route, never model prose
@@ -11451,16 +11599,17 @@ def build():
     hps.add_parser("list"); hps.add_parser("status")
     hpsh=hps.add_parser("show"); hpsh.add_argument("pname",nargs="?",default="")
     hpsv=hps.add_parser("validate"); hpsv.add_argument("pname")
-    hpa=hps.add_parser("add"); hpa.add_argument("pname"); hpa.add_argument("--instructions",default=None); hpa.add_argument("--skills",default=None); hpa.add_argument("--mcp",default=None); hpa.add_argument("--memory",action="append",default=[]); hpa.add_argument("--opencode-config",default=None); hpa.add_argument("--codex-config",default=None); hpa.add_argument("--claude-settings",default=None); hpa.add_argument("--notes",dest="pnotes",default=None); hpa.add_argument("--force",action="store_true")
+    hpa=hps.add_parser("add"); hpa.add_argument("pname"); hpa.add_argument("--instructions",default=None); hpa.add_argument("--skills",default=None); hpa.add_argument("--mcp",default=None); hpa.add_argument("--memory",action="append",default=[]); hpa.add_argument("--opencode-config",default=None); hpa.add_argument("--codex-config",default=None); hpa.add_argument("--claude-settings",default=None); hpa.add_argument("--notes",dest="pnotes",default=None); hpa.add_argument("--env",action="append",default=None,metavar="K=V"); hpa.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K"); hpa.add_argument("--force",action="store_true")
     hpr=hps.add_parser("rm"); hpr.add_argument("pname"); hpr.add_argument("--force",action="store_true")
     hpt=hps.add_parser("set"); hpt.add_argument("agent"); hpt.add_argument("--profile",default=""); hpt.add_argument("--none",action="store_true")
     hp.set_defaults(psub="list")
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode")
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false")
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login")
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
+    age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)
     ro = sub.add_parser("roles",help="behavior presets (system prompts) for agents"); ros=ro.add_subparsers(dest="sub",required=True)
     ros.add_parser("list")

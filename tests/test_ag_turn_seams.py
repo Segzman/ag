@@ -52,14 +52,18 @@ class Seams(unittest.TestCase):
         self.assertEqual(L["argv"][-3:], ["--resume", "s-1", "hello"]); self.assertNotIn("--append-system-prompt", L["argv"])
 
     def test_system_role_prepend_codex_gemini(self):
-        for b, pre in (("codex", ["exec", "--json"]), ("gemini", None)):
+        L = self.turn("codex", "--system", "Be terse.")  # codex: -c developer_instructions, no prepend
+        self.assertEqual(L["argv"][:5], ["exec", "--json", "-c", 'developer_instructions="Be terse."', L["argv"][4]])
+        self.assertEqual(L["argv"][-1], "hello")
+        L = self.turn("codex", "--system", "Be terse.", sid="t-9")
+        self.assertEqual(L["argv"][-3:], ["resume", "t-9", "hello"]); self.assertIn('developer_instructions="Be terse."', L["argv"])
+        for b, pre in (("gemini", None),):
             L = self.turn(b, "--system", "Be terse.")
             p = [x for x in L["argv"] if "hello" in x][0]
             self.assertTrue(p.startswith("[system role: custom]\nBe terse.\n\n---\n"), p); self.assertTrue(p.endswith("hello"), p)
             if pre: self.assertEqual(L["argv"][:2], pre)
             L = self.turn(b, "--system", "Be terse.", sid="t-9")  # resumed: no prepend
             self.assertIn("hello", L["argv"]); self.assertNotIn("[system role", " ".join(L["argv"]))
-            if b == "codex": self.assertEqual(L["argv"][-3:], ["resume", "t-9", "hello"])
 
     def test_mode_plan(self):
         L = self.turn("claude", "--mode", "ro")
@@ -89,9 +93,9 @@ class Seams(unittest.TestCase):
     def test_helpers_direct(self):
         a = {"name": "x", "backend": "codex", "system": "S"}
         pr, sysx, prof = ag._turn_prompt(self.sd, a, "codex", "", "hi", None, None)
-        self.assertEqual((prof, sysx), ("", "S")); self.assertTrue(pr.endswith("---\nhi"))
+        self.assertEqual((prof, sysx), ("", "S")); self.assertEqual(pr, "hi")  # codex: system via -c developer_instructions, no prepend
         self.assertEqual(ag._turn_prompt(self.sd, a, "codex", "sid", "hi", "cmd", None)[0], "hi")
-        self.assertEqual(ag._turn_argv(self.sd, a, "codex", "default", ".", "", "hi", "S", None, ""), ag.backend_argv("codex", model="default", workdir=".", prompt="hi"))
+        self.assertEqual(ag._turn_argv(self.sd, a, "codex", "default", ".", "", "hi", "S", None, ""), ag.backend_argv("codex", model="default", workdir=".", prompt="hi")[:3] + ["-c", 'developer_instructions="S"'] + ag.backend_argv("codex", model="default", workdir=".", prompt="hi")[3:])
         e = ag._turn_env(self.sd, a, "codex", "")
         self.assertEqual({k: v for k, v in e.items() if k in os.environ and os.environ[k] != v}, {})
         class P: stdout = iter(["a\n"])

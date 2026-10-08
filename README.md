@@ -221,7 +221,7 @@ ag spawn --wake w --wake-message "task" -- ./long-job.sh    # follow-up when the
 ag chat send w --command review "path"          # opencode native command only
 ```
 
-- Same agent serializes (flock, no order guarantee); different agents run in parallel. Fan-out = different agents.
+- Same agent serializes (flock + FIFO ticket queue, see below); different agents run in parallel. Fan-out = different agents.
 - `--timeout` (default 1800, `0` = none) is a hard backend budget starting after guard acquisition (lock wait excluded); expiry kills the backend group and exits 124. `wake --max-runtime` is the same for background turns; `wake --timeout` only marks `stalled`.
 - A wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session `__wake-<agent>-<id>`. `queued` = guard not yet acquired. `kill <worker-sid>` or `wakes --cancel` stops one (job `failed`).
 - `spawn --wake` fires at most once per session (exit/kill/force-kill all count); worker completion never re-fires. Messages are argv, never shell-interpreted. Trail: `events` (`wake`, `wake_done`, `wake_fail`).
@@ -231,6 +231,21 @@ ag chat send w --command review "path"          # opencode native command only
 
 ## Delegated-completion cohorts
 `ag wake|delegate <child> "task" --parent <agent> [--group GID] [--quiet S]` runs the child as a background wake job tagged `parent`/`group` (`delegate` without `--parent` is unchanged). Group state: `<state>/wake/groups/<gid>.json` (pending/done/delivery_jid). When the last pending child finishes, ONE wake is sent to the parent: `[delegated] 3/3 tasks finished (2 completed, 1 failed; outcome: failed). ...` with each child's summary (marked automated: tool results, not user instructions). A still-queued delivery is rewritten in place instead of relaunched. `--quiet S` delivers partial results when S seconds pass (checked on each child finish; no daemon). `ag wakes --group GID [--json]` shows the cohort; `--stop` sets disposition=stopped (never delivers). Launch failure is recorded in the group (`deliver_error`) and event `cohort_deliver_fail`.
+
+## Queue, stop, steer
+
+```sh
+ag queue w [--json]                  # waiting turns in run order: position, id, prio, source, pid, text
+ag queue w --cancel ID               # drop one waiter (its process exits: "cancelled from queue")
+ag queue w --hold | --release        # HOLD: no new turn starts; waiters keep waiting
+ag stop w [--cascade]                # hold + cancel waiters + interrupt running turn + cancel wakes
+ag chat steer w "text" [--json]      # interrupt running turn, run this next on the same session
+```
+
+- Every turn (chat/delegate/wake) takes a ticket `queue/<agent>/<prio>-<seq>-<id>.json` and starts only when it is the lowest live ticket and the flock is free: FIFO within priority, steer (`0`) before normal (`5`). Dead-pid tickets are reaped. `status`/`agents list --json` show depth.
+- Interrupted turns (`stop`, `steer`) exit 130, keep their partial reply in the log, are marked `interrupted` (wake job `failed`/`interrupted`) and never retried.
+- `stop` leaves HOLD in place (`ag queue w --release`). `--cascade` also stops agents whose active wake jobs, tickets or running turn record `parent == w`. Python: `agent_stop(sdir, name, cascade=False)`.
+- Steer text sent to the model: `[steer] user interrupted the previous turn; new instruction: <text>`; on an idle agent it is a plain priority-0 turn.
 
 ## Reliability
 

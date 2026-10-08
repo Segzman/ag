@@ -56,7 +56,9 @@ Native command flag (`chat send --command`) is opencode-only; others reject it. 
 
 ## Install
 
-Requires Python 3.9+, POSIX, git. `./install.sh [--prefix DIR] [--force]` copies only the `ag` file (default `~/.local/bin/ag`); no rc edits. Put the dir on `PATH`. Running `./ag` from the checkout also works. Details, SSH use, uninstall: [docs/INSTALL.md](docs/INSTALL.md).
+Requires Python 3.9+, POSIX, git. `./install.sh [--prefix DIR] [--force]` copies only the `ag` file (default `~/.local/bin/ag`); no rc edits. Put the dir on `PATH`. Running `./ag` from the checkout also works. Details, SSH use, uninstall: [docs/INSTALL.md](docs/INSTALL.md). Tip: symlink `~/.local/bin/ag` to the checkout's `ag` so updates land in place.
+
+**Updates.** ag checks GitHub at most once a day, in a detached background process, and applies updates on the next run. A git checkout gets `fetch` + `merge --ff-only`, but only when the tree is clean, tracking a remote, and not ahead; local commits or edits are never touched. A copy install downloads `ag` from `master`, checks that it compiles, and swaps it in atomically. `ag update` runs it now, `ag update --status` shows state, `ag update --auto off|on` toggles (`~/.config/ag/config.json`), and `AG_AUTO_UPDATE=0` disables per shell. Log: `~/.cache/ag/update.log`.
 
 ## State dir
 

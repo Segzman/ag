@@ -10031,6 +10031,7 @@ def build():
     sr=sysub.add_parser("resume"); sr.add_argument("snapshot"); sr.add_argument("--name",required=True); sr.add_argument("--project",required=True); sr.add_argument("--source-stopped",action="store_true"); sr.add_argument("--run",action="store_true"); sr.add_argument("--timeout",type=float,default=30); sr.add_argument("--max-runtime",dest="max_runtime",type=float,default=1800,help="hard runtime limit for --run backend turn in seconds (0=unlimited); budget starts at guard acquisition"); sr.add_argument("--backend",choices=["claude","opencode","gemini","codex","cursor","echo"]); sr.add_argument("--model")
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
+    up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
     return p
 
 # ---- portable task snapshots (outbound SSH, no native runtime migration) ----
@@ -10420,6 +10421,94 @@ def do_sync(a):
     except (ValueError, OSError, KeyError, TypeError) as e: return emit(a, 'sync', error=str(e))
 
 
+# ---- self-update from GitHub (fast-forward only; detached, <=1 check/day) ----
+# git checkout (install = symlink to clone): fetch + merge --ff-only, only when the
+# tree is clean, on a branch tracking a remote, and not ahead. Copy installs:
+# download raw `ag`, py_compile it, atomic replace. Off: `ag update --auto off`
+# or AG_AUTO_UPDATE=0. Takes effect on the next invocation, never mid-command.
+UPDATE_RAW_URL = "https://raw.githubusercontent.com/Segzman/ag/master/ag"
+UPDATE_EVERY_S = 86400
+UPDATE_SKIP = {"_daemon", "_wake_run", "_sudo", "askpass", "selfcheck", "update", "tui", "attach", "shell"}
+
+def _ag_conf_path():
+    return Path(os.environ.get("AG_CONFIG_HOME") or Path.home()/".config/ag")/"config.json"
+
+def _ag_conf():
+    try: return json.loads(_ag_conf_path().read_text())
+    except Exception: return {}
+
+def auto_update_on():
+    return os.environ.get("AG_AUTO_UPDATE", "1") != "0" and _ag_conf().get("auto_update", True) is not False
+
+def _update_stamp():
+    return Path(os.environ.get("AG_CACHE_HOME") or Path.home()/".cache/ag")/"update-check"
+
+def maybe_auto_update(subcmd):
+    """At most once per UPDATE_EVERY_S, fire a detached `ag update --quiet`. Never blocks or raises."""
+    if subcmd in UPDATE_SKIP or not auto_update_on(): return
+    try:
+        st = _update_stamp()
+        if st.exists() and time.time() - st.stat().st_mtime < UPDATE_EVERY_S: return
+        st.parent.mkdir(parents=True, exist_ok=True); st.touch()
+        subprocess.Popen([sys.executable, ag_script_path(), "update", "--quiet"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except Exception: pass
+
+def self_update(src=None):
+    """-> (status, detail). status: updated|current|skipped|error."""
+    src = Path(src or ag_script_path()); repo = src.parent
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=60)
+    try: in_git = g("rev-parse", "--is-inside-work-tree").stdout.strip() == "true"
+    except Exception: in_git = False
+    if in_git:
+        if g("rev-parse", "--abbrev-ref", "@{u}").returncode: return "skipped", "branch has no upstream"
+        if g("status", "--porcelain", "-uno").stdout.strip(): return "skipped", "local changes in " + str(repo)
+        f = g("fetch", "-q")
+        if f.returncode: return "error", "git fetch: " + f.stderr.strip()[:200]
+        ahead, behind = (int(x) for x in g("rev-list", "--left-right", "--count", "HEAD...@{u}").stdout.split())
+        if not behind: return "current", g("rev-parse", "--short", "HEAD").stdout.strip()
+        if ahead: return "skipped", f"diverged ({ahead} local, {behind} remote commits)"
+        old = g("rev-parse", "--short", "HEAD").stdout.strip()
+        m = g("merge", "-q", "--ff-only", "@{u}")
+        if m.returncode: return "error", "git merge: " + m.stderr.strip()[:200]
+        return "updated", f"{old} -> {g('rev-parse', '--short', 'HEAD').stdout.strip()} ({behind} commits)"
+    import urllib.request, py_compile, tempfile
+    try:
+        with urllib.request.urlopen(UPDATE_RAW_URL, timeout=30) as r: new = r.read()
+    except Exception as e: return "error", f"download: {e}"
+    if new == src.read_bytes(): return "current", VERSION
+    fd, tmp = tempfile.mkstemp(dir=str(repo), prefix=".ag-update-")
+    try:
+        with os.fdopen(fd, "wb") as f: f.write(new)
+        py_compile.compile(tmp, doraise=True)  # never install a file that doesn't parse
+        os.chmod(tmp, src.stat().st_mode); os.replace(tmp, src)
+    except Exception as e:
+        try: os.unlink(tmp)
+        except OSError: pass
+        return "error", f"install: {e}"
+    return "updated", f"replaced {src}"
+
+def do_update(a):
+    if a.auto:
+        c = _ag_conf(); c["auto_update"] = a.auto == "on"
+        p = _ag_conf_path(); p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp"); tmp.write_text(json.dumps(c, indent=2) + "\n"); os.replace(tmp, p)
+        return emit(a, "update", {"_text": f"auto-update {a.auto} ({p})", "auto_update": c["auto_update"]})
+    if a.status:
+        st = _update_stamp()
+        last = datetime.fromtimestamp(st.stat().st_mtime, timezone.utc).isoformat(timespec="seconds") if st.exists() else "never"
+        on = auto_update_on()
+        return emit(a, "update", {"_text": f"auto-update {'on' if on else 'off'}; last check {last}; source {Path(ag_script_path()).parent}", "auto_update": on, "last_check": last})
+    status, detail = self_update()
+    try:
+        lg = _update_stamp().with_name("update.log"); lg.parent.mkdir(parents=True, exist_ok=True)
+        with open(lg, "a") as f: f.write(f"{now_iso()} {status} {detail}\n")
+    except Exception: pass
+    if a.quiet: return 0 if status != "error" else 1
+    if status == "error": return emit(a, "update", error=detail)
+    return emit(a, "update", {"_text": f"{status}: {detail}", "status": status, "detail": detail})
+
 def main(argv=None):
     if argv is None: argv = sys.argv[1:]
     # Global --json only before explicit `--` boundary. Tokens after the
@@ -10450,7 +10539,8 @@ def main(argv=None):
         "handoff":do_handoff,"hosts":do_hosts,"sync":do_sync,
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
         "delegate":do_delegate,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
-        "_wake_run":do__wake_run,"askpass":do_askpass,"_sudo":do__sudo}[a.subcmd]
+        "_wake_run":do__wake_run,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update}[a.subcmd]
+    maybe_auto_update(a.subcmd)
     return fn(a)
 
 if __name__=="__main__":

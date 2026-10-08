@@ -485,11 +485,23 @@ def _prepare_tracked(sdir, name, cmd_str, cwd, extra=None, sid=None):
     _event(sdir, "spawn", sid, cmd=cmd_str, name=name or "")
     return sid, sp
 
+# Secret-looking env values reach the daemon by fork inheritance, never via status.json.
+_FORK_SECRET_ENV = {}
+
 def _spawn_tracked(sdir, name, cmd_str, cwd, extra=None, sid=None, pre_fork=None):
+    global _FORK_SECRET_ENV
+    extra = dict(extra or {})
+    env = dict(extra.get("env") or {})
+    secret = {k: v for k, v in env.items() if ENV_SECRET_RE.search(k)}
+    if secret:
+        extra["env"] = {k: ("<redacted>" if k in secret else v) for k, v in env.items()}
+        extra["env_secret_keys"] = sorted(secret)
     sid, sp = _prepare_tracked(sdir, name, cmd_str, cwd, extra=extra, sid=sid)
     if pre_fork is not None:
         pre_fork(sid, sp)
-    _fork_tracked_daemon(sp)
+    _FORK_SECRET_ENV = secret
+    try: _fork_tracked_daemon(sp)
+    finally: _FORK_SECRET_ENV = {}
     return sid, sp
 
 def _spawn_wake_session(sdir, agent, jid, sid=None, pre_fork=None):
@@ -1468,6 +1480,7 @@ def daemon_main(sp):
             except Exception: pass
             os._exit(127)
         for k,v in (st.get("env") or {}).items(): os.environ[k]=v
+        os.environ.update(_FORK_SECRET_ENV)  # inherited in memory; status.json only has "<redacted>"
         for k in st.get("env_unset") or []: os.environ.pop(k, None)
         secret_env(sp.parent.parent, os.environ, st.get("secret_popup", True))
         os.execv("/bin/sh",["sh","-c",st["cmd"]])
@@ -1568,13 +1581,16 @@ def do_spawn(a):
     sp = _sroot(sdir)/sid; sp.mkdir()
     os.mkfifo(sp/"stdin.fifo")
     _swrite(sp, {"id":sid,"name":a.name or "","cmd":cmd_str,"cwd":a.cwd or os.getcwd(),
-        "env":env,"cols":a.cols,"rows":a.rows,"on_exit":a.on_exit or "",
+        "env":{k: ("<redacted>" if ENV_SECRET_RE.search(k) else v) for k, v in env.items()},"cols":a.cols,"rows":a.rows,"on_exit":a.on_exit or "",
         "wake_agent":wake_agent,"wake_message":wake_message,"wake_fired":False,
         "wake_notify":wake_notify,"wake_on_done":wake_on_done,"wake_timeout":wake_timeout,
         "secret_popup":not getattr(a,"no_secret_popup",False),
         "running":True,"exit":None,"started_at":now_iso(),"daemon_pid":None,"child_pid":None})
     _event(sdir,"spawn",sid,cmd=cmd_str,name=a.name or "")
-    _fork_tracked_daemon(sp)
+    global _FORK_SECRET_ENV
+    _FORK_SECRET_ENV = {k: v for k, v in env.items() if ENV_SECRET_RE.search(k)}
+    try: _fork_tracked_daemon(sp)
+    finally: _FORK_SECRET_ENV = {}
     if getattr(a,"json",False):
         return emit(a,"spawn",{"id":sid,"name":a.name or "","cmd":cmd_str,
             "poll":f"ag snap --since 0 {sid}"})
@@ -1889,7 +1905,11 @@ def _copy_missing(src, dst):
 
 def harness_link(home, cwd, dest):
     linked, missing = [], []
-    for f in HARNESS_PROJ:
+    try: same = Path(cwd).resolve() == Path(home).resolve() or Path(cwd).resolve() == Path(dest).resolve()
+    except Exception: same = True
+    # cwd == home: the "project" .claude/.opencode ARE the global dirs (session
+    # transcripts, caches) — never bulk-copy them; the home part below is curated.
+    for f in ([] if same else HARNESS_PROJ):
         p = cwd/f
         if not p.exists(): missing.append(f); continue
         linked.append(f"{f} ({_copy_missing(p,dest/f)} new)")
@@ -10245,6 +10265,10 @@ def do_selfcheck(a):
         assert "REDACTED" in (td/"ihome"/"settings.json").read_text()
         assert "sk-ant-SECRET" not in (td/"h.tgz").read_bytes().decode(errors="replace")
         r2=harness_link(fh,fc,td/"linked")
+        # cwd == home: never bulk-copy ~/.claude (transcripts) as if it were a project dir
+        (fh/".claude"/"projects").mkdir(parents=True, exist_ok=True); (fh/".claude"/"projects"/"t.jsonl").write_text("private")
+        harness_link(fh,fh,td/"homelinked")
+        assert not (td/"homelinked"/".claude"/"projects").exists() and (td/"homelinked"/".claude"/"skills"/"s.md").exists()
         assert (td/"linked"/"CLAUDE.md").exists()
         assert (td/"linked"/".claude"/"skills"/"s.md").exists()
         assert do_harness(mk(sub="show",home=str(fh)))==0

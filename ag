@@ -3950,6 +3950,99 @@ def parse_events(backend, line):
     if backend=="codex": return _parse_codex(line)
     return _parse_generic(line)
 
+# ---- provider usage: real token counts per turn (pure extractor + store) ----
+# Verified shapes: claude assistant.message.usage (per API call = real context)
+# + result.usage/total_cost_usd (turn aggregate over all calls); codex
+# turn.completed.usage; opencode step_finish.part.tokens/cost (per step).
+# cursor/gemini: no verifiable usage output (unauthenticated) -> not parsed.
+# Normalized: in = whole prompt incl. cache; ctx = prompt size of the LAST call.
+USAGE_KEYS = ("in", "out", "cache_read", "cache_write", "reasoning", "cost")
+
+def _uint(v):
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else 0
+
+def parse_usage(backend, line):
+    """-> None | {"ctx"?, "in"?, ..., "final": bool}. Pure, no I/O.
+    final=True replaces per-turn totals; else additive (per step)."""
+    try: o = json.loads(line)
+    except Exception: return None
+    if not isinstance(o, dict): return None
+    t = o.get("type")
+    if backend == "claude":
+        if t == "assistant" and not o.get("parent_tool_use_id"):
+            u = (o.get("message") or {}).get("usage") if isinstance(o.get("message"), dict) else None
+            if isinstance(u, dict):
+                return {"ctx": _uint(u.get("input_tokens")) + _uint(u.get("cache_read_input_tokens"))
+                    + _uint(u.get("cache_creation_input_tokens")), "final": False}
+        if t == "result" and isinstance(o.get("usage"), dict):
+            u = o["usage"]; cr = _uint(u.get("cache_read_input_tokens")); cw = _uint(u.get("cache_creation_input_tokens"))
+            d = {"in": _uint(u.get("input_tokens")) + cr + cw, "out": _uint(u.get("output_tokens")),
+                "cache_read": cr, "cache_write": cw,
+                "reasoning": _uint((u.get("output_tokens_details") or {}).get("thinking_tokens")), "final": True}
+            if isinstance(o.get("total_cost_usd"), (int, float)): d["cost"] = float(o["total_cost_usd"])
+            return d
+    elif backend == "codex" and t == "turn.completed" and isinstance(o.get("usage"), dict):
+        u = o["usage"]; i = _uint(u.get("input_tokens"))
+        return {"ctx": i, "in": i, "out": _uint(u.get("output_tokens")),
+            "cache_read": _uint(u.get("cached_input_tokens")), "cache_write": _uint(u.get("cache_write_input_tokens")),
+            "reasoning": _uint(u.get("reasoning_output_tokens")), "final": True}
+    elif backend == "opencode" and t == "step_finish":
+        p = o.get("part") if isinstance(o.get("part"), dict) else {}
+        tk = p.get("tokens")
+        if isinstance(tk, dict):
+            c = tk.get("cache") if isinstance(tk.get("cache"), dict) else {}
+            cr, cw = _uint(c.get("read")), _uint(c.get("write"))
+            i = _uint(tk.get("input")) + cr + cw
+            d = {"ctx": i, "in": i, "out": _uint(tk.get("output")), "cache_read": cr,
+                "cache_write": cw, "reasoning": _uint(tk.get("reasoning")), "final": False}
+            if isinstance(p.get("cost"), (int, float)): d["cost"] = float(p["cost"])
+            return d
+    return None
+
+def usage_merge(acc, ev):
+    """Fold one parse_usage event into the per-turn accumulator (ctx: last wins)."""
+    if "ctx" in ev: acc["ctx"] = ev["ctx"]
+    for k in USAGE_KEYS:
+        if k in ev: acc[k] = ev[k] if ev.get("final") else acc.get(k, 0) + ev[k]
+    return acc
+
+def usage_record(sdir, name, backend, sid, fresh, acc):
+    """Persist last-turn usage + running totals (+ session baseline) in chat meta."""
+    if not acc: return None
+    m = load_chat_meta(sdir, name)
+    u = m.get("usage") if isinstance(m.get("usage"), dict) else {}
+    tot = u.get("totals") if isinstance(u.get("totals"), dict) else {}
+    for k in USAGE_KEYS:
+        if k in acc: tot[k] = round(tot.get(k, 0) + acc[k], 6) if k == "cost" else tot.get(k, 0) + acc[k]
+    tot["turns"] = tot.get("turns", 0) + 1
+    last = dict(acc, backend=backend, sid=sid, ts=now_iso())
+    base = u.get("base") if isinstance(u.get("base"), dict) else {}
+    # baseline = prompt size of the first turn of a fresh session (system prompt,
+    # tool defs, replayed history): growth above it is what compaction controls.
+    if "ctx" in acc and (fresh or base.get("backend") != backend):
+        base = {"backend": backend, "ctx": acc["ctx"]}
+    m["usage"] = {"last": last, "totals": tot, "base": base}
+    save_chat_meta(sdir, name, m)
+    return m["usage"]
+
+def usage_occupancy(sdir, agent):
+    """Real context growth of the live native session, or None (-> chars//4).
+    None unless the last measured turn is this backend's still-live session."""
+    try:
+        name, backend = agent.get("name", ""), agent.get("backend", "claude")
+        m = load_chat_meta(sdir, name, agent=agent)
+        u = m.get("usage") if isinstance(m.get("usage"), dict) else {}
+        last, base = u.get("last") or {}, u.get("base") or {}
+        sid = (m.get("sids") or {}).get(backend) or (m.get("sid") if m.get("backend") == backend else "")
+        if not sid or last.get("backend") != backend or base.get("backend") != backend: return None
+        if "ctx" not in last or "ctx" not in base: return None
+        return {"ctx": last["ctx"], "base": base["ctx"], "tokens": max(0, last["ctx"] - base["ctx"])}
+    except Exception:
+        return None
+
+def usage_short(acc):
+    return {k: acc[k] for k in ("ctx", "in", "out", "cache_read", "reasoning", "cost") if k in acc}
+
 # ---- streaming timeline: honest incremental provider events ----
 # ponytail: one TimelineBuffer per turn; deltas concatenate in memory,
 # snapshots persist-before-emit. Ceilings: no token-level invention for
@@ -5304,6 +5397,8 @@ def compact_stats(sdir, agent_name):
         if r.get("role") in ("user", "agent") and not r.get("compacted")]
     completed = sum(1 for r in rows if r.get("role") == "user")
     est = sum(len(r.get("text", "") or "") for r in rows) // 4
+    occ = usage_occupancy(sdir, {"name": agent_name, "backend": (next((x for x in load_agents(sdir) if x.get("name") == agent_name), {}) or {}).get("backend", "claude")})
+    used = occ["tokens"] if occ else est
     last = ""
     for r in reversed(log):
         if r.get("role") == "summary":
@@ -5313,11 +5408,12 @@ def compact_stats(sdir, agent_name):
         hits = []
         if st.get("max_turns") and completed >= st["max_turns"]:
             hits.append(f"turns {completed}>={st['max_turns']}")
-        if st.get("token_threshold") and est >= st["token_threshold"]:
-            hits.append(f"tokens≈{est}>={st['token_threshold']}")
-        reason = " & ".join(hits) if hits else f"below triggers ({completed} turns, ≈{est} tokens)"
+        if st.get("token_threshold") and used >= st["token_threshold"]:
+            hits.append(f"tokens{'' if occ else '≈'}{used}>={st['token_threshold']}")
+        reason = " & ".join(hits) if hits else f"below triggers ({completed} turns, {'' if occ else '≈'}{used} tokens)"
     return {"user_turns": sum(1 for r in log if r.get("role") == "user"),
-        "completed": completed, "est_tokens": est,
+        "completed": completed, "est_tokens": est, "used_tokens": used,
+        "used_source": "provider" if occ else "chars//4",
         "est_note": "chars//4 over uncompacted rows, rough estimate",
         "keep_recent": st.get("keep_recent", 0), "last_summary": last,
         "enabled": bool(st.get("enabled")), "would_compact": reason not in ("disabled",) and "below" not in reason,
@@ -5367,6 +5463,8 @@ def _compact_core(sdir, a, st, force):
         return {"compacted": False, "reason": "nothing beyond keep_recent"}
     if not force:
         est = sum(len(r.get("text", "") or "") for r in uncomp) // 4
+        _occ = usage_occupancy(sdir, a)
+        if _occ: est = _occ["tokens"]  # provider-measured growth of the live session
         fire = (st.get("max_turns") and completed >= st["max_turns"]) or \
             (st.get("token_threshold") and est >= st["token_threshold"])
         if not fire:
@@ -6054,6 +6152,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         buf.user_row(text, user_eid)
         mark_running(name,True)
         chunks, sid_new, rc, err = [], "", 0, ""
+        _usage, _fresh = {}, not sid
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
         penv = backend_env_for_profile(sdir, a, prof_name) if prof_name else {}
         _timed_out = {"hit": False}
@@ -6107,6 +6206,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                     _s = line.strip()
                     if _s.startswith("{") and _tl_json(_s) is not None:
                         _unknown_json = True
+                _uev = parse_usage(backend,line)
+                if _uev: usage_merge(_usage,_uev)
                 for kind,txt in parse_events(backend,line):
                     if kind=="meta":
                         if txt and not sid_new:
@@ -6196,6 +6297,10 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         _event(sdir,"chat",name,exit=rc)
         if on_event: on_event(name,"exit",str(rc))
         out = {"sid":sid_new or sid,"exit":rc,"reply":full}
+        if _usage:
+            try: usage_record(sdir,name,backend,sid_new or sid,_fresh,_usage)
+            except Exception: pass
+            out["usage"] = usage_short(_usage)
         if _timed_out["hit"]:
             out["timed_out"] = True
             out["error"] = f"max-runtime {timeout_s:g}s exceeded (backend killed)"
@@ -6293,6 +6398,7 @@ def do_chat(a):
                 hint=r["reply"][:300])
         if getattr(a,"json",False):
             data = {"reply":r["reply"],"exit":r["exit"],"sid":r["sid"]}
+            if r.get("usage"): data["usage"] = r["usage"]
             if r.get("timed_out"):
                 data["timed_out"] = True
                 data["error"] = r.get("error", "")
@@ -6305,6 +6411,22 @@ def do_chat(a):
                 hint=f'ag chat log {a.name}')
             return 124
         return emit(a,"chat",{"_text":f'[exit={r["exit"]}]'})
+    if a.sub=="usage":
+        ag_ = next((x for x in load_agents(sdir) if x.get("name")==a.name), None)
+        if not ag_: return emit(a,"chat",error=f"no such agent: {a.name}",hint="ag agents list")
+        u = load_chat_meta(sdir,a.name,agent=ag_).get("usage") or {}
+        if not u: return emit(a,"chat",{"_text":"(no usage recorded yet)","usage":{}})
+        occ = usage_occupancy(sdir,ag_)
+        if getattr(a,"json",False): return emit(a,"chat",{"usage":{**u,"occupancy":occ}})
+        l, t = u.get("last",{}), u.get("totals",{})
+        cs = lambda d: f'${d["cost"]:.4f}' if "cost" in d else "n/a"
+        txt = (f'{a.name} [{l.get("backend","")}] last turn: ctx={l.get("ctx","n/a")} in={l.get("in",0)} '
+            f'out={l.get("out",0)} cache_read={l.get("cache_read",0)} reasoning={l.get("reasoning",0)} cost={cs(l)}\n'
+            f'totals ({t.get("turns",0)} turns): in={t.get("in",0)} out={t.get("out",0)} '
+            f'cache_read={t.get("cache_read",0)} reasoning={t.get("reasoning",0)} cost={cs(t)}\n'
+            + (f'compaction occupancy: {occ["tokens"]} tokens (ctx {occ["ctx"]} - baseline {occ["base"]})' if occ
+               else 'compaction occupancy: n/a (no live session; chars//4 used)'))
+        return emit(a,"chat",{"_text":txt})
     if a.sub=="log":
         rows = load_chat_log(sdir,a.name)[-(a.limit or 20):]
         if getattr(a,"json",False): return emit(a,"chat",{"log":rows})
@@ -8633,6 +8755,33 @@ def do_selfcheck(a):
         assert ev[1]==("tool","bash ls")
         assert backend_argv("claude",model="sonnet",workdir=".",sid="s1",prompt="hi")==["claude","-p","--verbose","--output-format","stream-json","--include-partial-messages","--model","sonnet","--resume","s1","hi"]
         assert "--session" in backend_argv("opencode",model="",workdir=".",sid="ses_9",prompt="hi")
+        # usage: real captured lines (claude haiku 2026-10, codex exec 0.160, opencode 1.18.31)
+        _cu = parse_usage("claude",'{"type":"assistant","message":{"content":[{"type":"text","text":"Ready."}],"usage":{"input_tokens":10,"cache_creation_input_tokens":16367,"cache_read_input_tokens":17578,"output_tokens":4}},"parent_tool_use_id":null}')
+        assert _cu=={"ctx":33955,"final":False}, _cu
+        assert parse_usage("claude",'{"type":"assistant","parent_tool_use_id":"t1","message":{"usage":{"input_tokens":9}}}') is None
+        _cr = parse_usage("claude",'{"type":"result","subtype":"success","total_cost_usd":0.0791619,"usage":{"input_tokens":19,"cache_creation_input_tokens":36023,"cache_read_input_tokens":33919,"output_tokens":741,"output_tokens_details":{"thinking_tokens":654}}}')
+        assert _cr["in"]==69961 and _cr["out"]==741 and _cr["cache_read"]==33919 and _cr["reasoning"]==654 and abs(_cr["cost"]-0.0791619)<1e-9 and _cr["final"], _cr
+        _ac = usage_merge(usage_merge({},_cu),_cr)
+        assert _ac["ctx"]==33955 and _ac["in"]==69961, _ac   # ctx = last call, totals = aggregate
+        _cx = parse_usage("codex",'{"type":"turn.completed","usage":{"input_tokens":19090,"cached_input_tokens":13184,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}')
+        assert _cx["ctx"]==19090 and _cx["cache_read"]==13184 and _cx["out"]==5, _cx
+        _co = parse_usage("opencode",'{"type":"step_finish","sessionID":"ses_1","part":{"reason":"stop","type":"step-finish","tokens":{"total":26050,"input":26028,"output":5,"reasoning":17,"cache":{"write":0,"read":0}},"cost":0}}')
+        assert _co["ctx"]==26028 and _co["reasoning"]==17 and _co["cost"]==0 and not _co["final"], _co
+        assert usage_merge(usage_merge({},_co),_co)["out"]==10   # opencode steps add
+        assert parse_usage("claude","not json") is None and parse_usage("echo",'{"type":"result"}') is None
+        # usage persistence + compaction occupancy (fresh session baseline, growth after)
+        (td/"chats").mkdir(exist_ok=True)
+        _ag = {"name":"u1","backend":"codex"}
+        save_chat_meta(td,"u1",{"backend":"codex","sid":"t1","sids":{"codex":"t1"}})
+        assert usage_occupancy(td,_ag) is None
+        usage_record(td,"u1","codex","t1",True,dict(_cx))
+        usage_record(td,"u1","codex","t1",False,dict(_cx,ctx=25090,out=7))
+        _oc = usage_occupancy(td,_ag)
+        assert _oc=={"ctx":25090,"base":19090,"tokens":6000}, _oc
+        _um = load_chat_meta(td,"u1")["usage"]
+        assert _um["totals"]["turns"]==2 and _um["totals"]["out"]==12, _um
+        save_chat_meta(td,"u1",{"backend":"codex","sid":"","sids":{}})   # compaction clears sid
+        assert usage_occupancy(td,_ag) is None
         assert cycle_model("claude","sonnet")=="opus"
         assert backend_argv("cursor",model="",workdir=".",sid="",prompt="hi")[:3]==[_cursor_bin(),"-p","--output-format"]
         assert backend_argv("cursor",model="gpt-5",workdir=".",sid="c1",prompt="hi")==[_cursor_bin(),"-p","--output-format","stream-json","--stream-partial-output","--model","gpt-5","--resume","c1","hi"]
@@ -9110,6 +9259,7 @@ def build():
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
     chs2.add_argument("--command",default=None,help="opencode native custom command (message becomes its args)")
     chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded")
+    chu=chs.add_parser("usage",help="last-turn + total provider token usage"); chu.add_argument("name")
     chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--limit",type=int,default=20)
     ho=sub.add_parser("handoff",help="native interactive TUI argv + profile env (no global writes)"); ho.add_argument("agent"); ho.add_argument("backend",nargs="?",default=""); ho.add_argument("--spawn",action="store_true",help="start tracked pty session, print id + attach"); ho.add_argument("--exec",action="store_true",help="exec native TUI now (TTY only)")
     sub.add_parser("status",help="orchestration overview")

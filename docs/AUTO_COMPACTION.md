@@ -110,3 +110,26 @@ Native sessions (`handoff --exec`, TUI `H`, `/handoff`) bypass `run_turn`:
 no auto trigger there and the backend keeps its own full context. The
 durable `summary` row is still in the chat log for the next headless turn.
 No global config is rewritten for this.
+
+## Real provider usage (token trigger)
+
+Each headless turn records provider-reported usage in chat meta
+(`meta.usage = {last, totals, base}`); `ag chat usage NAME [--json]` shows it
+and `chat send --json` returns a short `usage` field. Extractor:
+`parse_usage(backend, line)` (pure, separate from `parse_events`).
+
+| backend | source | ctx (prompt size of last call) |
+|---|---|---|
+| claude | `assistant.message.usage` (per call) + `result.usage`/`total_cost_usd` (turn aggregate) | input + cache_read + cache_creation |
+| codex | `turn.completed.usage` | `input_tokens` (aggregate over the turn's calls: upper bound after tool loops) |
+| opencode | `step_finish.part.tokens/cost` (per step, summed) | input + cache.read + cache.write |
+| gemini/cursor | not verifiable (unauthenticated here) | not parsed; chars//4 |
+
+Compaction only resets the *native session*, so the token trigger uses real
+numbers only while that session is live. Raw ctx includes a fixed ~16-30k
+system/tool baseline that chars//4 never counted, so the trigger uses
+**growth = ctx - baseline**, baseline = ctx of the first turn of the session
+(recorded when the turn starts without a sid). It falls back to chars//4
+when: no usage yet, backend changed, or sids were cleared (just compacted,
+so no ping-pong). `compact show` reports `used_tokens` and `used_source`
+(`provider`|`chars//4`); `est_tokens` stays the chars estimate.

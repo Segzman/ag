@@ -271,7 +271,13 @@ ag chat steer w "text" [--json]      # interrupt running turn, run this next on 
 - **Transient retry:** rate limit, overload, 503/529, connection reset: up to 2 retries (2s, 6s) only if the attempt produced no output. Guard stays held, user row not duplicated, `--timeout` bounds the whole turn. `AG_RETRY=0` disables.
 - codex headless turns resume via `exec --json`; gemini turns are stateless (history replay).
 - **Provider probe:** `ag agents doctor [--refresh] [--json]` shows installed, version, compat (`COMPAT` min-version table: ok/graceful/broken/unknown) and auth (`claude auth status`, `codex login status`, `agent status`, `opencode auth list`; gemini = unknown). Cached 60s in `$AG_CACHE_HOME/providers.json`. Turns pre-flight it: definitely logged out fails fast with `not logged in to <backend>: <hint>` (no launch, no retry); unknown proceeds. `AG_PROBE=0` disables.
-- Daemon crash (`kill -9`): sessions go `stale`, pending wake does not fire.
+- Daemon crash (`kill -9`): sessions go `stale`; the pending wake fires once on the next reconcile (`ag sessions`/`snap`/`wait`/`kill`).
+
+## Reap lost wakes, process view
+
+`ag wakes --reap [--dry-run] [--include-running] [--agent A] [--max-attempts 3]` relaunches wake jobs whose worker died (`lost_status` recorded when reconcile fails a dead job). Default: only jobs lost while `queued`; `--include-running` also relaunches jobs lost mid-turn, prefixing the message `[reap] previous attempt was interrupted mid-turn; verify state before redoing.` The retry carries `retry_of` + `attempts+1`; the old job gets `reaped_by`. Double/concurrent reap launches once (O_EXCL claim in `wake/reap/`).
+
+`ag agents ps [--tree] [--json]`: per agent state (turn/wake/handoff), pids, procs, %CPU, RSS MB, elapsed, backend. One `ps` call; descendants by ppid + same pgid; records that predate the process start (pid reuse) are ignored.
 
 ## Capabilities and permission modes
 
@@ -348,7 +354,7 @@ System-prompt presets per agent: `ag roles list|show|add|set|rm|reset NAME`. Bui
 ## Limitations (honest)
 
 - Wake is at-most-once *launch*, not completion: a crash between claim and enqueue, or `kill -9` of a worker, can lose/stall it. Check `events` for a missing `wake` after `exit`, `wakes` for dead sessions. No retry scheduler (transient-error retry is per turn only).
-- Daemon `kill -9`: sessions go `stale` (`exit=-1`), pending wake does not fire (`wake_fired:false` in `status`). Re-wake manually.
+- Daemon `kill -9`: sessions go `stale` (`exit=-1`); the pending wake fires once on the next reconcile (exactly-once via `wake.claimed`).
 - While a turn runs its agent's guard is held: other turns on that agent block; backend/profile/model switches refuse. No queue fairness/priority/FIFO.
 - Message cap 4000 chars (truncated). `wake/jobs` is never pruned by `forget`.
 - POSIX only (`spawn`/workers need the pty daemon; TUI needs curses). Secret popup is macOS only.

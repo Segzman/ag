@@ -337,6 +337,8 @@ def _reconcile_stale(sdir, sp, st, *, grace_s=2.0):
     leaves on_exit intact for wake integration; emits one 'stale' event
     (not 'exit') so wake can decide fire vs missed exactly-once."""
     try:
+        if st.get("stale") and st.get("wake_agent") and not st.get("wake_fired"):
+            maybe_fire_wake(sdir, sp, st, st.get("exit"))  # daemon kill -9: fire the pending wake once (wake.claimed O_EXCL)
         if not st.get("running"): return st, False
         if st.get("exit") is not None: return st, False
         if st.get("stale"): return st, False
@@ -359,6 +361,9 @@ def _reconcile_stale(sdir, sp, st, *, grace_s=2.0):
         _swrite(sp, fresh)
         _event(sdir,"stale",fresh.get("id"),exit=-1,daemon_gone=True,
             cmd=fresh.get("cmd"))
+        if fresh.get("wake_agent") and not fresh.get("wake_fired"):
+            try: maybe_fire_wake(sdir, sp, fresh, -1)
+            except Exception: pass
         return fresh, True
     except Exception:
         return st, False
@@ -873,7 +878,7 @@ def _wake_reconcile(sdir, job):
             reason = "worker gone" + (" (stale daemon)" if sess_stale else "")
             if sess_exit not in (None, 0):
                 reason += f" exit={sess_exit}"
-            return _wake_finish(sdir, jid, "failed", error=reason, exit_code=-1)
+            return _wake_finish(sdir, jid, "failed", error=reason, exit_code=-1, fields={"lost_status": job.get("status")})
         try: timeout_s = float(job.get("timeout_s") or 0)
         except Exception: timeout_s = 0
         if timeout_s > 0 and not job.get("stalled"):
@@ -997,8 +1002,66 @@ def do__wake_run(a):
     _wake_finish(sdir, jid, "done", reply=r.get("reply", ""))
     return 0
 
+# ---- wakes --reap: relaunch jobs lost to a dead worker (exactly once per lost job) ----
+REAP_NOTE = "[reap] previous attempt was interrupted mid-turn; verify state before redoing."
+
+def wakes_reap(sdir, queued_only=True, include_running=False, agent=None, max_attempts=3, dry_run=False):
+    """Relaunch failed wake jobs whose worker died (lost_status queued; running only with include_running).
+    Claim = O_EXCL marker wake/reap/<old> (double/concurrent reap launches once); old job gets reaped_by.
+    Returns [{old,new,agent,attempts,lost_status,action}]; action: reaped|would-reap|skipped-*|error."""
+    _, jobs, _ = _wake_dirs(sdir); rd = jobs.parent / "reap"; out = []
+    allow = ("queued",) if (queued_only and not include_running) else ("queued", "running")
+    for pth in sorted(jobs.glob("*.json")):
+        try: j = json.loads(pth.read_text())
+        except Exception: continue
+        if j.get("status") != "failed" or j.get("lost_status") not in allow: continue
+        if agent and j.get("agent") != agent: continue
+        if j.get("reaped_by"): continue
+        at = int(j.get("attempts") or 1)
+        row = {"old": j["id"], "agent": j.get("agent"), "attempts": at + 1, "lost_status": j["lost_status"]}
+        if at >= max_attempts: out.append({**row, "action": "skipped-max-attempts"}); continue
+        if dry_run: out.append({**row, "action": "would-reap"}); continue
+        rd.mkdir(parents=True, exist_ok=True); mk = rd / re.sub(r"[^A-Za-z0-9_.-]", "_", j["id"])[:64]
+        try: os.close(os.open(mk, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            try:
+                if time.time() - mk.stat().st_mtime < 120 or _wake_read_job(sdir, j["id"]).get("reaped_by"): continue
+                mk.unlink(); os.close(os.open(mk, os.O_CREAT | os.O_EXCL | os.O_WRONLY))  # crashed claimer: take over
+            except Exception: continue
+        msg = j.get("message", "")
+        if j["lost_status"] == "running" and not msg.startswith("[reap]"): msg = REAP_NOTE + "\n" + msg
+        r = launch_wake_chat(sdir, j["agent"], msg, trigger=j.get("trigger"), exit_code=j.get("exit"),
+            notify=j.get("notify", ""), on_done=j.get("on_done", ""), timeout_s=j.get("timeout_s", 0),
+            max_runtime_s=j.get("max_runtime_s", 0), job_type=j.get("job"),
+            cohort=({"parent": j["parent"], "group": j["group"], "quiet_s": 0} if j.get("group") else None),
+            extra={"retry_of": j["id"], "attempts": at + 1})
+        if "error" in r:
+            try: mk.unlink()
+            except Exception: pass
+            out.append({**row, "action": "error", "error": r["error"]}); continue
+        lk = _acquire_wake_job(sdir, j["id"])
+        try:
+            cur = _wake_read_job(sdir, j["id"]); cur["reaped_by"] = r["job"]; _wake_write_job(sdir, cur)
+        finally: _release_wake_job(lk)
+        _event(sdir, "wake_reap", j.get("trigger"), agent=j["agent"], job=r["job"], old=j["id"])
+        out.append({**row, "new": r["job"], "action": "reaped"})
+    return out
+
+def do_wakes_reap(a, sdir):
+    for p in sorted(_wake_dirs(sdir)[1].glob("*.json")):  # reconcile first so dead workers get lost_status
+        try: j = json.loads(p.read_text())
+        except Exception: continue
+        if j.get("status") in ("queued", "running"):
+            try: _wake_reconcile(sdir, j)
+            except Exception: pass
+    rows = wakes_reap(sdir, queued_only=True, include_running=bool(getattr(a, "include_running", False)),
+        agent=getattr(a, "agent", None), max_attempts=int(getattr(a, "max_attempts", 3) or 3), dry_run=bool(getattr(a, "dry_run", False)))
+    if getattr(a, "json", False): return emit(a, "wakes", {"reaped": rows})
+    return emit(a, "wakes", {"_text": "\n".join(f'{r["old"]} {r["action"]}' + (f' -> {r["new"]}' if r.get("new") else "") + f' ({r["agent"]} lost={r["lost_status"]} attempt {r["attempts"]})' for r in rows) or "(nothing to reap)"})
+
 def do_wakes(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
+    if getattr(a, "reap", False): return do_wakes_reap(a, sdir)
     if getattr(a, "cancel", None) and getattr(a, "wait", None):
         return emit(a, "wakes", error="--cancel and --wait are incompatible",
             hint="ag wakes --cancel JOB  or  ag wakes --wait JOB")
@@ -6406,8 +6469,105 @@ def do_receipts(a):
         except OSError: pass
     return emit(a,"receipts",{"_text":f"removed {n} receipts","removed":n})
 
+# ---- agents ps: live process trees per agent (turn / wake / handoff) ----
+def _etime_s(e):
+    try:
+        d, _, r = e.partition("-") if "-" in e else ("0", "", e)
+        p = [int(x) for x in r.split(":")]; p = [0] * (3 - len(p)) + p
+        return int(d) * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
+    except Exception: return 0
+
+def _ps_table():
+    """{pid: {ppid,pgid,cpu,rss_mb,etime_s,comm}} from ONE ps call."""
+    try: out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,pcpu=,rss=,etime=,comm="], capture_output=True, text=True, timeout=10).stdout
+    except Exception: return {}
+    t = {}
+    for ln in out.splitlines():
+        f = ln.split(None, 6)
+        if len(f) < 7: continue
+        try: t[int(f[0])] = {"ppid": int(f[1]), "pgid": int(f[2]), "cpu": float(f[3]), "rss_mb": int(f[4]) / 1024.0, "etime_s": _etime_s(f[5]), "comm": f[6]}
+        except Exception: continue
+    return t
+
+def _ps_started(pid):
+    try:
+        o = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5, env={**os.environ, "LC_ALL": "C"}).stdout.strip()
+        return time.mktime(time.strptime(o, "%a %b %d %H:%M:%S %Y")) if o else None
+    except Exception: return None
+
+def _ps_root_ok(pid, ts, comm, backend):
+    """pid-reuse guard: record written at/after process start (1s slack) and comm plausible."""
+    c = os.path.basename(comm or "").lower()
+    if not (backend and backend.lower() in c or c.startswith(("python", "node", "bun", "sh", "bash", "zsh", "env", "ag", "sleep", "claude", "opencode", "codex", "gemini", "agent"))): return False
+    st = _ps_started(pid)
+    if st is None: return False
+    try: t = datetime.fromisoformat(ts).timestamp() if isinstance(ts, str) else float(ts)
+    except Exception: return True
+    return st <= t + 1
+
+def _ps_tree(table, root, pgid=None):
+    """root pid + descendants (by ppid) + same-pgid procs."""
+    if root not in table: return []
+    kids = {}
+    for p, r in table.items(): kids.setdefault(r["ppid"], []).append(p)
+    seen, stack = set(), [root]
+    while stack:
+        p = stack.pop()
+        if p in seen: continue
+        seen.add(p); stack.extend(kids.get(p, []))
+    if pgid:
+        seen |= {p for p, r in table.items() if r["pgid"] == pgid}
+    return sorted(seen)
+
+def agents_ps(sdir, table=None):
+    table = table if table is not None else _ps_table()
+    be = {r.get("name"): r.get("backend", "") for r in load_agents(sdir)}
+    roots = []  # (agent, state, pid, pgid, ts)
+    for a in be:
+        r = None
+        try: r = json.loads((_qdir(sdir, a) / "running.json").read_text())
+        except Exception: pass
+        if r and r.get("pid"): roots.append((a, "turn", int(r["pid"]), r.get("pgid"), r.get("ts")))
+        try:
+            m = json.loads(_handoff_marker_path(sdir, a).read_text()); pid = m.get("pid") or 0
+            if not pid and m.get("session"):
+                hit, _ = resolve_sess(sdir, m["session"]); pid = (hit[1].get("child_pid") or hit[1].get("daemon_pid")) if hit and hit[1].get("running") else 0
+            if pid: roots.append((a, "handoff", int(pid), None, m.get("ts") or m.get("started_at")))
+        except Exception: pass
+    _, jobs, _ = _wake_dirs(sdir)
+    for p in jobs.glob("*.json"):
+        try:
+            j = json.loads(p.read_text())
+            if j.get("status") != "running" or j.get("agent") not in be: continue
+            st = _sstatus(_sroot(sdir) / j["session"]); pid = st.get("daemon_pid")
+            if st.get("running") and pid: roots.append((j["agent"], "wake", int(pid), None, st.get("started_at")))
+        except Exception: continue
+    rows = []
+    for a, state, pid, pgid, ts in roots:
+        proc = table.get(pid)
+        if not proc or not _ps_root_ok(pid, ts, proc["comm"], be.get(a, "")): continue
+        pids = _ps_tree(table, pid, pgid)
+        rows.append({"agent": a, "state": state, "pids": pids, "root": pid, "procs": len(pids),
+            "cpu": round(sum(table[x]["cpu"] for x in pids), 1), "rss_mb": round(sum(table[x]["rss_mb"] for x in pids), 1),
+            "elapsed_s": proc["etime_s"], "backend": be.get(a, ""), "comm": proc["comm"]})
+    return rows
+
+def do_agents_ps(a, sdir):
+    rows = agents_ps(sdir)
+    if getattr(a, "json", False): return emit(a, "agents", {"ps": rows})
+    if not rows: return emit(a, "agents", {"_text": "(no running agents)"})
+    L = [f'{"AGENT":12} {"STATE":8} {"PIDS":18} {"PROCS":>5} {"%CPU":>6} {"RSS_MB":>8} {"ELAPSED":>8} BACKEND']
+    for r in rows:
+        pd = ",".join(map(str, r["pids"][:3])) + ("+" if len(r["pids"]) > 3 else "")
+        L.append(f'{r["agent"][:12]:12} {r["state"]:8} {pd:18} {r["procs"]:>5} {r["cpu"]:>6.1f} {r["rss_mb"]:>8.1f} {r["elapsed_s"]:>7}s {r["backend"]}')
+        if getattr(a, "tree", False):
+            tb = _ps_table()
+            for x in r["pids"]: L.append(f'  {x:>7} ppid={tb[x]["ppid"]} {tb[x]["comm"]}' if x in tb else f'  {x:>7} (gone)')
+    return emit(a, "agents", {"_text": "\n".join(L)})
+
 def do_agents(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
+    if a.sub=="ps": return do_agents_ps(a, sdir)
     if a.sub=="doctor":
         bs = ["claude","opencode","gemini","codex","echo","cursor"]
         snap = providers_snapshot(bs, refresh=getattr(a,"refresh",False), deadline=12)
@@ -10393,6 +10553,7 @@ def do_selfcheck(a):
         assert do_roles(mk(sub="rm",name="rev"))==0
         assert do_chat(mk(sub="log",name="t1",limit=5))==0
         _ckpt_selfcheck()
+        assert _etime_s("1-02:03:04")==93784 and _etime_s("05:09")==309 and _ps_tree({1:{"ppid":0,"pgid":1},2:{"ppid":1,"pgid":1},3:{"ppid":2,"pgid":3}},1)==[1,2,3]
         assert do_agents(mk(sub="rm",name="t1",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
         append_chat(td,"t1","user","hello")
         assert "user: hello" in recent_history(td,"t1")
@@ -11629,6 +11790,7 @@ def build():
     hp.set_defaults(psub="list")
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
+    agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
     aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
     ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login")
@@ -11672,7 +11834,7 @@ def build():
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
     wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)")
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
-    ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50); ws.add_argument("--wait",default=None); ws.add_argument("--timeout",type=int,default=30); ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)")
+    ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50); ws.add_argument("--wait",default=None); ws.add_argument("--timeout",type=int,default=30); ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3)
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
     hosts=sub.add_parser("hosts",help="outbound SSH host and project mappings"); hsub=hosts.add_subparsers(dest="hostsub",required=True)
     hsub.add_parser("list")

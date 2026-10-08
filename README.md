@@ -376,6 +376,10 @@ ag agents rm w1 --force                  # dirty: drops worktree + uncommitted w
 
 `add` prints the branch so an orchestrator can merge it (`git merge ag/w1`); ag has no merge command. An existing identical worktree is reused; any other clash on branch or path errors with a hint.
 
+## Stale-session recovery and transient retry
+
+If a backend no longer knows the stored session id ("Session not found", "No conversation found...", "no rollout found..."), `ag` clears that backend's sid, replays recent history into a fresh session, relaunches once, and logs a `[resume] ... started fresh` tool note. Rate limits, overload, 503/529 and connection resets are retried up to 2 times (2s, 6s backoff), only when the failed attempt produced no output. The per-agent turn guard stays held, the user row is never duplicated, and `--timeout` still bounds the whole turn. Disable with `AG_RETRY=0`.
+
 ## Docs
 
 - [Harness selection + behavior presets](docs/HARNESS_ROLES.md): `harness use/current`, per-backend models, editable/reset roles.

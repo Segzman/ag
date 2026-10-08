@@ -5992,7 +5992,7 @@ def _kill_tree(p, grace_s=2.0):
     try: p.wait(timeout=5)
     except subprocess.TimeoutExpired: pass
 
-def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0):
+def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0,_rs=None):
     """One prompt turn. on_event(name,kind,text). Returns {sid,exit,reply} or {error}.
     command: opencode-only native custom command (opencode run --command);
     message text becomes its args (bare, no history/role prepend). Others reject.
@@ -6023,11 +6023,11 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
     # Single shared guard: block here while another process runs this agent,
     # then re-read the roster under lock so a concurrent mutation cannot slip
     # between our snapshot and the backend launch.
-    _turn_lock = _acquire_agent_turn(sdir, name)
+    _turn_lock = _rs["lock"] if _rs else _acquire_agent_turn(sdir, name)
     try:
-        _t_guard = time.monotonic()
+        _t_guard = _rs["t0"] if _rs else time.monotonic()
         timeout_s = _valid_runtime(timeout_s) or 0
-        if on_start is not None:
+        if on_start is not None and not _rs:
             on_start()
         agents = {x["name"]:x for x in load_agents(sdir)}
         if name not in agents:
@@ -6077,7 +6077,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             # native custom command: message text is command args, sent bare.
             prompt = text
         else:
-            hist = "" if (sid and backend in ("claude","opencode","cursor","codex")) else recent_history(sdir,name)
+            hist = _rs["hist"] if _rs and "hist" in _rs else "" if (sid and backend in ("claude","opencode","cursor","codex")) else recent_history(sdir,name)
             prompt = (hist+"\n\n---\n"+text) if hist else text
         sys_txt = eff_system(sdir, a)
         # harness profile: instructions/memory/skills context must reach backend
@@ -6110,13 +6110,13 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         user_eid = tl_new_id()
         user_persist_ok = True
         try:
-            append_chat(sdir,name,"user",text,event_id=user_eid)
+            if not _rs: append_chat(sdir,name,"user",text,event_id=user_eid)
         except Exception:
             user_persist_ok = False
         buf = TimelineBuffer(sdir,name,on_event)
         if not user_persist_ok:
             buf.persist_failed = True
-        buf.user_row(text, user_eid)
+        if not _rs: buf.user_row(text, user_eid)
         mark_running(name,True)
         chunks, sid_new, rc, err = [], "", 0, ""
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
@@ -6225,6 +6225,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             rc = 124
             err = (err + f"\nmax-runtime {timeout_s:g}s exceeded (backend killed)").strip()
         full = "\n".join(c for c in chunks if c).strip()
+        _nx = None if command else _retry_plan(sdir,name,backend,sid,rc,err,_timed_out["hit"],bool(full) or any(r.get("role")!="user" for r in buf.rows.values()),_rs,_turn_lock,_t_guard,timeout_s,on_event)
+        if _nx: return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs=_nx)
         if rc != 0:
             # record failure even when prose already streamed; never fake ok.
             buf.error(f"(exit {rc}) " + ((err.strip().splitlines()[-3:] or [""])[-1][:300] or "turn failed"))
@@ -6268,7 +6270,62 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             out["persist_error"] = True
         return out
     finally:
-        _release_agent_turn(_turn_lock)
+        if not _rs: _release_agent_turn(_turn_lock)
+
+# ---- stale-session recovery + bounded transient retry (ported from T3 Code) ----
+# Opt out: AG_RETRY=0. resume_missing: backend lost our sid -> clear it, replay
+# history, relaunch once. transient: 429/5xx/network -> <=2 retries (2s,6s), only
+# when the failed attempt produced nothing. Guard stays held; user row never dup'd.
+RETRY_BACKOFF_S = (2, 6)
+_RESUME_MISSING_RE = re.compile(
+    r"no conversation found with session id|session not found|no rollout found for thread"
+    r"|(?:conversation|thread|chat) not found|could not find (?:session|conversation)"
+    r"|invalid session", re.I)
+_TRANSIENT_RE = re.compile(
+    r"\b429\b|rate.?limit|too many requests|overloaded|\b529\b|\b503\b|service unavailable"
+    r"|econnreset|stream (?:closed|ended|disconnected)|connection reset", re.I)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+def classify_turn_failure(backend, rc, stderr, got_output):
+    """Pure. -> "resume_missing" | "transient" | None. Output already produced = None."""
+    if not rc or got_output: return None
+    t = _ANSI_RE.sub("", stderr or "")
+    if _RESUME_MISSING_RE.search(t): return "resume_missing"
+    if _TRANSIENT_RE.search(t): return "transient"
+    return None
+
+def _retry_plan(sdir,name,backend,sid,rc,err,timed_out,got_output,rs,lock,t0,timeout_s,on_event):
+    """Decide + prepare a relaunch. Returns next run_turn _rs dict or None. Never raises."""
+    try:
+        if os.environ.get("AG_RETRY","1").strip() == "0" or timed_out: return None
+        kind = classify_turn_failure(backend, rc, err, got_output)
+        rs = rs or {"lock":lock,"t0":t0,"n":0,"resumed":False}
+        nx = dict(rs)
+        if kind == "resume_missing" and sid and not rs["resumed"]:
+            meta = load_chat_meta(sdir,name)
+            (meta.get("sids") or {}).pop(backend, None)
+            if meta.get("backend", backend) == backend: meta["sid"] = ""
+            save_chat_meta(sdir,name,meta)
+            rows = load_chat_log(sdir,name)
+            if rows and rows[-1].get("role") == "user": rows = rows[:-1]  # current msg is sent separately
+            rows = [r for r in rows if r.get("role") in ("user","agent")][-10:]
+            nx["hist"] = "\n".join(f'{r["role"]}: {r.get("text","")}' for r in rows)[-4000:]
+            nx["resumed"] = True
+            note = f"[resume] session {sid} not found; started fresh with history replay"
+            append_chat(sdir,name,"tool",note)
+            _event(sdir,"resume_recover",name,backend=backend,old_sid=sid)
+            if on_event: on_event(name,"tool",note)
+            return nx
+        if kind == "transient" and rs["n"] < len(RETRY_BACKOFF_S):
+            wait = RETRY_BACKOFF_S[rs["n"]]
+            if timeout_s and time.monotonic() + wait >= t0 + timeout_s: return None
+            _event(sdir,"transient_retry",name,backend=backend,attempt=rs["n"]+1,wait=wait,exit=rc)
+            time.sleep(wait)
+            nx["n"] = rs["n"] + 1
+            return nx
+    except Exception:
+        pass
+    return None
 
 def do_handoff(a):
     """Native interactive handoff reachable from CLI.
@@ -9103,6 +9160,15 @@ def do_selfcheck(a):
         assert do_harness(mk(sub="profile", psub="set", agent="pa", profile="", none=True))==0
         assert do_harness(mk(sub="profile", psub="rm", pname="p1", force=True))==0
         assert do_agents(mk(sub="rm",name="pa",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
+    # stale-session / transient classification (real CLI strings captured 2026-10-08)
+    for _b,_e in (("claude","No conversation found with session ID: 00000000-0000-4000-8000-000000000000"),
+            ("opencode","\x1b[91m\x1b[1mError: \x1b[0mSession not found"),
+            ("codex","Error: thread/resume: thread/resume failed: no rollout found for thread id 0000 (code -32600)")):
+        assert classify_turn_failure(_b,1,_e,False)=="resume_missing", _b
+        assert classify_turn_failure(_b,1,_e,True) is None and classify_turn_failure(_b,0,_e,False) is None
+    for _e in ("API Error: 429 rate_limit_error","Overloaded","HTTP 529","503 Service Unavailable","read ECONNRESET","stream closed unexpectedly"):
+        assert classify_turn_failure("claude",1,_e,False)=="transient", _e
+    assert classify_turn_failure("claude",1,"Authentication required",False) is None
     print(f"selfcheck ok ({td})")
     return 0
 

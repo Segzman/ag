@@ -65,7 +65,7 @@ class Modes(unittest.TestCase):
         self.assertFalse({x["name"]:x for x in json.loads(self.ag("--json","agents","list"))["data"]["agents"]}["m1"]["mode"])
         out = self.ag("agents","add","e1","--backend","echo","--mode","ro"); self.assertIn("[mode] echo", out)
         d = json.loads(self.ag("--json","agents","caps"))["data"]["caps"]
-        self.assertEqual([x["backend"] for x in d], ["claude","opencode","codex","gemini","cursor","echo"])
+        self.assertEqual([x["backend"] for x in d], ["claude","opencode","codex","gemini","cursor","echo","acp"])
         for k in ("resume","system_flag","mcp_flag","skills","interrupt","usage","modes","native_enforce"): self.assertIn(k, d[0])
         self.assertFalse(d[-1]["native_enforce"])
         self.assertEqual(json.loads(self.ag("--json","agents","caps","codex"))["data"]["caps"][0]["backend"], "codex")

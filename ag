@@ -4482,6 +4482,7 @@ def parse_events(backend, line):
     """-> [(kind, text)]; kinds: text|tool|done|meta. Pure, no I/O."""
     line = line.strip()
     if not line: return []
+    if (_ao := _acp_obj(line)) is not None: return parse_events_acp(_ao)
     if backend=="claude": return _parse_claude(line)
     if backend=="opencode": return _parse_opencode(line)
     if backend=="codex": return _parse_codex(line)
@@ -4504,6 +4505,7 @@ def parse_usage(backend, line):
     try: o = json.loads(line)
     except Exception: return None
     if not isinstance(o, dict): return None
+    if "ag_acp" in o: return parse_usage_acp(o)
     t = o.get("type")
     if backend == "claude":
         if t == "assistant" and not o.get("parent_tool_use_id"):
@@ -4836,6 +4838,7 @@ def parse_timeline(backend, line, scope=None):
     -> each call uses a fresh ephemeral scope (legacy line-pure shape)."""
     line = line.strip()
     if not line: return []
+    if (_ao := _acp_obj(line)) is not None: return parse_timeline_acp(_ao)
     if backend == "claude": return parse_timeline_claude(line, scope)
     if backend == "opencode": return parse_timeline_opencode(line)
     if backend == "codex": return parse_timeline_codex(line)
@@ -6418,6 +6421,7 @@ def do_agents(a):
             ra = routing_now()[0][job]["ag"]; be = ra["backend"]; mod = mod or ra["model"]
             if be not in NATIVE_ORDER: return emit(a,"agents",error=f"routing for {job} names unknown backend {be!r}",hint="ag route; ag setup")
         mod = mod or "default"
+        if (_ae := acp_check(be, getattr(a,"transport",None) or "", getattr(a,"acp_cmd",None))): return emit(a,"agents",error=_ae)
         if be=="opencode" and mod in ("","default"): mod = OPENCODE_MODEL_DEFAULT
         wt, adir = None, a.adir or "."
         if getattr(a,"worktree",False):
@@ -6428,7 +6432,7 @@ def do_agents(a):
             "dir":adir,"role":a.role,"persona":pers,"system":getattr(a,"system",None) or "",
             "instructions":[s for s in (getattr(a,"instructions",None) or []) if (s or "").strip()],
             **({"mode":a.mode} if getattr(a,"mode",None) else {}),**({"plan":True} if getattr(a,"plan",None) else {}),
-            **({"worktree":wt} if wt else {})})
+            **({"worktree":wt} if wt else {}),**{k:getattr(a,k) for k in ("transport","acp_cmd") if getattr(a,k,None)}})
         save_agents(sdir,rows)
         _mw = mode_warning(be, getattr(a,"mode",None) or "", bool(getattr(a,"plan",None)))
         if _mw and not wt: return emit(a,"agents",{"_text":f"added {a.name}\n{_mw}","warning":_mw})
@@ -6466,6 +6470,11 @@ def do_agents(a):
             if a.mode not in MODES + ("",): return emit(a, "agents", error=f"bad mode: {a.mode}", hint='|'.join(MODES)+' ("" clears)')
             updates["mode"] = a.mode
         if getattr(a, "plan", None) is not None: updates["plan"] = a.plan
+        for k in ("transport", "acp_cmd"):
+            if getattr(a, k, None) is not None: updates[k] = getattr(a, k)
+        if "transport" in updates or "acp_cmd" in updates:
+            cur = next((r for r in rows if r["name"] == a.name), {})
+            if (_ae := acp_check(updates.get("backend") or cur.get("backend", "claude"), updates.get("transport", cur.get("transport", "")), updates.get("acp_cmd", cur.get("acp_cmd")))): return emit(a, "agents", error=_ae)
         if getattr(a, "worktree", False):
             cur = next((r for r in rows if r["name"] == a.name), None)
             if cur is None: return emit(a, "agents", error=f"no such agent: {a.name}")
@@ -7267,6 +7276,328 @@ def _ckpt_selfcheck():
         try: shutil.rmtree(sd, ignore_errors=True)
         except NameError: pass
 
+# --- ACP transport (Agent Client Protocol over stdio; ported from T3 Code AcpSessionRuntime/AcpClientPolicy) ---
+# Opt-in: `agents set W --transport acp` (gemini/cursor/opencode) or `agents add W --backend acp --acp-cmd "x --acp"`.
+# AG_ACP=0 kills it globally. run_turn launches a private `_acp` bridge (stdin DEVNULL) through _turn_argv: the
+# bridge speaks JSON-RPC to the agent and prints `{"ag_acp":...}` lines that parse_events/timeline/usage route to
+# the acp parsers, so timeouts, `ag stop`, queue pids and retries stay run_turn's. Pre-prompt failure -> one
+# `[acp] fallback to cli` exec of the normal argv (decision 2); never after session/prompt was sent.
+ACP_BACKENDS = ("gemini", "cursor", "opencode")
+ACP_MAX_MSG = 4 << 20
+ACP_INIT_S, ACP_LOAD_S = 15, 30
+CAPS["acp"] = {**_CAP_BASE, "resume": True, "modes": list(MODES)}
+
+class AcpErr(Exception):
+    """kind: fallback (pre-prompt, rerun via cli) | auth | load_missing | fatal."""
+    def __init__(self, kind, msg): super().__init__(msg); self.kind = kind
+
+def acp_on(a, backend, command=None):
+    return (not command and os.environ.get("AG_ACP", "1").strip() != "0"
+        and (backend == "acp" or (a.get("transport") == "acp" and backend in ACP_BACKENDS)))
+
+def acp_check(backend, transport, acp_cmd):
+    """Agent-row validation -> error string or ''."""
+    if transport == "acp" and backend not in ACP_BACKENDS + ("acp",):
+        return f"--transport acp needs backend {'/'.join(ACP_BACKENDS)} (or --backend acp --acp-cmd CMD)"
+    if backend == "acp" and not (acp_cmd or "").strip(): return '--backend acp needs --acp-cmd "agent --acp"'
+    return ""
+
+def acp_argv(backend, a, model, workdir):
+    if backend == "gemini": return ["gemini", "--acp"] + (["-m", model] if model else [])
+    if backend == "cursor": return [_cursor_bin(), "acp"]
+    if backend == "opencode": return [_opencode_bin(), "acp", "--cwd", workdir]
+    return shlex.split(a.get("acp_cmd") or "")
+
+def acp_bridge_argv(sdir, a, backend, model, workdir, sid, prompt, cli):
+    if backend == "acp" and os.environ.get("AG_ACP", "1").strip() == "0":
+        raise ValueError(f"agent {a.get('name')} is ACP-only and AG_ACP=0")
+    m = eff_model(backend, model)
+    spec = {"sdir": str(sdir), "name": a.get("name", ""), "argv": acp_argv(backend, a, m, workdir), "cli": cli,
+        "workdir": workdir, "sid": sid, "prompt": prompt, "mode": "ro" if a.get("plan") else (a.get("mode") or "edits"),
+        "model": "" if backend == "gemini" else m}  # gemini takes -m at launch
+    return [sys.executable, ag_script_path(), "_acp", json.dumps(spec)]
+
+def _acp_canon(path):
+    """realpath of the deepest existing ancestor + missing suffix; None = fail closed (broken symlink etc.)."""
+    cand, miss = path, []
+    while True:
+        if os.path.lexists(cand):
+            if os.path.islink(cand) and not os.path.exists(cand): return None
+            try: return os.path.join(os.path.realpath(cand), *miss)
+            except OSError: return None
+        par = os.path.dirname(cand)
+        if par == cand: return None
+        miss.insert(0, os.path.basename(cand)); cand = par
+
+def acp_inside(path, root):
+    if not isinstance(path, str) or not path.strip(): return False
+    p = path if os.path.isabs(path) else os.path.join(root, path)
+    cp, cr = _acp_canon(p), _acp_canon(root)
+    return bool(cp and cr) and (cp == cr or cp.startswith(cr.rstrip(os.sep) + os.sep))
+
+def acp_permission(tc, mode, workdir):
+    """True = allow. read/search/think/fetch always; edit/delete/move at >=edits with every location inside
+    workdir (none given = deny); execute/other at auto/full; full allows all."""
+    kind = (tc or {}).get("kind") or "other"
+    r = MODES.index(mode) if mode in MODES else MODES.index("edits")
+    if kind in ("read", "search", "think", "fetch") or mode == "full": return True
+    if kind in ("edit", "delete", "move"):
+        locs = [l.get("path") for l in (tc.get("locations") or []) if isinstance(l, dict)]
+        return r >= MODES.index("edits") and bool(locs) and all(acp_inside(p, workdir) for p in locs)
+    return r >= MODES.index("auto")
+
+def _acp_pick(options, allow):
+    want = "allow_once" if allow else "reject_once"
+    return next((o.get("optionId") for o in options or [] if isinstance(o, dict) and o.get("kind") == want), None)
+
+def _acp_model_req(res, model):
+    """(method, params-without-sessionId) to select model, None if already current, or raise fallback."""
+    for o in (res or {}).get("configOptions") or []:
+        if isinstance(o, dict) and (o.get("category") == "model" or o.get("id") == "model"):
+            if o.get("currentValue") == model: return None
+            flat = []
+            for x in o.get("options") or []:
+                flat += x.get("options") if isinstance(x, dict) and isinstance(x.get("options"), list) else [x]
+            vals = [x.get("value") for x in flat if isinstance(x, dict)]
+            if model not in vals: raise AcpErr("fallback", f"model {model} not offered over ACP")
+            return "session/set_config_option", {"configId": o.get("id"), "value": model}
+    ms = (res or {}).get("models")
+    if isinstance(ms, dict):
+        if ms.get("currentModelId") == model: return None
+        if model in [x.get("modelId") for x in ms.get("availableModels") or [] if isinstance(x, dict)]:
+            return "session/set_model", {"modelId": model}
+    raise AcpErr("fallback", f"model {model} cannot be set via ACP")
+
+def _acp_tool_out(u):
+    out = []
+    for c in u.get("content") or []:
+        if not isinstance(c, dict): continue
+        if c.get("type") == "content" and isinstance(c.get("content"), dict) and c["content"].get("text"): out.append(c["content"]["text"])
+        elif c.get("type") == "diff": out.append(f'diff {c.get("path","")}')
+    if not out and u.get("rawOutput") not in (None, ""):
+        ro = u["rawOutput"]
+        out.append(ro if isinstance(ro, str) else ro.get("output") if isinstance(ro, dict) and isinstance(ro.get("output"), str) else json.dumps(ro)[:4000])
+    return "\n".join(out)
+
+def acp_turn_lines(argv, env, workdir, sid, prompt, mode="edits", model="", ctl=None):
+    """Generator of `ag_acp` dicts for one ACP turn. Raises AcpErr. ctl["cancel"]() = session/cancel + kill."""
+    import queue as _q
+    ctl = ctl if ctl is not None else {}
+    try:
+        p = subprocess.Popen(argv, cwd=workdir, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=(os.name == "posix"))
+    except OSError as e: raise AcpErr("fallback", f"launch failed: {e}")
+    _backend_note(p.pid)
+    q, err, st = _q.Queue(), [], {"sid": sid or "", "prompt": None, "n": 0, "seg": 0, "txt": "", "mid": None, "notes": 0}
+    def _rd():
+        try:
+            while True:
+                l = p.stdout.readline(ACP_MAX_MSG + 1)
+                if not l: break
+                if len(l) > ACP_MAX_MSG and not l.endswith(b"\n"):
+                    while l and not l.endswith(b"\n"): l = p.stdout.readline(ACP_MAX_MSG)
+                    err.append(b"[acp] dropped message > 4MB\n"); continue
+                try: m = json.loads(l)
+                except Exception: continue  # non-JSON stdout noise
+                if isinstance(m, dict): q.put(m)
+        except Exception: pass
+        q.put(None)
+    threading.Thread(target=_rd, daemon=True).start()
+    threading.Thread(target=lambda: [err.append(x) for x in iter(p.stderr.readline, b"")], daemon=True).start()
+    def send(o):
+        try: p.stdin.write((json.dumps(o) + "\n").encode()); p.stdin.flush(); return True
+        except Exception: return False
+    def req(method, params):
+        st["n"] += 1; send({"jsonrpc": "2.0", "id": st["n"], "method": method, "params": params}); return st["n"]
+    def stderr_tail(): return b"".join(err).decode("utf-8", "replace").strip()[-300:]
+    def note(text):
+        st["notes"] += 1
+        return {"ag_acp": "note", "id": f"acp-note-{st['notes']}", "text": text}
+    def flush_text():
+        if st["txt"]:
+            yield {"ag_acp": "text", "seg": st["seg"], "text": st["txt"]}
+            st["txt"] = ""; st["seg"] += 1
+    tools = {}
+    def update(u):
+        k = u.get("sessionUpdate")
+        if k == "agent_message_chunk":
+            mid = u.get("messageId")
+            if mid and st["mid"] and mid != st["mid"]: yield from flush_text()
+            st["mid"] = mid or st["mid"]
+            c = u.get("content") or {}
+            if isinstance(c, dict) and isinstance(c.get("text"), str): st["txt"] += c["text"]
+        elif k in ("tool_call", "tool_call_update"):
+            yield from flush_text()
+            if k == "tool_call": st["seg"] += 1
+            tid = str(u.get("toolCallId") or "")
+            cur = tools.setdefault(tid, {})
+            if cur.get("_done"): return  # terminal status already emitted once
+            cur.update({x: v for x, v in u.items() if v is not None})
+            if cur.get("status") in ("completed", "failed"): cur["_done"] = True
+            u = dict(cur, sessionUpdate=k)
+        yield {"ag_acp": "update", "seg": st["seg"], "update": u}
+    def pump(rid, timeout, live=True):
+        """Serve agent requests + updates until response `rid`. -> result. live=False drops updates (load replay)."""
+        end = time.monotonic() + timeout if timeout else None
+        while True:
+            try: m = q.get(timeout=max(0.01, end - time.monotonic()) if end else None)
+            except _q.Empty: raise AcpErr("fallback" if st["prompt"] is None else "fatal", f"no response to request {rid} in {timeout}s")
+            if m is None:
+                raise AcpErr("fallback" if st["prompt"] is None else "fatal",
+                    f"agent exited (rc={p.poll()}) {stderr_tail()}".strip())
+            if "method" in m and "id" in m:  # agent -> client request
+                if m["method"] == "session/request_permission":
+                    pr = m.get("params") or {}; tc = pr.get("toolCall") or {}
+                    ok = acp_permission(tc, mode, workdir); oid = _acp_pick(pr.get("options"), ok)
+                    send({"jsonrpc": "2.0", "id": m["id"], "result": {"outcome": {"outcome": "selected", "optionId": oid} if oid else {"outcome": "cancelled"}}})
+                    if not (ok and oid): yield note(f'[acp] denied {tc.get("kind") or "other"} {tc.get("title") or ""} (mode={mode})'.replace("  ", " "))
+                else:
+                    send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": f"method not supported by ag: {m['method']}"}})
+            elif "method" in m:
+                if m["method"] == "session/update" and live: yield from update((m.get("params") or {}).get("update") or {})
+            elif m.get("id") == rid:
+                if "error" in m:
+                    e = m["error"] if isinstance(m["error"], dict) else {}
+                    msg = str(e.get("message") or e)[:300]
+                    d = e.get("data")
+                    if isinstance(d, dict) and d.get("message"): msg = f'{msg}: {str(d["message"])[:200]}'
+                    if e.get("code") == -32000: raise AcpErr("auth", msg)
+                    raise AcpErr("rpc", msg)
+                return m.get("result") or {}
+    def cancel():
+        if st["prompt"] is not None and st["sid"]:
+            send({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": st["sid"]}})
+            end = time.monotonic() + 1.5
+            while time.monotonic() < end:
+                try: m = q.get(timeout=0.05)
+                except _q.Empty: continue
+                if m is None or m.get("id") == st["prompt"]: break
+        _kill_backend_group(p.pid, 0.5)
+    ctl["cancel"] = cancel
+    try:
+        try:
+            init = yield from pump(req("initialize", {"protocolVersion": 1, "clientCapabilities":
+                {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
+                "clientInfo": {"name": "ag", "version": VERSION}}), ACP_INIT_S)
+        except AcpErr as e: raise AcpErr("auth" if e.kind == "auth" else "fallback", f"initialize: {e}")
+        if sid:
+            if not (init.get("agentCapabilities") or {}).get("loadSession"):
+                raise AcpErr("load_missing", "acp session/load failed: session not found (agent lacks loadSession)")
+            try: res = yield from pump(req("session/load", {"sessionId": sid, "cwd": workdir, "mcpServers": []}), ACP_LOAD_S, live=False)
+            except AcpErr as e:
+                if e.kind == "auth": raise
+                raise AcpErr("load_missing", f"acp session/load failed: session not found ({e})")
+        else:
+            try: res = yield from pump(req("session/new", {"cwd": workdir, "mcpServers": []}), ACP_LOAD_S)
+            except AcpErr as e: raise AcpErr("auth" if e.kind == "auth" else "fallback", f"session/new: {e}")
+            st["sid"] = str(res.get("sessionId") or "")
+            if not st["sid"]: raise AcpErr("fallback", "session/new returned no sessionId")
+        yield {"ag_acp": "session", "sessionId": st["sid"]}
+        if model:
+            mr = _acp_model_req(res, model)
+            if mr:
+                try: yield from pump(req(mr[0], dict(mr[1], sessionId=st["sid"])), ACP_INIT_S)
+                except AcpErr as e: raise AcpErr("fallback", f"{mr[0]} {model}: {e}")
+        st["prompt"] = req("session/prompt", {"sessionId": st["sid"], "prompt": [{"type": "text", "text": prompt}]})
+        try: res = yield from pump(st["prompt"], 0)
+        except AcpErr as e: raise AcpErr(e.kind if e.kind == "auth" else "fatal", f"session/prompt: {e}")
+        yield from flush_text()
+        yield {"ag_acp": "done", "stopReason": res.get("stopReason") or "", "usage": res.get("usage") or {}}
+    finally:
+        try: p.stdin.close()
+        except Exception: pass
+        try: p.wait(timeout=2)
+        except Exception: pass
+        _kill_backend_group(p.pid, 0.5)
+
+def do__acp(a):
+    """Private bridge: one ACP turn -> `ag_acp` JSON lines on stdout. Spec JSON from _turn_argv."""
+    import signal as _sig
+    s = json.loads(a.spec); ctl = {}
+    def _term(*_):
+        try: ctl.get("cancel", lambda: None)()
+        finally: os._exit(143)
+    _sig.signal(_sig.SIGTERM, _term)
+    out = lambda o: (sys.stdout.write(json.dumps(o) + "\n"), sys.stdout.flush())
+    try:
+        for o in acp_turn_lines(s["argv"], dict(os.environ), s["workdir"], s.get("sid", ""), s["prompt"], s.get("mode", "edits"), s.get("model", ""), ctl):
+            out(o)
+        return 0
+    except AcpErr as e:
+        if e.kind == "fallback" and s.get("cli"):
+            msg = f"[acp] fallback to cli: {str(e)[:240]}"
+            out({"ag_acp": "note", "id": "acp-fallback", "text": msg}); sys.stderr.write(msg + "\n"); sys.stderr.flush()
+            try: _event(Path(s["sdir"]), "acp_fallback", s.get("name"), reason=str(e)[:200])
+            except Exception: pass
+            try: os.execvp(s["cli"][0], s["cli"])
+            except OSError as x: sys.stderr.write(f"backend launch failed: {x}\n"); return 127
+        if e.kind == "auth": sys.stderr.write(f"acp auth required: {e} (ag agents doctor)\n"); return 1
+        sys.stderr.write(f"{e}\n" if e.kind == "load_missing" else f"acp error: {e}\n"); return 1
+
+def _acp_obj(line):
+    return _tl_json(line) if line.startswith('{"ag_acp"') else None
+
+def parse_events_acp(o):
+    k = o.get("ag_acp")
+    if k == "session" and o.get("sessionId"): return [("meta", str(o["sessionId"]))]
+    if k == "text" and o.get("text"): return [("text", o["text"])]
+    if k == "note": return [("tool", o.get("text") or "")]
+    if k == "done": return [("done", o.get("stopReason") or "")]
+    u = o.get("update") if k == "update" and isinstance(o.get("update"), dict) else {}
+    if u.get("sessionUpdate") == "tool_call": return [("tool", f'{u.get("kind") or "tool"} {u.get("title") or ""}'.strip()[:200])]
+    if u.get("sessionUpdate") == "tool_call_update" and u.get("status") in ("completed", "failed"):
+        t = _acp_tool_out(u)
+        if t: return [("toolout", tl_bound(t, 600)[0])]
+    return []
+
+def parse_timeline_acp(o):
+    k = o.get("ag_acp")
+    if k == "text" and o.get("text"): return [{"op": "assistant_text", "text": o["text"]}]  # legacy text owns it; keeps line "known"
+    if k == "note": return [{"op": "tool", "tool_id": o.get("id") or "", "tool_name": "[acp]", "args": None, "title": (o.get("text") or "")[6:], "status": ""}]
+    u = o.get("update") if k == "update" and isinstance(o.get("update"), dict) else {}
+    su, seg, c = u.get("sessionUpdate"), o.get("seg", 0), u.get("content")
+    txt = c.get("text") if isinstance(c, dict) and isinstance(c.get("text"), str) else ""
+    if su == "agent_message_chunk" and txt: return [{"op": "assistant_delta", "seg": f"acp:{seg}", "delta": txt}]
+    if su == "agent_thought_chunk" and txt: return [{"op": "reasoning_delta", "seg": f"acpr:{seg}", "delta": txt}]
+    if su in ("tool_call", "tool_call_update"):
+        tid, s = str(u.get("toolCallId") or ""), u.get("status")
+        ops = [{"op": "tool", "tool_id": tid, "tool_name": str(u.get("kind") or "tool"), "args": u.get("rawInput"),
+            "title": str(u.get("title") or "")[:200], "status": "completed" if s == "completed" else "failed" if s == "failed" else ""}]
+        t = _acp_tool_out(u) if s in ("completed", "failed") else ""
+        if t: ops.append({"op": "toolout", "tool_id": tid, "text": tl_bound(t, TL_TOOLOUT_CAP)[0], "is_error": s == "failed"})
+        return ops
+    return []  # plan / available_commands_update / current_mode_update / user_message_chunk / config updates
+
+def parse_usage_acp(o):
+    k = o.get("ag_acp")
+    u = o.get("update") if k == "update" and isinstance(o.get("update"), dict) else {}
+    if u.get("sessionUpdate") == "usage_update" and "used" in u:
+        return {"ctx": _uint(u.get("used")), "final": False}
+    if k == "done" and isinstance(o.get("usage"), dict) and o["usage"]:
+        x = o["usage"]; cr, cw = _uint(x.get("cachedReadTokens")), _uint(x.get("cachedWriteTokens"))
+        return {"in": _uint(x.get("inputTokens")) + cr + cw, "out": _uint(x.get("outputTokens")), "cache_read": cr,
+            "cache_write": cw, "reasoning": _uint(x.get("thoughtTokens")), "final": True}
+    return None
+
+def _acp_selfcheck(td):
+    assert acp_check("claude", "acp", "") and acp_check("acp", "", "") and not acp_check("gemini", "acp", "")
+    assert acp_on({"transport": "acp"}, "gemini") and not acp_on({"transport": "acp"}, "gemini", "cmd") and not acp_on({}, "gemini")
+    w = os.path.join(td, "acpw"); os.makedirs(w, exist_ok=True); os.symlink("/", os.path.join(w, "out"))
+    os.symlink(os.path.join(w, "nope"), os.path.join(w, "broken"))
+    assert acp_inside("a/new.txt", w) and not acp_inside("out/etc/x", w) and not acp_inside("broken", w) and not acp_inside("../x", w)
+    E = lambda *p: {"kind": "edit", "locations": [{"path": x} for x in p]}
+    assert acp_permission(E("f"), "edits", w) and not acp_permission(E("f"), "ro", w) and not acp_permission(E("/etc/x"), "edits", w)
+    assert not acp_permission({"kind": "edit"}, "auto", w) and acp_permission({"kind": "read"}, "ro", w)
+    assert not acp_permission({"kind": "execute"}, "edits", w) and acp_permission({"kind": "execute"}, "auto", w) and acp_permission(E("/etc/x"), "full", w)
+    assert _acp_pick([{"optionId": "a", "kind": "allow_always"}, {"optionId": "r", "kind": "reject_once"}], False) == "r" and _acp_pick([{"optionId": "a", "kind": "allow_always"}], True) is None
+    assert _acp_model_req({"configOptions": [{"id": "model", "currentValue": "x", "options": [{"value": "y"}]}]}, "y") == ("session/set_config_option", {"configId": "model", "value": "y"})
+    try: _acp_model_req({}, "y"); assert False
+    except AcpErr as e: assert e.kind == "fallback"
+    L = lambda o: json.dumps(dict({"ag_acp": "update", "seg": 2}, **o))
+    assert parse_timeline("gemini", L({"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hi"}}})) == [{"op": "assistant_delta", "seg": "acp:2", "delta": "hi"}]
+    assert parse_events("opencode", json.dumps({"ag_acp": "session", "sessionId": "s1"})) == [("meta", "s1")]
+    assert parse_usage("acp", json.dumps({"ag_acp": "done", "usage": {"inputTokens": 5, "outputTokens": 2, "cachedReadTokens": 3}}))["in"] == 8
+
 # --- run_turn seams: each turn feature edits ONE helper ---
 def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
     """Prompt for one turn. Returns (prompt, sys_txt, prof_name): history replay
@@ -7276,7 +7607,7 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
         # native custom command: message text is command args, sent bare.
         prompt = text
     else:
-        hist = _rs["hist"] if _rs and "hist" in _rs else "" if (sid and backend in ("claude","opencode","cursor","codex")) else recent_history(sdir,name)
+        hist = _rs["hist"] if _rs and "hist" in _rs else "" if (sid and (backend in ("claude","opencode","cursor","codex") or acp_on(a, backend, command))) else recent_history(sdir,name)
         prompt = (hist+"\n\n---\n"+text) if hist else text
     sys_txt = eff_system(sdir, a)
     # harness profile: instructions/memory/skills context must reach backend
@@ -7304,7 +7635,11 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
     return prompt, sys_txt, prof_name
 
 def _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, prof_name):
-    """backend_argv (+mode/plan kwargs only when set) + profile extras. May raise ValueError."""
+    """backend_argv (+mode/plan kwargs only when set) + profile extras. May raise ValueError.
+    ACP transport: wraps that argv (cli fallback) in the private `_acp` bridge."""
+    if acp_on(a, backend, command) or backend == "acp":
+        cli = None if backend == "acp" else _turn_argv(sdir, dict(a, transport="cli"), backend, model, workdir, sid, prompt, sys_txt, command, prof_name)
+        return acp_bridge_argv(sdir, a, backend, model, workdir, sid, prompt, cli)
     argv = backend_argv(backend,model=model,workdir=workdir,sid=sid,prompt=prompt,
         system=sys_txt if backend=="claude" else "",command=command or "",
         **({"mode":a.get("mode") or "","plan":bool(a.get("plan"))} if a.get("mode") or a.get("plan") else {}))
@@ -10567,6 +10902,7 @@ def do_selfcheck(a):
     assert queue_list(td,"qa")==[] and not list(_qd.glob("[0-9]-*")) and not queue_held(td,"qa")
     secret_selfcheck()
     _setup_selfcheck()
+    _acp_selfcheck(str(td))
     assert compat_verdict("claude","2.1.10")=="graceful" and compat_verdict("claude","2.1.289")=="ok" and auth_parse("codex","Not logged in")=="no"
     print(f"selfcheck ok ({td})")
     return 0
@@ -11457,9 +11793,9 @@ def build():
     hp.set_defaults(psub="list")
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode")
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false")
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None)
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)
     ro = sub.add_parser("roles",help="behavior presets (system prompts) for agents"); ros=ro.add_subparsers(dest="sub",required=True)
@@ -11501,6 +11837,7 @@ def build():
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50); ws.add_argument("--wait",default=None); ws.add_argument("--timeout",type=int,default=30); ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)")
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
+    sub.add_parser("_acp",help=argparse.SUPPRESS).add_argument("spec")
     hosts=sub.add_parser("hosts",help="outbound SSH host and project mappings"); hsub=hosts.add_subparsers(dest="hostsub",required=True)
     hsub.add_parser("list")
     ha=hsub.add_parser("add"); ha.add_argument("host"); ha.add_argument("--ssh-json",required=True); ha.add_argument("--remote-ag",required=True); ha.add_argument("--remote-state",required=True); ha.add_argument("--remote-project",required=True); ha.add_argument("--local-project",required=True)
@@ -11916,7 +12253,7 @@ def do_sync(a):
 # or AG_AUTO_UPDATE=0. Takes effect on the next invocation, never mid-command.
 UPDATE_RAW_URL = "https://raw.githubusercontent.com/Segzman/ag/master/ag"
 UPDATE_EVERY_S = 86400
-UPDATE_SKIP = {"_daemon", "_wake_run", "_sudo", "askpass", "selfcheck", "update", "tui", "attach", "shell"}
+UPDATE_SKIP = {"_daemon", "_wake_run", "_acp", "_sudo", "askpass", "selfcheck", "update", "tui", "attach", "shell"}
 
 def _ag_conf_path():
     return Path(os.environ.get("AG_CONFIG_HOME") or Path.home()/".config/ag")/"config.json"
@@ -12027,7 +12364,7 @@ def main(argv=None):
         "handoff":do_handoff,"hosts":do_hosts,"sync":do_sync,
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
         "delegate":do_delegate,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
-        "_wake_run":do__wake_run,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
+        "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"queue":do_queue,"stop":do_stop}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)

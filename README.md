@@ -240,6 +240,11 @@ ag chat send w --command review "path"          # opencode native command only
 - **Provider probe:** `ag agents doctor [--refresh] [--json]` shows installed, version, compat (`COMPAT` min-version table: ok/graceful/broken/unknown) and auth (`claude auth status`, `codex login status`, `agent status`, `opencode auth list`; gemini = unknown). Cached 60s in `$AG_CACHE_HOME/providers.json`. Turns pre-flight it: definitely logged out fails fast with `not logged in to <backend>: <hint>` (no launch, no retry); unknown proceeds. `AG_PROBE=0` disables.
 - Daemon crash (`kill -9`): sessions go `stale`, pending wake does not fire.
 
+## Capabilities and permission modes
+
+`ag agents caps [BACKEND]` (`--json`) prints the per-backend capability table (`CAPS`: resume, system/mcp flag, skills, interrupt, usage, plan, supported `modes`, `native_enforce`).
+`ag agents add|set NAME --mode ro|edits|auto|full [--plan|--no-plan]` sets a per-agent permission mode (`--mode ""` clears; unset = backend default, unchanged). Mapping: claude `--permission-mode` (dontAsk/acceptEdits/auto/bypassPermissions, `plan`), codex `-s` read-only/workspace-write/danger-full-access, gemini `--approval-mode` (plan/auto_edit/yolo; no `auto`), cursor `--mode ask|plan` / `--force [--sandbox enabled|disabled]`, opencode a `permission` block merged into a scoped `OPENCODE_CONFIG` (`.agent/modes/<agent>/opencode.json`; profile config kept). Codex/opencode emulate `--plan` with read-only. A mode a backend cannot enforce (echo, gemini `auto`) prints one `[mode] ...` warning line on `add` and each turn and runs with the backend default.
+
 ## Isolation: worktree per agent
 
 Agents sharing a `dir` clobber each other. Give each a worktree:

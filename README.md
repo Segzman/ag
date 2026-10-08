@@ -380,6 +380,18 @@ ag agents rm w1 --force                  # dirty: drops worktree + uncommitted w
 
 If a backend no longer knows the stored session id ("Session not found", "No conversation found...", "no rollout found..."), `ag` clears that backend's sid, replays recent history into a fresh session, relaunches once, and logs a `[resume] ... started fresh` tool note. Rate limits, overload, 503/529 and connection resets are retried up to 2 times (2s, 6s backoff), only when the failed attempt produced no output. The per-agent turn guard stays held, the user row is never duplicated, and `--timeout` still bounds the whole turn. Disable with `AG_RETRY=0`.
 
+## Per-turn git checkpoints: diff + revert
+
+If an agent's dir is inside a git repo, every non-slash turn is snapshotted before and after the backend runs (hidden refs `refs/ag/<agent>/<n>-pre|post`; temp index, so your index, HEAD and branches are never touched; gitignored files excluded). Changed files are appended to the chat as a `[checkpoint] turn 7: 3 files changed (+40 -5): a.py, ...` tool note and returned as `checkpoint` in the turn result. Last 20 turns kept; non-git dirs are skipped silently; `AG_CHECKPOINT=0` disables.
+
+```sh
+./ag chat checkpoints w               # list turns
+./ag chat diff w [--turn N] [--stat]  # patch for turn N (default latest)
+./ag chat revert w [--turn N]         # restore the whole repo worktree to before turn N
+```
+
+`revert` rewrites snapshot files, deletes non-ignored files that did not exist then, never touches `.git`/ignored files, refuses while the agent is busy, and saves the pre-revert state at `refs/ag/<agent>/pre-revert` (undo: `git diff` / `git checkout` from that ref). Scope is the whole repo, not just the agent subdir.
+
 ## Docs
 
 - [Harness selection + behavior presets](docs/HARNESS_ROLES.md): `harness use/current`, per-backend models, editable/reset roles.

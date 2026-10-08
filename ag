@@ -5568,6 +5568,50 @@ def eff_system(sdir, agent):
         except Exception: sys_txt = ""
     return sys_txt
 
+def _git(cwd, *args):
+    try: return subprocess.run(["git","-C",str(cwd),*args],capture_output=True,text=True,timeout=60)
+    except Exception as e: return subprocess.CompletedProcess(args,1,"",str(e))
+
+def wt_create(name, adir, base=None):
+    """Per-agent git worktree at <repo-parent>/<repo>.ag-wt/<name>, branch ag/<name>.
+    -> (info, err, hint). Reuses an identical existing worktree; never nests in repo."""
+    d = Path(adir).expanduser()
+    cd = _git(d,"rev-parse","--path-format=absolute","--git-common-dir")
+    if cd.returncode or not d.is_dir():
+        return None, f"--worktree needs --dir inside a git repo: {adir}", "git init, or pass --dir <repo>"
+    gc = Path(cd.stdout.strip())
+    repo = gc.parent if gc.name==".git" else gc
+    branch = f"ag/{name}"
+    if _git(repo,"check-ref-format","--branch",branch).returncode:
+        return None, f"bad agent name for a branch: {name}", "use letters, digits, - _ ."
+    path = repo.parent/f"{repo.name}.ag-wt"/name
+    sha = _git(repo,"rev-parse","--verify","--quiet",f"{base or 'HEAD'}^{{commit}}")
+    if sha.returncode: return None, f"bad --base: {base or 'HEAD'}", "pass a branch, tag or commit"
+    info = {"repo":str(repo),"path":str(path),"branch":branch,"base":sha.stdout.strip()}
+    reg = _git(repo,"worktree","list","--porcelain").stdout
+    same = any(b.splitlines()[0]=="worktree "+str(path) and f"branch refs/heads/{branch}" in b.splitlines()
+               for b in reg.split("\n\n") if b.strip())
+    if same and path.is_dir(): return info, None, None
+    if path.exists() or _git(repo,"show-ref","--verify","--quiet",f"refs/heads/{branch}").returncode==0:
+        return None, f"branch {branch} or path {path} already in use (not this worktree)", f"git -C {repo} worktree list; remove or rename the stale one"
+    path.parent.mkdir(parents=True,exist_ok=True)
+    r = _git(repo,"worktree","add","-b",branch,str(path),info["base"])
+    if r.returncode: return None, "git worktree add failed: "+(r.stderr.strip()[:200]), None
+    return info, None, None
+
+def wt_remove(wt, force=False):
+    """Remove an agent worktree if clean (or --force); the branch is always kept. -> (err, hint)."""
+    path, repo = wt["path"], wt["repo"]
+    if Path(path).is_dir():
+        st = _git(path,"status","--porcelain")
+        if st.returncode==0 and st.stdout.strip() and not force:
+            return (f"worktree {path} has uncommitted changes",
+                    f"commit in {path} (branch {wt['branch']}), or rm --force to drop the worktree (branch kept)")
+        r = _git(repo,"worktree","remove",*(["--force"] if force else []),path)
+        if r.returncode: return "git worktree remove failed: "+r.stderr.strip()[:200], None
+    else: _git(repo,"worktree","prune")
+    return None, None
+
 def do_agents(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     if a.sub=="doctor":
@@ -5609,7 +5653,7 @@ def do_agents(a):
     rows = load_agents(sdir)
     if a.sub=="list":
         if getattr(a,"json",False): return emit(a,"agents",{"agents":rows})
-        txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("persona","") or "-":12} {r.get("profile","") or "-":12} {r.get("dir",".")}' for r in rows) or "(none)"
+        txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("persona","") or "-":12} {r.get("profile","") or "-":12} {r.get("dir",".")}{"  ["+r["worktree"]["branch"]+"]" if r.get("worktree") else ""}' for r in rows) or "(none)"
         return emit(a,"agents",{"_text":txt})
     if a.sub=="add":
         if any(r["name"]==a.name for r in rows):
@@ -5619,12 +5663,23 @@ def do_agents(a):
             return emit(a,"agents",error=f"no such role: {pers}",hint="ag roles list")
         mod = a.model or "default"
         if a.backend=="opencode" and mod in ("","default"): mod = OPENCODE_MODEL_DEFAULT
+        wt, adir = None, a.adir or "."
+        if getattr(a,"worktree",False):
+            wt, err, hint = wt_create(a.name, adir, getattr(a,"base",None))
+            if err: return emit(a,"agents",error=err,hint=hint)
+            adir = wt["path"]
         rows.append({"name":a.name,"backend":a.backend,"model":mod,
-            "dir":a.adir or ".","role":a.role,"persona":pers,"system":getattr(a,"system",None) or "",
-            "instructions":[s for s in (getattr(a,"instructions",None) or []) if (s or "").strip()]})
+            "dir":adir,"role":a.role,"persona":pers,"system":getattr(a,"system",None) or "",
+            "instructions":[s for s in (getattr(a,"instructions",None) or []) if (s or "").strip()],
+            **({"worktree":wt} if wt else {})})
         save_agents(sdir,rows)
+        if wt: return emit(a,"agents",{"_text":f"added {a.name}  branch {wt['branch']}  worktree {wt['path']}","worktree":wt})
         return emit(a,"agents",{"_text":f"added {a.name}"})
     if a.sub=="rm":
+        old = next((r for r in rows if r["name"]==a.name and r.get("worktree")),None)
+        if old:
+            err, hint = wt_remove(old["worktree"], getattr(a,"force",False))
+            if err: return emit(a,"agents",error=err,hint=hint)
         rows = [r for r in rows if r["name"]!=a.name]
         save_agents(sdir,rows)
         # Drop the removed agent's active assignment so a reused name starts
@@ -5648,9 +5703,19 @@ def do_agents(a):
             if val is not None: updates[key] = val
         if getattr(a, "instructions", None) is not None:
             updates["instructions"] = [s for s in a.instructions if (s or "").strip()]
+        if getattr(a, "worktree", False):
+            cur = next((r for r in rows if r["name"] == a.name), None)
+            if cur is None: return emit(a, "agents", error=f"no such agent: {a.name}")
+            if cur.get("worktree"): return emit(a, "agents", error=f"{a.name} already has a worktree", hint=cur["worktree"]["path"])
+            if agent_busy(sdir, a.name):
+                return emit(a, "agents", error=f"{a.name} is busy (turn or handoff running); retry when idle.")
+            wt, err, hint = wt_create(a.name, updates.get("dir") or cur.get("dir") or ".", getattr(a, "base", None))
+            if err: return emit(a, "agents", error=err, hint=hint)
+            updates.update({"dir": wt["path"], "worktree": wt})
         ok, message = update_agent_settings(sdir, a.name, updates)
         if not ok: return emit(a, "agents", error=message,
             hint="ag roles list" if "no such role" in message else None)
+        if updates.get("worktree"): return emit(a, "agents", {"_text": f"updated {a.name}  branch {updates['worktree']['branch']}  worktree {updates['dir']}", "worktree": updates["worktree"]})
         return emit(a, "agents", {"_text": f"updated {a.name}"})
 
 def do_roles(a):
@@ -9095,9 +9160,9 @@ def build():
     hp.set_defaults(psub="list")
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)")
-    agrm=ags.add_parser("rm"); agrm.add_argument("name")
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)')
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)")
+    agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)')
     ags.add_parser("doctor")
     ro = sub.add_parser("roles",help="behavior presets (system prompts) for agents"); ros=ro.add_subparsers(dest="sub",required=True)
     ros.add_parser("list")

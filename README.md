@@ -361,6 +361,21 @@ use fake fixture credentials.
 
 Each wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session (`__wake-<agent>-<id>`, visible in `sessions`/`status --json`). Turns on the same agent (`chat send`, `delegate`, wake workers) are mutually excluded via one shared per-agent flock guard held inside `run_turn` (no FIFO or arrival-order guarantee; the wake worker takes no second lock); different agents run in parallel. Backend/profile/model switches probe the same guard and refuse while the agent runs anywhere. `spawn --wake` launches at most once (atomic claim, not guaranteed completion or delivery); worker completion never re-fires (no callback loops). Argv is shell-free, so `; touch evil` in messages stays inert text. `--on-exit` still runs first and is unchanged.
 
+## Git worktree per agent (safe parallel fan-out)
+
+Agents sharing a `dir` clobber each other's files. Give each its own worktree:
+
+```bash
+ag agents add w1 --backend claude --dir ~/proj --worktree [--base main]
+# branch ag/w1 from --base (default HEAD), worktree at ~/proj.ag-wt/w1 (outside the repo); agent dir is set to it
+ag agents set existing --worktree        # move an idle agent into one (refused while busy)
+ag agents list                           # worktree agents show [ag/<name>] after the dir; --json has `worktree`
+ag agents rm w1                          # removes the worktree if clean, keeps branch ag/w1
+ag agents rm w1 --force                  # dirty: drops worktree + uncommitted work, still keeps the branch
+```
+
+`add` prints the branch so an orchestrator can merge it (`git merge ag/w1`); ag has no merge command. An existing identical worktree is reused; any other clash on branch or path errors with a hint.
+
 ## Docs
 
 - [Harness selection + behavior presets](docs/HARNESS_ROLES.md): `harness use/current`, per-backend models, editable/reset roles.

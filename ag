@@ -10804,49 +10804,77 @@ def do_route(a):
     out += [f'global:  {gp}{"" if gp.exists() else " (missing)"}', f'project: {pp}{"" if pp.exists() else " (missing)"}']
     return emit(a, "route", {**data, "_text": "\n".join(out)})
 
-def do_setup(a):
-    inter = sys.stdin.isatty() and not a.yes
-    if not inter and not a.yes and not a.dry_run:
-        return emit(a, "setup", error="stdin is not a TTY: pass --yes (plus flags) to run non-interactively",
-            hint="ag setup --yes --scope global --harness claude --preset cost-first")
-    try:
-        sets = parse_route_sets(a.set)
-        harn = parse_harness_list(a.harness) if a.harness is not None else None
-    except ValueError as e: return emit(a, "setup", error=str(e))
-    if inter:
-        _say("refreshing model lists…")
-        models_load(refresh=True, on_progress=lambda b, e: _say(f'  {b}: {len(e["models"])} models'
-            + (f' (error: {e["error"]}; kept last good)' if e["error"] else "")))
-    scope = a.scope or (_ask("scope (global|project)", "global") if inter else "global")
-    if scope not in ("global", "project"): return emit(a, "setup", error=f"bad scope {scope!r}: global|project")
-    proj = project_root()
+# ---- `ag setup` front-ends: one pure state model, three thin UIs (plain prompts / mac osascript / cli curses) ----
+SETUP_UIS = ("mac", "cli", "plain")
+SETUP_CLAUDE_ALIASES = ("haiku", "sonnet", "opus", "fable")
+SETUP_PRESET_DESC = {"cost-first": "cheapest model that can do each job (default)",
+    "balanced": "cost-first, but review on sonnet", "quality-first": "sonnet floor, opus implements, fable for the rest"}
+SETUP_FILTER_AT = 25          # mac: longer model lists get a filter dialog first
+SETUP_CUSTOM = "Type a custom id…"
+SETUP_SAVE = "✓ Save"
+SETUP_MIN = (16, 60)          # curses floor (rows, cols); smaller at start -> plain prompts
+
+def _setup_rebase(st):
+    """jobs = preset (+ that scope's on-disk picks when its file uses the same preset and the preset
+    wasn't forced) < --set < UI edits. Mutates + returns st. Pure."""
+    cur = st["existing"].get(st["scope"]) or {}
+    keep = {} if st["forced"] or st["preset"] != (cur.get("preset") or "cost-first") else cur
+    eff = routing_effective({"preset": st["preset"], "jobs": keep.get("jobs") or {}})
+    st["jobs"] = {j: {"claude": eff[j]["claude"], "ag": dict(eff[j]["ag"])} for j in JOB_KEYS}
+    for src in (st["sets"], st["edits"]):
+        for j, upd in src.items(): st["jobs"][j].update({k: dict(v) if isinstance(v, dict) else v for k, v in upd.items()})
+    return st
+
+def setup_state_from(scope="global", preset=None, sets=None, harn=None, claude_md=None, proj=None, existing=None):
+    """Shared setup state {scope, harnesses, preset, forced, jobs, claude_md (None=auto), proj, existing, sets, edits}.
+    A given preset is forced (drops on-disk per-job picks). Pure when proj + existing are given."""
+    proj = Path(proj or project_root())
+    if existing is None:
+        gp, pp = routing_paths(proj)
+        existing = {"global": _json_or_empty(gp), "project": _json_or_empty(pp)}
+    return _setup_rebase({"scope": scope, "harnesses": list(harn or []),
+        "preset": preset or (existing.get(scope) or {}).get("preset") or "cost-first", "forced": bool(preset),
+        "jobs": {}, "claude_md": claude_md, "proj": str(proj), "existing": existing, "sets": dict(sets or {}), "edits": {}})
+
+def setup_set_scope(st, scope): st["scope"] = scope; return _setup_rebase(st)
+def setup_apply_preset(st, preset):
+    """Preset wins outright (drops --set + UI edits); callers confirm first when setup_custom_jobs(st). Pure."""
+    st.update(preset=preset, forced=True, sets={}, edits={}); return _setup_rebase(st)
+def setup_edit_job(st, job, claude=None, ag=None):
+    e = st["edits"].setdefault(job, {})
+    if claude: e["claude"] = claude
+    if ag: e["ag"] = dict(ag)
+    return _setup_rebase(st)
+def setup_custom_jobs(st):
+    """Jobs whose picks differ from the preset table (what applying a preset would overwrite). Pure."""
+    p = ROUTING_PRESETS.get(st["preset"], _ROUTE_COST)
+    return [j for j in JOB_KEYS if st["jobs"][j] != {"claude": p[j]["claude"], "ag": dict(p[j]["ag"])}]
+def setup_claude_md_on(st): return st["claude_md"] if st["claude_md"] is not None else "claude" in st["harnesses"]
+def setup_rows(st):
+    """[(key, label)] for the mac hub / cli screen: 4 settings, then one row per job. Pure."""
+    cm = "n/a (global scope only)" if st["scope"] != "global" else \
+        ("yes" if setup_claude_md_on(st) else "no") + (" (auto)" if st["claude_md"] is None else "")
+    rows = [("scope", f'Scope: {st["scope"]}'), ("harnesses", "Harnesses: " + (", ".join(st["harnesses"]) or "none")),
+        ("preset", f'Preset: {st["preset"]}' + (" (custom picks)" if setup_custom_jobs(st) else "")),
+        ("claude_md", f"Write CLAUDE.md: {cm}")]
+    return rows + [(f"job:{j}", f'{j} — Claude: {e["claude"]} · ag: {e["ag"]["backend"]}/{e["ag"]["model"]}')
+        for j, e in ((j, st["jobs"][j]) for j in JOB_KEYS)]
+def setup_filter(ids, q):
+    """Case-insensitive; every whitespace-separated term must be a substring. Pure."""
+    terms = (q or "").lower().split()
+    return [i for i in ids if all(t in i.lower() for t in terms)]
+def setup_models_info(b):
+    """'opencode · 92 models · fetched 3h ago' from the cache (read-only)."""
+    e = _models_read()["backends"].get(b) or {}
+    src = "static" if b in MODELS_STATIC else f'fetched {_ago(e.get("fetched_at"))}'
+    return f"{b} · {len(model_choices(b))} models · {src}" + (f' · error: {e["error"][:60]}' if e.get("error") else "")
+
+def setup_targets(st):
+    """Planned writes [(path, text, old, new|changed|unchanged)] + notes, skill_err, block, tdir. Reads only."""
+    scope, harn, proj, jobs = st["scope"], st["harnesses"], Path(st["proj"]), st["jobs"]
     gp, pp = routing_paths(proj)
-    glob, projd = _json_or_empty(gp), _json_or_empty(pp)
-    cur = glob if scope == "global" else projd
-    if harn is None:
-        det = ",".join(detect_harnesses()) or "none"
-        try: harn = parse_harness_list(_ask("install skills for (claude,opencode,codex|all|none)", det) if inter else det)
-        except ValueError as e: return emit(a, "setup", error=str(e))
-    preset = a.preset or (_ask("preset (cost-first|balanced|quality-first)", cur.get("preset") or "cost-first")
-        if inter else cur.get("preset") or "cost-first")
-    if preset not in ROUTING_PRESETS: return emit(a, "setup", error=f"bad preset {preset!r}: {'|'.join(ROUTING_PRESETS)}")
-    # same preset as on disk (and not forced via --preset) keeps earlier per-job picks
-    keep = {} if a.preset or preset != (cur.get("preset") or "cost-first") else cur
-    eff0 = routing_effective({"preset": preset, "jobs": keep.get("jobs") or {}})
-    jobs = {j: {"claude": eff0[j]["claude"], "ag": dict(eff0[j]["ag"])} for j in JOB_KEYS}
-    for j, upd in sets.items(): jobs[j].update(upd)
-    if inter:
-        for j in JOB_KEYS:
-            e = jobs[j]
-            _say(f'{j} — {JOB_DESC[j]}: claude={e["claude"]}  ag={e["ag"]["backend"]}/{e["ag"]["model"]}')
-            if _ask("  change? (y/N)", "n").lower()[:1] != "y": continue
-            e["claude"] = _ask_pick("  claude subagent alias", ["haiku", "sonnet", "opus", "fable"], e["claude"])
-            b = _ask_pick("  ag backend", list(NATIVE_ORDER), e["ag"]["backend"])
-            if b not in NATIVE_ORDER: _say(f"  unknown backend {b!r}, keeping {e['ag']['backend']}"); b = e["ag"]["backend"]
-            m = _ask_pick("  ag model", model_choices(b), e["ag"]["model"] if b == e["ag"]["backend"] else "default")
-            e["ag"] = {"backend": b, "model": m}
-    doc = {"version": 1, "preset": preset, "jobs": jobs}
-    eff = routing_effective(doc) if scope == "global" else routing_effective(glob, doc)
+    doc = {"version": 1, "preset": st["preset"], "jobs": jobs}
+    eff = routing_effective(doc) if scope == "global" else routing_effective(st["existing"].get("global") or {}, doc)
     block = routing_block(eff)
     writes = [(gp if scope == "global" else pp, json.dumps(doc, indent=2) + "\n")]
     tdir, tpls, skill_err, notes = skill_templates_dir(), {}, "", []
@@ -10860,38 +10888,460 @@ def do_setup(a):
             writes += [(sd/n/"SKILL.md", render_skill(tpls[n], block, scope)) for n in SKILL_NAMES]
             notes += [f"left alone: old skill {sd/o} (remove by hand once ag-cli/ag-agents replace it)"
                 for o in OLD_SKILLS if (sd/o).exists()]
-    cmd_ = a.claude_md if a.claude_md is not None else "claude" in harn
-    if cmd_ and scope == "global":
+    if setup_claude_md_on(st) and scope == "global":
         cp, ap = _ag_home()/".claude"/"CLAUDE.md", _ag_home()/"AGENTS.md"
         writes.append((cp, routing_md_insert(_read_or_empty(cp), block)))
         t2 = routing_md_insert(_read_or_empty(ap), block, append=False)  # markers only, never append
         if t2 is not None: writes.append((ap, t2))
-    elif a.claude_md and scope == "project": notes.append("CLAUDE.md block is global-only; skipped for --scope project")
+    elif st["claude_md"] and scope == "project": notes.append("CLAUDE.md block is global-only; skipped for --scope project")
     plan = []
     for p, txt in writes:
         old, ex = _read_or_empty(p), p.exists()
         plan.append((p, txt, old, "unchanged" if ex and old == txt else "changed" if ex else "new"))
-    if inter:
+    return {"plan": plan, "notes": notes, "skill_err": skill_err, "block": block, "tdir": tdir}
+
+def _setup_short(p, n=200):
+    s, home = str(p), str(_ag_home())
+    if s.startswith(home + os.sep): s = "~" + s[len(home):]
+    return s if len(s) <= n else G("…") + s[-max(1, n - 1):]
+def setup_summary_lines(st, t):
+    return [f'scope={st["scope"]} preset={st["preset"]} harnesses={",".join(st["harnesses"]) or "none"}'] + \
+        [f"{s:9} {_setup_short(p)}" for p, _, _, s in t["plan"]] + t["notes"] + ([f'! {t["skill_err"]}'] if t["skill_err"] else [])
+
+def setup_ui_pick(want="", platform=None, env=None, osa=None, tty=True):
+    """Front-end: explicit --ui/AG_SETUP_UI wins (mac needs osascript; cli needs a TTY, else plain);
+    auto = mac on local macOS with osascript, else cli on a TTY, else plain. Pure."""
+    platform, env = platform or sys.platform, os.environ if env is None else env
+    if want == "mac" and osa: return "mac"
+    if want == "plain": return "plain"
+    if not want and platform == "darwin" and osa and not (env.get("SSH_CONNECTION") or env.get("SSH_TTY")): return "mac"
+    return "cli" if tty else "plain"
+
+def _setup_bg_refresh(wait=1.0):
+    """Refresh stale model lists in a daemon thread, blocking the first screen <= `wait`s. Pickers read
+    the cache each time, so a late finish shows up in the next picker."""
+    c = _models_read()
+    if not any(_age_s((c["backends"].get(b) or {}).get("checked_at")) > MODELS_TTL_S for b in MODEL_BACKENDS): return None
+    def run():
+        try: models_load()
+        except Exception: pass
+    t = threading.Thread(target=run, daemon=True, name="ag-setup-models"); t.start(); t.join(wait)
+    return t
+
+# -- mac: native dialogs via osascript. Dynamic strings ONLY via `on run argv`, never spliced into source.
+_OSA_LIST = """on run argv
+set {t, p, okb, cb, multi, defs} to items 1 thru 6 of argv
+set xs to items 7 thru -1 of argv
+set m to (multi is "1")
+set r to choose from list xs with title t with prompt p OK button name okb cancel button name cb default items (paragraphs of defs) multiple selections allowed m empty selection allowed m
+if r is false then return "__ag_cancel__"
+set AppleScript's text item delimiters to linefeed
+return r as text
+end run"""
+_OSA_ASK = """on run argv
+try
+set r to display dialog (item 2 of argv) with title (item 1 of argv) default answer (item 3 of argv) buttons {"Cancel", "OK"} default button "OK" cancel button "Cancel"
+return text returned of r
+on error number -128
+return "__ag_cancel__"
+end try
+end run"""
+_OSA_ALERT = """on run argv
+try
+set r to display alert (item 1 of argv) message (item 2 of argv) buttons {"Cancel", (item 3 of argv)} default button (item 3 of argv) cancel button "Cancel"
+return button returned of r
+on error number -128
+return "__ag_cancel__"
+end try
+end run"""
+_OSA_NOTE = """on run argv
+display notification (item 2 of argv) with title (item 1 of argv)
+end run"""
+
+def _setup_osa_bin(): return os.environ.get("AG_OSASCRIPT") or shutil.which("osascript")
+def _osa(script, *args):
+    """Run AppleScript with argv; None = user cancelled. AG_OSASCRIPT swaps the binary (tests)."""
+    p = subprocess.run([_setup_osa_bin() or "osascript", "-e", script, *map(str, args)],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if p.returncode != 0:
+        if "-128" in (p.stderr or ""): return None
+        raise RuntimeError(f"osascript failed: {(p.stderr or '').strip()[-300:]}")
+    out = (p.stdout or "").rstrip("\n")
+    return None if out == "__ag_cancel__" else out
+def _mac_list(title, prompt, items, defaults=(), multi=False, ok="OK", cancel="Cancel"):
+    r = _osa(_OSA_LIST, title, prompt, ok, cancel, "1" if multi else "0",
+        "\n".join(d for d in defaults if d in items), *items)
+    return r if r is None or not multi else [x for x in r.split("\n") if x]
+def _mac_ask(title, prompt, default=""): return _osa(_OSA_ASK, title, prompt, default)
+def _mac_alert(title, msg, ok): return _osa(_OSA_ALERT, title, msg, ok) == ok
+
+def _setup_mac_model(title, b, cur):
+    ids, info = model_choices(b), setup_models_info(b)
+    if len(ids) > SETUP_FILTER_AT:
+        f = _mac_ask(title, f"{info}\nFilter models (blank = all)", "")
+        if f is None: return None
+        ids = setup_filter(ids, f)
+    r = _mac_list(title, f"{info}" + ("" if ids else "\nno match: type a custom id"), ids + [SETUP_CUSTOM], [cur])
+    if r == SETUP_CUSTOM: r = (_mac_ask(title, f"Custom {b} model id", cur) or "").strip() or None
+    return r
+
+def _setup_mac_edit(st, key):
+    T = "ag setup"
+    if key == "scope":
+        gp, pp = routing_paths(st["proj"])
+        r = _mac_list(T, f"Scope: where routing + skills go.\nglobal: {_setup_short(gp)} + home skill dirs\nproject: {_setup_short(pp)} + project skill dirs",
+            ["global", "project"], [st["scope"]])
+        if r: setup_set_scope(st, r)
+    elif key == "harnesses":
+        r = _mac_list(T, "Install the ag-cli + ag-agents skills for (⌘-click for several; none = skip skills)",
+            list(SETUP_HARNESSES), st["harnesses"], multi=True)
+        if r is not None: st["harnesses"] = r
+    elif key == "preset":
+        r = _mac_list(T, "Preset (resets all six jobs):\n" + "\n".join(f"{k}: {v}" for k, v in SETUP_PRESET_DESC.items()),
+            list(ROUTING_PRESETS), [st["preset"]])
+        cj = setup_custom_jobs(st)
+        if r and (not cj or _mac_alert(f"Apply preset {r}?", "Overwrites your custom picks for: " + ", ".join(cj), "Apply")):
+            setup_apply_preset(st, r)
+    elif key == "claude_md":
+        opts = ["auto (yes when claude is a harness)", "yes", "no"]
+        r = _mac_list(T, "Write the routing block into ~/.claude/CLAUDE.md? (global scope only)", opts,
+            [opts[0] if st["claude_md"] is None else "yes" if st["claude_md"] else "no"])
+        if r: st["claude_md"] = None if r == opts[0] else r == "yes"
+    elif key.startswith("job:"):
+        j = key[4:]; e = st["jobs"][j]; T = f"ag setup: {j}"
+        c = _mac_list(T, f"{j}: {JOB_DESC[j]}\nClaude subagent model (Agent tool model:)", list(SETUP_CLAUDE_ALIASES), [e["claude"]])
+        if not c: return
+        b = _mac_list(T, f"{j}: ag backend for sub-agents", list(MODEL_BACKENDS), [e["ag"]["backend"]])
+        if not b: return
+        m = _setup_mac_model(T, b, e["ag"]["model"] if b == e["ag"]["backend"] else "default")
+        if m: setup_edit_job(st, j, claude=c, ag={"backend": b, "model": m})
+
+def setup_ui_mac(st, bg=None):
+    """Hub loop: pick a row -> its editor -> back to the hub. Save confirms -> st; Quit -> None."""
+    legend = "Pick a row, then Edit. ✓ Save shows the files, then writes them. Quit writes nothing."
+    last = None
+    while True:
+        rows = setup_rows(st)
+        r = _mac_list("ag setup", legend, [t for _, t in rows] + [SETUP_SAVE], [dict(rows).get(last, "")], ok="Edit", cancel="Quit")
+        if r is None: return None
+        if r == SETUP_SAVE:
+            if _mac_alert("ag setup: write these files?", "\n".join(setup_summary_lines(st, setup_targets(st))), "Save"): return st
+            continue
+        last = {t: k for k, t in rows}.get(r)
+        if last: _setup_mac_edit(st, last)
+
+# -- cli: single-screen curses editor
+def _setup_cli_ok():
+    try: import curses  # noqa: F401
+    except ImportError: return False
+    try: c, l = os.get_terminal_size(sys.stdout.fileno())
+    except OSError: return False
+    return l >= SETUP_MIN[0] and c >= SETUP_MIN[1]
+
+def _sput(win, y, x, s, attr=0):
+    import curses
+    h, w = win.getmaxyx()
+    if not (0 <= y < h and 0 <= x < w): return
+    try: win.addstr(y, x, s[:max(0, w - x - (1 if y == h - 1 else 0))], attr)
+    except curses.error: pass
+
+_SETUP_SEQ = {"A": "KEY_UP", "B": "KEY_DOWN", "C": "KEY_RIGHT", "D": "KEY_LEFT", "5~": "KEY_PPAGE", "6~": "KEY_NPAGE"}
+def _setup_getkey(win):
+    """get_wch + decode CSI/SS3 arrows terminfo didn't map (ESC [ B vs ESC O B); else a bare ESC would cancel."""
+    import curses
+    ch = win.get_wch()
+    if ch != "\x1b": return ch
+    win.nodelay(True); seq = ""
+    try:
+        while len(seq) < 4:
+            try: c = win.get_wch()
+            except curses.error: break
+            if not isinstance(c, str): curses.ungetch(c); break
+            if not seq and c not in "[O": curses.unget_wch(c); break
+            seq += c
+            if len(seq) > 1 and (c.isalpha() or c == "~"): break
+    finally: win.nodelay(False)
+    if not seq: return "\x1b"
+    k = _SETUP_SEQ.get(seq[1:])
+    return getattr(curses, k) if k else None
+
+_SETUP_ENTER = ("\n", "\r", 343)  # 343 = KEY_ENTER
+_SETUP_BS = ("\x7f", "\b", 263)   # 263 = KEY_BACKSPACE
+
+def _setup_cli_box(scr, redraw, bh, bw):
+    import curses
+    redraw(); h, w = scr.getmaxyx()
+    bh, bw = max(3, min(bh, h - 2)), max(10, min(bw, w - 2))
+    win = curses.newwin(bh, bw, max(0, (h - bh) // 2), max(0, (w - bw) // 2))
+    win.keypad(True); win.erase(); win.box()
+    return win, bh, bw
+
+def _setup_cli_pick(scr, redraw, title, items, cur=None, multi=False, chosen=(), custom=False, info=""):
+    """Popup picker: type to filter (Backspace edits), ↑↓/PgUp/PgDn, Enter picks, Esc cancels;
+    multi: Space toggles, Enter confirms; custom: Tab or the last row -> free-text id."""
+    import curses
+    q, pos, top, chosen = "", (items.index(cur) if cur in items else 0), 0, list(chosen)
+    CROW = "custom…" if not os.environ.get("AG_ASCII") else "custom..."
+    while True:
+        hits = setup_filter(items, q); vis = hits + ([CROW] if custom else [])
+        pos = max(0, min(pos, len(vis) - 1))
+        win, bh, bw = _setup_cli_box(scr, redraw, len(vis) + 6, max(46, max(map(len, vis + [title, info]), default=0) + 10))
+        n = max(1, bh - 6)
+        top = min(max(top, pos - n + 1), pos)
+        _sput(win, 0, 2, f" {title} ", curses.A_BOLD)
+        _sput(win, 1, 2, info + (f" · {len(hits)}/{len(items)} match" if q else ""))
+        _sput(win, 2, 2, f"filter: {q}_" if q else "type to filter", 0 if q else getattr(curses, "A_DIM", 0))
+        for i, it in enumerate(vis[top:top + n]):
+            k = top + i
+            box = ("[x] " if it in chosen else "[ ] ") if multi and it != CROW else ""
+            _sput(win, 3 + i, 2, f'{G("›") if k == pos else " "} {box}{it}{"  (current)" if it == cur else ""}',
+                curses.A_REVERSE if k == pos else 0)
+        hint = "Space toggle · Enter done · Esc cancel" if multi else "Enter pick · Esc cancel" + (" · Tab custom id" if custom else "")
+        _sput(win, bh - 2, 2, hint + (f"  {pos + 1}/{len(vis)}" if len(vis) > n else ""), getattr(curses, "A_DIM", 0))
+        win.noutrefresh(); curses.doupdate()
+        try: ch = _setup_getkey(win)
+        except curses.error: continue
+        if ch == "\x1b": return None
+        if ch in _SETUP_ENTER:
+            if multi: return [i for i in items if i in chosen]
+            if not vis: continue
+            if vis[pos] != CROW: return vis[pos]
+            ch = "\t"
+        if ch == "\t" and custom:
+            v = _setup_cli_input(scr, redraw, title, "custom id", cur or "")
+            if v: return v
+        elif ch == curses.KEY_UP: pos -= 1
+        elif ch == curses.KEY_DOWN: pos += 1
+        elif ch == curses.KEY_PPAGE: pos -= n
+        elif ch == curses.KEY_NPAGE: pos += n
+        elif ch == " " and multi:
+            if vis and vis[pos] != CROW: chosen = [c for c in chosen if c != vis[pos]] if vis[pos] in chosen else chosen + [vis[pos]]
+        elif ch in _SETUP_BS: q, pos = q[:-1], 0
+        elif ch == "\x15": q, pos = "", 0
+        elif isinstance(ch, str) and ch.isprintable() and not (ch == "/" and not q): q, pos = q + ch, 0
+
+def _setup_cli_input(scr, redraw, title, prompt, default=""):
+    import curses
+    s = default
+    try: curses.curs_set(1)
+    except curses.error: pass
+    try:
+        while True:
+            win, bh, bw = _setup_cli_box(scr, redraw, 6, 70)
+            _sput(win, 0, 2, f" {title} ", curses.A_BOLD); _sput(win, 1, 2, prompt)
+            shown = s[-(bw - 7):]
+            _sput(win, 2, 2, "> " + shown); _sput(win, 4, 2, "Enter ok · Esc cancel · Ctrl-U clear", getattr(curses, "A_DIM", 0))
+            try: win.move(2, min(4 + len(shown), bw - 2))
+            except curses.error: pass
+            win.noutrefresh(); curses.doupdate()
+            try: ch = _setup_getkey(win)
+            except curses.error: continue
+            if ch == "\x1b": return None
+            if ch in _SETUP_ENTER: return s.strip() or None
+            if ch in _SETUP_BS: s = s[:-1]
+            elif ch == "\x15": s = ""
+            elif isinstance(ch, str) and ch.isprintable(): s += ch
+    finally:
+        try: curses.curs_set(0)
+        except curses.error: pass
+
+def _setup_cli_confirm(scr, redraw, title, lines, hint="y/Enter yes · n/Esc no", anykey=False):
+    import curses
+    while True:
+        win, bh, bw = _setup_cli_box(scr, redraw, len(lines) + 5, max(map(len, lines + [title, hint])) + 6)
+        n = max(1, bh - 4)
+        shown = lines if len(lines) <= n else lines[:n - 1] + [f"{G('…')} {len(lines) - n + 1} more"]
+        _sput(win, 0, 2, f" {title} ", curses.A_BOLD)
+        for i, ln in enumerate(shown): _sput(win, 1 + i, 2, ln)
+        _sput(win, bh - 2, 2, hint, curses.A_BOLD)
+        win.noutrefresh(); curses.doupdate()
+        try: ch = _setup_getkey(win)
+        except curses.error: continue
+        if ch == curses.KEY_RESIZE: continue
+        if anykey or ch in ("y", "Y") + _SETUP_ENTER: return True
+        if ch in ("n", "N", "q", "\x1b"): return False
+
+def _setup_cli_head():
+    if os.environ.get("AG_ASCII"): return "ag setup - up/down move - Enter edit - s save - q quit - ? help"
+    return "ag setup — ↑↓ move · ⏎ edit · s save · q quit · ? help"
+
+def _setup_cli_draw(scr, st, S, bg):
+    import curses
+    scr.erase(); h, w = scr.getmaxyx()
+    if h < SETUP_MIN[0] or w < SETUP_MIN[1]:
+        _sput(scr, 0, 0, f"terminal too small ({w}x{h}, need {SETUP_MIN[1]}x{SETUP_MIN[0]}); q quits"); scr.noutrefresh(); return
+    B, R, D = curses.A_BOLD, curses.A_REVERSE, getattr(curses, "A_DIM", 0)
+    _sput(scr, 0, 0, _setup_cli_head(), B)
+    rows, y = setup_rows(st), 2
+    for i, (_, lab) in enumerate(rows[:4]):
+        name, _, val = lab.partition(": "); on = S["sel"] == i
+        _sput(scr, y, 0, f'{G("›") if on else " "} {name:<16}', B if on else 0); _sput(scr, y, 19, val, R if on else 0); y += 1
+    custom = setup_custom_jobs(st)
+    _sput(scr, y + 1, 2, f'{"Job":<12}{"Claude":<10}ag backend / model', B | curses.A_UNDERLINE); y += 2
+    for n, j in enumerate(JOB_KEYS):
+        e, on = st["jobs"][j], S["sel"] == 4 + n
+        _sput(scr, y, 0, f'{G("›") if on else " "} {j + ("*" if j in custom else ""):<11}', B if on else 0)
+        _sput(scr, y, 14, e["claude"], R if on and S["col"] == 0 else 0)
+        _sput(scr, y, 24, f'{e["ag"]["backend"]} / {e["ag"]["model"]}', R if on and S["col"] == 1 else 0); y += 1
+    t = setup_targets(st); plan = t["plan"]
+    _sput(scr, y + 1, 0, f'Writes ({st["scope"]}): {len(plan)} file{"s" * (len(plan) != 1)}', B); y += 2
+    room = h - 1 - y
+    shown = plan if len(plan) <= room else plan[:max(0, room - 1)]
+    for p, _, _, s in shown: _sput(scr, y, 2, f"{s:<9} {_setup_short(p, w - 14)}", D if s == "unchanged" else 0); y += 1
+    if len(shown) < len(plan): _sput(scr, y, 2, f"{G('…')} {len(plan) - len(shown)} more (s lists all)", D)
+    msg = S["msg"] or (f'! {t["skill_err"]}' if t["skill_err"] else "refreshing model lists…" if bg is not None and bg.is_alive()
+        else "* = differs from preset" if custom else "")
+    _sput(scr, h - 1, 0, msg, D)
+    scr.noutrefresh()
+
+_SETUP_HELP = ["↑↓ / j k   move between rows", "←→ / h l / Tab   Claude vs ag column (job rows)",
+    "Enter / e  edit the focused field", "  in pickers: type to filter, Backspace, Esc cancel,",
+    "  Space toggles (harnesses), Tab = custom id", "s  review target files, then write", "q / Esc  quit without writing",
+    "*  job differs from the preset"]
+
+def _setup_cli_edit(scr, redraw, st, key, col):
+    """Edit one field via popups; True if the state changed."""
+    pk = lambda *a, **k: _setup_cli_pick(scr, redraw, *a, **k)
+    if key == "scope":
+        r = pk("Scope", ["global", "project"], cur=st["scope"], info="where routing.json + skills go")
+        if r and r != st["scope"]: setup_set_scope(st, r); return True
+    elif key == "harnesses":
+        r = pk("Harnesses", list(SETUP_HARNESSES), multi=True, chosen=st["harnesses"], info="install ag-cli + ag-agents skills for")
+        if r is not None and r != st["harnesses"]: st["harnesses"] = r; return True
+    elif key == "preset":
+        r = pk("Preset", list(ROUTING_PRESETS), cur=st["preset"], info="resets all six jobs")
+        cj = setup_custom_jobs(st)
+        if r and (not cj or _setup_cli_confirm(scr, redraw, f"Apply preset {r}?", ["overwrites your custom picks for:", "  " + ", ".join(cj)])):
+            setup_apply_preset(st, r); return True
+    elif key == "claude_md":
+        cur = "auto" if st["claude_md"] is None else "yes" if st["claude_md"] else "no"
+        r = pk("Write CLAUDE.md routing block", ["auto", "yes", "no"], cur=cur, info="~/.claude/CLAUDE.md, global scope only; auto = if claude harness")
+        if r and r != cur: st["claude_md"] = None if r == "auto" else r == "yes"; return True
+    elif key.startswith("job:"):
+        j = key[4:]; e = st["jobs"][j]
+        if col == 0:
+            r = pk(f"{j}: Claude subagent model", list(SETUP_CLAUDE_ALIASES), cur=e["claude"], custom=True, info=JOB_DESC[j])
+            if r and r != e["claude"]: setup_edit_job(st, j, claude=r); return True
+        else:
+            b = pk(f"{j}: ag backend", list(MODEL_BACKENDS), cur=e["ag"]["backend"], info=JOB_DESC[j])
+            m = b and pk(f"{j}: {b} model", model_choices(b), cur=e["ag"]["model"] if b == e["ag"]["backend"] else "default",
+                custom=True, info=setup_models_info(b))
+            if m and {"backend": b, "model": m} != e["ag"]: setup_edit_job(st, j, ag={"backend": b, "model": m}); return True
+    return False
+
+def _setup_cli_main(scr, st, bg):
+    import curses
+    try: curses.curs_set(0)
+    except curses.error: pass
+    scr.keypad(True)
+    keys = [k for k, _ in setup_rows(st)]
+    S = {"sel": 0, "col": 1, "msg": ""}
+    dirty = False
+    redraw = lambda: _setup_cli_draw(scr, st, S, bg)
+    while True:
+        scr.timeout(400 if bg is not None and bg.is_alive() else -1)
+        redraw(); curses.doupdate()
+        try: ch = _setup_getkey(scr)
+        except curses.error: continue
+        S["msg"] = ""
+        h, w = scr.getmaxyx()
+        if ch in ("q", "Q", "\x1b"):
+            if not dirty or _setup_cli_confirm(scr, redraw, "Quit without saving?", ["your changes are not written"], "y quit · n/Esc stay"): return None
+        elif h < SETUP_MIN[0] or w < SETUP_MIN[1]: continue
+        elif ch in (curses.KEY_UP, "k"): S["sel"] = (S["sel"] - 1) % len(keys)
+        elif ch in (curses.KEY_DOWN, "j"): S["sel"] = (S["sel"] + 1) % len(keys)
+        elif ch in (curses.KEY_LEFT, "h"): S["col"] = 0
+        elif ch in (curses.KEY_RIGHT, "l"): S["col"] = 1
+        elif ch == "\t": S["col"] = 1 - S["col"]
+        elif ch == "?": _setup_cli_confirm(scr, redraw, "ag setup keys", _SETUP_HELP, "any key closes", anykey=True)
+        elif ch == "s":
+            t = setup_targets(st)
+            if _setup_cli_confirm(scr, redraw, "Write these files?", setup_summary_lines(st, t), "y/Enter write · n/Esc back"): return st
+        elif ch in _SETUP_ENTER + ("e",):
+            if _setup_cli_edit(scr, redraw, st, keys[S["sel"]], S["col"]): dirty = True; S["msg"] = "edited (s to save)"
+
+def setup_ui_cli(st, bg=None):
+    """Single-screen curses editor over the shared state; st on save, None on quit."""
+    import curses, locale
+    os.environ.setdefault("ESCDELAY", "25")
+    try: locale.setlocale(locale.LC_ALL, "")
+    except locale.Error: pass
+    return curses.wrapper(_setup_cli_main, st, bg)
+
+def do_setup(a):
+    want = (getattr(a, "ui", None) or os.environ.get("AG_SETUP_UI") or "").strip().lower()
+    if want and want not in SETUP_UIS: return emit(a, "setup", error=f"bad --ui/AG_SETUP_UI {want!r}: {'|'.join(SETUP_UIS)}")
+    osa = _setup_osa_bin()
+    if want == "mac" and not osa and not a.yes:
+        return emit(a, "setup", error="--ui mac needs osascript (macOS)", hint="ag setup --ui cli")
+    inter = not a.yes and (sys.stdin.isatty() or want == "mac")  # mac dialogs need no TTY
+    if not inter and not a.yes and not a.dry_run:
+        return emit(a, "setup", error="stdin is not a TTY: pass --yes (plus flags) to run non-interactively",
+            hint="ag setup --yes --scope global --harness claude --preset cost-first")
+    try:
+        sets = parse_route_sets(a.set)
+        harn = parse_harness_list(a.harness) if a.harness is not None else None
+    except ValueError as e: return emit(a, "setup", error=str(e))
+    ui = setup_ui_pick(want, osa=osa, tty=sys.stdin.isatty() and sys.stdout.isatty()) if inter else ""
+    if ui == "cli" and not _setup_cli_ok(): ui = "plain"
+    if ui == "plain":
+        _say("refreshing model lists…")
+        models_load(refresh=True, on_progress=lambda b, e: _say(f'  {b}: {len(e["models"])} models'
+            + (f' (error: {e["error"]}; kept last good)' if e["error"] else "")))
+    bg = _setup_bg_refresh() if ui in ("mac", "cli") else None
+    scope = a.scope or (_ask("scope (global|project)", "global") if ui == "plain" else "global")
+    if scope not in ("global", "project"): return emit(a, "setup", error=f"bad scope {scope!r}: global|project")
+    if harn is None:
+        det = ",".join(detect_harnesses()) or "none"
+        try: harn = parse_harness_list(_ask("install skills for (claude,opencode,codex|all|none)", det) if ui == "plain" else det)
+        except ValueError as e: return emit(a, "setup", error=str(e))
+    st = setup_state_from(scope, a.preset, sets, harn, a.claude_md)
+    if ui == "plain" and not a.preset:
+        p = _ask("preset (cost-first|balanced|quality-first)", st["preset"])
+        if p != st["preset"]: st["preset"] = p; _setup_rebase(st)
+    if st["preset"] not in ROUTING_PRESETS: return emit(a, "setup", error=f"bad preset {st['preset']!r}: {'|'.join(ROUTING_PRESETS)}")
+    if ui == "plain":
+        for j in JOB_KEYS:
+            e = st["jobs"][j]
+            _say(f'{j} — {JOB_DESC[j]}: claude={e["claude"]}  ag={e["ag"]["backend"]}/{e["ag"]["model"]}')
+            if _ask("  change? (y/N)", "n").lower()[:1] != "y": continue
+            c = _ask_pick("  claude subagent alias", list(SETUP_CLAUDE_ALIASES), e["claude"])
+            b = _ask_pick("  ag backend", list(NATIVE_ORDER), e["ag"]["backend"])
+            if b not in NATIVE_ORDER: _say(f"  unknown backend {b!r}, keeping {e['ag']['backend']}"); b = e["ag"]["backend"]
+            m = _ask_pick("  ag model", model_choices(b), e["ag"]["model"] if b == e["ag"]["backend"] else "default")
+            setup_edit_job(st, j, claude=c, ag={"backend": b, "model": m})
+    elif ui in ("mac", "cli"):
+        try: st = (setup_ui_mac if ui == "mac" else setup_ui_cli)(st, bg)
+        except RuntimeError as e: return emit(a, "setup", error=str(e), hint="retry with --ui cli or --ui plain")
+        if st is None: return emit(a, "setup", {"_text": "cancelled (nothing written)", "cancelled": True})
+    t = setup_targets(st)
+    scope, harn, preset, jobs = st["scope"], st["harnesses"], st["preset"], st["jobs"]
+    plan, notes, skill_err, block, tdir = t["plan"], t["notes"], t["skill_err"], t["block"], t["tdir"]
+    if ui == "plain":
         _say(f"\nscope={scope} preset={preset} harnesses={','.join(harn) or 'none'}\n{block}\n")
-        for p, _, _, st in plan: _say(f"  {st:9} {p}")
+        for p, _, _, s in plan: _say(f"  {s:9} {p}")
         if skill_err: _say(f"  ! {skill_err}")
         if _ask("write these files? (Y/n)", "y").lower()[:1] == "n": return emit(a, "setup", {"_text": "cancelled", "cancelled": True})
     files, out = [], []
-    for p, txt, old, st in plan:
-        rec = {"path": str(p), "status": st}
+    for p, txt, old, st_ in plan:
+        rec = {"path": str(p), "status": st_}
         if a.dry_run:
-            if st != "unchanged":
+            if st_ != "unchanged":
                 rec["diff"] = "".join(difflib.unified_diff(old.splitlines(True), txt.splitlines(True),
-                    str(p) if st == "changed" else "/dev/null", str(p)))
-            out.append(f"would write {p} ({st})" if st != "unchanged" else f"unchanged {p}")
+                    str(p) if st_ == "changed" else "/dev/null", str(p)))
+            out.append(f"would write {p} ({st_})" if st_ != "unchanged" else f"unchanged {p}")
             if rec.get("diff"): out.append(rec["diff"].rstrip("\n"))
         else:
-            if st != "unchanged": _put_file(p, txt)
-            out.append(f"{'wrote' if st != 'unchanged' else 'unchanged'} {p}")
+            if st_ != "unchanged": _put_file(p, txt)
+            out.append(f"{'wrote' if st_ != 'unchanged' else 'unchanged'} {p}")
         files.append(rec)
     out += notes
     data = {"scope": scope, "harnesses": harn, "preset": preset, "routing": jobs, "files": files,
         "dry_run": bool(a.dry_run), "notes": notes}
+    if ui == "mac" and not a.dry_run:
+        wrote = [Path(f["path"]).name for f in files if f["status"] != "unchanged"]
+        try: _osa(_OSA_NOTE, "ag setup", f"wrote {len(wrote)} file(s): {', '.join(wrote)}" if wrote else "nothing changed")
+        except RuntimeError: pass
     if skill_err:
         if not getattr(a, "json", False): print("\n".join(out))
         return emit(a, "setup", data, error=skill_err,
@@ -10914,6 +11364,20 @@ def _setup_selfcheck():
     assert routing_md_insert("x", "B", append=False) is None
     assert render_skill("{{AG}} {{SCOPE}} {{X}}", "R", "project") == f"{ag_script_path()} project {{{{X}}}}"
     assert parse_model_lines("\x1b[2K\x1b[GLoading models…\nAvailable models\n\ngpt-5 - GPT-5 (current)\nauto - Auto\n") == ["gpt-5", "auto"]
+    # setup state model (shared by plain / mac / cli front-ends)
+    ex = {"global": {"preset": "balanced", "jobs": {"plan": {"claude": "sonnet"}}}, "project": {}}
+    s = setup_state_from("global", None, {"debug": {"claude": "haiku"}}, ["claude"], None, proj="/x", existing=ex)
+    assert s["preset"] == "balanced" and s["jobs"]["plan"]["claude"] == "sonnet" and s["jobs"]["debug"]["claude"] == "haiku"
+    assert setup_custom_jobs(s) == ["debug", "plan"] and setup_rows(s)[2][1] == "Preset: balanced (custom picks)"
+    setup_edit_job(s, "review", ag={"backend": "codex", "model": "gpt-x"}); setup_set_scope(s, "project")
+    assert s["jobs"]["plan"]["claude"] == "opus" and s["jobs"]["debug"]["claude"] == "haiku" and s["jobs"]["review"]["ag"]["model"] == "gpt-x"
+    assert setup_rows(s)[3][1] == "Write CLAUDE.md: n/a (global scope only)"
+    setup_apply_preset(s, "cost-first")
+    assert setup_custom_jobs(s) == [] and s["edits"] == {} and setup_rows(s)[6] == ("job:review", "review — Claude: opus · ag: claude/opus")
+    assert setup_filter(["opencode/a", "anthropic/Claude-x"], "an CLA") == ["anthropic/Claude-x"]
+    assert setup_ui_pick("", "darwin", {}, "/o") == "mac" and setup_ui_pick("", "darwin", {"SSH_TTY": "x"}, "/o") == "cli"
+    assert setup_ui_pick("", "linux", {}, None, tty=False) == "plain" and setup_ui_pick("mac", "linux", {}, None) == "cli"
+    assert setup_ui_pick("plain", "darwin", {}, "/o") == "plain" and setup_ui_pick("mac", "linux", {}, "/o", tty=False) == "mac"
 
 def build():
     p = argparse.ArgumentParser(prog="ag", description="CLI helper for autonomous agents")
@@ -11035,7 +11499,7 @@ def build():
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
     mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now")
     rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS)
-    st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS or JOB=ag:BACKEND/MODEL (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs")
+    st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS or JOB=ag:BACKEND/MODEL (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: mac (native dialogs) | cli (full-screen) | plain (prompts); default auto, env AG_SETUP_UI")
     return p
 
 # ---- portable task snapshots (outbound SSH, no native runtime migration) ----

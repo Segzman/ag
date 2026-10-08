@@ -19,7 +19,7 @@ State lives in `./.agent/` (override: `--dir`, `$AGENT_CLI_DIR`). Every command 
 ```sh
 git clone https://github.com/Segzman/ag.git && cd ag
 ./install.sh                      # -> ~/.local/bin/ag (single file; no sudo, no network)
-ag setup                          # models -> scope -> harness skills -> routing preset
+ag setup                          # routing + skills editor (macOS dialogs / full-screen; --ui plain)
 ag --dir "$PWD/.agent" agents doctor     # which backends are installed
 ag --dir "$PWD/.agent" agents list
 ag --dir "$PWD/.agent" chat send claude "hi"
@@ -127,10 +127,16 @@ Live discovery: opencode (`opencode models`), codex (`~/.codex/models_cache.json
 ag setup [--scope global|project] [--harness claude,opencode,codex|all]
          [--preset cost-first|balanced|quality-first]
          [--set JOB=claude:ALIAS] [--set JOB=ag:BACKEND/MODEL]
-         [--claude-md|--no-claude-md] [--yes] [--dry-run]
+         [--claude-md|--no-claude-md] [--yes] [--dry-run] [--ui mac|cli|plain]
 ```
 
-Interactive on a TTY: refresh models, pick scope (default global), harnesses (default: detected), preset, then per-job model choices, then confirm. Flags make it fully scriptable. It writes:
+Interactive front-ends (flags pre-fill them; `--ui` or env `AG_SETUP_UI` picks one; `--yes`/`--dry-run`/no TTY stay non-interactive):
+
+- `mac` (default on local macOS): native dialogs. A hub lists Scope, Harnesses, Preset, Write CLAUDE.md and one row per job (`review — Claude: opus · ag: claude/opus`); pick a row → Edit → back to the hub. Jobs: Claude alias → ag backend → model (lists over 25 ask for a filter first; "Type a custom id…" for anything else). `✓ Save` shows the target files, then writes and notifies; Quit writes nothing. Needs no TTY.
+- `cli` (default elsewhere on a TTY): one curses screen: settings, the 6-job table (Job | Claude | ag backend/model, `*` = differs from preset), target files. `↑↓` move, `←→`/Tab pick the Claude or ag column, `Enter` edits in a popup (type to filter, Backspace, Esc cancels, Space toggles harnesses, Tab = custom id), `s` reviews + writes, `q` quits, `?` help. Needs 60x16; smaller falls back to `plain`.
+- `plain`: the original prompt sequence.
+
+Stale model lists refresh in the background; the next model picker sees the fresh list. Applying a preset over custom picks asks first. It writes:
 
 1. `routing.json` for the scope (see [Routing](#routing)).
 2. The `ag-cli` and `ag-agents` skills (rendered from `skills/` with your `ag` path, routing and scope) into each harness skill dir:

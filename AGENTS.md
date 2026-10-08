@@ -11,7 +11,7 @@ git clone https://github.com/Segzman/ag.git && cd ag && chmod +x ag
 
 State: `./.agent/` in cwd, overridden by `--dir` / `$AGENT_CLI_DIR`. **Always pass `--dir` explicitly** — running from another cwd silently starts a fresh roster. Never commit state (`./.agent/`, `approvals.json`, `history.jsonl`, `notes.jsonl`, `todos.json`).
 
-Skills: `.claude/skills/using-ag/SKILL.md` (full reference — load before driving `ag`), `.claude/skills/ag-delegate/SKILL.md` (delegation — load before assigning work). Details: `README.md` (Setup + Setup for coding agents), `docs/AGENT_CONTEXT.md` (scoped context), `custom.md` (scope chain).
+Skills: templates in `skills/ag-cli` (CLI/PTY/secrets/setup) and `skills/ag-agents` (routing, delegation); `ag setup` renders them into harness skill dirs. Details: `README.md`, `docs/AGENT_CONTEXT.md` (scoped context), `custom.md` (scope chain).
 
 ## Rules
 

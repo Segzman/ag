@@ -1,431 +1,313 @@
-# ag — CLI helper for autonomous agents
+# ag — CLI + agent orchestrator
 
-`ag` drives coding-CLI subagents from the terminal: headless turns
-(`chat send`, `delegate`), background wake-ups (`wake`), live PTY
-sessions (`spawn`/`snap`/`send`), and shared skills/MCP/memory via
-harness profiles. Single Python file, stdlib only. State lives in
-`./.agent/` (override with `--dir` or `$AGENT_CLI_DIR`). All commands
-accept `--json` for machine-readable output.
+`ag` is a single-file Python CLI (stdlib only, POSIX) with two halves:
+
+- **CLI** — logged commands with approvals, non-blocking PTY sessions, secret prompts, notes/todos, live model discovery, a TUI.
+- **Agents** — drives coding-CLI backends (`claude`, `opencode`, `codex`, `gemini`, `cursor`, plus a keyless `echo`): headless turns, background wakes, per-job model routing, worktree isolation, per-turn checkpoints, scoped context handoff.
+
+State lives in `./.agent/` (override: `--dir`, `$AGENT_CLI_DIR`). Every command takes `--json`.
 
 ## Contents
 
-- [Install](#install)
-- [Setup for coding agents](#setup-for-coding-agents)
-- [Getting started](#getting-started)
-- [TUI controls](#tui-controls)
-- [Backends](#backends)
-- [Native slash commands](#native-slash-commands)
-- [Model selection](#model-selection)
-- [Native limits](#native-limits-verified-from---help-no-remote-calls)
-- [Harness profiles](#harness-profiles-shared-named-backendsskillsmemorymcp)
-- [Wake](#wake-background-agents-wake-agents-on-completion)
-- [Secret input](#secret-input-passwords-otp-codes-passphrases)
-- [Docs](#docs)
-- [Limitations](#limitations-honest)
+- [Quickstart](#quickstart) · [Capability matrix](#capability-matrix)
+- [Part 1 — CLI](#part-1--cli): [Install](#install) · [State dir](#state-dir) · [Sessions](#sessions-pty) · [run / approvals / rtk](#run-approvals-rtk) · [Secrets](#secrets) · [Notes / todos](#notes-and-todos) · [Models](#models) · [Setup](#setup) · [TUI](#tui)
+- [Part 2 — Agents](#part-2--agents): [Roster](#roster-and-backends) · [Routing](#routing) · [Delegation / wake](#delegation-and-wake) · [Reliability](#reliability) · [Isolation](#isolation-worktree-per-agent) · [Checkpoints](#checkpoints) · [Usage](#usage) · [Context](#context-and-handoff) · [Harness profiles](#harness-profiles) · [Roles](#roles)
+- [Docs](#docs) · [Limitations](#limitations-honest)
+
+## Quickstart
+
+```sh
+git clone https://github.com/Segzman/ag.git && cd ag
+./install.sh                      # -> ~/.local/bin/ag (single file; no sudo, no network)
+ag setup                          # models -> scope -> harness skills -> routing preset
+ag --dir "$PWD/.agent" agents doctor     # which backends are installed
+ag --dir "$PWD/.agent" agents list
+ag --dir "$PWD/.agent" chat send claude "hi"
+```
+
+No-key smoke test (own state dir; `selfcheck` uses a temp dir):
+
+```sh
+STATE="$(mktemp -d)"
+./ag --dir "$STATE" selfcheck
+./ag --dir "$STATE" agents add smoke --backend echo --role sub
+./ag --dir "$STATE" chat send smoke "hi"
+JOB="$(./ag --dir "$STATE" --json wake smoke "summarize this" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["job"])')"
+./ag --dir "$STATE" wakes --wait "$JOB" --timeout 30
+./ag --dir "$STATE" chat log smoke
+```
+
+## Capability matrix
+
+| backend | resume | rtk | skills | MCP | profile config |
+|---|---|---|---|---|---|
+| claude | session id | own hook | `--plugin-dir` | `--mcp-config` | argv only |
+| opencode | session id | own plugin | `OPENCODE_CONFIG_DIR/skills` | translated `mcp` | `OPENCODE_CONFIG` |
+| codex | `exec --json` resume | prompt hint | mirrored in scoped `CODEX_HOME/skills` | `[mcp_servers.*]` | `CODEX_HOME` |
+| cursor | session id | prompt hint | prompt only (reported) | reported unsupported | — |
+| gemini | stateless (history replay) | prompt hint | prompt only (reported) | reported unsupported | — |
+| echo | stateless | — | — | — | — |
+
+Native command flag (`chat send --command`) is opencode-only; others reject it. Backend CLIs are installed/authenticated by you; `ag agents doctor` only reports.
+
+---
+
+# Part 1 — CLI
 
 ## Install
 
-Requirements: Python 3.9+, POSIX (macOS/Linux; no Windows), git.
-No Python packages. Full guide: [docs/INSTALL.md](docs/INSTALL.md).
+Requires Python 3.9+, POSIX, git. `./install.sh [--prefix DIR] [--force]` copies only the `ag` file (default `~/.local/bin/ag`); no rc edits. Put the dir on `PATH`. Running `./ag` from the checkout also works. Details, SSH use, uninstall: [docs/INSTALL.md](docs/INSTALL.md).
+
+## State dir
+
+Resolution, no upward search: `--dir` -> `$AGENT_CLI_DIR` -> `$PWD/.agent`. Wrong cwd silently creates a fresh roster (looks wiped, isn't). **Always pass `--dir`.** Never commit `.agent/`, `approvals.json`, `history.jsonl`, `notes.jsonl`, `todos.json`.
+
+For coding agents driving `ag`: absolute path to the binary, one invocation per shell call (no `;`/`&&` chains), never run TTY commands (`tui`, `attach`, `shell`, `handoff --exec`; use `spawn` + `snap`). The skills `ag-cli` and `ag-agents` encode this; see [Setup](#setup).
+
+## Sessions (PTY)
+
+Live programs, non-blocking; pings land in `events.jsonl`.
 
 ```sh
-git clone https://github.com/Segzman/ag.git
-cd ag
-./install.sh                  # installs standalone ag to ~/.local/bin/ag
+ag spawn -- bash                  # returns instantly; --name --cwd --env --on-exit
+ag snap <id> [--clean] [--since OFFSET]    # many readers OK
+ag send <id> "ls"                 # or --key ctrl-c|ctrl-d|esc|up|down|left|right|enter|tab, --no-enter
+ag wait <id> --timeout 30         # only blocking command; bound it
+ag attach <id>                    # full terminal (TTY; Ctrl-] detaches)
+ag kill [--force] <id>
+ag sessions | status | events --limit 20
+ag forget <id>                    # wipe logs (auth traces)
 ```
 
-Alternatives: `./install.sh --prefix DIR` installs to `DIR/bin/ag`;
-`./install.sh --force` updates an existing install.
-
-The installer copies only the single `ag` file: no sudo, no network or
-backend setup, no shell-rc edits. Put the install dir on `PATH` for the
-session (`export PATH="$HOME/.local/bin:$PATH"`) — details, custom
-prefixes, updates, remote use over SSH, and uninstall in [docs/INSTALL.md](docs/INSTALL.md).
-
-Backends are optional and installed/authenticated separately —
-`ag agents doctor` reports what is present. The local `echo` backend
-always works (no keys) for plumbing tests. Running from the checkout
-(`./ag`) keeps working with or without installing; skills
-(`.claude/skills/`) and docs stay in the clone.
-
-Verify with a no-key smoke test (fresh state dir; agent state stays
-inside it, while `selfcheck` uses its own temp dir):
+## run, approvals, rtk
 
 ```sh
-STATE="$(mktemp -d)"                                        # fresh state dir, no collisions
-./ag --dir "$STATE" selfcheck                               # built-in regression checks
-./ag --dir "$STATE" agents add smoke --backend echo --role sub
-./ag --dir "$STATE" chat send smoke "hi"                    # one headless turn, no keys
-JOB="$(./ag --dir "$STATE" --json wake smoke "summarize this" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["job"])')"
-./ag --dir "$STATE" wakes --wait "$JOB" --timeout 30        # wake is async: wait for done
-./ag --dir "$STATE" chat log smoke                          # follow-up reply lands here
+ag run -- git status              # logged to history.jsonl; `--` needed when the child takes flags
+ag approvals ; ag approve <id>    # dangerous command blocked -> approve (10 min) or re-run --force
+ag history
 ```
 
-No cleanup step: the daemon may still finalize the session after the
-job reports done, so leave the temp dir to the OS.
+Also `read|write|edit|ls|grep` file ops. Multi-token commands are shell-quoted (old approvals re-prompt once).
 
-State dir: every `ag` invocation resolves state as `--dir` → `$AGENT_CLI_DIR` → `$PWD/.agent` (no upward search). Running from the wrong cwd silently creates a fresh roster that looks wiped but isn't. **Always pass `--dir` explicitly** (or export `AGENT_CLI_DIR` once per session); examples below use `./ag` from the checkout — add `--dir <state>` (or the export) to each command. Never commit state contents (`.agent/`, `approvals.json`, `history.jsonl`, `notes.jsonl`, `todos.json` are git-ignored).
+**rtk output compaction:** if `rtk` is on PATH, `run` executes the rtk-rewritten command (result has `rtk`). `run --raw` skips it per call; `AG_RTK=0` disables. claude/opencode use their own rtk hooks; codex/gemini/cursor get a prompt hint. `agents doctor` shows coverage.
 
-Skills for coding agents live in `.claude/skills/`:
+## Secrets
 
-- `using-ag` — full command reference + recipes (spawn/snap/send, wake, harness profiles, context/compact). Load it before driving `ag`.
-- `ag-delegate` — "have another agent do X": headless turns, fan-out, background wakes, session follow-ups, context handoffs. No external queue, no Linear dependency.
-
-Share one setup across agents without touching home/global config:
+Sudo password, SSH passphrase, OTP/PIN: ag shows a native macOS dialog (masked, OK/Cancel) and passes the value straight to the program. The model never sees it.
 
 ```sh
-./ag harness profile add docs --instructions ./AGENTS.md \
-  --memory ./MEMORY.md --memory ./notes/ \
-  --skills ./.claude/skills --mcp ./.mcp.json
-./ag harness profile set oc --profile docs
+ag spawn -- sudo make install     # prompt detected -> dialog -> typed into PTY
+ag send <id> --secret             # value from dialog (getpass on a non-mac TTY)
+ag askpass "Password:"            # askpass protocol; Cancel = exit 1
+ag spawn --no-secret-popup -- ... # opt out per session; AG_SECRET_POPUP=0 globally
 ```
 
-## Setup for coding agents
+- **PTY detection:** output idle + (echo off in canonical mode with a prompt-like last line, or a last line matching `password|passphrase|passcode|verification code|one-time|otp|2fa|pin|security code|token ... :/?`). One dialog at a time; the same prompt never pops twice. `secret_prompt` event logs outcome `ok|cancel|error`, never the value.
+- **Backend turns and spawned sessions:** env gets `SUDO_ASKPASS`, `SSH_ASKPASS` (+ `SSH_ASKPASS_REQUIRE=force`), `GIT_ASKPASS` -> `<state>/bin/ag-askpass`; `<state>/bin` is prepended to `PATH` with a `sudo` shim adding `-A` (unless `-A/-S/-n` given). Your own variables are never overridden. A still-blocked prompt logs `secret_needed` and adds one retry note. `ag askpass` answers only when its parent process is sudo/ssh/git, so an agent cannot read a secret back.
+- **Guarantee:** never written to disk in plaintext; lives in memory and pipes only (osascript -> ag -> PTY fd, or askpass stdout -> sudo/ssh/git). `input.log` has `[secret input redacted]`.
+- **Limits:** the receiving program gets plaintext; Python can't zero strings; a program that echoes its own input can leak to `output.log`; keyword detection is heuristic (Cancel sends nothing); the parent-name check can be spoofed, so every dialog names the requesting command in `[brackets]`. macOS only (`osascript`); elsewhere injection/detection are off.
 
-1. Invoke via absolute path to this clone (`<repo>/ag`), one invocation per shell call. No `;`/`&&` chains around it.
-2. Always pass `--dir <state>` (or per-session `AGENT_CLI_DIR`). Confirm the roster before writing (`agents list`).
-3. Load `.claude/skills/using-ag/SKILL.md` before running commands; load `.claude/skills/ag-delegate/SKILL.md` before assigning work to another agent.
-4. Never run TTY commands from agent context: `tui`, `attach`, `shell`, `handoff --exec`. Use `spawn` + `snap` instead; tell the user to run TUI commands themselves.
-5. Delegate via `ag` (`chat send`, `delegate`, `wake`, `spawn --wake`, `context assign/show/checkpoint`) — see `ag-delegate`. Root repo guidance is in `AGENTS.md` (+ `custom.md` scope chain); scoped memory details in `docs/AGENT_CONTEXT.md`.
+## Notes and todos
 
-## Getting started
+`ag note "..."` / `ag notes` · `ag todo add|list|done|clear` · `ag history` · `ag events`.
+
+## Models
 
 ```sh
-./ag agents doctor          # check backends (claude, opencode, gemini, codex, cursor, echo)
-./ag agents list            # roster (default: claude orchestrator + oc sub)
-./ag chat send claude "hi"  # one headless turn
-./ag tui                    # landing dashboard (projects, chats, configurator)
-./ag selfcheck              # built-in regression checks
+ag models [--backend B] [--refresh] [--json]
 ```
 
-Sessions (live PTY programs) are non-blocking; pings land in `events.jsonl`:
+Live discovery: opencode (`opencode models`), codex (`~/.codex/models_cache.json`), cursor (`agent --list-models`); claude and gemini are static aliases (their CLIs have no list command). Cache `~/.cache/ag/models.json`, TTL 24h, refreshed automatically when stale; `--refresh` forces. A failing source keeps its last good list and records `error`. The built-in static list stays as fallback; pickers prefer the cache. `default` model = no `-m` flag, except opencode where it means `opencode/muse-spark-1.3-contributor-free` everywhere ag launches opencode (details: [docs/HARNESS_ROLES.md](docs/HARNESS_ROLES.md)).
+
+## Setup
 
 ```sh
-./ag spawn -- bash
-./ag snap <id> [--clean]    # many readers OK
-./ag send <id> "ls"         # or --key ctrl-c|esc|up|enter|tab
-./ag attach <id>            # full terminal (Ctrl-] detaches, keeps running)
-./ag kill [--force] <id>    # wait blocks only if you ask: ./ag wait <id>
+ag setup [--scope global|project] [--harness claude,opencode,codex|all]
+         [--preset cost-first|balanced|quality-first]
+         [--set JOB=claude:ALIAS] [--set JOB=ag:BACKEND/MODEL]
+         [--claude-md|--no-claude-md] [--yes] [--dry-run]
 ```
 
-Memory: `note`/`notes`, `todo add|list|done|clear`, `history`, `events`.
-Approvals: dangerous `run` commands block → `approvals` → `approve <id>` (10 min) or re-run with `--force`.
-Sharing: `harness show|export|import|link --to DIR` (secrets redacted, `~/.claude.json`/credentials never exported).
+Interactive on a TTY: refresh models, pick scope (default global), harnesses (default: detected), preset, then per-job model choices, then confirm. Flags make it fully scriptable. It writes:
 
-## TUI controls
+1. `routing.json` for the scope (see [Routing](#routing)).
+2. The `ag-cli` and `ag-agents` skills (rendered from `skills/` with your `ag` path, routing and scope) into each harness skill dir:
 
-Composer-first, OpenCode-style: just type — no insert mode, no `i`
-key. Home is the initial screen: centered `ag` wordmark, prompt-led
-charcoal composer (blue left rule) with `Build · <model> ·
-<agent>`, projects grouped by agent workdir with two-line rows (status,
-friendly model, turn count, last reply), quiet `cwd · status` bottom line.
-`Enter` sends the draft to the selected agent and opens its chat; `/` at
-the start opens the slash popup; `Esc` selects (`q` quits, arrows move,
-any text returns to the composer). Session: type, `Enter` sends, `Esc`
-back home (draft kept). Mouse clicks rows/popup/composer and the wheel
-scrolls; keyboard does everything.
-
-| Key | Home | Session |
+| harness | global | project |
 |---|---|---|
-| type | message (Enter sends + opens chat) | message (Enter sends) |
-| `/` | command popup (filter · `↑↓` · `Tab` complete · `Enter` run · `Esc` keep draft) | same |
-| `Enter` / `Esc` | open chat / select (`q` quits) | send / back home (draft kept) |
-| `↑↓`/`PgUp`/`PgDn`/`tab` / `1-9` | select agent | scroll / switch target agent |
-| `ctrl+p` | searchable command palette (everywhere; drafts kept) | same |
-| `c` | configurator: provider/model/profile/behavior/length/memory/appearance | same |
-| `m` / `M` | model picker / custom model string | same |
-| `b` | backend picker (switch coding CLI, persists) | same |
-| `P` | profile picker (shared harness profile, persists, clears session) | same |
-| `R` | role (persona) picker | same |
-| `H` | — | native handoff: suspends UI, execs backend TUI with profile env, restores |
-| `/cmd` | `/projects /agents /config /model /backend /profile /new /delegate /context /compact /compact-now /theme /handoff /approve /help /quit` (`/harness` = legacy `/backend`) | same; `/cmd args` typed forms run verbatim |
-| `n` | new agent (name, then backend; draft kept) | same |
-| `d` | delegate (agent name, then task; draft kept) | same |
-| `!cmd` | (via composer submit) | run shell now (e.g. `!git status`) |
-| `a` | approve oldest pending dangerous command | same |
-| `t` | cycle theme (`abyss`/`mono`/`ember`) | same |
-| `?` | full key list | same |
+| claude | `~/.claude/skills/<name>/` | `<project>/.claude/skills/<name>/` |
+| opencode | `~/.config/opencode/skills/<name>/` | `<project>/.opencode/skills/<name>/` |
+| codex | `~/.codex/skills/<name>/` | `<project>/.agents/skills/<name>/` |
 
-Conversation length (`c` → Conversation length, or `ctrl+p` →
-Conversation length, or `/compact`): first screen shows On/Off per
-scope — Orchestrator, Subagents, This agent (with `Using … settings`
-vs `Custom settings`) — plus `Summarize this chat now` and Back.
-Enter a scope to change it: Automatic summaries (On/Off), When to
-summarize (named presets with exact limits: Standard matches the role
-defaults — orchestrators every 30 user turns or ~20,000 tokens keeping
-10, subagents every 20 turns or ~20,000 tokens keeping 5; More often
-is 15/~10k/keep 5 (orch) and 10/~10k/keep 3 (sub); Less often is
-60/~40k/keep 15 (orch) and 40/~40k/keep 10 (sub); choosing never flips
-On/Off), Advanced
-settings (exact limits, kept turns, time limit; typing replaces the
-shown value, `Enter` saves, `Esc` cancels), Back. A per-agent scope
-always offers `Use … settings` to return to the shared role values.
-`Esc` steps one level back; from the overview it returns to the
-configurator (same row) or composer, drafts kept. `Summarize this chat
-now` keeps the newest messages and reports busy/failure or `No older
-messages to summarize yet. The newest N turns are kept.` Context
-(`c` → Guidance & memory, or `ctrl+p` → Context for NAME) is the
-read-only `get_agent_context` view: assignment, sources, warnings,
-content.
+3. claude + global (unless `--no-claude-md`): the routing block in `~/.claude/CLAUDE.md` between `<!-- ag:routing:start -->` / `<!-- ag:routing:end -->`; appended if markers are absent, other content untouched.
 
-Layout adapts: content max ~84 cols centered; logo/padding shrink at
-short heights; single pane below 110 cols (sidebar only on wide);
-40×16 stays usable (popup drops below the composer when the composer
-sits at the top). Below 40×16 it asks for a resize instead of drawing
-garbage. Live turns render as a rich timeline (reasoning as Thinking,
-tool cards with honest status words — Running only when the backend
-reports it, Done/Failed — diffs with `+-` kept, errors stay
-visible). Previews: `docs/ui-previews/` (actual renderer captures, see
-`docs/UI_DESIGN.md`). Launch with `scripts/ag-tui.command` (daily
-`~/.agent` state); `./ag --dir … tui` for an explicit state dir.
+Writes are atomic and printed; `--dry-run` writes nothing and prints a diff; nothing is ever deleted. The repo's old `.claude/skills/using-ag` and `ag-delegate` were removed; `ag setup --scope project --harness claude` renders their replacements (`ag-cli`, `ag-agents`). Old copies elsewhere are left alone; delete by hand once the new skills are in.
 
+## TUI
 
-Keys arrive via `get_wch` when available: arrows/keys stay keys (never typed as text), non-ASCII text stays text.
+`ag tui` (or `scripts/ag-tui.command`): composer-first, no insert mode — just type. Home lists projects grouped by agent workdir; `Enter` sends to the selected agent and opens its chat; `/` opens the slash popup; `Esc` selects (`q` quits). Mouse supported; keyboard has full parity. Needs a TTY, at least 40x16 (sidebar only at 110+ cols). `NO_COLOR=1`, `AG_ASCII=1` supported. `ag keys` prints the cheat-sheet; layout/design in [docs/UI_DESIGN.md](docs/UI_DESIGN.md), captures in `docs/ui-previews/`.
 
-## Backends
+| Key | Action |
+|---|---|
+| type / `Enter` | message / send (Home: also opens chat) |
+| `/` | command popup (`↑↓`, `Tab` complete, `Enter` run, `Esc` keep draft) |
+| `ctrl+p` | command palette |
+| `Esc` | Home: select; session: back home (draft kept) |
+| `↑↓ PgUp PgDn tab 1-9` | select agent / scroll / switch target |
+| `c` | configurator (provider, model, profile, behavior, conversation length, memory, appearance) |
+| `m` / `M` | model picker / custom model string |
+| `b` / `P` / `R` | backend / profile / role picker |
+| `H` | native handoff (suspend UI, exec backend TUI with profile env, restore) |
+| `n` / `d` | new agent / delegate |
+| `!cmd` | run shell now |
+| `a` | approve oldest pending dangerous command |
+| `t` | cycle theme (`abyss`/`mono`/`ember`) |
+| `?` | full key list |
 
-`claude` orchestrates; subs via `opencode`/`gemini`/`codex`/`cursor`. `echo` is a local plumbing-test backend. Stateless backends replay recent history; `claude`/`opencode`/`cursor` resume by session id. Each backend CLI is installed and authenticated separately — `ag` never does that; `agents doctor` only reports what it finds. Roles (`roles list/add/set/show/rm`) set system prompts; per-agent `--persona` or `--system` (`@file` loads text) overrides.
+Slash commands run locally and never reach the model; they work in the composer and headless (`ag chat send claude "/help"`; `\` is an alias): `/projects /agents /config /model /backend /profile /new /delegate /context /compact /compact-now /theme /handoff /approve /help /quit` (`/harness` = legacy `/backend`). Unknown `/word` errors with a hint; `/Users/...` paths stay messages. Conversation-length presets: orchestrators summarize every 30 turns / ~20k tokens keeping 10, subagents every 20 / ~20k keeping 5 (see [docs/AUTO_COMPACTION.md](docs/AUTO_COMPACTION.md)).
 
-## Native slash commands
+---
 
-Work in the TUI composer and headless chat (`./ag chat send claude "/help"`). Leading `\` is an alias (`\model`); other backslash text (paths) stays a normal message. Slash never reaches the model as prose: it runs locally and logs as tool lines (invisible to history replay). Unknown `/word` errors with help + handoff hint. A `/` glued to a known word (`/config/quit`) errors locally; absolute paths (`/Users/…`) stay messages.
+# Part 2 — Agents
+
+## Roster and backends
+
+`claude` orchestrates; subs run on `opencode`/`gemini`/`codex`/`cursor`; `echo` is the keyless test backend. Default roster: `claude` (orchestrator) + `oc` (sub).
 
 ```sh
-./ag chat send claude "/help"               # list
-./ag chat send claude "/harness list"       # backends (* = current)
-./ag chat send claude "/harness use opencode"  # switch (alias: /backend ...)
-./ag chat send claude "/model"                  # list models for claude's backend
-./ag chat send claude "/handoff"            # interactive native session
-./ag chat send claude "/profile list"       # shared profiles (* = this agent)
-./ag chat send claude "/profile show docs"  # sources + effective files + unsupported
-./ag chat send claude "/profile use docs"   # select (clears session); --none clears
-# in TUI: type / for the popup (Tab completes, Enter runs, Esc keeps draft):
-# /projects /agents /config /model [name] /backend [name] /profile [...] /
-# /new /delegate /context /compact /compact-now /theme /approve /quit.
-# b = backend picker, P = profile picker, H = exec handoff (suspend/restore),
-# c = configurator (home + session), ctrl+p = command palette (optional alias).
-# Backslash alias: \help \model \harness \handoff \profile
-# (other backslash text like C:\path stays a normal message).
+ag agents doctor | list
+ag agents add w --backend opencode --role sub [--model ID] [--dir D] [--persona P|--system TEXT|@file] [--job JOB]
+ag agents set w --backend B --model ID --persona P --worktree      # refused while busy
+ag agents rm w [--force]
+ag harness use w codex ; ag harness current w     # switch backend; remembers one model + one session id per backend
 ```
 
-Switching preserves name/workdir/role/persona/system, remembers one model and one native session id per backend (never resumes a foreign SID or carries a custom model across backends), and refuses while a turn is running. `harness show|export|import|link` subcommands are unchanged.
+Switches preserve name/workdir/role/persona, never resume a foreign session id, and refuse while a turn runs (one cross-process flock guard per agent, also covering live native handoffs).
 
-## Model selection
+## Routing
+
+Pick a **job type**, then use the routed model. Fixed keys: `mechanical` (scripts, rote edits, boilerplate, lookups), `implement` (clear spec), `review` (review, verification), `debug` (failing tests, root cause), `plan` (design, architecture), `hardest` (ambiguous, high-stakes, security).
+
+Each job maps to a Claude alias (for Claude Code subagents' `model:`) and an ag backend/model (for ag sub-agents). Preset `cost-first` (default):
+
+| job | claude | ag |
+|---|---|---|
+| mechanical | haiku | opencode / opencode/muse-spark-1.3-contributor-free |
+| implement | sonnet | claude / sonnet |
+| review, debug, plan | opus | claude / opus |
+| hardest | fable | claude / fable |
+
+Also `balanced` (review -> sonnet) and `quality-first` (mechanical sonnet, implement opus, rest fable). Unset ag entries fall back to opencode muse-spark.
+
+Storage: global `~/.config/ag/routing.json`; project `<git toplevel or cwd>/.agent/routing.json`; shape `{"version":1,"preset":"cost-first","jobs":{job:{"claude":...,"ag":{"backend":...,"model":...}}}}`. Effective routing = global overlaid per job by project.
 
 ```sh
-./ag agents list                       # roster with backend/model/role
-./ag agents set oc --model default        # reset to the ag-level default
-./ag chat send oc "/model"             # list models for oc's backend
-# in TUI: m = picker, M = custom model string, R = role picker
+ag setup                      # create/change routing (+ skills)
+ag route [JOB] [--json]       # effective routing + source of each entry (global/project/preset-default)
+ag agents add w --job mechanical        # backend+model from routing when --backend omitted
+ag chat send w "task" --job implement   # delegate / wake / chat send: records `job` only, no backend switch
 ```
 
-Ag-level default for OpenCode: an opencode agent whose model is `default`
-(or missing, e.g. older rosters) runs as
-`opencode/muse-spark-1.3-contributor-free` everywhere OpenCode runs through
-ag — headless `chat send`/`delegate`/wake turns (`opencode run -m …`),
-native handoff (`opencode -m …`, verified root flag), new agents
-(`agents add`, TUI `n`), backend switches onto opencode, the `m` picker and
-`/model list`. Explicit custom models always win (stored and passed
-through); each backend remembers its own last model (custom IDs included)
-and restores it on return (details: [docs/HARNESS_ROLES.md](docs/HARNESS_ROLES.md)). Other backends are untouched:
-`default` still means "no `-m` flag".
-
-## Native limits (verified from `--help`, no remote calls)
-
-Bare `/foo` as a headless message is prose to every backend, so ag never
-forwards it. The one verified headless native-command flag is opencode's:
+## Delegation and wake
 
 ```sh
-./ag chat send oc --command review "path/to/file"  # opencode-only; args sent bare
+ag chat send w "task" [--timeout S] [--job J]   # one headless turn; read with `ag chat log w`
+ag delegate w "task"                            # orchestrator assigns, logged in its chat
+ag wake w "task" [--max-runtime S] [--timeout S] [--notify X] [--on-done X] [--job J]
+ag wakes [--agent w] [--limit N] [--wait JOB --timeout S] [--cancel JOB]
+ag spawn --wake w --wake-message "task" -- ./long-job.sh    # follow-up when the session ends
+ag chat send w --command review "path"          # opencode native command only
 ```
 
-`claude -p`, `gemini -p`, `codex exec`, `agent -p` expose no slash/command
-flag (slash is interactive-TUI surface: `--disable-slash-commands` for claude,
-in-TUI pickers elsewhere), so other backends reject `--command` instead of
-faking it. Headless `/handoff` prints the interactive argv instead: `claude
-[--resume SID]` and `agent [--resume SID]` preserve the session flag;
-`opencode`/`gemini`/`codex` launch bare in the agent workdir (resume from the
-in-TUI picker; ag keeps gemini turns stateless, codex headless turns resume via `exec --json`). In the TUI, `/handoff`
-executes like `H` (below) instead of printing. Fallback anywhere
-without a TTY: `ag spawn -- <argv>` then `ag attach <id>`. Handoff argv never
-carries auto-approve/bypass flags. Unknown `/word` is never prose: it errors
-with an explicit real route (`/handoff`, `H`, or `ag handoff <agent>`), naming
-the backend TUI where that command actually runs.
+- Same agent serializes (flock, no order guarantee); different agents run in parallel. Fan-out = different agents.
+- `--timeout` (default 1800, `0` = none) is a hard backend budget starting after guard acquisition (lock wait excluded); expiry kills the backend group and exits 124. `wake --max-runtime` is the same for background turns; `wake --timeout` only marks `stalled`.
+- A wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session `__wake-<agent>-<id>`. `queued` = guard not yet acquired. `kill <worker-sid>` or `wakes --cancel` stops one (job `failed`).
+- `spawn --wake` fires at most once per session (exit/kill/force-kill all count); worker completion never re-fires. Messages are argv, never shell-interpreted. Trail: `events` (`wake`, `wake_done`, `wake_fail`).
+- Always-on bots: `spawn --wake` plus host cron/launchd re-issuing `ag wake`. ag has no scheduler.
 
-Executable handoff (real path, not just printed argv):
+## Reliability
+
+- **Stale-session recovery:** if the backend no longer knows the stored session id (`Session not found`, `No conversation found`, `no rollout found`), ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`.
+- **Transient retry:** rate limit, overload, 503/529, connection reset: up to 2 retries (2s, 6s) only if the attempt produced no output. Guard stays held, user row not duplicated, `--timeout` bounds the whole turn. `AG_RETRY=0` disables.
+- codex headless turns resume via `exec --json`; gemini turns are stateless (history replay).
+- Daemon crash (`kill -9`): sessions go `stale`, pending wake does not fire.
+
+## Isolation: worktree per agent
+
+Agents sharing a `dir` clobber each other. Give each a worktree:
 
 ```sh
-./ag handoff claude              # print native argv + scoped profile env + attach guidance
-./ag handoff oc opencode         # same for another agent/backend
-./ag handoff claude --spawn      # tracked pty session (non-TTY callers get id + attach)
-./ag handoff claude --exec       # exec native TUI now (TTY only, replaces ag process)
-# in TUI: H or /handoff suspends curses on the main thread, execs the backend
-# TUI with the selected profile env/config, always restores curses (finally),
-# then logs the outcome as tool lines. Busy agents refuse. Slash text is
-# never sent to the model: H and /handoff run locally.
+ag agents add w1 --backend claude --dir ~/proj --worktree [--base main]   # branch ag/w1, worktree ~/proj.ag-wt/w1
+ag agents set existing --worktree        # idle agent only
+ag agents rm w1 [--force]                # clean: removes worktree; --force drops uncommitted work; branch kept
 ```
 
-One shared per-agent guard (cross-process): a backend turn (`chat send`,
-`delegate`, wake worker) holds one flock guard for that agent; wake workers
-take no second lock (no double-lock deadlock). Backend/profile/model switches
-(`switch_backend`, `profile_set_agent`, `/model`, `agents set --backend/--model`)
-probe the same guard plus live-handoff markers and refuse while the agent runs
-in any process (`<agent> is busy ... retry when idle`). Tracked (`--spawn`)
-and exec/TUI handoffs record markers (session liveness / pid) so switches are
-refused for the whole native session; stale markers self-clean on next probe.
+`list` shows `[ag/<name>]`; `--json` has `worktree`. Merge yourself (`git merge ag/w1`); ag has no merge. An identical existing worktree is reused; other clashes error with a hint.
 
-## Harness profiles (shared named backends/skills/memory/MCP)
+## Checkpoints
 
-Opt-in named sources shared across agents; selected per agent. Existing
-`harness show|export|import|link` unchanged. All runtime files live under
-`.agent/profiles_effective/<name>/`; no `~/.claude`, `~/.codex`, `~/.config`
-writes, no global config mutation.
+If the agent dir is in a git repo, each non-slash turn is snapshotted before and after (hidden refs `refs/ag/<agent>/<n>-pre|post`, temp index; your index/HEAD/branches untouched; ignored files excluded; last 20 turns; non-git dirs skipped; `AG_CHECKPOINT=0` disables). Changed files append to the chat as `[checkpoint] turn 7: 3 files changed (+40 -5): ...` and appear as `checkpoint` in the turn result.
 
 ```sh
-./ag harness profile add docs --instructions ./AGENTS.md \
-  --memory ./MEMORY.md --memory ./notes/ \
-  --skills ./.claude/skills --mcp ./.mcp.json
-./ag harness profile list                    # profiles + per-agent selection
-./ag harness profile show docs               # sources + effective files + unsupported notes
-./ag harness profile validate docs           # ok/errors/warnings/unsupported (names only)
-./ag harness profile status                  # validity + agents per profile
-./ag harness profile set oc --profile docs   # select (keeps workdir/role/persona, clears session)
-./ag harness profile set oc --none           # clear
-./ag harness profile rm docs [--force]       # refuses while agents use it
+ag chat checkpoints w
+ag chat diff w [--turn N] [--stat]
+ag chat revert w [--turn N]      # whole repo worktree back to before turn N
 ```
 
-`.claude` -> OpenCode example (skills discovered natively):
+`revert` restores snapshot files, deletes non-ignored files that didn't exist then, never touches `.git`/ignored files, refuses while busy, and saves current state at `refs/ag/<agent>/pre-revert` (undo via `git diff`/`git checkout` from that ref). Scope is the whole repo, not just the agent subdir.
+
+## Usage
+
+`ag chat usage w` prints last-turn and total provider token usage for the agent.
+
+## Context and handoff
+
+Scoped task + memory so the next agent continues, not restarts (details: [docs/AGENT_CONTEXT.md](docs/AGENT_CONTEXT.md)).
 
 ```sh
-./ag harness profile add frontend --skills ./.claude/skills --mcp ./.mcp.json
-./ag harness profile set oc --profile frontend
-# opencode gets: OPENCODE_CONFIG=<state>/profiles_effective/frontend/opencode.json
-# (translated mcp + instructions:[.../INSTRUCTIONS.md]) and
-# OPENCODE_CONFIG_DIR=<state>/profiles_effective/frontend/opencode-config-dir
-# with skills/*/SKILL.md copied from .claude/skills (native discovery path).
+ag context init
+ag context assign ui-a --scope ui --task "own chat panel" --acceptance "tests pass" --brief-file brief-a.md
+ag context checkpoint ui-a --file ckpt-a.md
+ag context show ui-b             # what the agent actually got: sources + warnings
+ag compact show|config|run      # auto-summaries (docs/AUTO_COMPACTION.md)
+ag handoff w [--spawn|--exec]    # native backend TUI argv + profile env; --exec needs a TTY
 ```
 
-Custom Codex config example (scoped home, MCP TOML):
+Same scope inherits the prior `HANDOFF.md`; sibling scopes are isolated. Native TUI gets no auto-inject. Handoff argv never carries auto-approve flags; `claude`/`cursor` keep `--resume SID`, others launch bare. Multi-host portable snapshots: [docs/MULTI_HOST.md](docs/MULTI_HOST.md) (`hosts`, `sync`; no automatic failover).
+
+## Harness profiles
+
+Opt-in named sources (instructions, memory, skills, MCP) shared by N agents. Files live in `<state>/profiles_effective/<name>/`; no home/global config is written.
 
 ```sh
-./ag harness profile add coder --mcp ./.mcp.json --codex-config ./codex-extra.toml
-./ag harness profile set cx --profile coder
-# codex gets: CODEX_HOME=<state>/profiles_effective/coder/codex-home
-# (config.toml = [mcp_servers.*] translation + codex-extra.toml passthrough;
-# auth.json symlinked when present, never copied to reports; profile + user
-# skills mirrored under codex-home/skills so the scoped home keeps access).
+ag harness profile add docs --instructions ./AGENTS.md --memory ./MEMORY.md --skills ./.claude/skills --mcp ./.mcp.json
+ag harness profile list | show docs | validate docs | status
+ag harness profile set oc --profile docs      # --none clears; clears session
+ag harness profile rm docs [--force]          # refuses while agents use it
+ag harness show|export|import|link --to DIR   # sharing; secrets redacted
 ```
 
-Shared named profile across agents (headless + wake + native):
+Per-backend delivery is in the [capability matrix](#capability-matrix). MCP source accepts `{"mcpServers":...}`, `{"mcp":...}` or bare `{name: entry}`; `{env:X}`/`${X}` refs preserved. `show`/`validate`/`status` print names and counts, never env values. Codex extra config: `--codex-config ./extra.toml` (appended to the scoped `config.toml`; `auth.json` symlinked, never copied).
 
-```sh
-./ag harness profile set claude --profile docs
-./ag harness profile set oc --profile docs   # N agents -> 1 profile
-./ag chat send oc "hi"                       # headless turn uses docs (instructions/memory/MCP)
-./ag wake oc "summarize"                     # wake worker runs run_turn -> same profile env/argv
-./ag handoff oc                              # native TUI argv + docs env/config
-```
+## Roles
 
-What each backend actually gets (verified flags only):
+System-prompt presets per agent: `ag roles list|show|add|set|rm|reset NAME`. Built-ins include `planner` (assumptions, verifiable steps), `implementer` (minimal diffs), `reviewer` (terse bug/security check). Override per call/agent with `--persona` or `--system TEXT|@file`. Defaults for orchestrator vs sub: [docs/HARNESS_ROLES.md](docs/HARNESS_ROLES.md).
 
-| backend | instructions+memory | skills | MCP | scoped config |
-|---|---|---|---|---|
-| claude | `--append-system-prompt` | `--plugin-dir <eff>/claude-plugin` (+ prompt fallback) | `--mcp-config <eff>/claude_mcp.json` | argv only, no global writes |
-| opencode | `instructions: [<eff>/INSTRUCTIONS.md]` in generated config | `OPENCODE_CONFIG_DIR` with `skills/*/` (incl. `.claude/skills`) | translated `mcp` in generated config | `OPENCODE_CONFIG=<eff>/opencode.json` |
-| codex | prompt lead block | profile + user skills mirrored under scoped `CODEX_HOME/skills` (+ prompt context) | `[mcp_servers.*]` in `<eff>/codex-config.toml` via scoped `CODEX_HOME`: stdio `command/args/env`, remote `url` + `http_headers` (literals) + `env_http_headers` (`{env:V}`/`${V}`/`$V` refs) | `CODEX_HOME=<eff>/codex-home` (auth symlinked, custom `codex_config` appended) |
-| gemini/cursor/echo | prompt lead block | prompt context only (reported unsupported) | reported unsupported, never silently dropped | — |
-
-MCP source accepts Claude-style `{"mcpServers": ...}`, opencode-style
-`{"mcp": ...}`, or bare `{name: entry}`; stdio (`command`+`args`+`env`) and
-remote (`url`+`headers`) preserved verbatim, incl. `{env:X}` / `${X}` refs
-(which OpenCode itself expands). Codex mapping verified against
-`developers.openai.com/codex/mcp` + `codex mcp add --help` + `codex-rs/mcp_cmd`
-(`http_headers`/`env_http_headers`/`bearer_token_env_var`): only a header value
-that embeds an env ref inside a larger string (e.g. `Bearer {env:X}`) has no
-mapping -> reported (header names only, values never printed).
-`show`/`validate`/`status` print paths/names/counts, never env values; tests
-use fake fixture credentials.
-
-## Wake: background agents wake agents on completion
-
-```sh
-./ag agents add w --backend echo --role sub
-./ag wake w "summarize this"           # one background chat send, returns now
-./ag wakes                             # queued|running|done|failed + worker link
-./ag spawn --wake w --wake-message "summarize this" -- ./long-job.sh
-# on session end (exit, kill, kill --force) at most one follow-up is launched:
-#   [wake] session <id> (<cmd>) exited <code>. <message>
-./ag chat log w                        # follow-up lands here
-./ag events --limit 20                 # wake / wake_done / wake_fail trail
-./ag kill <worker-sid>                 # stop a wake worker (TERM marks job failed)
-```
-
-Each wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session (`__wake-<agent>-<id>`, visible in `sessions`/`status --json`). Turns on the same agent (`chat send`, `delegate`, wake workers) are mutually excluded via one shared per-agent flock guard held inside `run_turn` (no FIFO or arrival-order guarantee; the wake worker takes no second lock); different agents run in parallel. Backend/profile/model switches probe the same guard and refuse while the agent runs anywhere. `spawn --wake` launches at most once (atomic claim, not guaranteed completion or delivery); worker completion never re-fires (no callback loops). Argv is shell-free, so `; touch evil` in messages stays inert text. `--on-exit` still runs first and is unchanged.
-
-## Git worktree per agent (safe parallel fan-out)
-
-Agents sharing a `dir` clobber each other's files. Give each its own worktree:
-
-```bash
-ag agents add w1 --backend claude --dir ~/proj --worktree [--base main]
-# branch ag/w1 from --base (default HEAD), worktree at ~/proj.ag-wt/w1 (outside the repo); agent dir is set to it
-ag agents set existing --worktree        # move an idle agent into one (refused while busy)
-ag agents list                           # worktree agents show [ag/<name>] after the dir; --json has `worktree`
-ag agents rm w1                          # removes the worktree if clean, keeps branch ag/w1
-ag agents rm w1 --force                  # dirty: drops worktree + uncommitted work, still keeps the branch
-```
-
-`add` prints the branch so an orchestrator can merge it (`git merge ag/w1`); ag has no merge command. An existing identical worktree is reused; any other clash on branch or path errors with a hint.
-
-## Stale-session recovery and transient retry
-
-If a backend no longer knows the stored session id ("Session not found", "No conversation found...", "no rollout found..."), `ag` clears that backend's sid, replays recent history into a fresh session, relaunches once, and logs a `[resume] ... started fresh` tool note. Rate limits, overload, 503/529 and connection resets are retried up to 2 times (2s, 6s backoff), only when the failed attempt produced no output. The per-agent turn guard stays held, the user row is never duplicated, and `--timeout` still bounds the whole turn. Disable with `AG_RETRY=0`.
-
-## Per-turn git checkpoints: diff + revert
-
-If an agent's dir is inside a git repo, every non-slash turn is snapshotted before and after the backend runs (hidden refs `refs/ag/<agent>/<n>-pre|post`; temp index, so your index, HEAD and branches are never touched; gitignored files excluded). Changed files are appended to the chat as a `[checkpoint] turn 7: 3 files changed (+40 -5): a.py, ...` tool note and returned as `checkpoint` in the turn result. Last 20 turns kept; non-git dirs are skipped silently; `AG_CHECKPOINT=0` disables.
-
-```sh
-./ag chat checkpoints w               # list turns
-./ag chat diff w [--turn N] [--stat]  # patch for turn N (default latest)
-./ag chat revert w [--turn N]         # restore the whole repo worktree to before turn N
-```
-
-`revert` rewrites snapshot files, deletes non-ignored files that did not exist then, never touches `.git`/ignored files, refuses while the agent is busy, and saves the pre-revert state at `refs/ag/<agent>/pre-revert` (undo: `git diff` / `git checkout` from that ref). Scope is the whole repo, not just the agent subdir.
-
-## Secret input: passwords, OTP codes, passphrases
-
-When terminal work needs a sudo password, SSH passphrase, OTP/2FA code or PIN, ag pops a native macOS dialog (masked field, OK/Cancel) and hands the value straight to the program. The model never sees it and no agent cooperation is needed.
-
-```sh
-./ag spawn -- sudo make install      # tty prompt detected -> dialog -> typed into the PTY
-./ag send <sess> --secret            # value from the dialog (getpass on a non-mac TTY)
-./ag askpass "Password:"             # askpass protocol: secret on stdout, Cancel = exit 1
-./ag spawn --no-secret-popup -- ...  # opt out per session; AG_SECRET_POPUP=0 opts out globally
-```
-
-- **PTY sessions:** the daemon watches each session. A prompt counts when output has gone idle and either tty ECHO is off in canonical mode (getpass/readpassphrase) with a prompt-like last line, or the last line matches `password|passphrase|passcode|verification code|one-time|otp|2fa|pin|security code|token … :/?`. One dialog at a time, and the same prompt never pops twice until new output arrives. Every dialog logs a `secret_prompt` event with outcome `ok|cancel|error` and never the value.
-- **Backend turns and spawned sessions:** env gets `SUDO_ASKPASS`, `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` and `GIT_ASKPASS`, all pointing at `<state>/bin/ag-askpass`. `<state>/bin` is prepended to `PATH` with a `sudo` shim that execs the real sudo with `-A`, unless `-A/-S/-n` is already given or no prompt is possible. Variables you set yourself are never overridden. If a tool output still shows a blocked prompt (`a terminal is required…`, `Permission denied (publickey`, `Enter passphrase`, a trailing `Password:`), ag logs `secret_needed` and adds one retry note to the chat. Every backend's system context also says to never request secrets in chat.
-
-**Guarantee:** the secret is never written to disk in plaintext. It exists only in process memory and pipes: osascript stdout → ag → PTY fd, or askpass stdout → sudo/ssh/git. ag does not cache it. `input.log` records `[secret input redacted]`, and events and chat hold the outcome only. Framed `send --secret` payloads stay below `PIPE_BUF`, so each one is a single atomic write. Ordinary input that spoofs the frame markers can, at worst, produce a redacted log line.
-
-**Limits:** the receiving program gets the plaintext, as it must, and kernel pipe/tty buffers hold it briefly. Python strings cannot be zeroed, so ag only drops its references. ag turns tty echo off while it writes the secret. Even so, a program that echoes or prints its input itself (raw-mode masking, `print(input())`) can still put it into `output.log`. Keyword detection is heuristic: it can miss a prompt or pop for a harmless line ending in `token:`. In that case press Cancel, which sends nothing. `ag askpass` refuses unless its parent process is sudo/ssh/git, so an agent can't call `$SUDO_ASKPASS` itself to read a secret back. The check goes by process name and can be spoofed, so every dialog shows the requesting command in `[brackets]`; cancel anything you didn't expect. macOS only (`osascript`). On other systems, injection and detection stay off.
+---
 
 ## Docs
 
-- [Harness selection + behavior presets](docs/HARNESS_ROLES.md): `harness use/current`, per-backend models, editable/reset roles.
-- [Wake control: timeout, cancel, kill](docs/WAKE_CONTROL.md): `chat send`/`delegate --timeout`, wake `--max-runtime`, per-job flock, CLI 124.
-- [Multi-host portable snapshots](docs/MULTI_HOST.md): `hosts`, `sync pull/_export` over outbound SSH, no automatic failover.
-- [Muse feedback on brief 1–8](docs/MUSE_FEEDBACK.md): what is covered vs deferred (queue/dependencies, ephemeral agents, post-turn hooks; no concurrency cap).
+[INSTALL](docs/INSTALL.md) · [HARNESS_ROLES](docs/HARNESS_ROLES.md) · [AGENT_CONTEXT](docs/AGENT_CONTEXT.md) · [AUTO_COMPACTION](docs/AUTO_COMPACTION.md) · [WAKE_CONTROL](docs/WAKE_CONTROL.md) · [WAKE_STATE](docs/WAKE_STATE.md) · [WAKE_STATUS](docs/WAKE_STATUS.md) · [STREAMING](docs/STREAMING.md) · [MULTI_HOST](docs/MULTI_HOST.md) · [UI_DESIGN](docs/UI_DESIGN.md) · [MUSE_FEEDBACK](docs/MUSE_FEEDBACK.md)
 
 ## Limitations (honest)
 
-- Wake is at-most-once *launch*, not completion: a crash between claim and enqueue, or a `kill -9` of a worker, can lose/stall a wake. Check `events` for a missing `wake` after `exit`, `wakes` for jobs whose session is dead. No retry scheduler.
-- Daemon crash (`kill -9` daemon): session is marked `stale` (`exit=-1`, one `stale` event, prompt `wait`/`snap` return) and the pending wake does **not** fire — `wake_fired:false` stays visible in `status`. Re-wake manually if needed.
-- `chat send`/`delegate --timeout` (default 1800, `0` = unlimited) bounds backend runtime; expiry kills the backend group and exits 124. Wake jobs bound it separately via `--max-runtime` (budget starts at guard acquisition). While a turn runs, the agent's guard is held: backend/profile/model switches (any process) refuse, and other turns on the same agent block behind it.
-- No queue fairness/priority/FIFO; concurrent turns on one agent are mutually excluded with no arrival-order guarantee.
-- Message cap 4000 chars (truncated). `wake/jobs` history is never pruned by `forget`; delete files manually.
-- POSIX only for `spawn`/workers (`wake` enqueue works anywhere, workers need the pty daemon). TUI needs POSIX curses; no Windows support.
-- `ag run echo --json` (no `--`) still treats `--json` as global; use `ag run -- echo --json` to pass flags to the child. Multi-token commands are now shell-quoted (`shlex.join`); old approvals for such commands re-prompt once.
-- State writes are atomic only for `status.json`/wake jobs; other JSON files can corrupt on crash (agents/todos fall back to defaults — back up `.agent/` before risky ops). Logs (`output.log`, `events.jsonl`) are never rotated.
-- Wrapping is cell-based everywhere (CJK wide = 2, combining/ZWJ/skin-tone glued, never split); below the 40x16 floor a clean resize message shows. Side panels hide below 110 cols by design. `NO_COLOR=1` zeroes color pairs (selection → reverse, errors → `!`, diffs → `+-`, tools → status words); `AG_ASCII=1` swaps UI glyphs to ASCII. Mouse is best-effort with full keyboard parity.
+- Wake is at-most-once *launch*, not completion: a crash between claim and enqueue, or `kill -9` of a worker, can lose/stall it. Check `events` for a missing `wake` after `exit`, `wakes` for dead sessions. No retry scheduler (transient-error retry is per turn only).
+- Daemon `kill -9`: sessions go `stale` (`exit=-1`), pending wake does not fire (`wake_fired:false` in `status`). Re-wake manually.
+- While a turn runs its agent's guard is held: other turns on that agent block; backend/profile/model switches refuse. No queue fairness/priority/FIFO.
+- Message cap 4000 chars (truncated). `wake/jobs` is never pruned by `forget`.
+- POSIX only (`spawn`/workers need the pty daemon; TUI needs curses). Secret popup is macOS only.
+- `ag run echo --json` treats `--json` as global; use `ag run -- echo --json`.
+- Atomic writes only for `status.json`, wake jobs and `ag setup` outputs; other state JSON can corrupt on crash (agents/todos fall back to defaults). Back up `.agent/` before risky ops. Logs never rotate.
+- Checkpoints/revert act on the whole git repo; non-git dirs have none. Worktree agents leave their branch behind; ag does not merge.
+- Model lists for claude/gemini are static aliases; discovery depends on each backend CLI.
+- Rendering is cell-based (CJK/ZWJ safe); below 40x16 the TUI asks for a resize; mouse is best-effort.

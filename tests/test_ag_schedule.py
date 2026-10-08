@@ -142,7 +142,7 @@ class Cli(Env):
         self.run_ag("schedule", "pause", "s1"); self.run_ag("schedule", "tick", "--now", self.iso(due + 1)); self.assertEqual(self.wakes(), 0)
         self.run_ag("schedule", "resume", "s1"); self.assertTrue(self.rows()[0]["enabled"])
         p, o = self.j("schedule", "run", "s1"); self.assertEqual(p.returncode, 0, p.stderr); self.assertEqual(self.wakes(), 1)
-        self.run_ag("agents", "rm", "w1"); rows = self.rows(); rows[0]["next_due"] = due; self.put(rows)
+        self.run_ag("agents", "rm", "w1"); rows = self.rows(); rows[0]["next_due"] = due; rows[0]["last_job"] = None; self.put(rows)
         self.run_ag("schedule", "tick", "--now", self.iso(due + 1)); self.assertTrue(self.rows()[0]["last_status"].startswith("error"))
 
     def test_tick_all_uses_registry(self):

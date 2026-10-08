@@ -518,7 +518,7 @@ def _valid_runtime(v):
     return f
 
 def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
-        notify="", on_done="", timeout_s=0, max_runtime_s=0):
+        notify="", on_done="", timeout_s=0, max_runtime_s=0, job_type=None):
     """Enqueue one wake job + spawn tracked worker. Returns {job,session} or {error}."""
     try: rows = load_agents(sdir)
     except Exception: rows = []
@@ -546,10 +546,10 @@ def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
         "trigger": trigger, "exit": exit_code, "status": "queued",
         "ts": now_iso(), "session": sid,
         "notify": (notify or "").strip(), "on_done": (on_done or ""),
-        "timeout_s": timeout_s, "max_runtime_s": max_runtime_s}
+        "timeout_s": timeout_s, "max_runtime_s": max_runtime_s, **({"job": job_type} if job_type else {})}
     def _publish(wsid, sp):
         _wake_write_job(sdir, job)
-        _event(sdir, "wake", trigger, agent=agent, exit=exit_code, job=jid)
+        _event(sdir, "wake", trigger, agent=agent, exit=exit_code, job=jid, **({"job_type": job_type} if job_type else {}))
     try:
         wsid = _spawn_wake_session(sdir, agent, jid, sid=sid, pre_fork=_publish)
     except Exception as e:
@@ -2517,7 +2517,7 @@ def cycle_model(backend, cur):
     opts = MODELS.get(backend,["default"])
     return opts[(opts.index(cur)+1)%len(opts)] if cur in opts else opts[0]
 
-def _model_opts(backend): return MODELS.get(backend,["default"])+["[custom…]"]
+def _model_opts(backend): return model_choices(backend)+["[custom…]"]
 
 def _model_idx(c):
     opts = _model_opts(c["backend"])
@@ -2839,7 +2839,7 @@ def handle_slash(sdir, name, cmd, args):
     if cmd == "model":
         toks = (args or "").split()
         if not toks or toks[0].lower() == "list":
-            opts = MODELS.get(backend, ["default"])
+            opts = model_choices(backend)
             cur_eff = eff_model(backend, a.get("model", "default"))
             lines = [f'{"*" if eff_model(backend, o) == cur_eff else " "} {o}' for o in opts]
             return (True, f"models for {name} [{backend}] (* current):\n" + "\n".join(lines)
@@ -2850,7 +2850,7 @@ def handle_slash(sdir, name, cmd, args):
         ok, message = update_agent_settings(sdir, name, {"model": target})
         if not ok: return (False, message)
         _event(sdir, "model", name, model=target)
-        known = " (custom)" if target not in MODELS.get(backend, ["default"]) else ""
+        known = " (custom)" if target not in model_choices(backend) else ""
         return (True, f"model -> {target}{known} for {name} [{backend}].")
     if cmd == "handoff":
         tgt = (args or "").split()[0].lower() if (args or "").split() else ""
@@ -6094,14 +6094,19 @@ def do_agents(a):
         pers = getattr(a,"persona",None) or ""
         if pers and pers not in [r["name"] for r in load_roles(sdir)]:
             return emit(a,"agents",error=f"no such role: {pers}",hint="ag roles list")
-        mod = a.model or "default"
-        if a.backend=="opencode" and mod in ("","default"): mod = OPENCODE_MODEL_DEFAULT
+        be, mod, job = a.backend, getattr(a,"model",None), getattr(a,"job",None)
+        if not be:
+            if not job: return emit(a,"agents",error="need --backend or --job",hint=f"ag agents add NAME --backend opencode  |  --job {'|'.join(JOB_KEYS)}")
+            ra = routing_now()[0][job]["ag"]; be = ra["backend"]; mod = mod or ra["model"]
+            if be not in NATIVE_ORDER: return emit(a,"agents",error=f"routing for {job} names unknown backend {be!r}",hint="ag route; ag setup")
+        mod = mod or "default"
+        if be=="opencode" and mod in ("","default"): mod = OPENCODE_MODEL_DEFAULT
         wt, adir = None, a.adir or "."
         if getattr(a,"worktree",False):
             wt, err, hint = wt_create(a.name, adir, getattr(a,"base",None))
             if err: return emit(a,"agents",error=err,hint=hint)
             adir = wt["path"]
-        rows.append({"name":a.name,"backend":a.backend,"model":mod,
+        rows.append({"name":a.name,"backend":be,"model":mod,**({"job":job} if job else {}),
             "dir":adir,"role":a.role,"persona":pers,"system":getattr(a,"system",None) or "",
             "instructions":[s for s in (getattr(a,"instructions",None) or []) if (s or "").strip()],
             **({"worktree":wt} if wt else {})})
@@ -7106,6 +7111,7 @@ def do_chat(a):
             return emit(a,"chat",error="invalid --timeout: need finite seconds >= 0 (0 = unlimited)",
                 hint="ag chat send NAME --timeout 300 TEXT")
         live = not getattr(a,"json",False)
+        if getattr(a,"job",None): _event(sdir,"chat_job",a.name,job=a.job)
         r = run_turn(sdir,a.name,text,command=cmd,timeout_s=timeout_s,
             on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
         if "error" in r and not r.get("timed_out"):
@@ -7172,7 +7178,7 @@ def do_wake(a):
         if notify not in names:
             return emit(a,"wake",error=f"no such agent: {notify}",hint="ag agents list")
     r = launch_wake_chat(sdir,agent,text,notify=notify,on_done=on_done,timeout_s=timeout_s,
-        max_runtime_s=max_runtime_s)
+        max_runtime_s=max_runtime_s,job_type=getattr(a,"job",None))
     if "error" in r: return emit(a,"wake",error=r["error"],hint="ag agents list")
     if getattr(a,"json",False):
         return emit(a,"wake",{"agent":agent,"launched":True,
@@ -8424,16 +8430,20 @@ def _tui_main(stdscr, sdir):
             continue
         if mode=="modelpick" and chats:
             opts = _model_opts(chats[active]["backend"])
-            bw, bh = min(56,w-4), len(opts)+4
+            pick_idx = min(pick_idx, len(opts)-1)
+            mvis = max(1, min(len(opts), h-6))  # cached lists can be long (opencode ~90): scroll
+            moff = slash_visible_window(pick_idx, 0, mvis, len(opts))
+            bw, bh = min(56,w-4), mvis+4
             bx, by = (w-bw)//2, (h-bh)//2
             draw_panel(bx,by,bw,bh,f'model · {chats[active]["name"]}')
-            for i,o in enumerate(opts):
+            for i,o in enumerate(opts[moff:moff+mvis]):
+                i += moff
                 mark = ">" if i==pick_idx else " "
                 stored = chats[active].get("model")
                 curm = "*" if o==stored or (o==OPENCODE_MODEL_DEFAULT
                     and chats[active].get("backend")=="opencode"
                     and (stored or "default") in ("","default")) else " "
-                put(by+2+i,bx+2,f'{mark}{curm} {o}'[:bw-4],th["sel"] if i==pick_idx else th["text_c"])
+                put(by+2+i-moff,bx+2,f'{mark}{curm} {o}'[:bw-4],th["sel"] if i==pick_idx else th["text_c"])
             put(by+bh-1,bx+2,"up/down+enter, esc cancel"[:bw-4],th["dim_c"])
             stdscr.refresh()
             _cursor(False)
@@ -9370,7 +9380,7 @@ def do_keys(a):
     if getattr(a,"json",False): return emit(a,"keys",{"keys":KEYS_HELP.splitlines()})
     return emit(a,"keys",{"_text":KEYS_HELP})
 
-def delegate_task(sdir, agent_name, task, on_event=None, timeout_s=0):
+def delegate_task(sdir, agent_name, task, on_event=None, timeout_s=0, job=None):
     agents = {x["name"]:x for x in load_agents(sdir)}
     if agent_name not in agents: return {"error":f"no such agent: {agent_name}"}
     sub = agents[agent_name]
@@ -9382,7 +9392,7 @@ def delegate_task(sdir, agent_name, task, on_event=None, timeout_s=0):
     if "error" in r: return r
     orch = next((x["name"] for x in load_agents(sdir) if x.get("role")=="orchestrator"),None)
     if orch: append_chat(sdir,orch,"delegate",f'{agent_name}: {task} -> {r["reply"][:2000]}')
-    _event(sdir,"delegate",agent_name,task=task[:120],exit=r["exit"])
+    _event(sdir,"delegate",agent_name,task=task[:120],exit=r["exit"],**({"job":job} if job else {}))
     return r
 
 def do_delegate(a):
@@ -9394,7 +9404,7 @@ def do_delegate(a):
         return emit(a,"delegate",error="invalid --timeout: need finite seconds >= 0 (0 = unlimited)",
             hint="ag delegate AGENT --timeout 300 TASK")
     live = not getattr(a,"json",False)
-    r = delegate_task(sdir,a.agent,task,timeout_s=timeout_s,
+    r = delegate_task(sdir,a.agent,task,timeout_s=timeout_s,job=getattr(a,"job",None),
         on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
     if "error" in r and not r.get("timed_out"):
         return emit(a,"delegate",error=r["error"])
@@ -9511,8 +9521,13 @@ def do_selfcheck(a):
         assert ev==[("toolout","file data")]
         ev=_parse_opencode('{"type":"tool_use","sessionID":"s","part":{"type":"tool","tool":"read","state":{"title":"f","output":"hello out"}}}')
         assert ("toolout","hello out") in ev
-        assert _model_opts("opencode")==[OPENCODE_MODEL_DEFAULT,"[custom…]"]
-        assert _model_opts("claude")[0]=="default"  # other backends untouched
+        _och = os.environ.get("AG_CACHE_HOME"); os.environ["AG_CACHE_HOME"] = str(td/"nocache")
+        try:
+            assert _model_opts("opencode")==[OPENCODE_MODEL_DEFAULT,"[custom…]"]
+            assert _model_opts("claude")[0]=="default"  # other backends untouched
+        finally:
+            if _och is None: os.environ.pop("AG_CACHE_HOME", None)
+            else: os.environ["AG_CACHE_HOME"] = _och
         assert _model_idx({"backend":"claude","model":"opus"})==2
         # native slash: parse, local exec (never model prose), SID segregation
         assert parse_slash("/help")==("help","")
@@ -9916,8 +9931,373 @@ def do_selfcheck(a):
         assert classify_turn_failure("claude",1,_e,False)=="transient", _e
     assert classify_turn_failure("claude",1,"Authentication required",False) is None
     secret_selfcheck()
+    _setup_selfcheck()
     print(f"selfcheck ok ({td})")
     return 0
+
+# ---- models cache, job routing, `ag setup` (skills + CLAUDE.md routing block) ----
+# Paths: AG_HOME (default ~) roots ~/.claude, ~/.config/opencode, ~/.codex, ~/AGENTS.md;
+# AG_CONFIG_HOME (default $AG_HOME/.config/ag) holds routing.json; AG_CACHE_HOME
+# (default $AG_HOME/.cache/ag) holds models.json; AG_SKILLS_DIR overrides the
+# skill template dir (default <ag dir>/skills). Tests point all of them at a tmp dir.
+MODEL_BACKENDS = ("claude", "opencode", "codex", "cursor", "gemini")
+MODELS_TTL_S = 24 * 3600
+MODELS_STATIC = {
+    "claude": (["default", "fable", "opus", "sonnet", "haiku"], "static (claude CLI has no list command)"),
+    "gemini": (["default", "gemini-2.5-pro", "gemini-2.5-flash"], "static"),
+}
+MODELS_SHOW = 40
+JOB_KEYS = ("mechanical", "implement", "review", "debug", "plan", "hardest")
+JOB_DESC = {"mechanical": "scripts, rote edits, boilerplate, lookups",
+    "implement": "implement a clear spec / plan", "review": "code review, verification",
+    "debug": "debugging, failing tests, root cause", "plan": "planning, design, architecture",
+    "hardest": "ambiguous, high-stakes, security-sensitive"}
+def _rj(c, b, m): return {"claude": c, "ag": {"backend": b, "model": m}}
+_ROUTE_COST = {"mechanical": _rj("haiku", "opencode", OPENCODE_MODEL_DEFAULT),
+    "implement": _rj("sonnet", "claude", "sonnet"), "review": _rj("opus", "claude", "opus"),
+    "debug": _rj("opus", "claude", "opus"), "plan": _rj("opus", "claude", "opus"),
+    "hardest": _rj("fable", "claude", "fable")}
+ROUTING_PRESETS = {"cost-first": _ROUTE_COST,
+    "balanced": {**_ROUTE_COST, "review": _rj("sonnet", "claude", "sonnet")},
+    "quality-first": {"mechanical": _rj("sonnet", "claude", "sonnet"), "implement": _rj("opus", "claude", "opus"),
+        **{j: _rj("fable", "claude", "fable") for j in ("review", "debug", "plan", "hardest")}}}
+ROUTE_FALLBACK = {"backend": "opencode", "model": OPENCODE_MODEL_DEFAULT}
+SETUP_HARNESSES = ("claude", "opencode", "codex")
+SKILL_NAMES = ("ag-cli", "ag-agents")
+OLD_SKILLS = ("using-ag", "ag-delegate")
+ROUTING_MARKERS = ("<!-- ag:routing:start -->", "<!-- ag:routing:end -->")
+
+def _ag_home(): return Path(os.environ.get("AG_HOME") or Path.home()).expanduser()
+def ag_config_home(): return Path(os.environ.get("AG_CONFIG_HOME") or _ag_home()/".config"/"ag").expanduser()
+def ag_cache_home(): return Path(os.environ.get("AG_CACHE_HOME") or _ag_home()/".cache"/"ag").expanduser()
+def models_cache_path(): return ag_cache_home()/"models.json"
+def _read_or_empty(p):
+    try: return Path(p).read_text()
+    except OSError: return ""
+def _json_or_empty(p):
+    try: d = json.loads(Path(p).read_text())
+    except (OSError, ValueError): return {}
+    return d if isinstance(d, dict) else {}
+def _put_file(p, text):
+    p = Path(p); p.parent.mkdir(parents=True, exist_ok=True); _atomic_write(p, text)
+def _age_s(iso):
+    try: return max(0.0, time.time() - datetime.fromisoformat(iso).timestamp())
+    except (TypeError, ValueError): return float("inf")
+def _ago(iso):
+    s = _age_s(iso)
+    if s == float("inf"): return "never"
+    s = int(s)
+    return f"{s}s ago" if s < 60 else f"{s//60}m ago" if s < 3600 else f"{s//3600}h ago" if s < 86400 else f"{s//86400}d ago"
+
+def parse_model_lines(out):
+    """ids from `opencode models` / `agent --list-models` stdout (ANSI, spinner, headers stripped). Pure."""
+    ids = []
+    for ln in ANSI.sub("", out or "").replace("\r", "\n").splitlines():
+        ln = ln.strip()
+        low = ln.lower()
+        if not ln or low.startswith(("loading", "available models", "tip:", "no models available")): continue
+        tok = ln.split(" - ")[0].split()
+        if tok and tok[0] not in ids: ids.append(tok[0])
+    return ids
+
+def _models_fetch(b):
+    """(ids, source, error) for one backend; error == '' on success."""
+    if b in MODELS_STATIC:
+        ids, src = MODELS_STATIC[b]
+        return list(ids), src, ""
+    if b == "codex":
+        p = _ag_home()/".codex"/"models_cache.json"
+        d = _json_or_empty(p)
+        if not d: return [], str(p), "missing or unreadable (run codex once to create it)"
+        return [m["slug"] for m in d.get("models") or [] if isinstance(m, dict)
+            and m.get("visibility") == "list" and m.get("slug")], str(p), ""
+    argv = [_opencode_bin(), "models"] if b == "opencode" else [_cursor_bin(), "--list-models"]
+    src = " ".join([Path(argv[0]).name] + argv[1:])
+    for attempt in (0, 1):  # opencode: serialized (one at a time), one retry on sqlite lock
+        try: p = subprocess.run(argv, capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
+        except FileNotFoundError: return [], src, "not installed"
+        except Exception as e: return [], src, str(e)[:200]
+        both = (p.stdout or "") + (p.stderr or "")
+        if attempt == 0 and "database is locked" in both: time.sleep(1); continue
+        break
+    if "no models available" in both.lower(): return [], src, ""
+    if p.returncode != 0: return [], src, ANSI.sub("", both).strip()[-200:] or f"exit {p.returncode}"
+    return parse_model_lines(p.stdout), src, ""
+
+def _models_read():
+    d = _json_or_empty(models_cache_path())
+    if not isinstance(d.get("backends"), dict): d["backends"] = {}
+    d.setdefault("fetched_at", "")
+    return d
+
+def models_refresh(backends=MODEL_BACKENDS, on_progress=None):
+    """Re-fetch backends; a failed source keeps its last good list + records error."""
+    cache = _models_read()
+    for b in backends:
+        ids, src, err = _models_fetch(b)
+        prev = cache["backends"].get(b) or {}
+        ent = {"models": prev.get("models", []) if err else ids, "source": src, "error": err,
+            "fetched_at": prev.get("fetched_at", "") if err else now_iso(), "checked_at": now_iso()}
+        cache["backends"][b] = ent
+        if on_progress: on_progress(b, ent)
+    cache["fetched_at"] = now_iso()
+    try: _put_file(models_cache_path(), json.dumps(cache, indent=1) + "\n")
+    except OSError: pass
+    return cache
+
+def models_load(backends=MODEL_BACKENDS, refresh=False, on_progress=None):
+    """Cached lists; stale (> TTL) or missing backends refresh on read, --refresh forces."""
+    cache = _models_read()
+    stale = [b for b in backends if refresh or _age_s((cache["backends"].get(b) or {}).get("checked_at")) > MODELS_TTL_S]
+    return models_refresh(stale, on_progress) if stale else cache
+
+def model_choices(backend):
+    """Static MODELS first (default stays first), then cached ids. Read-only: never spawns a refresh."""
+    base = list(MODELS.get(backend, ["default"]))
+    cached = (_models_read()["backends"].get(backend) or {}).get("models") or []
+    return base + [m for m in cached if isinstance(m, str) and m and m not in base]
+
+def do_models(a):
+    bs = [a.backend] if a.backend else list(MODEL_BACKENDS)
+    cache = models_load(bs, refresh=a.refresh)
+    data = {"fetched_at": cache.get("fetched_at", ""), "path": str(models_cache_path()),
+        "backends": {b: cache["backends"].get(b, {}) for b in bs}}
+    if getattr(a, "json", False): return emit(a, "models", data)
+    out = []
+    for b in bs:
+        e = data["backends"][b]; ids = e.get("models") or []
+        out.append(f'{b} ({len(ids)}, {e.get("source", "")}, fetched {_ago(e.get("fetched_at"))})')
+        if e.get("error"): out.append(f'  error: {e["error"]}')
+        out += [f"  {m}" for m in ids[:MODELS_SHOW]]
+        if len(ids) > MODELS_SHOW: out.append(f"  … {len(ids)-MODELS_SHOW} more (--json for all)")
+    return emit(a, "models", {**data, "_text": "\n".join(out)})
+
+def project_root(cwd=None):
+    cwd = Path(cwd or Path.cwd())
+    p = _git(cwd, "rev-parse", "--show-toplevel")
+    return Path(p.stdout.strip()) if p.returncode == 0 and p.stdout.strip() else cwd
+
+def routing_paths(proj=None):
+    return ag_config_home()/"routing.json", Path(proj or project_root())/".agent"/"routing.json"
+
+def routing_effective(glob=None, proj=None):
+    """Per-job effective routing: preset < global < project (per field). Pure."""
+    glob, proj = glob or {}, proj or {}
+    base = ROUTING_PRESETS.get(proj.get("preset") or glob.get("preset") or "cost-first", _ROUTE_COST)
+    out = {}
+    for j in JOB_KEYS:
+        e = {"claude": base[j]["claude"], "ag": dict(base[j]["ag"]),
+            "source": {"claude": "preset-default", "ag": "preset-default"}}
+        for src, d in (("global", glob), ("project", proj)):
+            je = (d.get("jobs") or {}).get(j)
+            if not isinstance(je, dict): continue
+            if je.get("claude"): e["claude"] = str(je["claude"]); e["source"]["claude"] = src
+            ga = je.get("ag")
+            if isinstance(ga, dict) and ga.get("backend"):
+                e["ag"] = {"backend": str(ga["backend"]), "model": str(ga.get("model") or "default")}
+                e["source"]["ag"] = src
+        if not e["ag"].get("backend"): e["ag"] = dict(ROUTE_FALLBACK)
+        out[j] = e
+    return out
+
+def routing_now(cwd=None):
+    gp, pp = routing_paths(project_root(cwd))
+    return routing_effective(_json_or_empty(gp), _json_or_empty(pp)), gp, pp
+
+def _route_model(ag_): return eff_model(ag_["backend"], ag_["model"]) or ag_["model"]
+
+def routing_block(eff):
+    """Markdown routing block (spec §5). Pure."""
+    rows = [f'| {j} — {JOB_DESC[j]} | {eff[j]["claude"]} | {eff[j]["ag"]["backend"]} / {_route_model(eff[j]["ag"])} |'
+        for j in JOB_KEYS]
+    return "\n".join(["## Model routing (generated by `ag setup` — change it with `ag setup`, not by hand)", "",
+        "Default to the cheapest model that can do the job; escalate only when it gets stuck or the job turns out to need judgment.", "",
+        "| Job | Claude subagent (`model:`) | ag agent (backend / model) |", "|---|---|---|", *rows, "",
+        "Unsure which job it is? Start one tier lower; escalate on failure. Effective config: `ag route`."])
+
+def routing_md_insert(text, block, append=True):
+    """Replace the marked block (markers kept), else append it; append=False -> None when no markers. Pure."""
+    s, e = ROUTING_MARKERS
+    marked = f"{s}\n{block}\n{e}"
+    i = text.find(s); j = text.find(e, i + len(s)) if i >= 0 else -1
+    if i >= 0 and j >= 0: return text[:i] + marked + text[j + len(e):]
+    if not append: return None
+    if not text: return marked + "\n"
+    return text + ("" if text.endswith("\n\n") else "\n" if text.endswith("\n") else "\n\n") + marked + "\n"
+
+def render_skill(tpl, routing_md, scope):
+    """Substitute {{AG}} {{ROUTING}} {{SCOPE}}; any other {{...}} stays. Pure."""
+    return tpl.replace("{{AG}}", ag_script_path()).replace("{{SCOPE}}", scope).replace("{{ROUTING}}", routing_md)
+
+def skill_templates_dir(): return Path(os.environ.get("AG_SKILLS_DIR") or Path(ag_script_path()).parent/"skills")
+
+def harness_skills_dir(harness, scope, proj):
+    if scope == "global":
+        h = _ag_home()
+        return {"claude": h/".claude", "opencode": h/".config"/"opencode", "codex": h/".codex"}[harness]/"skills"
+    return Path(proj)/{"claude": ".claude", "opencode": ".opencode", "codex": ".agents"}[harness]/"skills"
+
+def detect_harnesses():
+    h = _ag_home()
+    dirs = {"claude": h/".claude", "opencode": h/".config"/"opencode", "codex": h/".codex"}
+    return [x for x in SETUP_HARNESSES if shutil.which(x) or dirs[x].is_dir()]
+
+def parse_route_sets(items):
+    """--set JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL -> {job: {claude|ag}}. Raises ValueError. Pure."""
+    out = {}
+    for it in items or []:
+        job, eq, rest = it.partition("=")
+        kind, colon, val = rest.partition(":")
+        job, kind, val = job.strip(), kind.strip(), val.strip()
+        if not (eq and colon and val) or job not in JOB_KEYS or kind not in ("claude", "ag"):
+            raise ValueError(f"bad --set {it!r}: want JOB=claude:ALIAS or JOB=ag:BACKEND/MODEL, JOB in {','.join(JOB_KEYS)}")
+        if kind == "claude": out.setdefault(job, {})["claude"] = val; continue
+        b, _, m = val.partition("/")
+        if b not in NATIVE_ORDER: raise ValueError(f"bad --set {it!r}: unknown backend {b!r} ({','.join(NATIVE_ORDER)})")
+        out.setdefault(job, {})["ag"] = {"backend": b, "model": m or "default"}
+    return out
+
+def parse_harness_list(v):
+    v = (v or "").strip().lower()
+    if v == "all": return list(SETUP_HARNESSES)
+    if v in ("", "none"): return []
+    hs = [x.strip() for x in v.split(",") if x.strip()]
+    bad = [x for x in hs if x not in SETUP_HARNESSES]
+    if bad: raise ValueError(f"unknown harness {','.join(bad)} (claude,opencode,codex|all|none)")
+    return list(dict.fromkeys(hs))
+
+def _say(*x): print(*x, file=sys.stderr)
+def _ask(prompt, default=""):
+    sys.stderr.write(f"{prompt} [{default}]: " if default else f"{prompt}: "); sys.stderr.flush()
+    try: v = input().strip()
+    except EOFError: v = ""
+    return v or default
+def _ask_pick(prompt, opts, default):
+    for i, o in enumerate(opts[:MODELS_SHOW], 1): _say(f"  {i:2}. {o}")
+    if len(opts) > MODELS_SHOW: _say(f"  … {len(opts)-MODELS_SHOW} more (type any id)")
+    v = _ask(prompt, default)
+    return opts[int(v)-1] if v.isdigit() and 1 <= int(v) <= min(len(opts), MODELS_SHOW) else v
+
+def do_route(a):
+    eff, gp, pp = routing_now()
+    jobs = {a.job: eff[a.job]} if a.job else eff
+    data = {"jobs": jobs, "global": str(gp), "project": str(pp)}
+    if getattr(a, "json", False): return emit(a, "route", data)
+    out = [f'{j:10} claude={e["claude"]:7} ({e["source"]["claude"]})  ag={e["ag"]["backend"]}/{_route_model(e["ag"])} ({e["source"]["ag"]})'
+        for j, e in jobs.items()]
+    out += [f'global:  {gp}{"" if gp.exists() else " (missing)"}', f'project: {pp}{"" if pp.exists() else " (missing)"}']
+    return emit(a, "route", {**data, "_text": "\n".join(out)})
+
+def do_setup(a):
+    inter = sys.stdin.isatty() and not a.yes
+    if not inter and not a.yes and not a.dry_run:
+        return emit(a, "setup", error="stdin is not a TTY: pass --yes (plus flags) to run non-interactively",
+            hint="ag setup --yes --scope global --harness claude --preset cost-first")
+    try:
+        sets = parse_route_sets(a.set)
+        harn = parse_harness_list(a.harness) if a.harness is not None else None
+    except ValueError as e: return emit(a, "setup", error=str(e))
+    if inter:
+        _say("refreshing model lists…")
+        models_load(refresh=True, on_progress=lambda b, e: _say(f'  {b}: {len(e["models"])} models'
+            + (f' (error: {e["error"]}; kept last good)' if e["error"] else "")))
+    scope = a.scope or (_ask("scope (global|project)", "global") if inter else "global")
+    if scope not in ("global", "project"): return emit(a, "setup", error=f"bad scope {scope!r}: global|project")
+    proj = project_root()
+    gp, pp = routing_paths(proj)
+    glob, projd = _json_or_empty(gp), _json_or_empty(pp)
+    cur = glob if scope == "global" else projd
+    if harn is None:
+        det = ",".join(detect_harnesses()) or "none"
+        try: harn = parse_harness_list(_ask("install skills for (claude,opencode,codex|all|none)", det) if inter else det)
+        except ValueError as e: return emit(a, "setup", error=str(e))
+    preset = a.preset or (_ask("preset (cost-first|balanced|quality-first)", cur.get("preset") or "cost-first")
+        if inter else cur.get("preset") or "cost-first")
+    if preset not in ROUTING_PRESETS: return emit(a, "setup", error=f"bad preset {preset!r}: {'|'.join(ROUTING_PRESETS)}")
+    # same preset as on disk (and not forced via --preset) keeps earlier per-job picks
+    keep = {} if a.preset or preset != (cur.get("preset") or "cost-first") else cur
+    eff0 = routing_effective({"preset": preset, "jobs": keep.get("jobs") or {}})
+    jobs = {j: {"claude": eff0[j]["claude"], "ag": dict(eff0[j]["ag"])} for j in JOB_KEYS}
+    for j, upd in sets.items(): jobs[j].update(upd)
+    if inter:
+        for j in JOB_KEYS:
+            e = jobs[j]
+            _say(f'{j} — {JOB_DESC[j]}: claude={e["claude"]}  ag={e["ag"]["backend"]}/{e["ag"]["model"]}')
+            if _ask("  change? (y/N)", "n").lower()[:1] != "y": continue
+            e["claude"] = _ask_pick("  claude subagent alias", ["haiku", "sonnet", "opus", "fable"], e["claude"])
+            b = _ask_pick("  ag backend", list(NATIVE_ORDER), e["ag"]["backend"])
+            if b not in NATIVE_ORDER: _say(f"  unknown backend {b!r}, keeping {e['ag']['backend']}"); b = e["ag"]["backend"]
+            m = _ask_pick("  ag model", model_choices(b), e["ag"]["model"] if b == e["ag"]["backend"] else "default")
+            e["ag"] = {"backend": b, "model": m}
+    doc = {"version": 1, "preset": preset, "jobs": jobs}
+    eff = routing_effective(doc) if scope == "global" else routing_effective(glob, doc)
+    block = routing_block(eff)
+    writes = [(gp if scope == "global" else pp, json.dumps(doc, indent=2) + "\n")]
+    tdir, tpls, skill_err, notes = skill_templates_dir(), {}, "", []
+    for n in SKILL_NAMES if harn else ():
+        t = tdir/n/"SKILL.md"
+        try: tpls[n] = t.read_text()
+        except OSError: skill_err = f"skill template missing: {t}"; break
+    if not skill_err:
+        for h in harn:
+            sd = harness_skills_dir(h, scope, proj)
+            writes += [(sd/n/"SKILL.md", render_skill(tpls[n], block, scope)) for n in SKILL_NAMES]
+            notes += [f"left alone: old skill {sd/o} (remove by hand once ag-cli/ag-agents replace it)"
+                for o in OLD_SKILLS if (sd/o).exists()]
+    cmd_ = a.claude_md if a.claude_md is not None else "claude" in harn
+    if cmd_ and scope == "global":
+        cp, ap = _ag_home()/".claude"/"CLAUDE.md", _ag_home()/"AGENTS.md"
+        writes.append((cp, routing_md_insert(_read_or_empty(cp), block)))
+        t2 = routing_md_insert(_read_or_empty(ap), block, append=False)  # markers only, never append
+        if t2 is not None: writes.append((ap, t2))
+    elif a.claude_md and scope == "project": notes.append("CLAUDE.md block is global-only; skipped for --scope project")
+    plan = []
+    for p, txt in writes:
+        old, ex = _read_or_empty(p), p.exists()
+        plan.append((p, txt, old, "unchanged" if ex and old == txt else "changed" if ex else "new"))
+    if inter:
+        _say(f"\nscope={scope} preset={preset} harnesses={','.join(harn) or 'none'}\n{block}\n")
+        for p, _, _, st in plan: _say(f"  {st:9} {p}")
+        if skill_err: _say(f"  ! {skill_err}")
+        if _ask("write these files? (Y/n)", "y").lower()[:1] == "n": return emit(a, "setup", {"_text": "cancelled", "cancelled": True})
+    files, out = [], []
+    for p, txt, old, st in plan:
+        rec = {"path": str(p), "status": st}
+        if a.dry_run:
+            if st != "unchanged":
+                rec["diff"] = "".join(difflib.unified_diff(old.splitlines(True), txt.splitlines(True),
+                    str(p) if st == "changed" else "/dev/null", str(p)))
+            out.append(f"would write {p} ({st})" if st != "unchanged" else f"unchanged {p}")
+            if rec.get("diff"): out.append(rec["diff"].rstrip("\n"))
+        else:
+            if st != "unchanged": _put_file(p, txt)
+            out.append(f"{'wrote' if st != 'unchanged' else 'unchanged'} {p}")
+        files.append(rec)
+    out += notes
+    data = {"scope": scope, "harnesses": harn, "preset": preset, "routing": jobs, "files": files,
+        "dry_run": bool(a.dry_run), "notes": notes}
+    if skill_err:
+        if not getattr(a, "json", False): print("\n".join(out))
+        return emit(a, "setup", data, error=skill_err,
+            hint=f"skill templates live at {tdir}/<{'|'.join(SKILL_NAMES)}>/SKILL.md (override: AG_SKILLS_DIR)")
+    return emit(a, "setup", {**data, "_text": "\n".join(out)})
+
+def _setup_selfcheck():
+    assert parse_route_sets(["review=claude:sonnet", "review=ag:opencode/opencode/x"]) == \
+        {"review": {"claude": "sonnet", "ag": {"backend": "opencode", "model": "opencode/x"}}}
+    for bad in ("review=sonnet", "nojob=claude:opus", "debug=ag:nope/x", "plan=claude:"):
+        try: parse_route_sets([bad]); raise AssertionError(bad)
+        except ValueError: pass
+    e = routing_effective({"preset": "balanced"}, {"jobs": {"debug": {"ag": {"backend": "codex"}}}})
+    assert e["review"]["claude"] == "sonnet" and e["review"]["source"]["claude"] == "preset-default"
+    assert e["debug"]["ag"] == {"backend": "codex", "model": "default"} and e["debug"]["source"] == {"claude": "preset-default", "ag": "project"}
+    b = routing_block(routing_effective())
+    assert "| mechanical — scripts, rote edits, boilerplate, lookups | haiku | opencode / " + OPENCODE_MODEL_DEFAULT + " |" in b
+    t = routing_md_insert("top\n", "B1")
+    assert t.startswith("top\n\n" + ROUTING_MARKERS[0]) and routing_md_insert(t, "B2") == t.replace("B1", "B2")
+    assert routing_md_insert("x", "B", append=False) is None
+    assert render_skill("{{AG}} {{SCOPE}} {{X}}", "R", "project") == f"{ag_script_path()} project {{{{X}}}}"
+    assert parse_model_lines("\x1b[2K\x1b[GLoading models…\nAvailable models\n\ngpt-5 - GPT-5 (current)\nauto - Auto\n") == ["gpt-5", "auto"]
 
 def build():
     p = argparse.ArgumentParser(prog="ag", description="CLI helper for autonomous agents")
@@ -9977,7 +10357,7 @@ def build():
     hp.set_defaults(psub="list")
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",required=True,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default="default"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)")
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
     ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)')
     ags.add_parser("doctor")
@@ -9990,7 +10370,7 @@ def build():
     rrst=ros.add_parser("reset",help="restore one built-in role's original prompt"); rrst.add_argument("name")
     ch = sub.add_parser("chat",help="talk to an agent headless"); chs=ch.add_subparsers(dest="sub",required=True)
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
-    chs2.add_argument("--command",default=None,help="opencode native custom command (message becomes its args)")
+    chs2.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); chs2.add_argument("--command",default=None,help="opencode native custom command (message becomes its args)")
     chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded")
     chu=chs.add_parser("usage",help="last-turn + total provider token usage"); chu.add_argument("name")
     chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--limit",type=int,default=20)
@@ -10003,7 +10383,7 @@ def build():
     ata=sub.add_parser("attach",help="jump into a live session terminal (Ctrl-] detaches)"); ata.add_argument("sess")
     fgt=sub.add_parser("forget",help="wipe a session's logs (auth traces)"); fgt.add_argument("sess")
     sub.add_parser("keys",help="control cheat-sheet")
-    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded")
+    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded")
     cx=sub.add_parser("context",help="scoped guidance + persistent memory"); cxs=cx.add_subparsers(dest="ctxsub",required=False)
     cxs.add_parser("init",help="non-destructive scaffold of context state")
     cxa=cxs.add_parser("assign",help="assign agent to project scope + brief"); cxa.add_argument("cname"); cxa.add_argument("--scope",default=""); cxa.add_argument("--project-root",default=None); cxa.add_argument("--task",default=None); cxa.add_argument("--acceptance",default=None); cxa.add_argument("--file",dest="cfile",action="append",default=[]); cxa.add_argument("--brief",default=None); cxa.add_argument("--brief-file",default=None)
@@ -10013,7 +10393,7 @@ def build():
     cmc=cms.add_parser("config",help="role defaults / per-agent override"); cmc.add_argument("--role",dest="cprole",default=None,choices=["orchestrator","sub"]); cmc.add_argument("--agent",dest="cpagent",default=None); cmc.add_argument("--enable",dest="cpenable",action="store_true",default=None); cmc.add_argument("--disable",dest="cpdisable",action="store_true"); cmc.add_argument("--max-turns",dest="cpmax",type=int,default=None); cmc.add_argument("--tokens",dest="cptokens",type=int,default=None); cmc.add_argument("--keep",dest="cpkeep",type=int,default=None); cmc.add_argument("--timeout",dest="cptimeout",type=int,default=None); cmc.add_argument("--clear",dest="cpclear",action="store_true")
     cmsh=cms.add_parser("show",help="effective settings + stats"); cmsh.add_argument("cpname",nargs="?",default="")
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
-    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired")
+    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired")
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50); ws.add_argument("--wait",default=None); ws.add_argument("--timeout",type=int,default=30); ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)")
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
     hosts=sub.add_parser("hosts",help="outbound SSH host and project mappings"); hsub=hosts.add_subparsers(dest="hostsub",required=True)
@@ -10031,6 +10411,9 @@ def build():
     sr=sysub.add_parser("resume"); sr.add_argument("snapshot"); sr.add_argument("--name",required=True); sr.add_argument("--project",required=True); sr.add_argument("--source-stopped",action="store_true"); sr.add_argument("--run",action="store_true"); sr.add_argument("--timeout",type=float,default=30); sr.add_argument("--max-runtime",dest="max_runtime",type=float,default=1800,help="hard runtime limit for --run backend turn in seconds (0=unlimited); budget starts at guard acquisition"); sr.add_argument("--backend",choices=["claude","opencode","gemini","codex","cursor","echo"]); sr.add_argument("--model")
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
+    mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now")
+    rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS)
+    st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS or JOB=ag:BACKEND/MODEL (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs")
     return p
 
 # ---- portable task snapshots (outbound SSH, no native runtime migration) ----
@@ -10450,7 +10833,8 @@ def main(argv=None):
         "handoff":do_handoff,"hosts":do_hosts,"sync":do_sync,
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
         "delegate":do_delegate,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
-        "_wake_run":do__wake_run,"askpass":do_askpass,"_sudo":do__sudo}[a.subcmd]
+        "_wake_run":do__wake_run,"askpass":do_askpass,"_sudo":do__sudo,
+        "models":do_models,"route":do_route,"setup":do_setup}[a.subcmd]
     return fn(a)
 
 if __name__=="__main__":

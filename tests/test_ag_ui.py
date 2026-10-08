@@ -31,6 +31,8 @@ assert AG.exists(), f"missing ag: {AG}"
 # and restores them itself.
 os.environ.pop("NO_COLOR", None)
 os.environ.pop("AG_ASCII", None)
+# model pickers merge the live models cache; pin it empty so lists stay static
+os.environ["AG_CACHE_HOME"] = tempfile.mkdtemp(prefix="ag-ui-cache-")
 
 # stub curses init calls; keep KEY_*/A_* constants real
 curses.curs_set = lambda *a, **k: None

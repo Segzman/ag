@@ -19,6 +19,7 @@ accept `--json` for machine-readable output.
 - [Native limits](#native-limits-verified-from---help-no-remote-calls)
 - [Harness profiles](#harness-profiles-shared-named-backendsskillsmemorymcp)
 - [Wake](#wake-background-agents-wake-agents-on-completion)
+- [Secret input](#secret-input-passwords-otp-codes-passphrases)
 - [Docs](#docs)
 - [Limitations](#limitations-honest)
 
@@ -391,6 +392,24 @@ If an agent's dir is inside a git repo, every non-slash turn is snapshotted befo
 ```
 
 `revert` rewrites snapshot files, deletes non-ignored files that did not exist then, never touches `.git`/ignored files, refuses while the agent is busy, and saves the pre-revert state at `refs/ag/<agent>/pre-revert` (undo: `git diff` / `git checkout` from that ref). Scope is the whole repo, not just the agent subdir.
+
+## Secret input: passwords, OTP codes, passphrases
+
+When terminal work needs a sudo password, SSH passphrase, OTP/2FA code or PIN, ag pops a native macOS dialog (masked field, OK/Cancel) and hands the value straight to the program. The model never sees it and no agent cooperation is needed.
+
+```sh
+./ag spawn -- sudo make install      # tty prompt detected -> dialog -> typed into the PTY
+./ag send <sess> --secret            # value from the dialog (getpass on a non-mac TTY)
+./ag askpass "Password:"             # askpass protocol: secret on stdout, Cancel = exit 1
+./ag spawn --no-secret-popup -- ...  # opt out per session; AG_SECRET_POPUP=0 opts out globally
+```
+
+- **PTY sessions:** the daemon watches each session. A prompt counts when output has gone idle and either tty ECHO is off in canonical mode (getpass/readpassphrase) with a prompt-like last line, or the last line matches `password|passphrase|passcode|verification code|one-time|otp|2fa|pin|security code|token … :/?`. One dialog at a time, and the same prompt never pops twice until new output arrives. Every dialog logs a `secret_prompt` event with outcome `ok|cancel|error` and never the value.
+- **Backend turns and spawned sessions:** env gets `SUDO_ASKPASS`, `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` and `GIT_ASKPASS`, all pointing at `<state>/bin/ag-askpass`. `<state>/bin` is prepended to `PATH` with a `sudo` shim that execs the real sudo with `-A`, unless `-A/-S/-n` is already given or no prompt is possible. Variables you set yourself are never overridden. If a tool output still shows a blocked prompt (`a terminal is required…`, `Permission denied (publickey`, `Enter passphrase`, a trailing `Password:`), ag logs `secret_needed` and adds one retry note to the chat. Every backend's system context also says to never request secrets in chat.
+
+**Guarantee:** the secret is never written to disk in plaintext. It exists only in process memory and pipes: osascript stdout → ag → PTY fd, or askpass stdout → sudo/ssh/git. ag does not cache it. `input.log` records `[secret input redacted]`, and events and chat hold the outcome only. Framed `send --secret` payloads stay below `PIPE_BUF`, so each one is a single atomic write. Ordinary input that spoofs the frame markers can, at worst, produce a redacted log line.
+
+**Limits:** the receiving program gets the plaintext, as it must, and kernel pipe/tty buffers hold it briefly. Python strings cannot be zeroed, so ag only drops its references. ag turns tty echo off while it writes the secret. Even so, a program that echoes or prints its input itself (raw-mode masking, `print(input())`) can still put it into `output.log`. Keyword detection is heuristic: it can miss a prompt or pop for a harmless line ending in `token:`. In that case press Cancel, which sends nothing. macOS only (`osascript`). On other systems, injection and detection stay off.
 
 ## Docs
 

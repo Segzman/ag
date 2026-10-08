@@ -146,8 +146,9 @@ Verified sources (2026-09-15): installed `opencode 1.18.23`
 installed `claude --help` (`--include-partial-messages`,
 `--output-format stream-json`); installed `agent --help`
 (`--stream-partial-output`); `gemini --help` (`-o stream-json`);
-`codex exec --help` (`--json` exists but schema unpinned, so not
-used). Prior note claiming "no partial-message flag" for Claude was
+`codex exec --json` (codex-cli 0.160, 2026-10-08: `thread.started`,
+`item.completed` agent_message/command_execution, `turn.completed` usage;
+parsed by `_parse_codex` / `parse_timeline_codex`). Prior note claiming "no partial-message flag" for Claude was
 stale — the installed CLI has it and it is used. Nothing above is
 assumed: unknown JSON shapes are ignored, never displayed.
 

@@ -244,7 +244,7 @@ in-TUI pickers elsewhere), so other backends reject `--command` instead of
 faking it. Headless `/handoff` prints the interactive argv instead: `claude
 [--resume SID]` and `agent [--resume SID]` preserve the session flag;
 `opencode`/`gemini`/`codex` launch bare in the agent workdir (resume from the
-in-TUI picker; ag keeps gemini/codex turns stateless). In the TUI, `/handoff`
+in-TUI picker; ag keeps gemini turns stateless, codex headless turns resume via `exec --json`). In the TUI, `/handoff`
 executes like `H` (below) instead of printing. Fallback anywhere
 without a TTY: `ag spawn -- <argv>` then `ag attach <id>`. Handoff argv never
 carries auto-approve/bypass flags. Unknown `/word` is never prose: it errors

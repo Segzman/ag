@@ -26,6 +26,23 @@ DANGEROUS = [
     (r"curl\b.*\|\s*(ba)?sh\b", "curl-pipe-shell"),
     (r"wget\b.*\|\s*(ba)?sh\b", "wget-pipe-shell"),
 ]
+# rtk (token-compact command output). claude/opencode get it from their own
+# hook/plugin; backends without one get this instruction instead.
+RTK_NOHOOK = ("codex", "gemini", "cursor")
+RTK_HINT = ("Shell commands: prefix with `rtk` (`rtk git log`, `rtk grep`, `rtk ls`, "
+    "`rtk read <file>`, `rtk test <cmd>`, `rtk err <cmd>`). It compacts output and passes "
+    "unknown commands through. Use `rtk proxy <cmd>` only if the compact output lacks what you need.")
+
+def rtk_on():
+    return os.environ.get("AG_RTK", "1") != "0" and bool(shutil.which("rtk"))
+
+def rtk_rewrite(cmd_str):
+    """rtk equivalent of cmd_str, or cmd_str unchanged (no rtk / AG_RTK=0 / unsupported)."""
+    if not rtk_on(): return cmd_str
+    try: p = subprocess.run(["rtk", "rewrite", cmd_str], capture_output=True, text=True, timeout=5)
+    except Exception: return cmd_str
+    out = (p.stdout or "").strip()
+    return out if p.returncode in (0, 3) and out else cmd_str  # 3 = rewritten, hook would ask
 
 def state_dir(explicit=None):
     d = explicit or os.environ.get("AGENT_CLI_DIR")
@@ -100,9 +117,10 @@ def do_run(a):
     env = dict(os.environ)
     for kv in (a.env or []):
         if "=" in kv: k,v = kv.split("=",1); env[k]=v
+    exec_str = cmd_str if getattr(a, "raw", False) else rtk_rewrite(cmd_str)
     t0 = time.time()
     try:
-        p = subprocess.run(cmd_str, shell=True, capture_output=True, text=True,
+        p = subprocess.run(exec_str, shell=True, capture_output=True, text=True,
             timeout=a.timeout, cwd=a.cwd or None, env=env)
         rc, out, err = p.returncode, p.stdout or "", p.stderr or ""
     except subprocess.TimeoutExpired as e:
@@ -112,6 +130,7 @@ def do_run(a):
     data = {"exit":rc,"duration_ms":dur,"truncated":trunc,
         "stdout":out[:MAX_OUT],"stderr":err[:MAX_OUT],
         "cmd":cmd_str,"cwd":a.cwd or os.getcwd()}
+    if exec_str != cmd_str: data["rtk"] = exec_str
     # log
     try:
         with open(sdir/"history.jsonl","a") as f:
@@ -2134,7 +2153,7 @@ def do_harness_profile(a):
 # ---- multi-backend agents: claude orchestrates, subs via opencode/gemini/codex ----
 # ponytail: headless CLIs as backends, no API keys here. Ceilings: gemini free-tier
 # dead (needs Antigravity/API key), codex vendor binary broken on this box (see doctor),
-# gemini/codex turns are stateless + history replay (no reliable resume id).
+# gemini turns are stateless + history replay; codex resumes its `exec --json` thread_id.
 # ag-level default model for OpenCode: "default"/missing resolves to this ID
 # everywhere OpenCode runs through ag (headless argv, handoff, new agents,
 # switches, pickers). Explicit custom models always win; other backends untouched.
@@ -2356,7 +2375,8 @@ def native_handoff_text(sdir, name, backend=""):
         if sid:
             extra += f'\n  headless resume instead: opencode run --session {sid} --dir {cwd} "<msg>"'
     if b in ("gemini", "codex"):
-        extra = "\n  note: ag keeps gemini/codex turns stateless (history replay); the TUI owns its own sessions."
+        extra = ("\n  note: ag keeps gemini turns stateless (history replay); codex headless turns resume their thread"
+            if b == "codex" else "\n  note: ag keeps gemini turns stateless (history replay); the TUI owns its own sessions.")
     cmd = " ".join(shlex.quote(t) for t in argv)
     prof_line = ""
     if launch.get("ok") and launch.get("profile"):
@@ -3797,7 +3817,7 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system=""
         if m: argv += ["-m",m]
         return argv
     if backend=="codex":
-        argv = ["codex","exec"]
+        argv = ["codex","exec","--json"]
         if m: argv += ["-m",m]
         if sid: argv += ["resume",sid]
         return argv + [prompt]
@@ -3878,6 +3898,26 @@ def _parse_opencode(line):
     elif t=="step_finish" and p.get("reason")=="stop": evs.append(("done","stop"))
     return evs
 
+def _parse_codex(line):
+    """`codex exec --json` JSONL (verified codex-cli 0.160): thread.started
+    {thread_id}, item.completed {agent_message|command_execution}, turn.completed {usage}."""
+    try: o = json.loads(line)
+    except Exception: return [("text",line[:500])] if line.strip() else []
+    t, it = o.get("type"), o.get("item") if isinstance(o.get("item"),dict) else {}
+    if t=="thread.started" and o.get("thread_id"): return [("meta",o["thread_id"])]
+    if t=="item.completed":
+        if it.get("type")=="agent_message" and it.get("text"): return [("text",it["text"])]
+        if it.get("type")=="command_execution":
+            out = (it.get("aggregated_output") or "").strip()
+            return [("tool",f'shell {it.get("command","")[:160]}'),
+                    ("toolout",tl_bound(out,600)[0] if out else f'(exit {it.get("exit_code")})')]
+    if t=="turn.completed":
+        u = o.get("usage") or {}
+        return [("done",f'in={u.get("input_tokens",0)} cached={u.get("cached_input_tokens",0)} out={u.get("output_tokens",0)}')]
+    if t in ("turn.failed","error"):
+        e = o.get("error"); return [("text",f'error: {(e.get("message") if isinstance(e,dict) else e) or "codex error"}'[:500])]
+    return []
+
 def _parse_generic(line):
     try: o = json.loads(line)
     except Exception: return [("text",line[:500])] if line.strip() else []
@@ -3907,6 +3947,7 @@ def parse_events(backend, line):
     if not line: return []
     if backend=="claude": return _parse_claude(line)
     if backend=="opencode": return _parse_opencode(line)
+    if backend=="codex": return _parse_codex(line)
     return _parse_generic(line)
 
 # ---- streaming timeline: honest incremental provider events ----
@@ -4167,7 +4208,33 @@ def parse_timeline(backend, line, scope=None):
     if not line: return []
     if backend == "claude": return parse_timeline_claude(line, scope)
     if backend == "opencode": return parse_timeline_opencode(line)
+    if backend == "codex": return parse_timeline_codex(line)
     return parse_timeline_generic(line)
+
+def parse_timeline_codex(line):
+    """`codex exec --json` items (see _parse_codex). Only completed items are
+    rendered; unknown shapes -> [] (never prose). Pure, no I/O."""
+    o = _tl_json(line)
+    if o is None: return []
+    it = o.get("item") if isinstance(o.get("item"), dict) else {}
+    t = o.get("type")
+    if t == "item.completed" and it.get("type") == "agent_message" and isinstance(it.get("text"), str):
+        return [{"op": "assistant_text", "text": it["text"]}]
+    if t == "item.completed" and it.get("type") == "reasoning" and isinstance(it.get("text"), str):
+        return [{"op": "reasoning_text", "text": it["text"]}]
+    if t == "item.completed" and it.get("type") == "command_execution":
+        tid, rc = str(it.get("id") or ""), it.get("exit_code")
+        ops = [{"op": "tool", "tool_id": tid, "tool_name": "shell", "args": {"command": it.get("command")},
+            "title": str(it.get("command") or "")[:200],
+            "status": "completed" if rc == 0 else "failed", "meta": None}]
+        out = it.get("aggregated_output")
+        if out:
+            ops.append({"op": "toolout", "tool_id": tid, "text": tl_bound(str(out), TL_TOOLOUT_CAP)[0], "is_error": rc != 0})
+        return ops
+    if t in ("turn.failed", "error"):
+        e = o.get("error")
+        return [{"op": "error", "text": str((e.get("message") if isinstance(e, dict) else e) or "codex error")[:500]}]
+    return []
 
 def tl_diff_for_tool(tool_name, args, meta=None):
     """Unified diff from KNOWN edit inputs only. Returns (diff_text, path)
@@ -5520,6 +5587,22 @@ def do_agents(a):
                 rows.append({"backend":b,"ok":False,"version":"","hint":"not on PATH"})
             except Exception as e:
                 rows.append({"backend":b,"ok":False,"version":"","hint":str(e)[:100]})
+        # rtk coverage: claude/opencode via their global hook/plugin, the rest via prompt hint
+        def _has_rtk(*paths):
+            for p in paths:
+                try:
+                    if p.is_file() and "rtk" in p.read_text(errors="replace"): return True
+                    if p.is_dir() and any("rtk" in f.read_text(errors="replace") for f in p.glob("*.[jt]s")): return True
+                except Exception: pass
+            return False
+        if rtk_on():
+            hk = {"claude":_has_rtk(Path.home()/".claude/settings.json"),
+                  "opencode":_has_rtk(Path.home()/".config/opencode/plugins",Path.home()/".config/opencode/plugin")}
+            miss = [b for b,v in hk.items() if not v]
+            rows.append({"backend":"rtk","ok":not miss,"version":shutil.which("rtk"),
+                "hint":(f"no hook for {','.join(miss)} (rtk init -g)" if miss else "hooks: claude,opencode")+"; prompt hint: "+",".join(RTK_NOHOOK)})
+        else:
+            rows.append({"backend":"rtk","ok":False,"version":"","hint":"off (AG_RTK=0)" if shutil.which("rtk") else "not on PATH (optional)"})
         if getattr(a,"json",False): return emit(a,"agents",{"backends":rows})
         txt = "\n".join(f'{"ok " if r["ok"] else "BAD"} {r["backend"]:9} {r["version"]} {r["hint"]}' for r in rows)
         return emit(a,"agents",{"_text":txt})
@@ -5929,7 +6012,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             # native custom command: message text is command args, sent bare.
             prompt = text
         else:
-            hist = "" if (sid and backend in ("claude","opencode","cursor")) else recent_history(sdir,name)
+            hist = "" if (sid and backend in ("claude","opencode","cursor","codex")) else recent_history(sdir,name)
             prompt = (hist+"\n\n---\n"+text) if hist else text
         sys_txt = eff_system(sdir, a)
         # harness profile: instructions/memory/skills context must reach backend
@@ -5948,6 +6031,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                 prompt = ("[background context — labeled sources; memory notes are "
                     "fallible and may be stale]\n" + _ctx["text"][:CTX_TOTAL] +
                     "\n\n---\n[current request — answer this]:\n" + prompt)
+        if backend in RTK_NOHOOK and not command and rtk_on():
+            sys_txt = (sys_txt + "\n\n" + RTK_HINT) if sys_txt else RTK_HINT
         if sys_txt and backend!="claude" and not sid and not command:
             # backends without a native system flag: lead the first turn with the role block
             prompt = f'[system role: {a.get("persona") or "custom"}]\n{sys_txt}\n\n---\n{prompt}'
@@ -8922,6 +9007,20 @@ def do_selfcheck(a):
             {"w": normalize_mcp_entry("w", {"url": "https://m.example/m",
                 "headers": {"Authorization": "Bearer {env:FK}"}})}, "codex")
         assert any("env ref" in x for x in _u2), _u2
+        # rtk: AG_RTK=0 is a hard off; unsupported commands pass through untouched
+        _rk = os.environ.get("AG_RTK"); os.environ["AG_RTK"] = "0"
+        assert rtk_rewrite("git status") == "git status"
+        if _rk is None: os.environ.pop("AG_RTK")
+        else: os.environ["AG_RTK"] = _rk
+        assert rtk_rewrite("echo hi") == "echo hi"
+        if rtk_on(): assert rtk_rewrite("git status").startswith("rtk "), rtk_rewrite("git status")
+        # codex exec --json: thread_id resumes, items render, usage lands on done
+        assert _parse_codex('{"type":"thread.started","thread_id":"t-1"}')==[("meta","t-1")]
+        assert _parse_codex('{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}')==[("text","ok")]
+        assert _parse_codex('{"type":"item.completed","item":{"type":"command_execution","command":"ls","aggregated_output":"a\\n","exit_code":0}}')[1]==("toolout","a")
+        assert "cached=5" in _parse_codex('{"type":"turn.completed","usage":{"input_tokens":9,"cached_input_tokens":5,"output_tokens":1}}')[0][1]
+        assert [o["op"] for o in parse_timeline("codex",'{"type":"item.completed","item":{"id":"i","type":"command_execution","command":"ls","aggregated_output":"x","exit_code":1}}')]==["tool","toolout"]
+        assert backend_argv("codex",sid="t-1",prompt="hi")==["codex","exec","--json","resume","t-1","hi"]
         # unknown /word: explicit real route, never model prose
         _r = run_turn(td,"pa","/frobnicate")
         assert _r["exit"]==1 and "NOT sent to the model" in _r["reply"] and "/handoff" in _r["reply"], _r
@@ -8950,7 +9049,8 @@ def build():
     sub = p.add_subparsers(dest="subcmd")
     r = sub.add_parser("run", help="run shell cmd, logged"); r.add_argument("--timeout",type=int,default=30)
     r.add_argument("--cwd",default=None); r.add_argument("--env",action="append",default=[])
-    r.add_argument("--force",action="store_true"); r.add_argument("cmd",nargs=argparse.REMAINDER)
+    r.add_argument("--force",action="store_true"); r.add_argument("--raw",action="store_true",help="skip rtk output compaction")
+    r.add_argument("cmd",nargs=argparse.REMAINDER)
     rd = sub.add_parser("read",help="read file numbered"); rd.add_argument("path")
     rd.add_argument("--offset",type=int,default=1); rd.add_argument("--limit",type=int,default=200)
     w = sub.add_parser("write",help="write file (arg or stdin)"); w.add_argument("path")

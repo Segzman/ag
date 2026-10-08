@@ -361,6 +361,10 @@ use fake fixture credentials.
 
 Each wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session (`__wake-<agent>-<id>`, visible in `sessions`/`status --json`). Turns on the same agent (`chat send`, `delegate`, wake workers) are mutually excluded via one shared per-agent flock guard held inside `run_turn` (no FIFO or arrival-order guarantee; the wake worker takes no second lock); different agents run in parallel. Backend/profile/model switches probe the same guard and refuse while the agent runs anywhere. `spawn --wake` launches at most once (atomic claim, not guaranteed completion or delivery); worker completion never re-fires (no callback loops). Argv is shell-free, so `; touch evil` in messages stays inert text. `--on-exit` still runs first and is unchanged.
 
+## Stale-session recovery and transient retry
+
+If a backend no longer knows the stored session id ("Session not found", "No conversation found...", "no rollout found..."), `ag` clears that backend's sid, replays recent history into a fresh session, relaunches once, and logs a `[resume] ... started fresh` tool note. Rate limits, overload, 503/529 and connection resets are retried up to 2 times (2s, 6s backoff), only when the failed attempt produced no output. The per-agent turn guard stays held, the user row is never duplicated, and `--timeout` still bounds the whole turn. Disable with `AG_RETRY=0`.
+
 ## Docs
 
 - [Harness selection + behavior presets](docs/HARNESS_ROLES.md): `harness use/current`, per-backend models, editable/reset roles.

@@ -19,6 +19,7 @@ accept `--json` for machine-readable output.
 - [Native limits](#native-limits-verified-from---help-no-remote-calls)
 - [Harness profiles](#harness-profiles-shared-named-backendsskillsmemorymcp)
 - [Wake](#wake-background-agents-wake-agents-on-completion)
+- [Secret input](#secret-input-passwords-otp-codes-passphrases)
 - [Docs](#docs)
 - [Limitations](#limitations-honest)
 
@@ -360,6 +361,24 @@ use fake fixture credentials.
 ```
 
 Each wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session (`__wake-<agent>-<id>`, visible in `sessions`/`status --json`). Turns on the same agent (`chat send`, `delegate`, wake workers) are mutually excluded via one shared per-agent flock guard held inside `run_turn` (no FIFO or arrival-order guarantee; the wake worker takes no second lock); different agents run in parallel. Backend/profile/model switches probe the same guard and refuse while the agent runs anywhere. `spawn --wake` launches at most once (atomic claim, not guaranteed completion or delivery); worker completion never re-fires (no callback loops). Argv is shell-free, so `; touch evil` in messages stays inert text. `--on-exit` still runs first and is unchanged.
+
+## Secret input: passwords, OTP codes, passphrases
+
+When terminal work needs a sudo password, SSH passphrase, OTP/2FA code or PIN, ag pops a native macOS dialog (masked field, OK/Cancel) and hands the value straight to the program. The model never sees it and no agent cooperation is needed.
+
+```sh
+./ag spawn -- sudo make install      # tty prompt detected -> dialog -> typed into the PTY
+./ag send <sess> --secret            # value from the dialog (getpass on a non-mac TTY)
+./ag askpass "Password:"             # askpass protocol: secret on stdout, Cancel = exit 1
+./ag spawn --no-secret-popup -- ...  # opt out per session; AG_SECRET_POPUP=0 opts out globally
+```
+
+- **PTY sessions:** the daemon watches each session. A prompt counts when output has gone idle and either tty ECHO is off in canonical mode (getpass/readpassphrase) with a prompt-like last line, or the last line matches `password|passphrase|passcode|verification code|one-time|otp|2fa|pin|security code|token … :/?`. One dialog at a time, and the same prompt never pops twice until new output arrives. Every dialog logs a `secret_prompt` event with outcome `ok|cancel|error` and never the value.
+- **Backend turns and spawned sessions:** env gets `SUDO_ASKPASS`, `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` and `GIT_ASKPASS`, all pointing at `<state>/bin/ag-askpass`. `<state>/bin` is prepended to `PATH` with a `sudo` shim that execs the real sudo with `-A`, unless `-A/-S/-n` is already given or no prompt is possible. Variables you set yourself are never overridden. If a tool output still shows a blocked prompt (`a terminal is required…`, `Permission denied (publickey`, `Enter passphrase`, a trailing `Password:`), ag logs `secret_needed` and adds one retry note to the chat. Every backend's system context also says to never request secrets in chat.
+
+**Guarantee:** the secret is never written to disk in plaintext. It exists only in process memory and pipes: osascript stdout → ag → PTY fd, or askpass stdout → sudo/ssh/git. ag does not cache it. `input.log` records `[secret input redacted]`, and events and chat hold the outcome only. Framed `send --secret` payloads stay below `PIPE_BUF`, so each one is a single atomic write. Ordinary input that spoofs the frame markers can, at worst, produce a redacted log line.
+
+**Limits:** the receiving program gets the plaintext, as it must, and kernel pipe/tty buffers hold it briefly. Python strings cannot be zeroed, so ag only drops its references. ag turns tty echo off while it writes the secret. Even so, a program that echoes or prints its input itself (raw-mode masking, `print(input())`) can still put it into `output.log`. Keyword detection is heuristic: it can miss a prompt or pop for a harmless line ending in `token:`. In that case press Cancel, which sends nothing. macOS only (`osascript`). On other systems, injection and detection stay off.
 
 ## Docs
 

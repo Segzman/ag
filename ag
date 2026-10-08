@@ -506,7 +506,7 @@ def _spawn_wake_session(sdir, agent, jid, sid=None, pre_fork=None):
     name = f"{WAKE_WORKER_PREFIX}{agent}-{jid[:6]}"[:48]
     launch_cwd = os.getcwd()
     wsid, _ = _spawn_tracked(sdir, name, cmd_str, launch_cwd,
-        extra={"wake_agent": "", "wake_job": jid, "wake_worker_for": agent},
+        extra={"wake_agent": "", "wake_job": jid, "wake_worker_for": agent, "secret_popup": False},
         sid=sid, pre_fork=pre_fork)
     return wsid
 
@@ -1001,6 +1001,310 @@ def resolve_sess(sdir, ident):
     if len(hits)>1: return None, f"ambiguous: {ident} matches {len(hits)}"
     return hits[0], None
 
+# ---- secret input: native macOS dialog for passwords / OTP / passphrases ----
+# The value lives only in memory and pipes (dialog stdout -> PTY fd, or
+# askpass stdout -> sudo/ssh/git). Never written to input.log, output.log,
+# events, chat or argv; no caching. Opt-out: AG_SECRET_POPUP=0.
+SECRET_HINT = ("Passwords/OTP codes: never ask the user to paste secrets into chat; run the "
+    "command normally — ag pops a secure macOS dialog for sudo/ssh/git prompts.")
+SECRET_NOTE = ("[secret] a command was blocked on a password/passphrase prompt. ag askpass is "
+    "now wired (sudo/ssh/git pop a secure macOS dialog for the user) — retry the command; "
+    "never ask for the secret in chat.")
+SECRET_TITLE = "ag — secret requested"
+SECRET_REDACTED = b"[secret input redacted]\n"
+SECRET_FRAME = (b"\x00AG-SECRET\x00", b"\x00AG-END\x00")
+SECRET_MAX = 400       # framed payload < PIPE_BUF (512): one atomic fifo write
+SECRET_QUIET_S = 0.3   # output must be idle this long before a prompt counts
+SECRET_PROMPT_RE = re.compile(r"\b(password|passphrase|passcode|verification code|one[- ]time"
+    r"|otp|2fa|pin|security code|token)\b[^\n]{0,40}[:?]\s*$", re.I)
+SECRET_BLOCKED_RE = re.compile(r"a terminal is required to read the password|sudo: a password "
+    r"is required|Permission denied \(publickey|Enter passphrase|Password:\s*$", re.I)
+# Prompt text is passed via `on run argv` (item 2): never interpolated into source.
+SECRET_OSA = ('on run argv', 'activate',
+    'set r to display dialog (item 2 of argv) with title (item 1 of argv) default answer "" '
+    'with hidden answer buttons {"Cancel", "OK"} default button "OK" cancel button "Cancel" '
+    'with icon caution giving up after 590',
+    'if gave up of r then error number -128', 'return text returned of r', 'end run')
+_SUDO_ARGOPTS = set("ugpCDrtUTR")  # short options that take a value
+_SUDO_LONGARG = {"user", "group", "prompt", "close-from", "chdir", "host", "role", "type",
+    "other-user", "command-timeout", "chroot"}
+_SUDO_LONGMAP = {"askpass": "A", "stdin": "S", "non-interactive": "n", "help": "h",
+    "version": "V", "reset-timestamp": "k", "remove-timestamp": "K"}
+
+def secret_enabled(env=None):
+    env = os.environ if env is None else env
+    if env.get("AG_SECRET_POPUP", "1") == "0": return False
+    return sys.platform == "darwin" or bool(env.get("AG_ASKPASS_CMD"))
+
+def secret_sanitize(text, cap=200):
+    """Printable one-line prompt (terminal output is untrusted input)."""
+    s = ANSI.sub("", text or "")
+    s = " ".join("".join(c if c.isprintable() else " " for c in s).split())
+    if len(s) > cap: s = s[:cap-1] + "…"
+    return s or "Secret input requested"
+
+def secret_dialog(prompt):
+    """(status, value): ok|cancel|error. AG_ASKPASS_CMD = test override whose
+    stdout is the secret (prompt in $AG_ASKPASS_PROMPT); nonzero exit = cancel."""
+    if os.environ.get("AG_SECRET_POPUP", "1") == "0": return "error", None
+    prompt = secret_sanitize(prompt)
+    cmd, env = os.environ.get("AG_ASKPASS_CMD"), None
+    if cmd:
+        argv, env = shlex.split(cmd), dict(os.environ, AG_ASKPASS_PROMPT=prompt)
+    elif sys.platform == "darwin":
+        argv = ["osascript"] + [x for l in SECRET_OSA for x in ("-e", l)] + [SECRET_TITLE, prompt]
+    else: return "error", None
+    try: p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=600, env=env)
+    except Exception: return "error", None
+    if p.returncode != 0:
+        return ("cancel" if cmd or "-128" in (p.stderr or "") else "error"), None
+    val = p.stdout[:-1] if p.stdout.endswith("\n") else p.stdout
+    return "ok", val
+
+def secret_read(prompt):
+    """Dialog when available, else getpass on a TTY (never echoed)."""
+    if secret_enabled(): return secret_dialog(prompt)
+    if sys.stdin.isatty():
+        import getpass
+        try: return "ok", getpass.getpass(secret_sanitize(prompt) + " ")
+        except (EOFError, KeyboardInterrupt): return "cancel", None
+    return "error", None
+
+def secret_frame(body): return SECRET_FRAME[0] + body + SECRET_FRAME[1]
+
+def secret_send_payload(st, enter=True):
+    """(framed fifo bytes, error) for `ag send --secret`."""
+    label = st.get("name") or st.get("id", "")
+    outcome, val = secret_read(f"Secret input for ag session {label}: {st.get('cmd', '')[:80]}")
+    if outcome != "ok":
+        return None, f"secret input {outcome}" + (" (needs macOS dialog or a TTY)" if outcome == "error" else "")
+    body = val.encode() + (b"\r" if enter else b""); val = None
+    if len(body) > SECRET_MAX: return None, f"secret too long (max {SECRET_MAX} bytes)"
+    return secret_frame(body), None
+
+def secret_fifo_split(chunk):
+    """[(is_secret, bytes)]. An unterminated frame is treated as secret
+    (fail closed): spoofed markers at worst cost a redacted log line."""
+    out, (s, e) = [], SECRET_FRAME
+    while chunk:
+        i = chunk.find(s)
+        if i < 0: out.append((False, chunk)); break
+        if i: out.append((False, chunk[:i]))
+        rest = chunk[i+len(s):]; j = rest.find(e)
+        if j < 0: out.append((True, rest)); break
+        out.append((True, rest[:j])); chunk = rest[j+len(e):]
+    return out
+
+def secret_write_pty(fd, data):
+    """Write to the PTY with tty echo suppressed for the write, so the line
+    discipline never echoes the secret into output.log."""
+    import termios
+    old = None
+    try:
+        old = termios.tcgetattr(fd)
+        if old[3] & termios.ECHO:
+            new = list(old); new[3] = old[3] & ~termios.ECHO
+            termios.tcsetattr(fd, termios.TCSANOW, new)
+        else: old = None
+    except Exception: old = None
+    try: os.write(fd, data)
+    finally:
+        if old is not None:
+            try: termios.tcsetattr(fd, termios.TCSANOW, old)
+            except Exception: pass
+
+def secret_feed(sp, fd, chunk):
+    """fifo chunk -> PTY; framed secrets are echo-suppressed and redacted in input.log."""
+    log = bytearray()
+    for sec, part in secret_fifo_split(chunk):
+        try: (secret_write_pty if sec else os.write)(fd, part)
+        except OSError: pass
+        log += SECRET_REDACTED if sec else part
+    with open(Path(sp)/"input.log", "ab") as inf: inf.write(bytes(log))
+
+def secret_prompt_line(tail):
+    """Last visible output line of a bytes tail (ANSI stripped, \\r-overwrites resolved)."""
+    s = ANSI.sub("", tail.decode("utf-8", "replace")).rsplit("\n", 1)[-1]
+    parts = [x for x in s.split("\r") if x.strip()]
+    return parts[-1] if parts else ""
+
+def secret_detect(line, echo_off, icanon=True):
+    """Sanitized prompt if `line` asks for a secret, else None. Primary: tty
+    ECHO off in canonical mode (getpass/readpassphrase; raw-mode TUIs have
+    ICANON off) + prompt-like line. Secondary: keyword regex."""
+    s = (line or "").strip()
+    if not s or len(s) > 300: return None
+    if (echo_off and icanon and s[-1] in ":?>") or SECRET_PROMPT_RE.search(s):
+        return secret_sanitize(s)
+    return None
+
+def secret_blocked(text):
+    """Tool output shows a command stalled/failed on a secret prompt."""
+    return bool(text) and bool(SECRET_BLOCKED_RE.search(text))
+
+def secret_toolout(sdir, name, txt, buf, on_event):
+    """Backend turn hook: one secret_needed event + one retry note per turn."""
+    if getattr(buf, "_secret_noted", False) or not secret_blocked(txt): return
+    buf._secret_noted = True
+    _event(sdir, "secret_needed", name)
+    if not secret_enabled(): return
+    try: append_chat(sdir, name, "tool", SECRET_NOTE)
+    except Exception: pass
+    if on_event: on_event(name, "tool", SECRET_NOTE)
+
+def sudo_args(args):
+    """sudo argv with -A prepended, unless already -A/-S/-n or a no-command
+    invocation that never prompts (-k/-K/-V/-h alone)."""
+    letters, i, cmd = set(), 0, False
+    while i < len(args):
+        t = args[i]
+        if t == "--": cmd = i + 1 < len(args); break
+        if t.startswith("--"):
+            n = t[2:].split("=", 1)[0]
+            letters.add(_SUDO_LONGMAP.get(n, "?"))
+            if "=" not in t and n in _SUDO_LONGARG: i += 1
+        elif t.startswith("-") and len(t) > 1:
+            for j, c in enumerate(t[1:], 1):
+                letters.add(c)
+                if c in _SUDO_ARGOPTS:
+                    if j == len(t) - 1: i += 1
+                    break
+        else: cmd = True; break
+        i += 1
+    if letters & set("ASn") or (not cmd and letters <= set("kKVh")): return list(args)
+    return ["-A"] + list(args)
+
+def secret_real_bin(name, path, skip):
+    """First executable `name` on `path`, skipping the shim dir `skip`."""
+    sk = os.path.realpath(skip)
+    for d in (path or "").split(os.pathsep):
+        if not d or os.path.realpath(d) == sk: continue
+        c = os.path.join(d, name)
+        if os.path.isfile(c) and os.access(c, os.X_OK): return c
+    return None
+
+def secret_shim_dir(sdir):
+    """<sdir>/bin (0700) holding the ag-askpass and sudo shims. Abs path."""
+    sd = Path(sdir).resolve(); d = sd / "bin"
+    d.mkdir(parents=True, exist_ok=True); os.chmod(d, 0o700)
+    base = " ".join(shlex.quote(x) for x in (sys.executable, ag_script_path(), "--dir", str(sd)))
+    for fname, sub in (("ag-askpass", "askpass --"), ("sudo", "_sudo --")):
+        body, p = f'#!/bin/sh\nexec {base} {sub} "$@"\n', d / fname
+        try: cur = p.read_text()
+        except OSError: cur = None
+        if cur != body:
+            tmp = d / f".{fname}.{os.getpid()}"
+            tmp.write_text(body); os.chmod(tmp, 0o700); os.replace(tmp, p)
+    return str(d)
+
+def secret_env(sdir, env, enabled=True):
+    """Wire askpass into env (dict or os.environ) in place; user-set ASKPASS
+    vars win. sudo shim goes first on PATH so plain `sudo` gets -A."""
+    if not enabled or not secret_enabled(env): return env
+    try: d = secret_shim_dir(sdir)
+    except Exception: return env
+    ap = os.path.join(d, "ag-askpass")
+    env.setdefault("SUDO_ASKPASS", ap)
+    env.setdefault("GIT_ASKPASS", ap)
+    if "SSH_ASKPASS" not in env:
+        env["SSH_ASKPASS"] = ap; env["SSH_ASKPASS_REQUIRE"] = "force"
+    parts = env.get("PATH", os.defpath).split(os.pathsep)
+    if d not in parts: env["PATH"] = os.pathsep.join([d] + parts)
+    return env
+
+class SecretWatch:
+    """Daemon-side PTY prompt detector: debounced, one dialog at a time, and
+    no re-pop for the same prompt until new output arrives."""
+    def __init__(self, sdir, sp, fd, enabled):
+        self.sdir, self.sp, self.fd, self.on = sdir, Path(sp), fd, enabled
+        self.tail, self.seq, self.seen, self.t, self.busy = b"", 0, 0, 0.0, False
+    def output(self, data):
+        self.tail = (self.tail + data)[-1024:]; self.seq += 1; self.t = time.monotonic()
+    def poll(self):
+        if not self.on or self.busy or self.seq == self.seen: return
+        if time.monotonic() - self.t < SECRET_QUIET_S: return
+        self.seen = self.seq
+        import termios
+        try: lf = termios.tcgetattr(self.fd)[3]
+        except Exception: return
+        prompt = secret_detect(secret_prompt_line(self.tail),
+            not lf & termios.ECHO, bool(lf & termios.ICANON))
+        if not prompt: return
+        self.busy = True
+        threading.Thread(target=self._ask, args=(prompt,), daemon=True).start()
+    def _ask(self, prompt):
+        outcome = "error"
+        try:
+            outcome, val = secret_dialog(prompt)
+            if outcome == "ok":
+                data = val.encode() + b"\r"; val = None
+                secret_write_pty(self.fd, data); data = None
+                with open(self.sp/"input.log", "ab") as inf: inf.write(SECRET_REDACTED)
+        except Exception: outcome = "error"
+        finally:
+            try: _event(self.sdir, "secret_prompt", self.sp.name, outcome=outcome, source="pty")
+            except Exception: pass
+            self.busy = False
+
+def do_askpass(a):
+    """askpass protocol (sudo -A / SSH_ASKPASS / GIT_ASKPASS): secret on stdout."""
+    args = list(getattr(a, "prompt", None) or [])
+    if args[:1] == ["--"]: args = args[1:]
+    if not secret_enabled():
+        print("ag askpass: secret popup unavailable (macOS only; AG_SECRET_POPUP=0 disables)",
+            file=sys.stderr)
+        return 1
+    st, val = secret_dialog(" ".join(args) or "Password:")
+    sdir = state_dir(a.dir)
+    if sdir.is_dir():
+        try: _event(sdir, "secret_prompt", None, outcome=st, source="askpass")
+        except Exception: pass
+    if st != "ok": return 1
+    sys.stdout.write(val + "\n"); sys.stdout.flush(); val = None
+    return 0
+
+def do__sudo(a):
+    """PATH shim target: exec the real sudo, adding -A so it uses askpass."""
+    args = list(a.args or [])
+    if args[:1] == ["--"]: args = args[1:]
+    real = secret_real_bin("sudo", os.environ.get("PATH", ""),
+        str(Path(state_dir(a.dir)).resolve() / "bin"))
+    if not real:
+        print("ag: real sudo not found on PATH", file=sys.stderr); return 127
+    if os.environ.get("SUDO_ASKPASS") and secret_enabled(): args = sudo_args(args)
+    os.execv(real, [real] + args)
+
+def secret_selfcheck():
+    assert secret_detect("Password: ", True) == "Password:"
+    assert secret_detect("[sudo] password for me: ", False)
+    assert secret_detect("Enter verification code:", False)
+    assert secret_detect("Enter PIN?", False) and secret_detect("2FA token:", False)
+    assert secret_detect("spinning:", False) is None and secret_detect("tokens: 5", False) is None
+    assert secret_detect("Continue? ", True, icanon=False) is None  # raw-mode TUI
+    assert secret_detect("Name: ", True) == "Name:" and secret_detect("$ ", True) is None
+    assert secret_prompt_line(b"x\r\n\x1b[1mPass\x1b[0mword: ") == "Password: "
+    assert secret_prompt_line(b"a\n50%\r99%\rOTP: ") == "OTP: "
+    assert secret_sanitize("\x1b[31mhi\x07\tthere\n") == "hi there"
+    assert secret_sanitize("") and len(secret_sanitize("x" * 999)) == 200
+    assert secret_fifo_split(b"ab") == [(False, b"ab")]
+    assert secret_fifo_split(b"a" + secret_frame(b"pw\r") + b"b") == [
+        (False, b"a"), (True, b"pw\r"), (False, b"b")]
+    assert secret_fifo_split(SECRET_FRAME[0] + b"x") == [(True, b"x")]  # fail closed
+    assert sudo_args(["ls"]) == ["-A", "ls"] and sudo_args(["-u", "root", "id"])[0] == "-A"
+    assert sudo_args(["-unobody", "id"])[0] == "-A" and sudo_args(["-v"]) == ["-A", "-v"]
+    for keep in (["-S", "ls"], ["-n", "ls"], ["-A", "ls"], ["-nk"], ["-k"], ["-V"], [],
+            ["--non-interactive", "ls"]):
+        assert sudo_args(keep) == keep, keep
+    assert sudo_args(["-k", "ls"]) == ["-A", "-k", "ls"]
+    assert secret_blocked("sudo: a terminal is required to read the password; either")
+    assert secret_blocked("git@github.com: Permission denied (publickey).")
+    assert secret_blocked("Password:") and not secret_blocked("Password: ok\ndone")
+    assert not secret_enabled({"AG_SECRET_POPUP": "0", "AG_ASKPASS_CMD": "x"})
+    assert secret_enabled({"AG_ASKPASS_CMD": "x"})
+    e = secret_env(".", {"SUDO_ASKPASS": "/mine", "PATH": "/bin"}, enabled=False)
+    assert e == {"SUDO_ASKPASS": "/mine", "PATH": "/bin"}
+
 def daemon_main(sp):
     import pty, select, signal, fcntl, termios, struct
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -1024,6 +1328,7 @@ def daemon_main(sp):
             except Exception: pass
             os._exit(127)
         for k,v in (st.get("env") or {}).items(): os.environ[k]=v
+        secret_env(sp.parent.parent, os.environ, st.get("secret_popup", True))
         os.execv("/bin/sh",["sh","-c",st["cmd"]])
     st["child_pid"] = pid
     _swrite(sp, st)
@@ -1032,6 +1337,7 @@ def daemon_main(sp):
             struct.pack("HHHH", st.get("rows",30), st.get("cols",100), 0, 0))
     except Exception: pass
     lastwz = 0
+    sw = SecretWatch(sp.parent.parent, sp, fd, st.get("secret_popup", True) and secret_enabled())
     ff = os.open(fifo, os.O_RDONLY|os.O_NONBLOCK)
     code, drain = None, 0
     try:
@@ -1047,15 +1353,13 @@ def daemon_main(sp):
             if fd in r:
                 try: data = os.read(fd, 65536)
                 except OSError: data = b""
-                if data: logf.write(data)
+                if data: logf.write(data); sw.output(data)
                 else: eof = True
             if ff in r:
                 try: chunk = os.read(ff, 65536)
                 except OSError: chunk = b""
                 if chunk:
-                    try: os.write(fd, chunk)
-                    except OSError: pass
-                    with open(sp/"input.log","ab") as inf: inf.write(chunk)
+                    secret_feed(sp, fd, chunk)
                 else:
                     os.close(ff); ff = os.open(fifo, os.O_RDONLY|os.O_NONBLOCK)
             try:
@@ -1068,6 +1372,7 @@ def daemon_main(sp):
                     try: os.kill(pid, signal.SIGWINCH)
                     except Exception: pass
             except Exception: pass
+            if code is None: sw.poll()
             if code is not None: drain += 1
             if (eof and code is not None) or drain > 20: break
     finally:
@@ -1125,6 +1430,7 @@ def do_spawn(a):
         "env":env,"cols":a.cols,"rows":a.rows,"on_exit":a.on_exit or "",
         "wake_agent":wake_agent,"wake_message":wake_message,"wake_fired":False,
         "wake_notify":wake_notify,"wake_on_done":wake_on_done,"wake_timeout":wake_timeout,
+        "secret_popup":not getattr(a,"no_secret_popup",False),
         "running":True,"exit":None,"started_at":now_iso(),"daemon_pid":None,"child_pid":None})
     _event(sdir,"spawn",sid,cmd=cmd_str,name=a.name or "")
     _fork_tracked_daemon(sp)
@@ -1141,7 +1447,12 @@ def do_send(a):
     if not st.get("running"):
         return emit(a,"send",error=f'session {st["id"]} exited ({st.get("exit")})',
             hint=f'ag snap {st["id"]}')
-    if a.key:
+    secret = getattr(a,"secret",False)
+    if secret:
+        if a.key or a.text: return emit(a,"send",error="--secret takes no text/--key",hint="the value comes from a dialog, never argv")
+        payload, serr = secret_send_payload(st, not a.no_enter)
+        if serr: return emit(a,"send",error=serr)
+    elif a.key:
         if a.key not in KEYS:
             return emit(a,"send",error=f"unknown key: {a.key}",hint=str(sorted(KEYS)))
         payload = KEYS[a.key].encode()
@@ -1163,6 +1474,9 @@ def do_send(a):
     except OSError as e: return emit(a,"send",error=f"fifo: {e}")
     try: os.write(fd, payload)
     finally: os.close(fd)
+    if secret:
+        payload = None; _event(sdir,"send",st["id"],secret=True)
+        return emit(a,"send",{"_text":f'sent secret -> {st["id"]}',"id":st["id"],"secret":True})
     _event(sdir,"send",st["id"],bytes=len(payload))
     return emit(a,"send",{"_text":f'sent {len(payload)}B -> {st["id"]}',"id":st["id"],"bytes":len(payload)})
 
@@ -6033,6 +6347,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                     "\n\n---\n[current request — answer this]:\n" + prompt)
         if backend in RTK_NOHOOK and not command and rtk_on():
             sys_txt = (sys_txt + "\n\n" + RTK_HINT) if sys_txt else RTK_HINT
+        if not command and secret_enabled(): sys_txt = (sys_txt + "\n\n" + SECRET_HINT) if sys_txt else SECRET_HINT
         if sys_txt and backend!="claude" and not sid and not command:
             # backends without a native system flag: lead the first turn with the role block
             prompt = f'[system role: {a.get("persona") or "custom"}]\n{sys_txt}\n\n---\n{prompt}'
@@ -6061,7 +6376,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         _watcher = None
         try:
             import os as _os
-            env = dict(_os.environ, **penv) if penv else None
+            env = secret_env(sdir, dict(_os.environ, **penv))
             p = subprocess.Popen(argv,cwd=workdir,stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,text=True,bufsize=1,env=env,
                 start_new_session=(os.name == "posix"))
@@ -6123,6 +6438,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                         if on_event: on_event(name,"tool",txt)
                     elif kind=="toolout":
                         _event(sdir,"toolout",name,out=txt[:200])
+                        secret_toolout(sdir, name, txt, buf, on_event)
                         if on_event: on_event(name,"toolout",txt)
                     elif kind=="done" and on_event: on_event(name,"done",txt)
                 # timeline engine owns tool/toolout/error persistence (with
@@ -9038,6 +9354,7 @@ def do_selfcheck(a):
         assert do_harness(mk(sub="profile", psub="set", agent="pa", profile="", none=True))==0
         assert do_harness(mk(sub="profile", psub="rm", pname="p1", force=True))==0
         assert do_agents(mk(sub="rm",name="pa",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
+    secret_selfcheck()
     print(f"selfcheck ok ({td})")
     return 0
 
@@ -9072,6 +9389,10 @@ def build():
     ap=sub.add_parser("approve",help="approve blocked cmd"); ap.add_argument("id")
     s = sub.add_parser("spawn",help="spawn live pty session, returns instantly"); s.add_argument("--name",default=""); s.add_argument("--cols",type=int,default=100); s.add_argument("--rows",type=int,default=30); s.add_argument("--cwd",default=None); s.add_argument("--env",action="append",default=[]); s.add_argument("--on-exit",default=""); s.add_argument("--wake",default=""); s.add_argument("--wake-message",default=""); s.add_argument("--wake-notify",default=""); s.add_argument("--wake-on-done",default=""); s.add_argument("--wake-timeout",type=float,default=0); s.add_argument("cmd",nargs=argparse.REMAINDER)
     se = sub.add_parser("send",help="send keystrokes to session"); se.add_argument("sess"); se.add_argument("text",nargs="*"); se.add_argument("--key",default=None,help="enter|tab|up|down|left|right|esc|ctrl-c|ctrl-d"); se.add_argument("--no-enter",action="store_true")
+    s.add_argument("--no-secret-popup",action="store_true",help="no secret dialog / askpass wiring")
+    se.add_argument("--secret",action="store_true",help="value from a secure dialog; never logged")
+    aq = sub.add_parser("askpass",help="secure macOS secret dialog (askpass protocol)"); aq.add_argument("prompt",nargs=argparse.REMAINDER)
+    su = sub.add_parser("_sudo",help=argparse.SUPPRESS); su.add_argument("args",nargs=argparse.REMAINDER)
     sn = sub.add_parser("snap",help="snapshot live output (many readers OK)"); sn.add_argument("sess"); sn.add_argument("--lines",type=int,default=40); sn.add_argument("--since",type=int,default=None,help="byte offset from prior snap"); sn.add_argument("--clean",action="store_true",help="strip ANSI codes")
     sub.add_parser("sessions",help="list sessions")
     k = sub.add_parser("kill",help="kill session"); k.add_argument("sess"); k.add_argument("--force",action="store_true")
@@ -9564,7 +9885,7 @@ def main(argv=None):
         "handoff":do_handoff,"hosts":do_hosts,"sync":do_sync,
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
         "delegate":do_delegate,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
-        "_wake_run":do__wake_run}[a.subcmd]
+        "_wake_run":do__wake_run,"askpass":do_askpass,"_sudo":do__sudo}[a.subcmd]
     return fn(a)
 
 if __name__=="__main__":

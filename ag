@@ -4131,15 +4131,98 @@ def live_session_count(sdir):
     except Exception:
         return 0
 
-def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system="", command=""):
+# --- capability table + permission modes (ported from T3 Code providerPolicy/adapters) ---
+MODES = ("ro", "edits", "auto", "full")
+_CAP_BASE = {"resume": False, "system_flag": "", "mcp_flag": "", "skills": False, "interrupt": True, "usage": False,
+    "plan": "", "modes": [], "native_enforce": False}
+CAPS = {b: {**_CAP_BASE, **v} for b, v in {
+    "claude":   {"resume": True, "system_flag": "--append-system-prompt", "mcp_flag": "--mcp-config", "skills": True, "usage": True,
+                 "plan": "native", "modes": ["ro", "edits", "auto", "full"], "native_enforce": True},
+    "opencode": {"resume": True, "mcp_flag": "OPENCODE_CONFIG", "skills": True, "usage": True,
+                 "plan": "emulated", "modes": ["ro", "edits", "auto", "full"], "native_enforce": True},
+    "codex":    {"resume": True, "mcp_flag": "CODEX_HOME", "usage": True,
+                 "plan": "emulated", "modes": ["ro", "edits", "auto", "full"], "native_enforce": True},
+    "gemini":   {"plan": "native", "modes": ["ro", "edits", "full"], "native_enforce": True},
+    "cursor":   {"resume": True, "plan": "native", "modes": ["ro", "edits", "auto", "full"], "native_enforce": True},
+    "echo":     {"interrupt": False},
+}.items()}
+
+# mode -> backend flags. plan wins over mode where the backend has a native plan mode.
+_CLAUDE_PM = {"ro": "dontAsk", "edits": "acceptEdits", "auto": "auto", "full": "bypassPermissions"}  # headless can't ask: ro = strictest non-prompting
+_CODEX_SB = {"ro": "read-only", "edits": "workspace-write", "auto": "workspace-write", "full": "danger-full-access"}
+_GEMINI_AM = {"ro": "plan", "edits": "auto_edit", "full": "yolo"}
+_CURSOR_MODE = {"ro": ["--mode", "ask"], "edits": ["--force", "--sandbox", "enabled"], "auto": ["--force"], "full": ["--force", "--sandbox", "disabled"]}
+
+def mode_warning(backend, mode, plan=False):
+    """One advisory line when the chosen mode can't be enforced natively, else ''."""
+    c = CAPS.get(backend) or {}
+    if mode and mode not in (c.get("modes") or []):
+        return f"[mode] {backend} cannot enforce mode={mode}; running with backend default (advisory only)"
+    if (mode or plan) and not c.get("native_enforce"):
+        return f"[mode] {backend} does not enforce permission modes natively; mode={mode or 'plan'} is advisory"
+    return ""
+
+def mode_flags(backend, mode="", plan=False):
+    """Pure: -> argv flags for (backend, mode, plan). '' / unsupported -> backend default flags."""
+    ok = mode if mode in (CAPS.get(backend) or {}).get("modes", []) else ""
+    if backend == "claude":
+        pm = "plan" if plan else _CLAUDE_PM.get(ok)
+        return ["--permission-mode", pm] if pm else []
+    if backend == "codex":
+        sb = _CODEX_SB["ro"] if plan else _CODEX_SB.get(ok)
+        return ["-s", sb] if sb else []
+    if backend == "gemini":
+        return ["--approval-mode", "plan" if plan else _GEMINI_AM.get(ok, "default")]
+    if backend == "cursor":
+        return ["--mode", "plan"] if plan else list(_CURSOR_MODE.get(ok, []))
+    return []
+
+def opencode_permission(mode="", plan=False):
+    """Pure: opencode `permission` config block for the mode ({} = leave backend default)."""
+    m = "ro" if plan else mode
+    return {"ro": {"edit": "deny", "bash": "deny"}, "edits": {"edit": "allow", "bash": "deny"},
+            "auto": {"edit": "allow", "bash": "allow"}, "full": {"*": "allow"}}.get(m, {})
+
+def mode_env(sdir, agent, env):
+    """Overlay OPENCODE_CONFIG with a generated config carrying the `permission` block,
+    merged onto the profile's config (env['OPENCODE_CONFIG']) if any. No-op otherwise."""
+    perm = opencode_permission(agent.get("mode") or "", bool(agent.get("plan"))) if agent.get("backend") == "opencode" else {}
+    if not perm: return env
+    base = {}
+    if env.get("OPENCODE_CONFIG"):
+        try: base = json.loads(Path(env["OPENCODE_CONFIG"]).read_text())
+        except Exception: base = {}
+    cur = base.get("permission")
+    base["permission"] = {**(cur if isinstance(cur, dict) else {}), **perm}
+    base.setdefault("$schema", "https://opencode.ai/config.json")
+    p = sdir/"modes"/re.sub(r"[^\w.-]", "_", agent.get("name") or "agent")/"opencode.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(p, json.dumps(base, indent=2))
+    return {**env, "OPENCODE_CONFIG": str(p)}
+
+def caps_rows(backend=None):
+    names = [backend] if backend else list(CAPS)
+    return [{"backend": b, **CAPS[b], "advisory": [m for m in MODES if m not in CAPS[b]["modes"]]} for b in names]
+
+def do_caps(a):
+    be = getattr(a, "backend", None)
+    if be and be not in CAPS: return emit(a, "agents", error=f"unknown backend: {be}", hint="/".join(CAPS))
+    rows = caps_rows(be)
+    if getattr(a, "json", False): return emit(a, "agents", {"caps": rows})
+    f = lambda v: ",".join(v) if isinstance(v, list) else ("y" if v is True else "-" if v in (False, "") else str(v))
+    txt = "\n".join(f'{r["backend"]:9} resume={f(r["resume"])} sys={f(r["system_flag"])} mcp={f(r["mcp_flag"])} skills={f(r["skills"])} intr={f(r["interrupt"])} usage={f(r["usage"])} plan={f(r["plan"])} modes={f(r["modes"]) or "-"} enforce={"native" if r["native_enforce"] else "advisory"}' for r in rows)
+    return emit(a, "agents", {"_text": txt})
+
+def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system="", command="", mode="", plan=False):
     m = eff_model(backend, model)
+    mf = mode_flags(backend, mode or "", plan)
     if backend=="claude":
         argv = ["claude","-p","--verbose","--output-format","stream-json",
                 "--include-partial-messages"]
         if m: argv += ["--model",m]
         if system: argv += ["--append-system-prompt",system]
         if sid: argv += ["--resume",sid]
-        return argv + [prompt]
+        return argv + mf + [prompt]
     if backend=="opencode":
         argv = [_opencode_bin(),"run","--format","json","--thinking"]
         if command: argv += ["--command",command]
@@ -4148,11 +4231,11 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system=""
         if sid: argv += ["--session",sid]
         return argv + ([prompt] if prompt or not command else [])
     if backend=="gemini":
-        argv = ["gemini","-p",prompt,"-o","stream-json","--approval-mode","default"]
+        argv = ["gemini","-p",prompt,"-o","stream-json"] + mf
         if m: argv += ["-m",m]
         return argv
     if backend=="codex":
-        argv = ["codex","exec","--json"]
+        argv = ["codex","exec","--json"] + mf
         if m: argv += ["-m",m]
         if sid: argv += ["resume",sid]
         return argv + [prompt]
@@ -4161,7 +4244,7 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system=""
                 "--stream-partial-output"]
         if m: argv += ["--model",m]
         if sid: argv += ["--resume",sid]
-        return argv + [prompt]
+        return argv + mf + [prompt]
     if backend=="echo":
         return ["printf","%s\n",prompt]
     raise ValueError(f"unknown backend: {backend}")
@@ -6086,11 +6169,13 @@ def do_agents(a):
     rows = load_agents(sdir)
     if a.sub=="list":
         if getattr(a,"json",False): return emit(a,"agents",{"agents":rows})
-        txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("persona","") or "-":12} {r.get("profile","") or "-":12} {r.get("dir",".")}{"  ["+r["worktree"]["branch"]+"]" if r.get("worktree") else ""}' for r in rows) or "(none)"
+        txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("persona","") or "-":12} {r.get("profile","") or "-":12} {(r.get("mode") or "-")+("+plan" if r.get("plan") else ""):9} {r.get("dir",".")}{"  ["+r["worktree"]["branch"]+"]" if r.get("worktree") else ""}' for r in rows) or "(none)"
         return emit(a,"agents",{"_text":txt})
+    if a.sub=="caps": return do_caps(a)
     if a.sub=="add":
         if any(r["name"]==a.name for r in rows):
             return emit(a,"agents",error=f"exists: {a.name}")
+        if getattr(a,"mode",None) and a.mode not in MODES: return emit(a,"agents",error=f"bad mode: {a.mode}",hint="|".join(MODES))
         pers = getattr(a,"persona",None) or ""
         if pers and pers not in [r["name"] for r in load_roles(sdir)]:
             return emit(a,"agents",error=f"no such role: {pers}",hint="ag roles list")
@@ -6109,8 +6194,11 @@ def do_agents(a):
         rows.append({"name":a.name,"backend":be,"model":mod,**({"job":job} if job else {}),
             "dir":adir,"role":a.role,"persona":pers,"system":getattr(a,"system",None) or "",
             "instructions":[s for s in (getattr(a,"instructions",None) or []) if (s or "").strip()],
+            **({"mode":a.mode} if getattr(a,"mode",None) else {}),**({"plan":True} if getattr(a,"plan",None) else {}),
             **({"worktree":wt} if wt else {})})
         save_agents(sdir,rows)
+        _mw = mode_warning(be, getattr(a,"mode",None) or "", bool(getattr(a,"plan",None)))
+        if _mw and not wt: return emit(a,"agents",{"_text":f"added {a.name}\n{_mw}","warning":_mw})
         if wt: return emit(a,"agents",{"_text":f"added {a.name}  branch {wt['branch']}  worktree {wt['path']}","worktree":wt})
         return emit(a,"agents",{"_text":f"added {a.name}"})
     if a.sub=="rm":
@@ -6141,6 +6229,10 @@ def do_agents(a):
             if val is not None: updates[key] = val
         if getattr(a, "instructions", None) is not None:
             updates["instructions"] = [s for s in a.instructions if (s or "").strip()]
+        if getattr(a, "mode", None) is not None:
+            if a.mode not in MODES + ("",): return emit(a, "agents", error=f"bad mode: {a.mode}", hint='|'.join(MODES)+' ("" clears)')
+            updates["mode"] = a.mode
+        if getattr(a, "plan", None) is not None: updates["plan"] = a.plan
         if getattr(a, "worktree", False):
             cur = next((r for r in rows if r["name"] == a.name), None)
             if cur is None: return emit(a, "agents", error=f"no such agent: {a.name}")
@@ -6796,7 +6888,12 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             prompt = f'[system role: {a.get("persona") or "custom"}]\n{sys_txt}\n\n---\n{prompt}'
         try:
             argv = backend_argv(backend,model=model,workdir=workdir,sid=sid,prompt=prompt,
-                system=sys_txt if backend=="claude" else "",command=command or "")
+                system=sys_txt if backend=="claude" else "",command=command or "",
+                **({"mode":a.get("mode") or "","plan":bool(a.get("plan"))} if a.get("mode") or a.get("plan") else {}))
+            _mw = mode_warning(backend, a.get("mode") or "", bool(a.get("plan")))
+            if _mw and not _rs:
+                _event(sdir, "mode_warn", name, warning=_mw)
+                if on_event: on_event(name, "tool", _mw)
             if prof_name:
                 argv = list(argv) + backend_argv_extra(backend, sdir, prof_name)
         except ValueError as e: return {"error":str(e)}
@@ -6815,7 +6912,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         chunks, sid_new, rc, err = [], "", 0, ""
         _usage, _fresh = {}, not sid
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
-        penv = backend_env_for_profile(sdir, a, prof_name) if prof_name else {}
+        penv = mode_env(sdir, a, backend_env_for_profile(sdir, a, prof_name) if prof_name else {})
         _timed_out = {"hit": False}
         _watch_stop = threading.Event()
         _watcher = None
@@ -7113,7 +7210,7 @@ def do_chat(a):
         live = not getattr(a,"json",False)
         if getattr(a,"job",None): _event(sdir,"chat_job",a.name,job=a.job)
         r = run_turn(sdir,a.name,text,command=cmd,timeout_s=timeout_s,
-            on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
+            on_event=(lambda n,k,t: print(t) if live and k=="text" and t else print(t,file=sys.stderr) if live and k=="tool" and (t or "").startswith("[mode]") else None))
         if "error" in r and not r.get("timed_out"):
             return emit(a,"chat",error=r["error"])
         if r.get("slash") and r.get("exit") and getattr(a,"json",False):
@@ -9904,6 +10001,8 @@ def do_selfcheck(a):
         assert "cached=5" in _parse_codex('{"type":"turn.completed","usage":{"input_tokens":9,"cached_input_tokens":5,"output_tokens":1}}')[0][1]
         assert [o["op"] for o in parse_timeline("codex",'{"type":"item.completed","item":{"id":"i","type":"command_execution","command":"ls","aggregated_output":"x","exit_code":1}}')]==["tool","toolout"]
         assert backend_argv("codex",sid="t-1",prompt="hi")==["codex","exec","--json","resume","t-1","hi"]
+        assert backend_argv("claude",prompt="hi",mode="ro")[-3:]==["--permission-mode","dontAsk","hi"] and mode_flags("gemini")==["--approval-mode","default"]
+        assert mode_flags("codex","full")==["-s","danger-full-access"] and opencode_permission("full")=={"*":"allow"} and mode_warning("echo","ro") and not mode_warning("claude","ro")
         # unknown /word: explicit real route, never model prose
         _r = run_turn(td,"pa","/frobnicate")
         assert _r["exit"]==1 and "NOT sent to the model" in _r["reply"] and "/handoff" in _r["reply"], _r
@@ -10357,10 +10456,11 @@ def build():
     hp.set_defaults(psub="list")
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)")
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)')
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false")
     ags.add_parser("doctor")
+    agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)
     ro = sub.add_parser("roles",help="behavior presets (system prompts) for agents"); ros=ro.add_subparsers(dest="sub",required=True)
     ros.add_parser("list")
     roa=ros.add_parser("add"); roa.add_argument("name"); roa.add_argument("--system",default=None); roa.add_argument("--file",default=None)

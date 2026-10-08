@@ -1236,7 +1236,9 @@ class SecretWatch:
     def _ask(self, prompt):
         outcome = "error"
         try:
-            outcome, val = secret_dialog(prompt)
+            try: who = (_sstatus(self.sp).get("cmd") or "")[:80]
+            except Exception: who = ""
+            outcome, val = secret_dialog((f"[{who}] " if who else "") + prompt)
             if outcome == "ok":
                 data = val.encode() + b"\r"; val = None
                 secret_write_pty(self.fd, data); data = None
@@ -1247,6 +1249,18 @@ class SecretWatch:
             except Exception: pass
             self.busy = False
 
+ASKPASS_CALLERS = re.compile(r"^(sudo|ssh|ssh-add|ssh-keygen|scp|sftp|git|git-remote-https?|git-credential-[\w-]+)$")
+
+def askpass_requester(ppid=None):
+    """Parent command line if it's a legit askpass caller (sudo/ssh/git), else None.
+    The askpass shim execs us, so our parent is whoever invoked $*_ASKPASS."""
+    ps = lambda f: subprocess.run(["ps", "-o", f + "=", "-p", str(ppid or os.getppid())],
+        capture_output=True, text=True, timeout=5).stdout.strip()
+    try: comm, argv = ps("comm"), ps("args")
+    except Exception: return None
+    if not ASKPASS_CALLERS.match(os.path.basename(comm)): return None
+    return secret_sanitize(argv.strip() or comm, 80)
+
 def do_askpass(a):
     """askpass protocol (sudo -A / SSH_ASKPASS / GIT_ASKPASS): secret on stdout."""
     args = list(getattr(a, "prompt", None) or [])
@@ -1255,7 +1269,12 @@ def do_askpass(a):
         print("ag askpass: secret popup unavailable (macOS only; AG_SECRET_POPUP=0 disables)",
             file=sys.stderr)
         return 1
-    st, val = secret_dialog(" ".join(args) or "Password:")
+    who = "" if os.environ.get("AG_ASKPASS_CMD") else askpass_requester()
+    if who is None:
+        # an agent calling $SUDO_ASKPASS itself would read the secret into its context
+        print("ag askpass: refused — only sudo/ssh/git may request secrets", file=sys.stderr)
+        return 1
+    st, val = secret_dialog((f"[{who}] " if who else "") + (" ".join(args) or "Password:"))
     sdir = state_dir(a.dir)
     if sdir.is_dir():
         try: _event(sdir, "secret_prompt", None, outcome=st, source="askpass")
@@ -1276,6 +1295,8 @@ def do__sudo(a):
     os.execv(real, [real] + args)
 
 def secret_selfcheck():
+    assert askpass_requester(os.getpid()) is None  # python isn't sudo/ssh/git: refused
+    assert ASKPASS_CALLERS.match("sudo") and ASKPASS_CALLERS.match("git-remote-https") and not ASKPASS_CALLERS.match("sh")
     assert secret_detect("Password: ", True) == "Password:"
     assert secret_detect("[sudo] password for me: ", False)
     assert secret_detect("Enter verification code:", False)

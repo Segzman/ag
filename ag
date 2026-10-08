@@ -7786,6 +7786,274 @@ def do_wake(a):
             "job":r.get("job"),"session":r.get("session"),**({"group":grp} if grp else {})})
     return emit(a,"wake",{"_text":f"wake sent -> {agent} (background job {r.get('job')})"+(f" group {grp}" if grp else ""),"agent":agent})
 
+# ---- schedule: recurring wakes. ONE global launchd/cron tick (`schedule tick --all --reap`) walks the
+# registry $AG_CONFIG_HOME/schedule-dirs.json; rows live in <sdir>/schedules.json. See README "Scheduled tasks".
+SCHED_LABEL = "org.ag.schedule"
+SCHED_LATE_S = 600  # fixed-time row later than this is "missed" unless --catch-up
+SCHED_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+def _sched_every(s):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd])", (s or "").strip().lower())
+    if not m: raise ValueError(f"bad --every {s!r}: use 15m | 2h | 1d")
+    v = int(float(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]])
+    if v < 60: raise ValueError("--every must be >= 60s")
+    return v
+
+def _sched_at(s):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", (s or "").strip())
+    if not m or int(m[1]) > 23 or int(m[2]) > 59: raise ValueError(f"bad --at {s!r}: use HH:MM")
+    return f"{int(m[1]):02d}:{m[2]}"
+
+def _sched_days(s):
+    s = (s or "daily").strip().lower()
+    if s == "daily": return None
+    if s == "weekends": return [5, 6]
+    if s == "weekdays": return [0, 1, 2, 3, 4]
+    def ix(x):
+        if x not in SCHED_DAYS: raise ValueError(f"bad --days {s!r}: use mon-fri | mon,wed,fri | daily | weekends")
+        return SCHED_DAYS.index(x)
+    out = set()
+    for part in s.split(","):
+        if "-" in part:
+            i, j = (ix(x.strip()) for x in part.split("-", 1))
+            out.update((i + k) % 7 for k in range((j - i) % 7 + 1))
+        else: out.add(ix(part.strip()))
+    return sorted(out)
+
+def _sched_next(row, now):
+    """Next due epoch > now. Interval: fixed grid next_due+k*every (missed slots collapse). Fixed: local wall clock."""
+    from datetime import timedelta
+    if row.get("every_s"):
+        e = row["every_s"]; due = row["next_due"] if row.get("next_due") is not None else row.get("created", now)
+        return due if due > now else due + (int((now - due) // e) + 1) * e
+    h, m = (int(x) for x in row["at"].split(":")); days = row.get("days"); d0 = datetime.fromtimestamp(now).date()
+    for off in range(8):
+        d = d0 + timedelta(days=off)
+        if days is not None and d.weekday() not in days: continue
+        t = datetime(d.year, d.month, d.day, h, m).astimezone().timestamp()  # gap -> forward, overlap -> fold=0
+        if t > now: return t
+    return None
+
+_SCHED_FILES = []  # forked wake workers must not inherit (and so outlive) tick/schedule locks
+def _sched_atfork():
+    for f in _SCHED_FILES:
+        try: f.close()
+        except Exception: pass
+os.register_at_fork(after_in_child=_sched_atfork)
+
+def _sched_flock(sdir, name, block=True):
+    import fcntl
+    p = sdir / "schedule" / name; p.parent.mkdir(parents=True, exist_ok=True)
+    f = open(p, "a+b"); _SCHED_FILES[:] = [x for x in _SCHED_FILES if not x.closed] + [f]
+    try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
+    except OSError: f.close(); return None
+    return f
+
+def _sched_load(sdir):
+    p = sdir / "schedules.json"
+    if not p.exists(): return []
+    try: d = json.loads(p.read_text())
+    except ValueError as e: raise ValueError(f"corrupt schedules.json: {e}")
+    if not isinstance(d, list): raise ValueError("corrupt schedules.json: not a list")
+    return d
+
+def _sched_save(sdir, rows): _atomic_write(sdir / "schedules.json", json.dumps(rows, indent=1))
+
+def _sched_reg_path(): return ag_config_home() / "schedule-dirs.json"
+def _sched_reg_get():
+    try: d = json.loads(_sched_reg_path().read_text())
+    except (OSError, ValueError): return []
+    return [x for x in d if isinstance(x, str)] if isinstance(d, list) else []
+def _sched_reg_set(sdir, on):
+    import fcntl
+    p = _sched_reg_path(); p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p.with_suffix(".lock"), "a+b") as lk:
+        fcntl.flock(lk.fileno(), fcntl.LOCK_EX)
+        cur = _sched_reg_get(); s = str(Path(sdir).resolve())
+        new = sorted(set(cur) | {s}) if on else [x for x in cur if x != s]
+        if new != cur: _atomic_write(p, json.dumps(new, indent=1))
+
+def _sched_fire(sdir, row, rid, trigger_extra=None):
+    """Launch one wake gated by a request-id receipt (same store as `wake --request-id`). -> (job, err)."""
+    agent = row["agent"]; d = sdir / "receipts"; d.mkdir(parents=True, exist_ok=True)
+    f = d / (hashlib.sha1("\0".join(("wake", agent, rid)).encode()).hexdigest() + ".json")
+    try: old = json.loads(f.read_text())
+    except Exception: old = None
+    if old and old.get("job"): return old["job"], None
+    if old and old.get("status") == "failed": return None, old.get("error", "failed")
+    if old:  # in_progress w/o job: crashed mid-launch; adopt a job that did get written, else relaunch
+        try:
+            for jf in _wake_dirs(sdir)[1].glob("*.json"):
+                try: j = json.loads(jf.read_text())
+                except Exception: continue
+                if j.get("schedule_rid") == rid: return j.get("id"), None
+        except Exception: pass
+    f.write_text(json.dumps({"cmd": "wake", "agent": agent, "payload_hash": "", "status": "in_progress", "ref": rid, "ts": time.time()}))
+    r = launch_wake_chat(sdir, agent, row["message"], trigger=f"schedule:{row['id']}", notify=row.get("notify") or "",
+        on_done=row.get("on_done") or "", max_runtime_s=row.get("max_runtime_s") or 0, job_type=row.get("job"),
+        extra={"schedule_rid": rid})
+    _rcpt_done(f, r)
+    return r.get("job"), r.get("error")
+
+def _sched_step(sdir, r, now, dry):
+    """One due row: missed | skipped | fire | error. Mutates r unless dry."""
+    due = r["next_due"]; act = "fire"
+    if r.get("at") and now - due > SCHED_LATE_S and not r.get("catch_up"):
+        act = "missed"
+        if not dry: r["missed"] = r.get("missed", 0) + 1; r["last_status"] = "missed"; _event(sdir, "schedule_missed", None, id=r["id"], due=due)
+    else:
+        busy = False
+        if r.get("last_job") and r.get("overlap", "skip") == "skip":
+            j = _wake_read_job(sdir, r["last_job"])
+            if not dry: j = _wake_reconcile(sdir, j)
+            busy = j.get("status") in ("queued", "running")
+        if busy:
+            act = "skipped"
+            if not dry: r["skipped"] = r.get("skipped", 0) + 1; r["last_status"] = "skipped"; _event(sdir, "schedule_skip", None, id=r["id"], job=r["last_job"])
+        elif not dry:
+            jid, err = _sched_fire(sdir, r, f"{r['id']}:{int(due)}")
+            if err or not jid:
+                act = "error"; r["last_status"] = f"error: {err}"[:200]; _event(sdir, "schedule_fail", None, id=r["id"], reason=str(err)[:200])
+            else:
+                r.update(last_due=due, last_job=jid, runs=r.get("runs", 0) + 1, last_status="fired"); _event(sdir, "schedule_fire", None, id=r["id"], job=jid)
+    if not dry: r["next_due"] = _sched_next(r, now)
+    return act
+
+def _sched_tick_dir(sdir, now, dry, reap):
+    out = {"dir": str(sdir), "actions": []}
+    if not sdir.is_dir(): out["error"] = "no state dir"; return out
+    tl = _sched_flock(sdir, "tick.lock", False)
+    if tl is None: out["busy"] = True; return out
+    try:
+        ll = _sched_flock(sdir, "schedules.lock")
+        try:
+            try: rows = _sched_load(sdir)
+            except ValueError as e:
+                _event(sdir, "schedule_fail", None, reason=str(e)); out["error"] = str(e); return out
+            for r in rows:
+                if r.get("enabled", True) and r.get("next_due") is not None and r["next_due"] <= now:
+                    out["actions"].append({"id": r["id"], "action": _sched_step(sdir, r, now, dry), "due": r["next_due"]})
+            if not dry:
+                if out["actions"]: _sched_save(sdir, rows)
+                (sdir / "schedule" / "last_tick").write_text(str(time.time()))
+        finally: ll.close()
+        fn = globals().get("wakes_reap")
+        if reap and not dry and fn:
+            try: fn(sdir, queued_only=True)
+            except Exception as e: out["reap_error"] = str(e)[:200]
+    finally: tl.close()
+    return out
+
+def _sched_ts(t): return datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M") if t else "-"
+def _sched_spec(r): return f"every {r['every_s']}s" if r.get("every_s") else f"at {r['at']} " + ("daily" if r.get("days") is None else ",".join(SCHED_DAYS[i] for i in r["days"]))
+
+def _sched_plist(interval):
+    env = {"PATH": os.environ.get("PATH", "")}
+    env.update({k: os.environ[k] for k in ("AG_HOME", "AG_CONFIG_HOME", "AG_CACHE_HOME") if os.environ.get(k)})
+    log = str(ag_cache_home() / "schedule-tick.log")
+    return {"Label": SCHED_LABEL, "ProgramArguments": [sys.executable, ag_script_path(), "schedule", "tick", "--all", "--reap"],
+        "StartInterval": int(interval), "EnvironmentVariables": env, "StandardOutPath": log, "StandardErrorPath": log}
+
+def do_schedule(a):
+    sub = a.ssub; sdir = state_dir(a.dir); cmd = "schedule"
+    def err(m, h=None): return emit(a, cmd, error=m, hint=h) or 1
+    if sub == "install":
+        iv = int(a.interval)
+        if iv < 10: return err("--interval must be >= 10")
+        if a.cron:
+            line = f"{'*' if iv <= 60 else '*/' + str(max(1, iv // 60))} * * * * {shlex.quote(sys.executable)} {shlex.quote(ag_script_path())} schedule tick --all --reap >> {shlex.quote(str(ag_cache_home() / 'schedule-tick.log'))} 2>&1"
+            return emit(a, cmd, {"_text": line, "cron": line})
+        import plistlib
+        pl = _sched_plist(iv); path = _ag_home() / "Library" / "LaunchAgents" / f"{SCHED_LABEL}.plist"
+        uid = os.getuid(); boot = f"launchctl bootstrap gui/{uid} {shlex.quote(str(path))}"
+        if not a.write:
+            return emit(a, cmd, {"_text": plistlib.dumps(pl).decode() + f"\n# write to {path} then:\n#   {boot}\n# or: ag schedule install --write   (cron alternative: --cron)",
+                "plist": pl, "path": str(path), "bootstrap": boot})
+        path.parent.mkdir(parents=True, exist_ok=True); ag_cache_home().mkdir(parents=True, exist_ok=True)
+        path.write_bytes(plistlib.dumps(pl)); steps = []
+        lc = shutil.which("launchctl")
+        if not lc: return emit(a, cmd, {"_text": f"wrote {path}; launchctl not found, run: {boot}", "path": str(path), "loaded": False})
+        tgt = f"gui/{uid}/{SCHED_LABEL}"
+        if subprocess.run([lc, "print", tgt], capture_output=True).returncode == 0:
+            subprocess.run([lc, "bootout", tgt], capture_output=True); steps.append("bootout")
+        p = subprocess.run([lc, "bootstrap", f"gui/{uid}", str(path)], capture_output=True, text=True); steps.append("bootstrap")
+        if p.returncode: return err(f"launchctl bootstrap failed: {(p.stderr or p.stdout).strip()[:200]}", f"plist written at {path}; run: {boot}")
+        return emit(a, cmd, {"_text": f"installed {path} ({', '.join(steps)}); ticks every {iv}s", "path": str(path), "loaded": True, "steps": steps})
+    if sub == "tick":
+        try: now = datetime.fromisoformat(a.now).astimezone().timestamp() if a.now else time.time()
+        except ValueError: return err(f"bad --now {a.now!r}: need ISO time")
+        dirs = [Path(x) for x in _sched_reg_get()] if a.all else [sdir]
+        res = [_sched_tick_dir(d, now, a.dry_run, a.reap) for d in dirs]
+        txt = [f"{r['dir']}: " + (f"error: {r['error']}" if r.get("error") else "busy" if r.get("busy") else ", ".join(f"{x['id']}={x['action']}" for x in r["actions"]) or "nothing due") for r in res]
+        return emit(a, cmd, {"_text": "\n".join(txt) or "no schedule dirs registered", "dirs": res, "dry_run": a.dry_run})
+    ensure_state(sdir)
+    if sub == "add":
+        try:
+            if bool(a.every) == bool(a.at): raise ValueError("give exactly one of --every / --at")
+            if a.days and not a.at: raise ValueError("--days needs --at")
+            row = {"every_s": _sched_every(a.every)} if a.every else {"at": _sched_at(a.at), "days": _sched_days(a.days)}
+        except ValueError as e: return err(str(e), "ag schedule add AGENT --every 15m|--at 09:00 [--days mon-fri] MSG")
+        msg = " ".join(a.message).strip()[:WAKE_MSG_MAX]; names = [r.get("name") for r in load_agents(sdir)]
+        if not msg: return err("empty message")
+        if a.agent not in names: return err(f"no such agent: {a.agent}", "ag agents list")
+        if a.notify and a.notify not in names: return err(f"no such agent: {a.notify}", "ag agents list")
+        mr = _valid_runtime(a.max_runtime)
+        if mr is None: return err("invalid --max-runtime: need finite seconds >= 0")
+        rid = a.id or f"{a.agent}-{hashlib.sha1(f'{time.time()}{os.getpid()}'.encode()).hexdigest()[:4]}"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", rid): return err(f"bad id {rid!r}")
+        now = time.time(); row.update(id=rid, agent=a.agent, message=msg, enabled=not a.disabled, overlap=a.overlap, catch_up=a.catch_up,
+            max_runtime_s=mr, notify=a.notify, on_done=a.on_done, job=a.job, created=now, next_due=None, last_due=None, last_job=None,
+            last_status=None, runs=0, missed=0, skipped=0)
+        row["next_due"] = _sched_next(dict(row, next_due=now), now)
+        ll = _sched_flock(sdir, "schedules.lock")
+        try:
+            try: rows = _sched_load(sdir)
+            except ValueError as e: return err(str(e), "fix or remove schedules.json; ag never resets it")
+            if any(r.get("id") == rid for r in rows): return err(f"schedule id exists: {rid}")
+            rows.append(row); _sched_save(sdir, rows); _sched_reg_set(sdir, True)
+        finally: ll.close()
+        return emit(a, cmd, {"_text": f"scheduled {rid}: {a.agent} {_sched_spec(row)}, next {_sched_ts(row['next_due'])}", "schedule": row})
+    if sub == "list":
+        dirs = [Path(x) for x in _sched_reg_get()] if a.all else [sdir]
+        if a.all and sdir not in dirs and (sdir / "schedules.json").exists(): dirs.append(sdir)
+        out = []
+        for d in dirs:
+            try: rows = _sched_load(d)
+            except ValueError as e: out.append({"dir": str(d), "error": str(e)}); continue
+            for r in rows:
+                j = _wake_read_job(d, r["last_job"]) if r.get("last_job") else {}
+                out.append({**r, "dir": str(d), "status": j.get("status") or r.get("last_status")})
+        try: age = time.time() - float((sdir / "schedule" / "last_tick").read_text())
+        except Exception: age = None
+        tick = f"tick: last ran {int(age // 60)}m ago" if age is not None else "tick: never ran (ag schedule install)"
+        L = [f"{'id':14} {'agent':10} {'spec':22} {'next_due':16} {'last_due':16} {'status':10} runs miss skip"]
+        for r in out:
+            if r.get("error"): L.append(f"{r['dir']}: error: {r['error']}"); continue
+            L.append(f"{r['id'][:14]:14} {r['agent'][:10]:10} {_sched_spec(r)[:22]:22} {('paused' if not r.get('enabled', True) else _sched_ts(r.get('next_due'))):16} {_sched_ts(r.get('last_due')):16} {str(r.get('status') or '-')[:10]:10} {r.get('runs', 0):4} {r.get('missed', 0):4} {r.get('skipped', 0):4}")
+        return emit(a, cmd, {"_text": "\n".join(L + [tick]), "schedules": out, "tick_age_s": age})
+    ll = _sched_flock(sdir, "schedules.lock")
+    try:
+        try: rows = _sched_load(sdir)
+        except ValueError as e: return err(str(e), "fix or remove schedules.json; ag never resets it")
+        r = next((x for x in rows if x.get("id") == a.id), None)
+        if not r: return err(f"no such schedule: {a.id}", "ag schedule list")
+        now = time.time()
+        if sub == "rm":
+            rows.remove(r); _sched_save(sdir, rows)
+            if not rows: _sched_reg_set(sdir, False)
+            return emit(a, cmd, {"_text": f"removed {a.id}", "removed": a.id})
+        if sub == "pause": r["enabled"] = False; msg = f"paused {a.id}"
+        elif sub == "resume":
+            r["enabled"] = True; r["next_due"] = _sched_next(dict(r, next_due=now), now); msg = f"resumed {a.id}, next {_sched_ts(r['next_due'])}"
+        else:  # run
+            jid, e = _sched_fire(sdir, r, f"{a.id}:manual:{int(now)}")
+            if e or not jid: r["last_status"] = f"error: {e}"[:200]; _sched_save(sdir, rows); return err(str(e))
+            r.update(last_job=jid, runs=r.get("runs", 0) + 1, last_status="fired"); _event(sdir, "schedule_fire", None, id=a.id, job=jid, manual=True)
+            msg = f"fired {a.id} (background job {jid})"
+        _sched_save(sdir, rows)
+        return emit(a, cmd, {"_text": msg, "schedule": r, **({"job": r["last_job"]} if sub == "run" else {})})
+    finally: ll.close()
+
 def orch_snapshot(sdir):
     ensure_state(sdir)
     sess = []
@@ -10050,6 +10318,7 @@ def do_selfcheck(a):
             "opencode_config":None,"codex_config":None,"claude_settings":None,"pnotes":None,
             "profile":"","none":False,"spawn":False,"exec":False})
         o.__dict__.update(k); return o
+    assert [_sched_every(x) for x in ("15m","2h","1d")]==[900,7200,86400] and _sched_days("mon-fri")==[0,1,2,3,4] and _sched_next({"every_s":60,"next_due":0.0},100.0)==120.0 and "schedule" in UPDATE_SKIP
     import io, contextlib
     buf=io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -11478,6 +11747,12 @@ def build():
     cmsh=cms.add_parser("show",help="effective settings + stats"); cmsh.add_argument("cpname",nargs="?",default="")
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
     wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)")
+    sc=sub.add_parser("schedule",help="recurring wakes (one global launchd/cron tick)"); scs=sc.add_subparsers(dest="ssub",required=True)
+    sca=scs.add_parser("add"); sca.add_argument("agent"); sca.add_argument("message",nargs="+"); sca.add_argument("--every",default=None,help="15m | 2h | 1d (>=60s)"); sca.add_argument("--at",default=None,help="HH:MM local"); sca.add_argument("--days",default=None,help="mon-fri | mon,wed,fri | daily | weekends (with --at)"); sca.add_argument("--max-runtime",dest="max_runtime",type=float,default=0); sca.add_argument("--notify",default=""); sca.add_argument("--on-done",dest="on_done",default=""); sca.add_argument("--job",default=None,choices=JOB_KEYS); sca.add_argument("--overlap",choices=["skip","queue"],default="skip"); sca.add_argument("--catch-up",dest="catch_up",action="store_true",help="fixed-time: fire even if >10min late"); sca.add_argument("--disabled",action="store_true"); sca.add_argument("--id",default=None)
+    scl=scs.add_parser("list"); scl.add_argument("--all",action="store_true",help="every registered state dir")
+    for v_ in ("rm","pause","resume","run"): scs.add_parser(v_).add_argument("id")
+    sct=scs.add_parser("tick"); sct.add_argument("--all",action="store_true"); sct.add_argument("--now",default=None,help="ISO time (tests)"); sct.add_argument("--reap",action="store_true"); sct.add_argument("--dry-run",dest="dry_run",action="store_true")
+    sci=scs.add_parser("install"); sci.add_argument("--write",action="store_true"); sci.add_argument("--cron",action="store_true"); sci.add_argument("--interval",type=int,default=60)
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50); ws.add_argument("--wait",default=None); ws.add_argument("--timeout",type=int,default=30); ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)")
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
@@ -11896,7 +12171,7 @@ def do_sync(a):
 # or AG_AUTO_UPDATE=0. Takes effect on the next invocation, never mid-command.
 UPDATE_RAW_URL = "https://raw.githubusercontent.com/Segzman/ag/master/ag"
 UPDATE_EVERY_S = 86400
-UPDATE_SKIP = {"_daemon", "_wake_run", "_sudo", "askpass", "selfcheck", "update", "tui", "attach", "shell"}
+UPDATE_SKIP = {"schedule", "_daemon", "_wake_run", "_sudo", "askpass", "selfcheck", "update", "tui", "attach", "shell"}
 
 def _ag_conf_path():
     return Path(os.environ.get("AG_CONFIG_HOME") or Path.home()/".config/ag")/"config.json"
@@ -12008,7 +12283,7 @@ def main(argv=None):
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
         "delegate":do_delegate,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
-        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"queue":do_queue,"stop":do_stop}[a.subcmd]
+        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"queue":do_queue,"stop":do_stop}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)
 

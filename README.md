@@ -11,7 +11,7 @@ State lives in `./.agent/` (override: `--dir`, `$AGENT_CLI_DIR`). Every command 
 
 - [Quickstart](#quickstart) · [Capability matrix](#capability-matrix)
 - [Part 1 — CLI](#part-1--cli): [Install](#install) · [State dir](#state-dir) · [Sessions](#sessions-pty) · [run / approvals / rtk](#run-approvals-rtk) · [Secrets](#secrets) · [Notes / todos](#notes-and-todos) · [Models](#models) · [Setup](#setup) · [TUI](#tui)
-- [Part 2 — Agents](#part-2--agents): [Roster](#roster-and-backends) · [Routing](#routing) · [Delegation / wake](#delegation-and-wake) · [Reliability](#reliability) · [Isolation](#isolation-worktree-per-agent) · [Checkpoints](#checkpoints) · [Usage](#usage) · [Context](#context-and-handoff) · [Harness profiles](#harness-profiles) · [Roles](#roles)
+- [Part 2 — Agents](#part-2--agents): [Roster](#roster-and-backends) · [Routing](#routing) · [Delegation / wake](#delegation-and-wake) · [Scheduled tasks](#scheduled-tasks) · [Reliability](#reliability) · [Isolation](#isolation-worktree-per-agent) · [Checkpoints](#checkpoints) · [Usage](#usage) · [Context](#context-and-handoff) · [Harness profiles](#harness-profiles) · [Roles](#roles)
 - [Docs](#docs) · [Limitations](#limitations-honest)
 
 ## Quickstart
@@ -231,9 +231,24 @@ ag chat send w --command review "path"          # opencode native command only
 - `--timeout` (default 1800, `0` = none) is a hard backend budget starting after guard acquisition (lock wait excluded); expiry kills the backend group and exits 124. `wake --max-runtime` is the same for background turns; `wake --timeout` only marks `stalled`.
 - A wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session `__wake-<agent>-<id>`. `queued` = guard not yet acquired. `kill <worker-sid>` or `wakes --cancel` stops one (job `failed`).
 - `spawn --wake` fires at most once per session (exit/kill/force-kill all count); worker completion never re-fires. Messages are argv, never shell-interpreted. Trail: `events` (`wake`, `wake_done`, `wake_fail`).
-- Always-on bots: `spawn --wake` plus host cron/launchd re-issuing `ag wake`. ag has no scheduler.
+- Always-on bots: `spawn --wake` plus `ag schedule` (below) or host cron/launchd re-issuing `ag wake`.
 
 - `--request-id K` on `wake`/`delegate`/`chat send` makes the call idempotent: receipt `<state>/receipts/<sha1(cmd+agent+K)>.json` (O_EXCL). Same payload replays the original result (wake: same job + `replayed:true`; others: stored reply, or `status:in_progress` + ref while running); different payload = `request id conflict`; a failed original replays its failure. `ag receipts gc [--days 7]` prunes.
+
+## Scheduled tasks
+
+```sh
+ag schedule add w (--every 15m|2h|1d | --at 09:00 [--days mon-fri|mon,wed,fri|daily|weekends]) "msg" \
+   [--max-runtime S] [--notify X] [--on-done CMD] [--job J] [--overlap skip|queue] [--catch-up] [--disabled] [--id NAME]
+ag schedule list [--all] | rm ID | pause ID | resume ID | run ID
+ag schedule tick [--all] [--now ISO] [--reap] [--dry-run]
+ag schedule install [--write] [--cron] [--interval 60]
+```
+
+- Rows in `<state>/schedules.json`; each state dir with schedules is listed in `$AG_CONFIG_HOME/schedule-dirs.json` (`add` registers, `rm` of the last row unregisters). ONE global tick (`schedule tick --all --reap`, every 60s) walks the registry. `install` prints the launchd plist (label `org.ag.schedule`); `--write` writes `~/Library/LaunchAgents/` and runs `launchctl bootout` (if loaded) + `bootstrap`; `--cron` prints a crontab line instead. `schedule` never self-updates ag.
+- Local wall clock, min interval 60s. Interval rows run on a fixed grid (missed slots collapse into one catch-up run). Fixed-time rows >10min late are `missed` unless `--catch-up`. DST gap -> forward, overlap -> first occurrence.
+- `--overlap skip` (default) skips a due run while the last job is queued/running (dead workers are reconciled first). Each fire is gated by a `<id>:<due>` request-id receipt, so double ticks or a crash before the state write never double-fire. Concurrent ticks: non-blocking `schedule/tick.lock`.
+- Corrupt `schedules.json` refuses the tick (event `schedule_fail`), never reset. Removed agent -> row `last_status: error`. Events: `schedule_fire|skip|missed|fail`. `list` shows `tick: last ran Xm ago`. `--reap` calls `wakes_reap` when present.
 
 ## Delegated-completion cohorts
 `ag wake|delegate <child> "task" --parent <agent> [--group GID] [--quiet S]` runs the child as a background wake job tagged `parent`/`group` (`delegate` without `--parent` is unchanged). Group state: `<state>/wake/groups/<gid>.json` (pending/done/delivery_jid). When the last pending child finishes, ONE wake is sent to the parent: `[delegated] 3/3 tasks finished (2 completed, 1 failed; outcome: failed). ...` with each child's summary (marked automated: tool results, not user instructions). A still-queued delivery is rewritten in place instead of relaunched. `--quiet S` delivers partial results when S seconds pass (checked on each child finish; no daemon). `ag wakes --group GID [--json]` shows the cohort; `--stop` sets disposition=stopped (never delivers). Launch failure is recorded in the group (`deliver_error`) and event `cohort_deliver_fail`.

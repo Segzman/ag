@@ -859,6 +859,8 @@ def do__wake_run(a):
     if "error" in r:
         _mark_failed(r["error"], 1)
         return 1
+    if r.get("interrupted"):
+        _wake_finish(sdir, jid, "failed", error="interrupted", exit_code=130, fields={"interrupted": True}); return 1
     code = r.get("exit", 0)
     if code != 0:
         excerpt = " ".join(str(r.get("reply") or "").split())[:160]
@@ -6085,7 +6087,7 @@ def do_agents(a):
         return emit(a,"agents",{"_text":txt})
     rows = load_agents(sdir)
     if a.sub=="list":
-        if getattr(a,"json",False): return emit(a,"agents",{"agents":rows})
+        if getattr(a,"json",False): return emit(a,"agents",{"agents":[{**r,"queue":len(queue_list(sdir,r["name"])),"queue_held":queue_held(sdir,r["name"])} for r in rows]})
         txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("persona","") or "-":12} {r.get("profile","") or "-":12} {r.get("dir",".")}{"  ["+r["worktree"]["branch"]+"]" if r.get("worktree") else ""}' for r in rows) or "(none)"
         return emit(a,"agents",{"_text":txt})
     if a.sub=="add":
@@ -6381,6 +6383,264 @@ def _release_agent_turn(f):
     except Exception: pass
     try: f.close()
     except Exception: pass
+
+# --- visible turn queue + stop/steer (ported from T3 Code QueuedRunOrder/holdQueue) ---
+# Tickets <state>/queue/<agent>/<prio>-<seq>-<id>.json order waiters (prio 0 =
+# steer, 5 = normal; FIFO within prio). A turn starts only when its ticket is
+# the lowest live one AND the flock (still the real guard) is free. HOLD file
+# pauses starts. run_turn writes running.json {pid,pgid,owner} inside the
+# guard; stop/steer write interrupt.json then kill that pgid, and run_turn
+# marks the turn interrupted (exit 130, never retried). Cancel = unlink the
+# ticket (atomic claim) then SIGTERM main-thread waiters; waiters also poll.
+QUEUE_PRIO_STEER, QUEUE_PRIO_NORMAL = 0, 5
+_QCTX = threading.local()
+
+class QueueCancelled(Exception): pass
+
+def _qdir(sdir, agent, mk=False):
+    d = Path(sdir) / "queue" / (re.sub(r"[^A-Za-z0-9_.-]", "_", agent or "unknown")[:64] or "unknown")
+    if mk: d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _ticket_name(prio, seq, tid): return f"{int(prio)}-{int(seq):010d}-{tid}.json"
+
+class queue_ctx:
+    """with queue_ctx(prio=0, source="delegate", on_ticket=fn, parent=x): run_turn(...)"""
+    def __init__(self, **kw): self.kw = kw
+    def __enter__(self):
+        self.old = getattr(_QCTX, "d", None); _QCTX.d = {**(self.old or {}), **self.kw}
+    def __exit__(self, *e): _QCTX.d = self.old
+
+def _pid_alive(pid):
+    try: os.kill(int(pid), 0); return True
+    except PermissionError: return True
+    except Exception: return False
+
+def _queue_seq(qd):
+    import fcntl
+    with open(qd / "seq.lock", "a+b") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try: n = int((qd / "seq").read_text().strip() or 0) + 1
+        except Exception: n = 1
+        (qd / "seq").write_text(str(n))
+        return n
+
+def queue_list(sdir, agent):
+    """Live tickets in run order (dead-pid tickets reaped), with 1-based position."""
+    rows = []
+    for p in sorted(_qdir(sdir, agent).glob("[0-9]-*.json")):
+        try: t = json.loads(p.read_text())
+        except Exception: continue
+        if not _pid_alive(t.get("pid")):
+            try: p.unlink()
+            except Exception: pass
+            continue
+        rows.append({**t, "position": len(rows) + 1})
+    return rows
+
+def queue_held(sdir, agent): return (_qdir(sdir, agent) / "HOLD").exists()
+
+def queue_hold(sdir, agent, on=True):
+    hp = _qdir(sdir, agent, mk=True) / "HOLD"
+    if on: hp.write_text(now_iso())
+    else:
+        try: hp.unlink()
+        except FileNotFoundError: pass
+    _event(sdir, "queue_hold" if on else "queue_release", agent)
+
+def queue_cancel(sdir, agent, tid):
+    """Claim by unlink, then SIGTERM the waiter (main-thread waiters only)."""
+    if not re.fullmatch(r"[A-Za-z0-9]+", tid or ""): return {"error": f"bad ticket id: {tid}"}
+    for p in _qdir(sdir, agent).glob(f"[0-9]-*-{tid}.json"):
+        try: t = json.loads(p.read_text()); p.unlink()
+        except Exception: return {"error": f"ticket {tid} already started or gone"}
+        pid = int(t.get("pid") or 0)
+        if t.get("sig") and pid and pid != os.getpid() and _pid_alive(pid):
+            import signal as _sig
+            try: os.kill(pid, _sig.SIGTERM)
+            except Exception: pass
+        _event(sdir, "queue_cancel", agent, ticket=tid)
+        return {"cancelled": True, "ticket": t}
+    return {"error": f"no such ticket: {tid}"}
+
+def _queued_acquire(sdir, agent, text="", source=None):
+    """Ticketed blocking acquire of the shared turn guard. Raises QueueCancelled."""
+    if os.name != "posix": return _acquire_agent_turn(sdir, agent)
+    import fcntl, signal as _sig
+    ctx = dict(getattr(_QCTX, "d", None) or {})
+    prio = int(ctx.get("prio", QUEUE_PRIO_NORMAL))
+    qd = _qdir(sdir, agent, mk=True)
+    tid = "%x%04x" % (time.time_ns() & 0xffffffffff, os.getpid() & 0xffff)
+    main = threading.current_thread() is threading.main_thread()
+    tk = {"id": tid, "pid": os.getpid(), "text": " ".join(str(text or "").split())[:120],
+        "source": ctx.get("source") or source or "chat", "prio": prio, "ts": now_iso(), "sig": main}
+    if ctx.get("parent"): tk["parent"] = ctx["parent"]
+    tp, st, prev, f = None, {"seen": False, "done": False}, None, None
+    def _on_term(signum, frame):
+        if tp is not None and not tp.exists():  # cancel unlinks before signalling
+            st["seen"] = True
+            if not st["done"]: raise QueueCancelled()
+            return
+        if callable(prev): return prev(signum, frame)
+        _sig.signal(signum, _sig.SIG_DFL); os.kill(os.getpid(), signum)
+    if main:
+        try: prev = _sig.signal(_sig.SIGTERM, _on_term)
+        except Exception: main = tk["sig"] = False
+    try:
+        tp = qd / _ticket_name(prio, _queue_seq(qd), tid)
+        tmp = qd / f".{tid}.tmp"; tmp.write_text(json.dumps(tk)); tmp.rename(tp)
+        _event(sdir, "queue_add", agent, ticket=tid, prio=prio, source=tk["source"])
+        if callable(ctx.get("on_ticket")): ctx["on_ticket"]()
+        told = False
+        while True:
+            if not tp.exists(): raise QueueCancelled()
+            if (qd / "HOLD").exists():
+                if not told:
+                    told = True
+                    print(f"ag: queue for {agent} is held; waiting (ag queue {agent} --release)", file=sys.stderr)
+            else:
+                rows = queue_list(sdir, agent)
+                if rows and rows[0]["id"] == tid:
+                    f = open(_agent_lock_path(sdir, agent), "a+b")
+                    try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError: f.close(); f = None
+                    if f is not None:
+                        try: tp.unlink()
+                        except FileNotFoundError: raise QueueCancelled()
+                        g, f = f, None
+                        return g
+            time.sleep(0.2)
+    except QueueCancelled:
+        st["done"] = True
+        if main:  # absorb the canceller's in-flight SIGTERM before restoring
+            t_end = time.monotonic() + 1.0
+            while not st["seen"] and time.monotonic() < t_end:
+                try: time.sleep(0.05)
+                except QueueCancelled: break
+        raise
+    finally:
+        st["done"] = True
+        _release_agent_turn(f)
+        try:
+            if tp is not None: tp.unlink()
+        except Exception: pass
+        if main:
+            try: _sig.signal(_sig.SIGTERM, prev if prev is not None else _sig.SIG_DFL)
+            except Exception: pass
+
+def _queue_running(sdir, agent, pid):
+    """pid: record running backend group. None: clear; True if it was interrupted."""
+    qd = _qdir(sdir, agent, mk=True); rp, ip = qd / "running.json", qd / "interrupt.json"
+    try:
+        if pid:
+            try: ip.unlink()
+            except FileNotFoundError: pass
+            r = {"pid": pid, "pgid": pid, "owner": os.getpid(), "ts": now_iso()}
+            par = (getattr(_QCTX, "d", None) or {}).get("parent")
+            if par: r["parent"] = par
+            rp.write_text(json.dumps(r)); return False
+        try: cur = json.loads(rp.read_text())
+        except Exception: cur = {}
+        hit = False
+        try: hit = bool(cur) and json.loads(ip.read_text()).get("pgid") == cur.get("pgid")
+        except Exception: pass
+        if cur.get("owner") == os.getpid():
+            for p in (rp, ip):
+                try: p.unlink()
+                except FileNotFoundError: pass
+        return hit
+    except Exception: return False
+
+def queue_running(sdir, agent):
+    """Live running.json record or None (stale owner cleaned)."""
+    rp = _qdir(sdir, agent) / "running.json"
+    try: r = json.loads(rp.read_text())
+    except Exception: return None
+    if _pid_alive(r.get("owner")): return r
+    try: rp.unlink()
+    except Exception: pass
+    return None
+
+def agent_interrupt(sdir, agent, wait_s=8.0):
+    """Kill the running backend turn's group; run_turn records it interrupted."""
+    r = queue_running(sdir, agent)
+    if not r: return None
+    qd = _qdir(sdir, agent)
+    (qd / "interrupt.json").write_text(json.dumps({"pgid": r.get("pgid"), "ts": now_iso()}))
+    _kill_backend_group(r.get("pgid"))
+    t_end = time.monotonic() + wait_s
+    while time.monotonic() < t_end and (qd / "running.json").exists() and _pid_alive(r.get("owner")):
+        time.sleep(0.05)
+    _event(sdir, "interrupt", agent, pgid=r.get("pgid"))
+    return r
+
+def agent_stop(sdir, name, cascade=False, hold=True, _seen=None):
+    """HOLD queue, cancel tickets, interrupt the running turn, cancel queued/running
+    wake jobs, emit `stop`. cascade: also stop agents whose active wake jobs,
+    tickets or running turn record parent == name. HOLD stays (queue --release)."""
+    seen = set() if _seen is None else _seen
+    seen.add(name)
+    if hold: queue_hold(sdir, name, True)
+    tickets = [t["id"] for t in queue_list(sdir, name) if queue_cancel(sdir, name, t["id"]).get("cancelled")]
+    run = agent_interrupt(sdir, name)
+    wakes, kids = [], set()
+    _, jobs, _ = _wake_dirs(sdir)
+    for p in sorted(jobs.glob("*.json")):
+        try: j = json.loads(p.read_text())
+        except Exception: continue
+        if j.get("status") not in ("queued", "running"): continue
+        if j.get("agent") == name:
+            if agent_cancel(sdir, j.get("id", ""), "stopped").get("cancelled"): wakes.append(j["id"])
+        elif j.get("parent") == name and j.get("agent"): kids.add(j["agent"])
+    if cascade:
+        qroot = Path(sdir) / "queue"
+        for d in (qroot.iterdir() if qroot.is_dir() else []):
+            r = queue_running(sdir, d.name)
+            if r and r.get("parent") == name: kids.add(d.name)
+            kids.update(d.name for t in queue_list(sdir, d.name) if t.get("parent") == name)
+    _event(sdir, "stop", name, tickets=len(tickets), interrupted=bool(run), wakes=len(wakes), cascade=bool(cascade))
+    out = {"agent": name, "held": bool(hold), "cancelled_tickets": tickets,
+        "interrupted": bool(run), "cancelled_wakes": wakes}
+    if cascade:
+        out["cascade"] = [agent_stop(sdir, k, True, hold, seen) for k in sorted(kids) if k not in seen]
+    return out
+
+def agent_steer(sdir, name, text, **kw):
+    """Interrupt a running turn (no HOLD) and run a priority-0 turn on the same
+    session; idle agent = plain priority-0 turn."""
+    busy = queue_running(sdir, name) is not None
+    msg = f"[steer] user interrupted the previous turn; new instruction: {text}" if busy else text
+    with queue_ctx(prio=QUEUE_PRIO_STEER, on_ticket=(lambda: agent_interrupt(sdir, name, 0)) if busy else None):
+        r = run_turn(sdir, name, msg, **kw)
+    r["steered"] = busy
+    return r
+
+def do_queue(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    n = a.agent
+    if n not in {x["name"] for x in load_agents(sdir)}:
+        return emit(a, "queue", error=f"no such agent: {n}", hint="ag agents list")
+    if a.cancel:
+        r = queue_cancel(sdir, n, a.cancel)
+        if "error" in r: return emit(a, "queue", error=r["error"], hint=f"ag queue {n}")
+        return emit(a, "queue", {"_text": f"cancelled {a.cancel}", **r})
+    if a.hold or a.release: queue_hold(sdir, n, bool(a.hold))
+    rows, held, run = queue_list(sdir, n), queue_held(sdir, n), queue_running(sdir, n)
+    if getattr(a, "json", False):
+        return emit(a, "queue", {"agent": n, "held": held, "running": run, "depth": len(rows), "tickets": rows})
+    L = [f'{n}: {"HELD" if held else "open"}, {"running" if run else "idle"}, {len(rows)} queued']
+    L += [f'{t["position"]:>3} {t["id"]} p{t.get("prio")} {t.get("source",""):8} pid={t.get("pid")} {t.get("text","")[:60]}' for t in rows]
+    return emit(a, "queue", {"_text": "\n".join(L)})
+
+def do_stop(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    if a.agent not in {x["name"] for x in load_agents(sdir)}:
+        return emit(a, "stop", error=f"no such agent: {a.agent}", hint="ag agents list")
+    r = agent_stop(sdir, a.agent, cascade=a.cascade)
+    def _t(x): return (f'{x["agent"]}: held, {len(x["cancelled_tickets"])} ticket(s) cancelled, '
+        f'{"turn interrupted" if x["interrupted"] else "no running turn"}, {len(x["cancelled_wakes"])} wake(s) cancelled')
+    txt = "\n".join([_t(r)] + ["  cascade " + _t(c) for c in r.get("cascade", [])])
+    return emit(a, "stop", {"_text": txt + f"\nqueue stays held: ag queue {a.agent} --release", **r})
 
 def _describe_backend_launch(argv, workdir, agent_name, exc):
     """Actionable launch failure. Popen raises FileNotFoundError for a missing
@@ -6715,7 +6975,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
     # Single shared guard: block here while another process runs this agent,
     # then re-read the roster under lock so a concurrent mutation cannot slip
     # between our snapshot and the backend launch.
-    _turn_lock = _rs["lock"] if _rs else _acquire_agent_turn(sdir, name)
+    try: _turn_lock = _rs["lock"] if _rs else _queued_acquire(sdir, name, text, "wake" if on_start else None)
+    except QueueCancelled: return {"error":"cancelled from queue"}
     try:
         _t_guard = _rs["t0"] if _rs else time.monotonic()
         timeout_s = _valid_runtime(timeout_s) or 0
@@ -6825,7 +7086,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             p = subprocess.Popen(argv,cwd=workdir,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,text=True,bufsize=1,env=env,
                 start_new_session=(os.name == "posix"))
-            _backend_note(p.pid)
+            _backend_note(p.pid); _queue_running(sdir, name, p.pid)
             if timeout_s > 0 and _t_guard is not None:
                 _deadline = _t_guard + timeout_s
                 def _watch():
@@ -6917,16 +7178,17 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             try:
                 if _watcher is not None: _watcher.join(timeout=5)
             except Exception: pass
-            _backend_clear()
+            _backend_clear(); _intr = _queue_running(sdir, name, None)
             mark_running(name,False)
         if _timed_out["hit"]:
             rc = 124
             err = (err + f"\nmax-runtime {timeout_s:g}s exceeded (backend killed)").strip()
+        if _intr: rc = 130; _event(sdir, "interrupted", name)
         full = "\n".join(c for c in chunks if c).strip()
-        _nx = None if command else _retry_plan(sdir,name,backend,sid,rc,err,_timed_out["hit"],bool(full) or any(r.get("role")!="user" for r in buf.rows.values()),_rs,_turn_lock,_t_guard,timeout_s,on_event)
+        _nx = None if command else _retry_plan(sdir,name,backend,sid,rc,err,_timed_out["hit"] or _intr,bool(full) or any(r.get("role")!="user" for r in buf.rows.values()),_rs,_turn_lock,_t_guard,timeout_s,on_event)
         if _nx: _nx["ck"] = _ck
         if _nx: return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs=_nx)
-        if rc != 0:
+        if rc != 0 and not _intr:
             # record failure even when prose already streamed; never fake ok.
             buf.error(f"(exit {rc}) " + ((err.strip().splitlines()[-3:] or [""])[-1][:300] or "turn failed"))
         buf.finalize()
@@ -6938,10 +7200,10 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             # segments, joined as distinct blocks. Otherwise legacy owns reply.
             _segs = [t for t in buf.seg_texts("a") if (t or "").strip()]
             if _segs: full = "\n\n".join(_segs).strip()
-        if not full and rc!=0:
+        if not full and rc!=0 and not _intr:
             full = (err.strip().splitlines()[-3:] or ["(failed)"])[-1][:500]
             full = f"(exit {rc}) {full}"
-        full = full or "(no output)"
+        full = full or ("(interrupted)" if _intr else "(no output)")
         extra = {"timeline_summary": True} if buf.had_assistant else None
         agent_persist_ok = True
         try:
@@ -6968,6 +7230,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             try: usage_record(sdir,name,backend,sid_new or sid,_fresh,_usage)
             except Exception: pass
             out["usage"] = usage_short(_usage)
+        if _intr: out["interrupted"] = True
         if _timed_out["hit"]:
             out["timed_out"] = True
             out["error"] = f"max-runtime {timeout_s:g}s exceeded (backend killed)"
@@ -7102,7 +7365,7 @@ def do_handoff(a):
 
 def do_chat(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
-    if a.sub=="send":
+    if a.sub in ("send","steer"):
         text = " ".join(a.text or []).strip()
         cmd = (getattr(a,"command",None) or "").strip() or None
         if not text and not cmd: return emit(a,"chat",error="empty message")
@@ -7112,7 +7375,7 @@ def do_chat(a):
                 hint="ag chat send NAME --timeout 300 TEXT")
         live = not getattr(a,"json",False)
         if getattr(a,"job",None): _event(sdir,"chat_job",a.name,job=a.job)
-        r = run_turn(sdir,a.name,text,command=cmd,timeout_s=timeout_s,
+        r = (agent_steer if a.sub=="steer" else run_turn)(sdir,a.name,text,command=cmd,timeout_s=timeout_s,
             on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
         if "error" in r and not r.get("timed_out"):
             return emit(a,"chat",error=r["error"])
@@ -7122,6 +7385,8 @@ def do_chat(a):
         if getattr(a,"json",False):
             data = {"reply":r["reply"],"exit":r["exit"],"sid":r["sid"]}
             if r.get("usage"): data["usage"] = r["usage"]
+            for _k in ("interrupted","steered"):
+                if r.get(_k): data[_k] = True
             if r.get("timed_out"):
                 data["timed_out"] = True
                 data["error"] = r.get("error", "")
@@ -7217,7 +7482,7 @@ def orch_snapshot(sdir):
         lastm = next((r for r in reversed(log) if r.get("role")=="agent"),{})
         chats.append({"name":ag["name"],"backend":ag.get("backend","?"),
             "model":ag.get("model","default"),"role":ag.get("role","sub"),
-            "running":is_running(ag["name"]),
+            "running":is_running(ag["name"]),"queue":len(queue_list(sdir,ag["name"])),
             "turns":len([r for r in log if r.get("role")=="user"]),
             "last":(lastm.get("text","") or "")[:100]})
     return {"sessions":sess,"events":events,"todos":todos,"approvals":approvals,"chats":chats}
@@ -7226,7 +7491,7 @@ def render_snapshot(s, width=100):
     L = ["== agents =="]
     for c in s["chats"]:
         flag = "*" if c["running"] else " "
-        L.append(f'{flag} {c["name"][:12]:12} {c["backend"][:8]:8} {c["model"][:14]:14} {c["role"][:11]:11} {c["last"]}'[:width])
+        L.append(f'{flag} {c["name"][:12]:12} {c["backend"][:8]:8} {c["model"][:14]:14} {c["role"][:11]:11} {"q="+str(c["queue"])+" " if c.get("queue") else ""}{c["last"]}'[:width])
     L.append("== live sessions ==")
     L += [f'{"run" if x["running"] else "dead":4} {(x["name"] or x["id"])[:14]:14} {(x["cmd"] or "")[:30]:30} idle={x["idle_s"]}s {x["last"]}'[:width] for x in s["sessions"]] or ["(none)"]
     L.append("== activity ==")
@@ -9388,7 +9653,7 @@ def delegate_task(sdir, agent_name, task, on_event=None, timeout_s=0, job=None):
         harness_link(Path.home(), Path.cwd(),
             Path(sub.get("dir",".") or ".").expanduser() or Path.cwd())
     except Exception: pass
-    r = run_turn(sdir,agent_name,task,on_event=on_event,timeout_s=timeout_s)
+    with queue_ctx(source="delegate"): r = run_turn(sdir,agent_name,task,on_event=on_event,timeout_s=timeout_s)
     if "error" in r: return r
     orch = next((x["name"] for x in load_agents(sdir) if x.get("role")=="orchestrator"),None)
     if orch: append_chat(sdir,orch,"delegate",f'{agent_name}: {task} -> {r["reply"][:2000]}')
@@ -9930,6 +10195,10 @@ def do_selfcheck(a):
     for _e in ("API Error: 429 rate_limit_error","Overloaded","HTTP 529","503 Service Unavailable","read ECONNRESET","stream closed unexpectedly"):
         assert classify_turn_failure("claude",1,_e,False)=="transient", _e
     assert classify_turn_failure("claude",1,"Authentication required",False) is None
+    # turn queue: steer prio first, FIFO by seq within prio; dead-pid tickets reaped
+    assert sorted([_ticket_name(5,10,"b"),_ticket_name(0,11,"c"),_ticket_name(5,9,"a")])==[_ticket_name(0,11,"c"),_ticket_name(5,9,"a"),_ticket_name(5,10,"b")]
+    _qd = _qdir(td,"qa",mk=True); (_qd/_ticket_name(5,1,"dead")).write_text(json.dumps({"id":"dead","pid":2**22+7}))
+    assert queue_list(td,"qa")==[] and not list(_qd.glob("[0-9]-*")) and not queue_held(td,"qa")
     secret_selfcheck()
     _setup_selfcheck()
     print(f"selfcheck ok ({td})")
@@ -10372,6 +10641,9 @@ def build():
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
     chs2.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); chs2.add_argument("--command",default=None,help="opencode native custom command (message becomes its args)")
     chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded")
+    chst=chs.add_parser("steer",help="interrupt the running turn, run this next (priority 0, same session)"); chst.add_argument("name"); chst.add_argument("text",nargs="*"); chst.add_argument("--timeout",type=float,default=1800)
+    qu=sub.add_parser("queue",help="per-agent turn queue: list/cancel/hold/release"); qu.add_argument("agent"); qu.add_argument("--cancel",default=None,metavar="ID"); qu.add_argument("--hold",action="store_true"); qu.add_argument("--release",action="store_true")
+    sp_=sub.add_parser("stop",help="hold queue, cancel waiters + wakes, interrupt running turn"); sp_.add_argument("agent"); sp_.add_argument("--cascade",action="store_true",help="also stop agents whose jobs record parent == agent")
     chu=chs.add_parser("usage",help="last-turn + total provider token usage"); chu.add_argument("name")
     chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--limit",type=int,default=20)
     chd=chs.add_parser("diff",help="patch of one turn's changes (git checkpoints)"); chd.add_argument("name"); chd.add_argument("--turn",type=int,default=None); chd.add_argument("--stat",action="store_true")
@@ -10923,7 +11195,7 @@ def main(argv=None):
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
         "delegate":do_delegate,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
-        "models":do_models,"route":do_route,"setup":do_setup}[a.subcmd]
+        "models":do_models,"route":do_route,"setup":do_setup,"queue":do_queue,"stop":do_stop}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)
 

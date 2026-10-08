@@ -361,6 +361,18 @@ use fake fixture credentials.
 
 Each wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session (`__wake-<agent>-<id>`, visible in `sessions`/`status --json`). Turns on the same agent (`chat send`, `delegate`, wake workers) are mutually excluded via one shared per-agent flock guard held inside `run_turn` (no FIFO or arrival-order guarantee; the wake worker takes no second lock); different agents run in parallel. Backend/profile/model switches probe the same guard and refuse while the agent runs anywhere. `spawn --wake` launches at most once (atomic claim, not guaranteed completion or delivery); worker completion never re-fires (no callback loops). Argv is shell-free, so `; touch evil` in messages stays inert text. `--on-exit` still runs first and is unchanged.
 
+## Per-turn git checkpoints: diff + revert
+
+If an agent's dir is inside a git repo, every non-slash turn is snapshotted before and after the backend runs (hidden refs `refs/ag/<agent>/<n>-pre|post`; temp index, so your index, HEAD and branches are never touched; gitignored files excluded). Changed files are appended to the chat as a `[checkpoint] turn 7: 3 files changed (+40 -5): a.py, ...` tool note and returned as `checkpoint` in the turn result. Last 20 turns kept; non-git dirs are skipped silently; `AG_CHECKPOINT=0` disables.
+
+```sh
+./ag chat checkpoints w               # list turns
+./ag chat diff w [--turn N] [--stat]  # patch for turn N (default latest)
+./ag chat revert w [--turn N]         # restore the whole repo worktree to before turn N
+```
+
+`revert` rewrites snapshot files, deletes non-ignored files that did not exist then, never touches `.git`/ignored files, refuses while the agent is busy, and saves the pre-revert state at `refs/ag/<agent>/pre-revert` (undo: `git diff` / `git checkout` from that ref). Scope is the whole repo, not just the agent subdir.
+
 ## Docs
 
 - [Harness selection + behavior presets](docs/HARNESS_ROLES.md): `harness use/current`, per-backend models, editable/reset roles.

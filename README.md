@@ -227,11 +227,14 @@ ag chat send w --command review "path"          # opencode native command only
 - `spawn --wake` fires at most once per session (exit/kill/force-kill all count); worker completion never re-fires. Messages are argv, never shell-interpreted. Trail: `events` (`wake`, `wake_done`, `wake_fail`).
 - Always-on bots: `spawn --wake` plus host cron/launchd re-issuing `ag wake`. ag has no scheduler.
 
+- `--request-id K` on `wake`/`delegate`/`chat send` makes the call idempotent: receipt `<state>/receipts/<sha1(cmd+agent+K)>.json` (O_EXCL). Same payload replays the original result (wake: same job + `replayed:true`; others: stored reply, or `status:in_progress` + ref while running); different payload = `request id conflict`; a failed original replays its failure. `ag receipts gc [--days 7]` prunes.
+
 ## Reliability
 
 - **Stale-session recovery:** if the backend no longer knows the stored session id (`Session not found`, `No conversation found`, `no rollout found`), ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`.
 - **Transient retry:** rate limit, overload, 503/529, connection reset: up to 2 retries (2s, 6s) only if the attempt produced no output. Guard stays held, user row not duplicated, `--timeout` bounds the whole turn. `AG_RETRY=0` disables.
 - codex headless turns resume via `exec --json`; gemini turns are stateless (history replay).
+- **Provider probe:** `ag agents doctor [--refresh] [--json]` shows installed, version, compat (`COMPAT` min-version table: ok/graceful/broken/unknown) and auth (`claude auth status`, `codex login status`, `agent status`, `opencode auth list`; gemini = unknown). Cached 60s in `$AG_CACHE_HOME/providers.json`. Turns pre-flight it: definitely logged out fails fast with `not logged in to <backend>: <hint>` (no launch, no retry); unknown proceeds. `AG_PROBE=0` disables.
 - Daemon crash (`kill -9`): sessions go `stale`, pending wake does not fire.
 
 ## Isolation: worktree per agent

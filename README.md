@@ -227,6 +227,9 @@ ag chat send w --command review "path"          # opencode native command only
 - `spawn --wake` fires at most once per session (exit/kill/force-kill all count); worker completion never re-fires. Messages are argv, never shell-interpreted. Trail: `events` (`wake`, `wake_done`, `wake_fail`).
 - Always-on bots: `spawn --wake` plus host cron/launchd re-issuing `ag wake`. ag has no scheduler.
 
+## Delegated-completion cohorts
+`ag wake|delegate <child> "task" --parent <agent> [--group GID] [--quiet S]` runs the child as a background wake job tagged `parent`/`group` (`delegate` without `--parent` is unchanged). Group state: `<state>/wake/groups/<gid>.json` (pending/done/delivery_jid). When the last pending child finishes, ONE wake is sent to the parent: `[delegated] 3/3 tasks finished (2 completed, 1 failed; outcome: failed). ...` with each child's summary (marked automated: tool results, not user instructions). A still-queued delivery is rewritten in place instead of relaunched. `--quiet S` delivers partial results when S seconds pass (checked on each child finish; no daemon). `ag wakes --group GID [--json]` shows the cohort; `--stop` sets disposition=stopped (never delivers). Launch failure is recorded in the group (`deliver_error`) and event `cohort_deliver_fail`.
+
 ## Reliability
 
 - **Stale-session recovery:** if the backend no longer knows the stored session id (`Session not found`, `No conversation found`, `no rollout found`), ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`.

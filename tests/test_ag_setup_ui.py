@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""`ag setup` front-ends: pure state model, mac hub (fake osascript via AG_OSASCRIPT), curses
-editor driven through a real pty. Same isolation as test_ag_setup (temp AG_HOME etc.).
+"""`ag setup` front-ends: pure state model + curses editor driven through a real pty
+(the mac form is covered by test_ag_setup_form). Same isolation as test_ag_setup (temp AG_HOME etc.).
 Run: python3 tests/test_ag_setup_ui.py
 """
 import fcntl, importlib.machinery, importlib.util, json, os, pty, select, signal, struct, sys, termios, time, unittest
@@ -10,15 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_ag_setup as base  # noqa: E402
 
 AG = base.AG
-FAKE_OSA = """#!{py}
-import json, os, sys
-d = os.environ["FAKE_DIR"]
-q = json.load(open(d + "/osa.json"))
-ans = q.pop(0) if q else "__ag_cancel__"
-json.dump(q, open(d + "/osa.json", "w"))
-with open(d + "/osa.log", "a") as f: f.write(json.dumps(sys.argv[1:]) + "\\n")
-print(ans)
-"""
 DOWN, LEFT, RIGHT, ENTER = "\x1bOB", "\x1bOD", "\x1bOC", "\r"
 
 
@@ -61,7 +52,8 @@ class SetupState(unittest.TestCase):
     def test_rows(self):
         m, s = self.m, self.st(harn=["claude", "opencode"])
         rows = m.setup_rows(s)
-        self.assertEqual([k for k, _ in rows], ["scope", "harnesses", "preset", "claude_md"] + [f"job:{j}" for j in m.JOB_KEYS])
+        self.assertEqual([k for k, _ in rows], ["scope", "harnesses", "preset", "claude_md"] + [f"job:{j}" for j in m.JOB_KEYS]
+            + [f"bk:{b}" for b in m.BACKEND_TABS])
         self.assertEqual(rows[1][1], "Harnesses: claude, opencode")
         self.assertEqual(rows[3][1], "Write CLAUDE.md: yes (auto)")
         self.assertEqual(rows[4][1], f"mechanical — Claude: haiku · ag: opencode/{m.OPENCODE_MODEL_DEFAULT}")
@@ -94,56 +86,6 @@ class SetupState(unittest.TestCase):
 
 class SetupUIs(unittest.TestCase):
     setUp, ag, agj = base.AgSetup.setUp, base.AgSetup.ag, base.AgSetup.agj
-
-    def mac(self, answers, *args, oc_ids=None):
-        if oc_ids: (self.fake/"oc.ids").write_text("\n".join(oc_ids) + "\n")
-        self.agj("models")                                  # warm cache -> no background refresh race
-        (self.fake/"osascript").write_text(FAKE_OSA.format(py=sys.executable)); (self.fake/"osascript").chmod(0o755)
-        (self.fake/"osa.json").write_text(json.dumps(answers))
-        p = self.ag("setup", "--ui", "mac", *args, env={"AG_OSASCRIPT": str(self.fake/"osascript")})
-        log = [json.loads(l) for l in (self.fake/"osa.log").read_text().splitlines()]
-        self.assertEqual(json.loads((self.fake/"osa.json").read_text()), [], (p.stdout, p.stderr))  # all consumed
-        for call in log:                                  # dynamic strings only via argv
-            self.assertEqual(call[0], "-e"); self.assertIn("on run argv", call[1])
-            for s in ("review", "anthropic", "opencode/", "Harnesses"): self.assertNotIn(s, call[1])
-        return p, log
-
-    def test_mac_hub_session_filter_custom_save(self):
-        ids = [f"opencode/m{i:02}" for i in range(29)] + ["anthropic/c"]
-        p, log = self.mac(["Harnesses: opencode, codex", "claude\nopencode",
-            "review — Claude: opus · ag: claude/opus", "sonnet", "opencode", "anthropic", "anthropic/c",
-            "debug — Claude: opus · ag: claude/opus", "haiku", "codex", "Type a custom id…", "my/custom",
-            "✓ Save", "Save", ""], oc_ids=ids)
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("wrote", p.stdout)
-        rt = json.loads((self.cfg/"routing.json").read_text())["jobs"]
-        self.assertEqual(rt["review"], {"claude": "sonnet", "ag": {"backend": "opencode", "model": "anthropic/c"}})
-        self.assertEqual(rt["debug"], {"claude": "haiku", "ag": {"backend": "codex", "model": "my/custom"}})
-        self.assertTrue((self.home/".claude"/"skills"/"ag-agents"/"SKILL.md").exists(), p.stdout)
-        self.assertFalse((self.home/".codex"/"skills").exists())  # deselected
-        self.assertIn("| review — code review, verification | sonnet | opencode / anthropic/c |",
-            (self.home/".claude"/"CLAUDE.md").read_text())
-        self.assertEqual(log[0][2:6], ["ag setup", log[0][3], "Edit", "Quit"])
-        self.assertTrue(log[0][3].startswith("Pick a row"))
-        self.assertIn("Filter models", log[5][3])           # >25 ids -> filter dialog first
-        self.assertEqual(log[6][8:], ["anthropic/c", "Type a custom id…"])  # filtered list + custom row
-        self.assertIn(str(self.cfg/"routing.json").replace(str(self.home), "~"), log[13][3])  # save alert lists targets
-        self.assertIn("display notification", log[14][1])
-
-    def test_mac_preset_confirm_and_project_scope(self):
-        p, log = self.mac(["review — Claude: opus · ag: claude/opus", "haiku", "claude", "haiku",
-            "Preset: cost-first (custom picks)", "balanced", "Apply", "✓ Save", "Save", ""], "--scope", "project", "--harness", "none")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        doc = json.loads((self.proj/".agent"/"routing.json").read_text())
-        self.assertEqual(doc["preset"], "balanced")
-        self.assertEqual(doc["jobs"]["review"], {"claude": "sonnet", "ag": {"backend": "claude", "model": "sonnet"}})
-        self.assertIn("review", log[6][3])                  # confirm names the overwritten job
-        self.assertFalse((self.cfg/"routing.json").exists())
-
-    def test_mac_quit_writes_nothing(self):
-        p, _ = self.mac(["__ag_cancel__"])
-        self.assertIn("cancelled", p.stdout)
-        self.assertFalse((self.cfg/"routing.json").exists() or (self.home/".claude").exists())
 
     # ---- curses in a real pty ----
     def pty_run(self, args, keys, size=(24, 80), after_start=None):

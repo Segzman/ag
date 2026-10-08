@@ -6415,8 +6415,13 @@ def do_agents(a):
         be, mod, job = a.backend, getattr(a,"model",None), getattr(a,"job",None)
         if not be:
             if not job: return emit(a,"agents",error="need --backend or --job",hint=f"ag agents add NAME --backend opencode  |  --job {'|'.join(JOB_KEYS)}")
-            ra = routing_now()[0][job]["ag"]; be = ra["backend"]; mod = mod or ra["model"]
+            ra = routing_now()[0][job]["ag"]; be = ra["backend"]; mod = mod or (ra["model"] if ra["model"] not in ("","default") else "")
             if be not in NATIVE_ORDER: return emit(a,"agents",error=f"routing for {job} names unknown backend {be!r}",hint="ag route; ag setup")
+        bkd = backends_now().get(be) if be in BACKEND_TABS else None  # per-backend defaults from routing.json (ag setup)
+        if bkd:
+            mod = mod or bkd["model"]
+            if getattr(a,"mode",None) is None and bkd["mode"]: a.mode = bkd["mode"]
+            if getattr(a,"plan",None) is None and bkd["plan"]: a.plan = True
         mod = mod or "default"
         if be=="opencode" and mod in ("","default"): mod = OPENCODE_MODEL_DEFAULT
         wt, adir = None, a.adir or "."
@@ -6430,7 +6435,8 @@ def do_agents(a):
             **({"mode":a.mode} if getattr(a,"mode",None) else {}),**({"plan":True} if getattr(a,"plan",None) else {}),
             **({"worktree":wt} if wt else {})})
         save_agents(sdir,rows)
-        _mw = mode_warning(be, getattr(a,"mode",None) or "", bool(getattr(a,"plan",None)))
+        _mw = "\n".join(x for x in (mode_warning(be, getattr(a,"mode",None) or "", bool(getattr(a,"plan",None))),
+            f"[setup] backend {be} is disabled in routing (ag setup to enable)" if bkd and not bkd["enabled"] else "") if x)
         if _mw and not wt: return emit(a,"agents",{"_text":f"added {a.name}\n{_mw}","warning":_mw})
         if wt: return emit(a,"agents",{"_text":f"added {a.name}  branch {wt['branch']}  worktree {wt['path']}","worktree":wt})
         return emit(a,"agents",{"_text":f"added {a.name}"})
@@ -10722,13 +10728,70 @@ def routing_now(cwd=None):
 
 def _route_model(ag_): return eff_model(ag_["backend"], ag_["model"]) or ag_["model"]
 
-def routing_block(eff):
-    """Markdown routing block (spec §5). Pure."""
+# per-backend defaults: routing.json "backends": {b: {enabled, model, mode, plan}}; project overlays global per field
+BACKEND_TABS = ("claude", "opencode", "codex", "gemini", "cursor")
+BK_DEFAULT = {"enabled": True, "model": "", "mode": "", "plan": False}
+_BOOL = {"true": True, "yes": True, "on": True, "1": True, "false": False, "no": False, "off": False, "0": False}
+def _bk_clean(d):
+    """Valid fields of one routing.json backends entry ('default' model -> ''). Pure."""
+    if not isinstance(d, dict): return {}
+    out = {k: d[k] for k in ("enabled", "plan") if isinstance(d.get(k), bool)}
+    if isinstance(d.get("model"), str): out["model"] = "" if d["model"].strip() in ("", "default") else d["model"].strip()
+    if d.get("mode") in ("",) + MODES: out["mode"] = d["mode"]
+    return out
+def backends_effective(glob=None, proj=None):
+    """{b: {enabled, model, mode, plan, source}}: default < global < project, per field. Pure."""
+    out = {}
+    for b in BACKEND_TABS:
+        e, src = dict(BK_DEFAULT), "default"
+        for s, d in (("global", glob or {}), ("project", proj or {})):
+            bd = d.get("backends") if isinstance(d.get("backends"), dict) else {}
+            c = _bk_clean(bd.get(b))
+            if c: e.update(c); src = s
+        out[b] = {**e, "source": src}
+    return out
+def backends_now(cwd=None):
+    gp, pp = routing_paths(project_root(cwd))
+    return backends_effective(_json_or_empty(gp), _json_or_empty(pp))
+def routing_disabled(eff, bk):
+    """[(job, backend)] routed to a disabled backend. Pure."""
+    return [(j, e["ag"]["backend"]) for j, e in eff.items() if not (bk.get(e["ag"]["backend"]) or BK_DEFAULT)["enabled"]]
+def backends_line(bk):
+    """'opencode: m (mode edits) · gemini: off' — compact skill line. Pure."""
+    def one(b, e):
+        if not e["enabled"]: return f"{b}: off"
+        x = ", ".join(([f'mode {e["mode"]}'] if e["mode"] else []) + (["plan"] if e["plan"] else []))
+        return f'{b}: {eff_model(b, e["model"]) or "default"}' + (f" ({x})" if x else "")
+    return " · ".join(one(b, bk[b]) for b in BACKEND_TABS if b in bk)
+def parse_backend_sets(items):
+    """Split --set items: backend.B.FIELD=V -> (other items, {b: {field: v}}). Raises ValueError. Pure."""
+    rest, out = [], {}
+    for it in items or []:
+        if not it.startswith("backend."): rest.append(it); continue
+        k, eq, v = it.partition("=")
+        _, b, f = (k.strip().split(".", 2) + ["", ""])[:3]
+        v = v.strip()
+        bad = f"bad --set {it!r}: want backend.BACKEND.(enabled|model|mode|plan)=VALUE, BACKEND in {','.join(BACKEND_TABS)}"
+        if not eq or b not in BACKEND_TABS or f not in BK_DEFAULT: raise ValueError(bad)
+        if f in ("enabled", "plan"):
+            if v.lower() not in _BOOL: raise ValueError(f"bad --set {it!r}: {f} wants true|false")
+            val = _BOOL[v.lower()]
+            if f == "plan" and val and not CAPS[b]["plan"]: raise ValueError(f"bad --set {it!r}: {b} has no plan mode")
+        elif f == "mode":
+            val = "" if v in ("", "unset") else v
+            if val and val not in CAPS[b]["modes"]: raise ValueError(f"bad --set {it!r}: {b} modes are {'|'.join(CAPS[b]['modes'])} (or unset)")
+        else: val = "" if v in ("", "default") else v
+        out.setdefault(b, {})[f] = val
+    return rest, out
+
+def routing_block(eff, bk=None):
+    """Markdown routing block (spec §5); bk adds the compact backend-defaults line (skills). Pure."""
     rows = [f'| {j} — {JOB_DESC[j]} | {eff[j]["claude"]} | {eff[j]["ag"]["backend"]} / {_route_model(eff[j]["ag"])} |'
         for j in JOB_KEYS]
+    bl = ["", f"Backend defaults (`ag agents add NAME --backend B` without --model/--mode): {backends_line(bk)}"] if bk else []
     return "\n".join(["## Model routing (generated by `ag setup` — change it with `ag setup`, not by hand)", "",
         "Default to the cheapest model that can do the job; escalate only when it gets stuck or the job turns out to need judgment.", "",
-        "| Job | Claude subagent (`model:`) | ag agent (backend / model) |", "|---|---|---|", *rows, "",
+        "| Job | Claude subagent (`model:`) | ag agent (backend / model) |", "|---|---|---|", *rows, *bl, "",
         "Unsure which job it is? Start one tier lower; escalate on failure. Effective config: `ag route`."])
 
 def routing_md_insert(text, block, append=True):
@@ -10797,10 +10860,17 @@ def _ask_pick(prompt, opts, default):
 def do_route(a):
     eff, gp, pp = routing_now()
     jobs = {a.job: eff[a.job]} if a.job else eff
-    data = {"jobs": jobs, "global": str(gp), "project": str(pp)}
+    bk = backends_effective(_json_or_empty(gp), _json_or_empty(pp))
+    warn = [f"{j}: routed to disabled backend {b} (ag setup: enable {b} or re-route {j})" for j, b in routing_disabled(jobs, bk)]
+    data = {"jobs": jobs, "backends": bk, "warnings": warn, "global": str(gp), "project": str(pp)}
     if getattr(a, "json", False): return emit(a, "route", data)
+    off = dict(routing_disabled(jobs, bk))
     out = [f'{j:10} claude={e["claude"]:7} ({e["source"]["claude"]})  ag={e["ag"]["backend"]}/{_route_model(e["ag"])} ({e["source"]["ag"]})'
-        for j, e in jobs.items()]
+        + ("  ! backend disabled" if j in off else "") for j, e in jobs.items()]
+    if not a.job:
+        out += [f'backend {b:9} ' + (f'model={eff_model(b, e["model"]) or "default"} mode={e["mode"] or "-"}{" plan" if e["plan"] else ""}'
+            if e["enabled"] else "disabled") + f' ({e["source"]})' for b, e in bk.items()]
+    out += [f"! {w}" for w in warn]
     out += [f'global:  {gp}{"" if gp.exists() else " (missing)"}', f'project: {pp}{"" if pp.exists() else " (missing)"}']
     return emit(a, "route", {**data, "_text": "\n".join(out)})
 
@@ -10809,10 +10879,7 @@ SETUP_UIS = ("mac", "cli", "plain")
 SETUP_CLAUDE_ALIASES = ("haiku", "sonnet", "opus", "fable")
 SETUP_PRESET_DESC = {"cost-first": "cheapest model that can do each job (default)",
     "balanced": "cost-first, but review on sonnet", "quality-first": "sonnet floor, opus implements, fable for the rest"}
-SETUP_FILTER_AT = 25          # mac: longer model lists get a filter dialog first
-SETUP_CUSTOM = "Type a custom id…"
-SETUP_SAVE = "✓ Save"
-SETUP_MIN = (16, 60)          # curses floor (rows, cols); smaller at start -> plain prompts
+SETUP_MIN = (23, 60)          # curses floor (rows, cols); smaller at start -> plain prompts
 
 def _setup_rebase(st):
     """jobs = preset (+ that scope's on-disk picks when its file uses the same preset and the preset
@@ -10823,18 +10890,24 @@ def _setup_rebase(st):
     st["jobs"] = {j: {"claude": eff[j]["claude"], "ag": dict(eff[j]["ag"])} for j in JOB_KEYS}
     for src in (st["sets"], st["edits"]):
         for j, upd in src.items(): st["jobs"][j].update({k: dict(v) if isinstance(v, dict) else v for k, v in upd.items()})
+    ex = st["existing"]  # backends: effective for the scope (project sees global under it) < --set backend.* < UI edits
+    bk = backends_effective(ex.get("global") or {}, (ex.get("project") or {}) if st["scope"] == "project" else {})
+    st["backends"] = {b: {k: e[k] for k in BK_DEFAULT} for b, e in bk.items()}
+    for src in (st["bsets"], st["bedits"]):
+        for b, upd in src.items(): st["backends"][b].update(upd)
     return st
 
-def setup_state_from(scope="global", preset=None, sets=None, harn=None, claude_md=None, proj=None, existing=None):
-    """Shared setup state {scope, harnesses, preset, forced, jobs, claude_md (None=auto), proj, existing, sets, edits}.
-    A given preset is forced (drops on-disk per-job picks). Pure when proj + existing are given."""
+def setup_state_from(scope="global", preset=None, sets=None, harn=None, claude_md=None, proj=None, existing=None, bsets=None):
+    """Shared setup state {scope, harnesses, preset, forced, jobs, backends, claude_md (None=auto), proj, existing,
+    sets, edits, bsets, bedits}. A given preset is forced (drops on-disk per-job picks). Pure when proj + existing are given."""
     proj = Path(proj or project_root())
     if existing is None:
         gp, pp = routing_paths(proj)
         existing = {"global": _json_or_empty(gp), "project": _json_or_empty(pp)}
     return _setup_rebase({"scope": scope, "harnesses": list(harn or []),
         "preset": preset or (existing.get(scope) or {}).get("preset") or "cost-first", "forced": bool(preset),
-        "jobs": {}, "claude_md": claude_md, "proj": str(proj), "existing": existing, "sets": dict(sets or {}), "edits": {}})
+        "jobs": {}, "claude_md": claude_md, "proj": str(proj), "existing": existing, "sets": dict(sets or {}), "edits": {},
+        "backends": {}, "bsets": {b: dict(v) for b, v in (bsets or {}).items()}, "bedits": {}})
 
 def setup_set_scope(st, scope): st["scope"] = scope; return _setup_rebase(st)
 def setup_apply_preset(st, preset):
@@ -10845,6 +10918,12 @@ def setup_edit_job(st, job, claude=None, ag=None):
     if claude: e["claude"] = claude
     if ag: e["ag"] = dict(ag)
     return _setup_rebase(st)
+def setup_edit_backend(st, b, **kw):
+    st["bedits"].setdefault(b, {}).update(_bk_clean(kw)); return _setup_rebase(st)
+def setup_enabled_backends(st): return [b for b in BACKEND_TABS if st["backends"][b]["enabled"]]
+def setup_validate(st):
+    """Errors that block a save: a job's ag target on a disabled backend. Pure."""
+    return [f"{j}: ag target {b} is disabled (enable {b} or pick another target)" for j, b in routing_disabled(st["jobs"], st["backends"])]
 def setup_custom_jobs(st):
     """Jobs whose picks differ from the preset table (what applying a preset would overwrite). Pure."""
     p = ROUTING_PRESETS.get(st["preset"], _ROUTE_COST)
@@ -10858,7 +10937,7 @@ def setup_rows(st):
         ("preset", f'Preset: {st["preset"]}' + (" (custom picks)" if setup_custom_jobs(st) else "")),
         ("claude_md", f"Write CLAUDE.md: {cm}")]
     return rows + [(f"job:{j}", f'{j} — Claude: {e["claude"]} · ag: {e["ag"]["backend"]}/{e["ag"]["model"]}')
-        for j, e in ((j, st["jobs"][j]) for j in JOB_KEYS)]
+        for j, e in ((j, st["jobs"][j]) for j in JOB_KEYS)] + [(f"bk:{b}", backends_line({b: st["backends"][b]})) for b in BACKEND_TABS]
 def setup_filter(ids, q):
     """Case-insensitive; every whitespace-separated term must be a substring. Pure."""
     terms = (q or "").lower().split()
@@ -10873,7 +10952,9 @@ def setup_targets(st):
     """Planned writes [(path, text, old, new|changed|unchanged)] + notes, skill_err, block, tdir. Reads only."""
     scope, harn, proj, jobs = st["scope"], st["harnesses"], Path(st["proj"]), st["jobs"]
     gp, pp = routing_paths(proj)
-    doc = {"version": 1, "preset": st["preset"], "jobs": jobs}
+    under = backends_effective(st["existing"].get("global") or {}) if scope == "project" else backends_effective()
+    bks = {b: d for b, d in ((b, {k: v for k, v in st["backends"][b].items() if v != under[b][k]}) for b in BACKEND_TABS) if d}
+    doc = {"version": 1, "preset": st["preset"], "jobs": jobs, **({"backends": bks} if bks else {})}
     eff = routing_effective(doc) if scope == "global" else routing_effective(st["existing"].get("global") or {}, doc)
     block = routing_block(eff)
     writes = [(gp if scope == "global" else pp, json.dumps(doc, indent=2) + "\n")]
@@ -10885,7 +10966,7 @@ def setup_targets(st):
     if not skill_err:
         for h in harn:
             sd = harness_skills_dir(h, scope, proj)
-            writes += [(sd/n/"SKILL.md", render_skill(tpls[n], block, scope)) for n in SKILL_NAMES]
+            writes += [(sd/n/"SKILL.md", render_skill(tpls[n], routing_block(eff, st["backends"]), scope)) for n in SKILL_NAMES]
             notes += [f"left alone: old skill {sd/o} (remove by hand once ag-cli/ag-agents replace it)"
                 for o in OLD_SKILLS if (sd/o).exists()]
     if setup_claude_md_on(st) and scope == "global":
@@ -10928,35 +11009,163 @@ def _setup_bg_refresh(wait=1.0):
     t = threading.Thread(target=run, daemon=True, name="ag-setup-models"); t.start(); t.join(wait)
     return t
 
-# -- mac: native dialogs via osascript. Dynamic strings ONLY via `on run argv`, never spliced into source.
-_OSA_LIST = """on run argv
-set {t, p, okb, cb, multi, defs} to items 1 thru 6 of argv
-set xs to items 7 thru -1 of argv
-set m to (multi is "1")
-set r to choose from list xs with title t with prompt p OK button name okb cancel button name cb default items (paragraphs of defs) multiple selections allowed m empty selection allowed m
-if r is false then return "__ag_cancel__"
-set AppleScript's text item delimiters to linefeed
-return r as text
-end run"""
-_OSA_ASK = """on run argv
-try
-set r to display dialog (item 2 of argv) with title (item 1 of argv) default answer (item 3 of argv) buttons {"Cancel", "OK"} default button "OK" cancel button "Cancel"
-return text returned of r
-on error number -128
-return "__ag_cancel__"
-end try
-end run"""
-_OSA_ALERT = """on run argv
-try
-set r to display alert (item 1 of argv) message (item 2 of argv) buttons {"Cancel", (item 3 of argv)} default button (item 3 of argv) cancel button "Cancel"
-return button returned of r
-on error number -128
-return "__ag_cancel__"
-end try
-end run"""
+# -- mac: one native form (JXA + Cocoa). Python passes state as ONE JSON argv (never spliced into source);
+# the script prints ONE JSON result, exits 1 (no stderr) on Cancel. AG_FORM_SELFTEST=1 builds it without running.
 _OSA_NOTE = """on run argv
 display notification (item 2 of argv) with title (item 1 of argv)
 end run"""
+_JXA_FORM = r"""ObjC.import('Cocoa');
+ObjC.import('stdlib');
+var AG_H = null, AG_ON = function (s) {};
+function run(argv) {
+  var D = JSON.parse(argv[0]), env = $.NSProcessInfo.processInfo.environment;
+  var test = ObjC.unwrap(env.objectForKey('AG_FORM_SELFTEST')) === '1';
+  var app = $.NSApplication.sharedApplication;
+  if (!test) { app.setActivationPolicy(1); app.activateIgnoringOtherApps(true); }
+  if (!AG_H) {
+    ObjC.registerSubclass({name: 'AGSetupFormHandler', methods: {'changed:': {types: ['void', ['id']], implementation: function (s) { AG_ON(s); }}}});
+    AG_H = $.AGSetupFormHandler.alloc.init;
+  }
+  var SEP = ' · ', W = 760, H = 460, basePreset = D.preset;
+  function R(x, y, w, h) { return $.NSMakeRect(x, y, w, h); }
+  function lab(s) { return $.NSTextField.labelWithString(s); }
+  function chk(s, on, tag) { var b = $.NSButton.checkboxWithTitleTargetAction(s, AG_H, 'changed:'); b.state = on ? 1 : 0; b.tag = tag || 0; return b; }
+  function sel(p, t) { if (p.indexOfItemWithTitle(t) < 0) p.addItemWithTitle(t); p.selectItemWithTitle(t); }
+  function pop(items, cur, tag) {
+    var p = $.NSPopUpButton.alloc.initWithFramePullsDown(R(0, 0, 100, 26), false);
+    p.addItemsWithTitles($(items)); sel(p, cur); p.target = AG_H; p.action = 'changed:'; p.tag = tag || 0; return p;
+  }
+  function cmb(items, cur) {
+    var c = $.NSComboBox.alloc.initWithFrame(R(0, 0, 100, 26));
+    c.addItemsWithObjectValues($(items)); c.stringValue = cur; c.completes = true; c.numberOfVisibleItems = 16; return c;
+  }
+  function put(par, v, x, y, w, h) { v.frame = R(x, y, w, h); par.addSubview(v); return v; }
+  function on(b) { return Number(b.state) === 1; }
+  function title(p) { return ObjC.unwrap(p.titleOfSelectedItem) || ''; }
+  function txt(c) { return (ObjC.unwrap(c.stringValue) || '').trim(); }
+  function tgt(a) { return a.backend + SEP + (a.model || 'default'); }
+  function wfix(v, w) { v.widthAnchor.constraintEqualToConstant(w).active = true; return v; }
+
+  var root = $.NSView.alloc.initWithFrame(R(0, 0, W, H));
+  put(root, lab('Scope'), 0, 434, 44, 18);
+  var scope = put(root, pop(['global', 'project'], D.scope, 3), 46, 428, 100, 26);
+  scope.toolTip = 'global: ' + D.paths.global + '\nproject: ' + D.paths.project;
+  put(root, lab('Preset'), 164, 434, 46, 18);
+  var preset = put(root, pop(D.presets.concat(['custom']), D.preset_shown, 1), 212, 428, 140, 26);
+  preset.toolTip = D.presets.map(function (p) { return p + ': ' + (D.preset_desc[p] || ''); }).join('\n');
+  var cmd = put(root, chk('Write routing block into ~/.claude/CLAUDE.md', D.claude_md), 372, 430, 388, 22);
+  cmd.enabled = D.scope === 'global';
+  put(root, lab('Install skills for'), 0, 406, 112, 18);
+  var harn = {};
+  D.harness_opts.forEach(function (h, i) { harn[h] = put(root, chk(h, D.harnesses.indexOf(h) >= 0), 116 + i * 100, 402, 96, 22); });
+
+  var tabs = put(root, $.NSTabView.alloc.initWithFrame(R(0, 0, W, 396)), 0, 0, W, 396);
+  var CH = tabs.contentRect.size.height, CW = tabs.contentRect.size.width;
+  function tab(name) {
+    var it = $.NSTabViewItem.alloc.initWithIdentifier($(name)); it.label = name;
+    var v = $.NSView.alloc.initWithFrame(R(0, 0, CW, CH)); it.view = v; tabs.addTabViewItem(it); return v;
+  }
+  function enabled(b) { return B[b] ? on(B[b].en) : D.backends[b].enabled; }
+  function targets() {
+    var out = [];
+    D.backend_order.forEach(function (b) { if (enabled(b)) D.models[b].forEach(function (m) { out.push(b + SEP + m); }); });
+    return out;
+  }
+
+  // Jobs tab: one grid row per job
+  var B = {}, J = {}, jv = tab('Jobs'), T0 = targets();
+  var rows = [[lab('Job'), lab('Claude subagent (model:)'), lab('ag target (backend' + SEP + 'model)')]];
+  rows[0].forEach(function (l) { l.font = $.NSFont.boldSystemFontOfSize(0); });
+  D.job_keys.forEach(function (j) {
+    var e = D.jobs[j], l = lab(j); l.toolTip = D.job_desc[j];
+    var c = wfix(pop(D.claude_models, e.claude, 2), 130), a = wfix(cmb(T0, tgt(e.ag)), 420);
+    c.toolTip = j + ': ' + D.job_desc[j] + '\nmodel for Claude Code subagents (Agent tool model:)';
+    a.toolTip = j + ': ag sub-agent backend' + SEP + 'model. Type any id as "backend' + SEP + 'model" or backend/model.';
+    J[j] = {c: c, a: a}; rows.push([l, c, a]);
+  });
+  var grid = $.NSGridView.gridViewWithViews($(rows.map(function (r) { return $(r); })));
+  grid.rowSpacing = 10; grid.columnSpacing = 14; grid.rowAlignment = 2;
+  var gs = grid.fittingSize;
+  put(jv, grid, 16, CH - gs.height - 14, gs.width, gs.height);
+  var hint = put(jv, lab('Only enabled backends are listed (backend tabs). Changing a Claude pick sets Preset to custom.'), 16, 12, CW - 32, 18);
+  hint.textColor = $.NSColor.secondaryLabelColor;
+
+  // one tab per backend
+  D.backend_order.forEach(function (b, i) {
+    var v = tab(b), bd = D.backends[b], cp = D.caps[b], y = CH - 42;
+    var en = put(v, chk('Enabled (offered as an ag target for jobs)', bd.enabled, 100 + i), 20, y, 520, 22);
+    y -= 42; put(v, lab('Default model'), 20, y + 4, 130, 18);
+    var mo = put(v, cmb(D.models[b], bd.model || 'default'), 156, y, 470, 26);
+    y -= 40; put(v, lab('Permission mode'), 20, y + 4, 130, 18);
+    var items = ['unset'].concat(cp.modes.map(function (m) { return m + (cp.advisory ? ' (advisory)' : ''); }));
+    var cur = 'unset'; items.forEach(function (t) { if (bd.mode && t.split(' ')[0] === bd.mode) cur = t; });
+    if (bd.mode && cur === 'unset') { cur = bd.mode + ' (advisory)'; items.push(cur); }
+    var md = put(v, pop(items, cur, 0), 156, y, 180, 26);
+    var pl = null;
+    if (cp.plan) { y -= 36; pl = put(v, chk('Plan (read-only) mode by default — ' + cp.plan, bd.plan), 156, y, 470, 22); }
+    y -= 40; var d1 = put(v, lab('Defaults for `ag agents add NAME --backend ' + b + '` when --model / --mode / --plan are omitted.'), 20, y, CW - 40, 18);
+    d1.textColor = $.NSColor.secondaryLabelColor;
+    y -= 30; var st = put(v, lab(D.status[b] || ''), 20, y, CW - 40, 18); st.textColor = $.NSColor.secondaryLabelColor;
+    B[b] = {en: en, mo: mo, md: md, pl: pl};
+  });
+
+  AG_ON = function (s) {
+    var t = Number(s.tag);
+    if (t === 1) {
+      var p = title(preset); if (p === 'custom') return;
+      basePreset = p;
+      D.job_keys.forEach(function (j) { var e = D.preset_jobs[p][j]; sel(J[j].c, e.claude); J[j].a.stringValue = tgt(e.ag); });
+    } else if (t === 2) { sel(preset, 'custom'); }
+    else if (t === 3) { cmd.enabled = title(scope) === 'global'; }
+    else if (t >= 100) {
+      var ts = $(targets());
+      D.job_keys.forEach(function (j) { var a = J[j].a, v = a.stringValue; a.removeAllItems; a.addItemsWithObjectValues(ts); a.stringValue = v; });
+    }
+  };
+  function parseT(s) {
+    var i = s.indexOf(SEP), b, m;
+    if (i >= 0) { b = s.slice(0, i); m = s.slice(i + SEP.length); }
+    else if ((i = s.indexOf('/')) > 0) { b = s.slice(0, i); m = s.slice(i + 1); }
+    else { b = s; m = ''; }
+    return {backend: b.trim(), model: m.trim() || 'default'};
+  }
+  function collect() {
+    var o = {scope: title(scope), preset: title(preset) === 'custom' ? basePreset : title(preset), claude_md: on(cmd),
+      harnesses: D.harness_opts.filter(function (h) { return on(harn[h]); }), jobs: {}, backends: {}};
+    D.job_keys.forEach(function (j) { o.jobs[j] = {claude: title(J[j].c), ag: parseT(txt(J[j].a))}; });
+    D.backend_order.forEach(function (b) {
+      var x = B[b], m = txt(x.mo), md = title(x.md).split(' ')[0];
+      o.backends[b] = {enabled: on(x.en), model: m === 'default' ? '' : m, mode: md === 'unset' ? '' : md, plan: x.pl ? on(x.pl) : false};
+    });
+    return o;
+  }
+  function validate(o) {
+    var errs = [];
+    D.job_keys.forEach(function (j) {
+      var a = o.jobs[j].ag;
+      if (D.backend_order.indexOf(a.backend) < 0) errs.push(j + ': unknown ag backend "' + a.backend + '" (want backend' + SEP + 'model, backend one of ' + D.backend_order.join(', ') + ')');
+      else if (!o.backends[a.backend].enabled) errs.push(j + ': ag target ' + a.backend + ' is disabled (enable it on the ' + a.backend + ' tab or pick another target)');
+    });
+    return errs;
+  }
+
+  var alert = $.NSAlert.alloc.init;
+  alert.messageText = 'ag setup';
+  alert.informativeText = D.info;
+  alert.addButtonWithTitle('Save'); alert.addButtonWithTitle('Cancel');
+  alert.accessoryView = root;
+  alert.window.autorecalculatesKeyViewLoop = true;
+  if (test) {
+    var o = collect(); o._errors = validate(o); return JSON.stringify(o);
+  }
+  while (true) {
+    if (alert.runModal !== 1000) $.exit(1);
+    var out = collect(), errs = validate(out);
+    if (!errs.length) return JSON.stringify(out);
+    var e = $.NSAlert.alloc.init; e.messageText = 'Fix before saving'; e.informativeText = errs.join('\n');
+    e.addButtonWithTitle('OK'); e.runModal;
+  }
+}"""
 
 def _setup_osa_bin(): return os.environ.get("AG_OSASCRIPT") or shutil.which("osascript")
 def _osa(script, *args):
@@ -10966,69 +11175,71 @@ def _osa(script, *args):
     if p.returncode != 0:
         if "-128" in (p.stderr or ""): return None
         raise RuntimeError(f"osascript failed: {(p.stderr or '').strip()[-300:]}")
-    out = (p.stdout or "").rstrip("\n")
-    return None if out == "__ag_cancel__" else out
-def _mac_list(title, prompt, items, defaults=(), multi=False, ok="OK", cancel="Cancel"):
-    r = _osa(_OSA_LIST, title, prompt, ok, cancel, "1" if multi else "0",
-        "\n".join(d for d in defaults if d in items), *items)
-    return r if r is None or not multi else [x for x in r.split("\n") if x]
-def _mac_ask(title, prompt, default=""): return _osa(_OSA_ASK, title, prompt, default)
-def _mac_alert(title, msg, ok): return _osa(_OSA_ALERT, title, msg, ok) == ok
+    return (p.stdout or "").rstrip("\n")
+def _osa_form(payload):
+    """Run the setup form; dict result, None on Cancel. Raises RuntimeError on script failure."""
+    p = subprocess.run([_setup_osa_bin() or "osascript", "-l", "JavaScript", "-e", _JXA_FORM, json.dumps(payload)],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if p.returncode == 1 and not (p.stderr or "").strip(): return None
+    if p.returncode != 0: raise RuntimeError(f"setup form failed: {(p.stderr or '').strip()[-300:]}")
+    try: out = json.loads(p.stdout)
+    except ValueError: raise RuntimeError(f"setup form returned non-JSON: {(p.stdout or '')[:200]!r}")
+    if not isinstance(out, dict): raise RuntimeError("setup form returned non-object JSON")
+    return out
 
-def _setup_mac_model(title, b, cur):
-    ids, info = model_choices(b), setup_models_info(b)
-    if len(ids) > SETUP_FILTER_AT:
-        f = _mac_ask(title, f"{info}\nFilter models (blank = all)", "")
-        if f is None: return None
-        ids = setup_filter(ids, f)
-    r = _mac_list(title, f"{info}" + ("" if ids else "\nno match: type a custom id"), ids + [SETUP_CUSTOM], [cur])
-    if r == SETUP_CUSTOM: r = (_mac_ask(title, f"Custom {b} model id", cur) or "").strip() or None
-    return r
+def setup_backend_status(wait=1.0):
+    """{b: 'v1.2 · auth yes · 92 models · fetched 3h ago'}: provider probe refreshed <= wait s (AG_PROBE=0: cache only)."""
+    snap = {}
+    if os.environ.get("AG_PROBE", "1") != "0":
+        try: snap = providers_snapshot(list(BACKEND_TABS), deadline=wait)
+        except Exception: snap = {}
+    cache = _json_or_empty(_providers_path())
+    out = {}
+    for b in BACKEND_TABS:
+        r = snap.get(b) or (cache.get(b) if isinstance(cache.get(b), dict) else {})
+        inst = (r.get("version") or "installed") if r.get("installed", r.get("ok")) else "not installed" if r else "not probed"
+        out[b] = f'{inst} · auth {r.get("auth") or "unknown"} · ' + setup_models_info(b).split(" · ", 1)[1]
+    return out
 
-def _setup_mac_edit(st, key):
-    T = "ag setup"
-    if key == "scope":
-        gp, pp = routing_paths(st["proj"])
-        r = _mac_list(T, f"Scope: where routing + skills go.\nglobal: {_setup_short(gp)} + home skill dirs\nproject: {_setup_short(pp)} + project skill dirs",
-            ["global", "project"], [st["scope"]])
-        if r: setup_set_scope(st, r)
-    elif key == "harnesses":
-        r = _mac_list(T, "Install the ag-cli + ag-agents skills for (⌘-click for several; none = skip skills)",
-            list(SETUP_HARNESSES), st["harnesses"], multi=True)
-        if r is not None: st["harnesses"] = r
-    elif key == "preset":
-        r = _mac_list(T, "Preset (resets all six jobs):\n" + "\n".join(f"{k}: {v}" for k, v in SETUP_PRESET_DESC.items()),
-            list(ROUTING_PRESETS), [st["preset"]])
-        cj = setup_custom_jobs(st)
-        if r and (not cj or _mac_alert(f"Apply preset {r}?", "Overwrites your custom picks for: " + ", ".join(cj), "Apply")):
-            setup_apply_preset(st, r)
-    elif key == "claude_md":
-        opts = ["auto (yes when claude is a harness)", "yes", "no"]
-        r = _mac_list(T, "Write the routing block into ~/.claude/CLAUDE.md? (global scope only)", opts,
-            [opts[0] if st["claude_md"] is None else "yes" if st["claude_md"] else "no"])
-        if r: st["claude_md"] = None if r == opts[0] else r == "yes"
-    elif key.startswith("job:"):
-        j = key[4:]; e = st["jobs"][j]; T = f"ag setup: {j}"
-        c = _mac_list(T, f"{j}: {JOB_DESC[j]}\nClaude subagent model (Agent tool model:)", list(SETUP_CLAUDE_ALIASES), [e["claude"]])
-        if not c: return
-        b = _mac_list(T, f"{j}: ag backend for sub-agents", list(MODEL_BACKENDS), [e["ag"]["backend"]])
-        if not b: return
-        m = _setup_mac_model(T, b, e["ag"]["model"] if b == e["ag"]["backend"] else "default")
-        if m: setup_edit_job(st, j, claude=c, ag={"backend": b, "model": m})
+def setup_form_payload(st, status=None):
+    """Everything the mac form shows, as one JSON-able dict (the Python -> form contract). Reads the model cache."""
+    gp, pp = routing_paths(st["proj"])
+    cm = list(dict.fromkeys(list(SETUP_CLAUDE_ALIASES) + [m for m in model_choices("claude") if m != "default"]))
+    return {"scope": st["scope"], "paths": {"global": _setup_short(gp), "project": _setup_short(pp)},
+        "harness_opts": list(SETUP_HARNESSES), "harnesses": list(st["harnesses"]), "claude_md": setup_claude_md_on(st),
+        "presets": list(ROUTING_PRESETS), "preset_desc": SETUP_PRESET_DESC, "preset": st["preset"],
+        "preset_shown": "custom" if setup_custom_jobs(st) else st["preset"],
+        "preset_jobs": {p: {j: {"claude": t[j]["claude"], "ag": dict(t[j]["ag"])} for j in JOB_KEYS} for p, t in ROUTING_PRESETS.items()},
+        "job_keys": list(JOB_KEYS), "job_desc": JOB_DESC, "jobs": st["jobs"], "claude_models": cm,
+        "backend_order": list(BACKEND_TABS), "backends": st["backends"], "models": {b: model_choices(b) for b in BACKEND_TABS},
+        "caps": {b: {"modes": list(CAPS[b]["modes"]), "advisory": not CAPS[b]["native_enforce"], "plan": CAPS[b]["plan"]} for b in BACKEND_TABS},
+        "status": status or {},
+        "info": "Return = Save (writes immediately) · Esc = Cancel. Jobs: who does what. Backend tabs: defaults for `ag agents add --backend B`."}
+
+def setup_apply_form(st, out):
+    """Fold the form's JSON result into st (form -> Python contract). Bad fields are ignored. Pure."""
+    if out.get("scope") in ("global", "project"): st["scope"] = out["scope"]
+    if isinstance(out.get("harnesses"), list): st["harnesses"] = [h for h in SETUP_HARNESSES if h in out["harnesses"]]
+    if out.get("preset") in ROUTING_PRESETS and out["preset"] != st["preset"]: st.update(preset=out["preset"], forced=True, sets={})
+    if isinstance(out.get("claude_md"), bool): st["claude_md"] = out["claude_md"]
+    for j, e in (out.get("jobs") or {}).items():
+        if j not in JOB_KEYS or not isinstance(e, dict): continue
+        ga = e.get("ag") if isinstance(e.get("ag"), dict) else {}
+        st["edits"][j] = {**({"claude": str(e["claude"])} if e.get("claude") else {}),
+            **({"ag": {"backend": str(ga["backend"]), "model": str(ga.get("model") or "default")}} if ga.get("backend") else {})}
+    for b, e in (out.get("backends") or {}).items():
+        if b in BACKEND_TABS: st["bedits"][b] = _bk_clean(e)
+    return _setup_rebase(st)
 
 def setup_ui_mac(st, bg=None):
-    """Hub loop: pick a row -> its editor -> back to the hub. Save confirms -> st; Quit -> None."""
-    legend = "Pick a row, then Edit. ✓ Save shows the files, then writes them. Quit writes nothing."
-    last = None
-    while True:
-        rows = setup_rows(st)
-        r = _mac_list("ag setup", legend, [t for _, t in rows] + [SETUP_SAVE], [dict(rows).get(last, "")], ok="Edit", cancel="Quit")
-        if r is None: return None
-        if r == SETUP_SAVE:
-            if _mac_alert("ag setup: write these files?", "\n".join(setup_summary_lines(st, setup_targets(st))), "Save"): return st
-            continue
-        last = {t: k for k, t in rows}.get(r)
-        if last: _setup_mac_edit(st, last)
+    """One native form: top strip + Jobs tab + one tab per backend. Save -> st (validated); Cancel -> None."""
+    out = _osa_form(setup_form_payload(st, setup_backend_status()))
+    if out is None: return None
+    setup_apply_form(st, out)
+    errs = setup_validate(st)
+    if errs: raise RuntimeError("; ".join(errs))
+    return st
+
 
 # -- cli: single-screen curses editor
 def _setup_cli_ok():
@@ -11182,7 +11393,15 @@ def _setup_cli_draw(scr, st, S, bg):
         e, on = st["jobs"][j], S["sel"] == 4 + n
         _sput(scr, y, 0, f'{G("›") if on else " "} {j + ("*" if j in custom else ""):<11}', B if on else 0)
         _sput(scr, y, 14, e["claude"], R if on and S["col"] == 0 else 0)
-        _sput(scr, y, 24, f'{e["ag"]["backend"]} / {e["ag"]["model"]}', R if on and S["col"] == 1 else 0); y += 1
+        _sput(scr, y, 24, f'{e["ag"]["backend"]} / {e["ag"]["model"]}', R if on and S["col"] >= 1 else 0); y += 1
+    _sput(scr, y + 1, 2, f'{"Backend":<12}{"On":<5}{"Default model":<32}{"Mode":<8}Plan', B | curses.A_UNDERLINE); y += 2
+    for n, b in enumerate(BACKEND_TABS):
+        e, on = st["backends"][b], S["sel"] == 10 + n
+        _sput(scr, y, 0, f'{G("›") if on else " "} {b:<11}', B if on else 0)
+        for c, (x, v) in enumerate(((14, "yes" if e["enabled"] else "no"), (19, (e["model"] or "default")[:30]),
+                (51, e["mode"] or "-"), (59, ("yes" if e["plan"] else "no") if CAPS[b]["plan"] else "n/a"))):
+            _sput(scr, y, x, v, R if on and S["col"] == c else D if not e["enabled"] and c else 0)
+        y += 1
     t = setup_targets(st); plan = t["plan"]
     _sput(scr, y + 1, 0, f'Writes ({st["scope"]}): {len(plan)} file{"s" * (len(plan) != 1)}', B); y += 2
     room = h - 1 - y
@@ -11197,7 +11416,8 @@ def _setup_cli_draw(scr, st, S, bg):
 _SETUP_HELP = ["↑↓ / j k   move between rows", "←→ / h l / Tab   Claude vs ag column (job rows)",
     "Enter / e  edit the focused field", "  in pickers: type to filter, Backspace, Esc cancel,",
     "  Space toggles (harnesses), Tab = custom id", "s  review target files, then write", "q / Esc  quit without writing",
-    "*  job differs from the preset"]
+    "*  job differs from the preset", "Backend rows: ←→ pick On / model / mode / plan; Enter toggles or edits",
+    "  disabled backends drop out of the ag backend picker"]
 
 def _setup_cli_edit(scr, redraw, st, key, col):
     """Edit one field via popups; True if the state changed."""
@@ -11223,10 +11443,22 @@ def _setup_cli_edit(scr, redraw, st, key, col):
             r = pk(f"{j}: Claude subagent model", list(SETUP_CLAUDE_ALIASES), cur=e["claude"], custom=True, info=JOB_DESC[j])
             if r and r != e["claude"]: setup_edit_job(st, j, claude=r); return True
         else:
-            b = pk(f"{j}: ag backend", list(MODEL_BACKENDS), cur=e["ag"]["backend"], info=JOB_DESC[j])
+            b = pk(f"{j}: ag backend", setup_enabled_backends(st), cur=e["ag"]["backend"], info=JOB_DESC[j] + " · enabled backends only")
             m = b and pk(f"{j}: {b} model", model_choices(b), cur=e["ag"]["model"] if b == e["ag"]["backend"] else "default",
                 custom=True, info=setup_models_info(b))
             if m and {"backend": b, "model": m} != e["ag"]: setup_edit_job(st, j, ag={"backend": b, "model": m}); return True
+    elif key.startswith("bk:"):
+        b = key[3:]; e, cp = st["backends"][b], CAPS[b]
+        if col == 0: setup_edit_backend(st, b, enabled=not e["enabled"]); return True
+        if col == 1:
+            r = pk(f"{b}: default model", model_choices(b), cur=e["model"] or "default", custom=True, info=setup_models_info(b))
+            if r and (r if r != "default" else "") != e["model"]: setup_edit_backend(st, b, model=r); return True
+        elif col == 2:
+            adv = "" if cp["native_enforce"] else " (advisory)"
+            r = pk(f"{b}: default permission mode", ["unset"] + [m + adv for m in cp["modes"]],
+                cur=(e["mode"] + adv) if e["mode"] else "unset", info="used by ag agents add --backend " + b + " without --mode")
+            if r and (r.split()[0] if r != "unset" else "") != e["mode"]: setup_edit_backend(st, b, mode="" if r == "unset" else r.split()[0]); return True
+        elif cp["plan"]: setup_edit_backend(st, b, plan=not e["plan"]); return True
     return False
 
 def _setup_cli_main(scr, st, bg):
@@ -11250,15 +11482,18 @@ def _setup_cli_main(scr, st, bg):
         elif h < SETUP_MIN[0] or w < SETUP_MIN[1]: continue
         elif ch in (curses.KEY_UP, "k"): S["sel"] = (S["sel"] - 1) % len(keys)
         elif ch in (curses.KEY_DOWN, "j"): S["sel"] = (S["sel"] + 1) % len(keys)
-        elif ch in (curses.KEY_LEFT, "h"): S["col"] = 0
-        elif ch in (curses.KEY_RIGHT, "l"): S["col"] = 1
-        elif ch == "\t": S["col"] = 1 - S["col"]
+        elif ch in (curses.KEY_LEFT, "h", curses.KEY_RIGHT, "l", "\t"):  # job rows: 2 columns, backend rows: 4
+            mc = 3 if keys[S["sel"]].startswith("bk:") else 1; c = min(S["col"], mc)
+            S["col"] = max(0, c - 1) if ch in (curses.KEY_LEFT, "h") else min(mc, c + 1) if ch != "\t" else (c + 1) % (mc + 1)
         elif ch == "?": _setup_cli_confirm(scr, redraw, "ag setup keys", _SETUP_HELP, "any key closes", anykey=True)
         elif ch == "s":
+            errs = setup_validate(st)
+            if errs: _setup_cli_confirm(scr, redraw, "Can't save yet", errs, "any key closes", anykey=True); continue
             t = setup_targets(st)
             if _setup_cli_confirm(scr, redraw, "Write these files?", setup_summary_lines(st, t), "y/Enter write · n/Esc back"): return st
         elif ch in _SETUP_ENTER + ("e",):
-            if _setup_cli_edit(scr, redraw, st, keys[S["sel"]], S["col"]): dirty = True; S["msg"] = "edited (s to save)"
+            k = keys[S["sel"]]
+            if _setup_cli_edit(scr, redraw, st, k, S["col"] if k.startswith("bk:") else min(S["col"], 1)): dirty = True; S["msg"] = "edited (s to save)"
 
 def setup_ui_cli(st, bg=None):
     """Single-screen curses editor over the shared state; st on save, None on quit."""
@@ -11279,7 +11514,8 @@ def do_setup(a):
         return emit(a, "setup", error="stdin is not a TTY: pass --yes (plus flags) to run non-interactively",
             hint="ag setup --yes --scope global --harness claude --preset cost-first")
     try:
-        sets = parse_route_sets(a.set)
+        rest, bsets = parse_backend_sets(a.set)
+        sets = parse_route_sets(rest)
         harn = parse_harness_list(a.harness) if a.harness is not None else None
     except ValueError as e: return emit(a, "setup", error=str(e))
     ui = setup_ui_pick(want, osa=osa, tty=sys.stdin.isatty() and sys.stdout.isatty()) if inter else ""
@@ -11295,7 +11531,7 @@ def do_setup(a):
         det = ",".join(detect_harnesses()) or "none"
         try: harn = parse_harness_list(_ask("install skills for (claude,opencode,codex|all|none)", det) if ui == "plain" else det)
         except ValueError as e: return emit(a, "setup", error=str(e))
-    st = setup_state_from(scope, a.preset, sets, harn, a.claude_md)
+    st = setup_state_from(scope, a.preset, sets, harn, a.claude_md, bsets=bsets)
     if ui == "plain" and not a.preset:
         p = _ask("preset (cost-first|balanced|quality-first)", st["preset"])
         if p != st["preset"]: st["preset"] = p; _setup_rebase(st)
@@ -11306,7 +11542,7 @@ def do_setup(a):
             _say(f'{j} — {JOB_DESC[j]}: claude={e["claude"]}  ag={e["ag"]["backend"]}/{e["ag"]["model"]}')
             if _ask("  change? (y/N)", "n").lower()[:1] != "y": continue
             c = _ask_pick("  claude subagent alias", list(SETUP_CLAUDE_ALIASES), e["claude"])
-            b = _ask_pick("  ag backend", list(NATIVE_ORDER), e["ag"]["backend"])
+            b = _ask_pick("  ag backend (enabled)", setup_enabled_backends(st), e["ag"]["backend"])
             if b not in NATIVE_ORDER: _say(f"  unknown backend {b!r}, keeping {e['ag']['backend']}"); b = e["ag"]["backend"]
             m = _ask_pick("  ag model", model_choices(b), e["ag"]["model"] if b == e["ag"]["backend"] else "default")
             setup_edit_job(st, j, claude=c, ag={"backend": b, "model": m})
@@ -11314,6 +11550,8 @@ def do_setup(a):
         try: st = (setup_ui_mac if ui == "mac" else setup_ui_cli)(st, bg)
         except RuntimeError as e: return emit(a, "setup", error=str(e), hint="retry with --ui cli or --ui plain")
         if st is None: return emit(a, "setup", {"_text": "cancelled (nothing written)", "cancelled": True})
+    errs = setup_validate(st)
+    if errs: return emit(a, "setup", error="; ".join(errs), hint="ag setup --set backend.B.enabled=true  |  --set JOB=ag:BACKEND/MODEL")
     t = setup_targets(st)
     scope, harn, preset, jobs = st["scope"], st["harnesses"], st["preset"], st["jobs"]
     plan, notes, skill_err, block, tdir = t["plan"], t["notes"], t["skill_err"], t["block"], t["tdir"]
@@ -11336,11 +11574,12 @@ def do_setup(a):
             out.append(f"{'wrote' if st_ != 'unchanged' else 'unchanged'} {p}")
         files.append(rec)
     out += notes
-    data = {"scope": scope, "harnesses": harn, "preset": preset, "routing": jobs, "files": files,
+    data = {"scope": scope, "harnesses": harn, "preset": preset, "routing": jobs, "backends": st["backends"], "files": files,
         "dry_run": bool(a.dry_run), "notes": notes}
     if ui == "mac" and not a.dry_run:
         wrote = [Path(f["path"]).name for f in files if f["status"] != "unchanged"]
-        try: _osa(_OSA_NOTE, "ag setup", f"wrote {len(wrote)} file(s): {', '.join(wrote)}" if wrote else "nothing changed")
+        msg = f"wrote {len(wrote)} file(s): {', '.join(wrote)} · routing {_setup_short(plan[0][0])}" if wrote else "nothing changed"
+        try: _osa(_OSA_NOTE, "ag setup", msg)
         except RuntimeError: pass
     if skill_err:
         if not getattr(a, "json", False): print("\n".join(out))
@@ -11375,6 +11614,20 @@ def _setup_selfcheck():
     setup_apply_preset(s, "cost-first")
     assert setup_custom_jobs(s) == [] and s["edits"] == {} and setup_rows(s)[6] == ("job:review", "review — Claude: opus · ag: claude/opus")
     assert setup_filter(["opencode/a", "anthropic/Claude-x"], "an CLA") == ["anthropic/Claude-x"]
+    # per-backend config
+    r, bs = parse_backend_sets(["plan=claude:opus", "backend.codex.mode=edits", "backend.gemini.enabled=false", "backend.opencode.model=default"])
+    assert r == ["plan=claude:opus"] and bs == {"codex": {"mode": "edits"}, "gemini": {"enabled": False}, "opencode": {"model": ""}}
+    for bad in ("backend.nope.mode=ro", "backend.codex.colour=x", "backend.gemini.mode=auto", "backend.codex.enabled=maybe"):
+        try: parse_backend_sets([bad]); raise AssertionError(bad)
+        except ValueError: pass
+    bk = backends_effective({"backends": {"codex": {"mode": "ro", "model": "g"}}}, {"backends": {"codex": {"mode": "edits"}, "x": 1}})
+    assert bk["codex"] == {"enabled": True, "model": "g", "mode": "edits", "plan": False, "source": "project"} and bk["claude"]["source"] == "default"
+    bk["opencode"]["enabled"] = False
+    assert routing_disabled(routing_effective(), bk) == [("mechanical", "opencode")]
+    assert "opencode: off" in backends_line(bk) and "codex: g (mode edits)" in backends_line(bk)
+    s = setup_state_from("global", None, None, [], None, proj="/x", existing={"global": {}, "project": {}}, bsets={"opencode": {"enabled": False}})
+    assert setup_validate(s) and "opencode" not in setup_enabled_backends(s)
+    setup_edit_backend(s, "opencode", enabled=True); assert not setup_validate(s)
     assert setup_ui_pick("", "darwin", {}, "/o") == "mac" and setup_ui_pick("", "darwin", {"SSH_TTY": "x"}, "/o") == "cli"
     assert setup_ui_pick("", "linux", {}, None, tty=False) == "plain" and setup_ui_pick("mac", "linux", {}, None) == "cli"
     assert setup_ui_pick("plain", "darwin", {}, "/o") == "plain" and setup_ui_pick("mac", "linux", {}, "/o", tty=False) == "mac"
@@ -11499,7 +11752,7 @@ def build():
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
     mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now")
     rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS)
-    st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS or JOB=ag:BACKEND/MODEL (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: mac (native dialogs) | cli (full-screen) | plain (prompts); default auto, env AG_SETUP_UI")
+    st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL | backend.B.(enabled|model|mode|plan)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: mac (native dialogs) | cli (full-screen) | plain (prompts); default auto, env AG_SETUP_UI")
     return p
 
 # ---- portable task snapshots (outbound SSH, no native runtime migration) ----

@@ -127,18 +127,20 @@ Live discovery: opencode (`opencode models`), codex (`~/.codex/models_cache.json
 ag setup [--scope global|project] [--harness claude,opencode,codex|all]
          [--preset cost-first|balanced|quality-first]
          [--set JOB=claude:ALIAS] [--set JOB=ag:BACKEND/MODEL]
+         [--set backend.B.enabled=true|false] [--set backend.B.model=ID]
+         [--set backend.B.mode=ro|edits|auto|full|unset] [--set backend.B.plan=true|false]
          [--claude-md|--no-claude-md] [--yes] [--dry-run] [--ui mac|cli|plain]
 ```
 
 Interactive front-ends (flags pre-fill them; `--ui` or env `AG_SETUP_UI` picks one; `--yes`/`--dry-run`/no TTY stay non-interactive):
 
-- `mac` (default on local macOS): native dialogs. A hub lists Scope, Harnesses, Preset, Write CLAUDE.md and one row per job (`review — Claude: opus · ag: claude/opus`); pick a row → Edit → back to the hub. Jobs: Claude alias → ag backend → model (lists over 25 ask for a filter first; "Type a custom id…" for anything else). `✓ Save` shows the target files, then writes and notifies; Quit writes nothing. Needs no TTY.
-- `cli` (default elsewhere on a TTY): one curses screen: settings, the 6-job table (Job | Claude | ag backend/model, `*` = differs from preset), target files. `↑↓` move, `←→`/Tab pick the Claude or ag column, `Enter` edits in a popup (type to filter, Backspace, Esc cancels, Space toggles harnesses, Tab = custom id), `s` reviews + writes, `q` quits, `?` help. Needs 60x16; smaller falls back to `plain`.
+- `mac` (default on local macOS): one native window (JXA + Cocoa, no TTY needed). Top strip: Scope popup, Preset popup (cost-first/balanced/quality-first/custom; changing it refills the job rows at once), skill checkboxes per harness, Write CLAUDE.md checkbox. Tab **Jobs**: per job a Claude-alias popup and an editable **ag target** combo (`backend · model` for every cached model of every enabled backend; type any id as `backend · model` or `backend/model`). One tab per backend (claude, opencode, codex, gemini, cursor): Enabled, Default model (editable combo), Default permission mode (only modes that backend supports; `(advisory)` where not enforced natively), Plan, plus a status line (version, auth from the provider probe refreshed ≤1s before opening, model count + fetch age). Return = Save, Esc = Cancel. A job pointing at a disabled backend shows an error and keeps the window open. Save writes immediately and posts a notification (file count + routing path); `--dry-run` prints the diff instead. Contract: Python passes one JSON argv, the script prints one JSON result (`AG_FORM_SELFTEST=1` builds the window without showing it and prints the initial values + `_errors`).
+- `cli` (default elsewhere on a TTY): one curses screen: settings, the 6-job table (Job | Claude | ag backend/model, `*` = differs from preset), target files. `↑↓` move, `←→`/Tab pick the Claude or ag column, `Enter` edits in a popup (type to filter, Backspace, Esc cancels, Space toggles harnesses, Tab = custom id), `s` reviews + writes, `q` quits, `?` help. A **Backends** table follows the jobs (On / Default model / Mode / Plan): `←→` picks the field, `Enter` toggles or opens the picker. The ag backend picker lists enabled backends only; `s` refuses to save while a job targets a disabled backend. Needs 60x23; smaller falls back to `plain`.
 - `plain`: the original prompt sequence.
 
-Stale model lists refresh in the background; the next model picker sees the fresh list. Applying a preset over custom picks asks first. It writes:
+Stale model lists refresh in the background; the next model picker sees the fresh list. Applying a preset in `cli` over custom picks asks first. It writes:
 
-1. `routing.json` for the scope (see [Routing](#routing)).
+1. `routing.json` for the scope (see [Routing](#routing)), including per-backend defaults.
 2. The `ag-cli` and `ag-agents` skills (rendered from `skills/` with your `ag` path, routing and scope) into each harness skill dir:
 
 | harness | global | project |
@@ -207,7 +209,9 @@ Each job maps to a Claude alias (for Claude Code subagents' `model:`) and an ag 
 
 Also `balanced` (review -> sonnet) and `quality-first` (mechanical sonnet, implement opus, rest fable). Unset ag entries fall back to opencode muse-spark.
 
-Storage: global `~/.config/ag/routing.json`; project `<git toplevel or cwd>/.agent/routing.json`; shape `{"version":1,"preset":"cost-first","jobs":{job:{"claude":...,"ag":{"backend":...,"model":...}}}}`. Effective routing = global overlaid per job by project.
+Storage: global `~/.config/ag/routing.json`; project `<git toplevel or cwd>/.agent/routing.json`; shape `{"version":1,"preset":"cost-first","jobs":{job:{"claude":...,"ag":{"backend":...,"model":...}}},"backends":{b:{"enabled":bool,"model":str,"mode":str,"plan":bool}}}`. Effective routing = global overlaid per job by project; `backends` overlays per field (only non-default fields are written).
+
+Backend defaults: `ag agents add N --backend B` without `--model`/`--mode`/`--plan` takes B's default model/mode/plan; `--job` still picks backend+model from routing (a routed `default` model falls to the backend default), mode/plan from the backend. Disabled backends vanish from every setup picker; `ag route` flags a job routed to one (`! backend disabled`, `warnings` in `--json`, which also carries `backends`); `agents add` on one warns. The ag-agents skill gets a compact line: `Backend defaults (...): opencode: <model> (mode edits) · gemini: off`.
 
 ```sh
 ag setup                      # create/change routing (+ skills)

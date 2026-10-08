@@ -6162,25 +6162,139 @@ def wt_remove(wt, force=False):
     else: _git(repo,"worktree","prune")
     return None, None
 
+import concurrent.futures as _cf
+# ---- provider probe (installed/version/auth/compat) + idempotent receipts ----
+def _ver_tuple(s):
+    m = re.search(r"\d+(?:\.\d+)*", s or "")
+    return tuple(int(x) for x in m.group(0).split(".")) if m else ()
+# (min_version, verdict) ascending; highest min <= version wins. Seeded with versions seen working; no known broken.
+COMPAT = {"claude":[("0","graceful"),("2.1.289","ok")], "codex":[("0","graceful"),("0.160.0","ok")],
+    "cursor":[("0","graceful"),("2026.04.17","ok")], "opencode":[("0","graceful"),("1.18.31","ok")],
+    "gemini":[("0","graceful"),("0.45.2","ok")], "echo":[("0","ok")]}
+def compat_verdict(backend, version):
+    v, out = _ver_tuple(version), "unknown"
+    if backend == "echo": return "ok"
+    if not v: return out
+    for mn, verdict in COMPAT.get(backend, []):
+        if v >= _ver_tuple(mn): out = verdict
+    return out
+AUTH_HINT = {"claude":"run 'claude' once to log in","codex":"run 'codex login'","cursor":"run 'agent login'",
+    "opencode":"run 'opencode auth login'"}
+def _auth_cmd(b):
+    return {"claude":["claude","auth","status"],"codex":["codex","login","status"],
+        "cursor":[_cursor_bin(),"status"],"opencode":[_opencode_bin(),"auth","list"]}.get(b)
+def auth_parse(b, out):
+    """-> 'yes'|'no'|'unknown' from auth-status output (exit codes are unreliable: cursor says 'Not logged in' with rc 0)."""
+    t = ANSI.sub("", out or "").strip(); low = t.lower()
+    if b == "claude":
+        try: return "yes" if json.loads(t).get("loggedIn") else "no"
+        except Exception: return "unknown"
+    if b in ("codex","cursor"):
+        if "not logged in" in low: return "no"
+        return "yes" if "logged in" in low else "unknown"
+    if b == "opencode":
+        m = re.search(r"(\d+) credentials?", low)
+        return "yes" if m and int(m.group(1)) > 0 else "unknown"  # none stored != unauthenticated (env keys/free models)
+    return "unknown"
+def _run_probe(argv, t=10):
+    try:
+        p = subprocess.run(argv,capture_output=True,text=True,timeout=t,stdin=subprocess.DEVNULL)
+        return p.returncode, (p.stdout or "")+(p.stderr or "")
+    except FileNotFoundError: return None, ""
+    except Exception as e: return -1, str(e)[:100]
+def probe_backend(b):
+    prog = {"cursor":[_cursor_bin(),"--version"],"opencode":[_opencode_bin(),"--version"]}.get(b) or PROBES.get(b)
+    ac = _auth_cmd(b)
+    with _cf.ThreadPoolExecutor(2) as ex:
+        fv = ex.submit(_run_probe, prog); fa = ex.submit(_run_probe, ac) if ac else None
+        rc, out = fv.result(); arc, aout = fa.result() if fa else (None, "")
+    ok = rc == 0; ver = (out.strip().splitlines() or [""])[0][:60] if ok else ""
+    hint = ("not on PATH" if rc is None else (out.strip()[:120] if not ok else ""))
+    if not ok and b == "codex" and rc is not None: hint = "reinstall: npm i -g @openai/codex"
+    if b == "gemini" and ok: hint = "free tier retired; needs Antigravity or API key"
+    if b == "echo" and ok: hint = "local plumbing-test backend"
+    auth = auth_parse(b, aout) if ok and arc is not None else "unknown"
+    if auth == "no": hint = AUTH_HINT.get(b, "log in")
+    return {"backend":b,"installed":ok,"ok":ok,"version":ver,"compat":compat_verdict(b,ver) if ok else "unknown",
+        "auth":auth,"hint":hint,"bin":prog[0],"ts":time.time()}
+PROBE_TTL = 60
+def _providers_path(): return ag_cache_home()/"providers.json"
+def providers_snapshot(backends, refresh=False, deadline=10):
+    """Cached per-backend probes (TTL 60s, keyed on binary path); stale/missing ones re-probed in parallel, never blocking > deadline."""
+    p = _providers_path()
+    try: cache = json.loads(p.read_text())
+    except Exception: cache = {}
+    bins = {"cursor":_cursor_bin(),"opencode":_opencode_bin()}
+    need = [b for b in backends if refresh or time.time()-(cache.get(b) or {}).get("ts",0) > PROBE_TTL
+        or (cache[b].get("bin") != (bins.get(b) or PROBES.get(b,[""])[0]))]
+    if need:
+        ex = _cf.ThreadPoolExecutor(max(1,len(need)))
+        futs = {ex.submit(probe_backend,b):b for b in need}
+        done, _ = _cf.wait(futs, timeout=deadline)
+        ex.shutdown(wait=False, cancel_futures=True)
+        for f in done:
+            try: cache[futs[f]] = f.result()
+            except Exception: pass
+        try: p.parent.mkdir(parents=True, exist_ok=True); tmp = p.with_suffix(f".{os.getpid()}.tmp"); tmp.write_text(json.dumps(cache)); os.replace(tmp, p)
+        except Exception: pass
+    return {b:cache[b] for b in backends if b in cache}
+def preflight_auth(backend):
+    """Error string if backend is definitely unauthenticated, else None (unknown = proceed). Never raises."""
+    if backend not in AUTH_HINT or os.environ.get("AG_PROBE","1") == "0": return None
+    try: r = providers_snapshot([backend]).get(backend) or {}
+    except Exception: return None
+    return f'not logged in to {backend}: {AUTH_HINT[backend]}' if r.get("auth") == "no" else None
+
+# Receipts: --request-id K makes wake/delegate/chat send idempotent.
+def _rcpt(a, sdir, cmd, agent, payload):
+    """(early_rc, handle). early_rc not None => replay/conflict already emitted. handle => pass to _rcpt_done."""
+    k = getattr(a,"request_id",None)
+    if not k: return None, None
+    d = sdir/"receipts"; d.mkdir(parents=True, exist_ok=True)
+    f = d/(hashlib.sha1("\0".join((cmd,agent,k)).encode()).hexdigest()+".json")
+    ph = hashlib.sha1(payload.encode()).hexdigest()
+    rec = {"cmd":cmd,"agent":agent,"payload_hash":ph,"status":"in_progress","ref":getattr(a,"job",None) or k,"ts":time.time()}
+    try:
+        fd = os.open(f, os.O_CREAT|os.O_EXCL|os.O_WRONLY, 0o600); os.write(fd, json.dumps(rec).encode()); os.close(fd)
+        return None, f
+    except FileExistsError: pass
+    old = {}
+    for _ in range(20):
+        try: old = json.loads(f.read_text()); break
+        except Exception: time.sleep(0.05)
+    if old.get("payload_hash") != ph: return emit(a,cmd,error="request id conflict",hint=f"request id {k} was used with a different payload") or 1, None
+    st = old.get("status")
+    if st == "failed": return emit(a,cmd,{"replayed":True,"status":"failed"},error=old.get("error","failed")) or 1, None
+    data = {k2:old[k2] for k2 in ("job","session","reply","exit","sid","agent") if k2 in old}
+    data.update(replayed=True, status=st, **({"ref":old.get("ref")} if st == "in_progress" else {}))
+    if not getattr(a,"json",False) and cmd != "wake":
+        data["_text"] = (old.get("reply","") + "\n" if st == "done" else "") + (f'[exit={old.get("exit")}]' if st == "done" else f'in_progress (ref {old.get("ref")})')
+    elif not getattr(a,"json",False): data["_text"] = f'wake replayed -> {agent} (background job {old.get("job")})'
+    return emit(a,cmd,data) or 0, None
+def _rcpt_done(h, r):
+    """Finalize receipt from a run_turn/launch result dict."""
+    if not h: return
+    try:
+        rec = json.loads(h.read_text())
+        if "error" in r: rec.update(status="failed", error=r["error"])
+        else: rec.update(status="done", **{k:r[k] for k in ("job","session","reply","exit","sid") if k in r})
+        tmp = h.with_suffix(".tmp"); tmp.write_text(json.dumps(rec)); os.replace(tmp, h)
+    except Exception: pass
+def do_receipts(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    cut = time.time() - float(a.days)*86400; n = 0
+    for f in (sdir/"receipts").glob("*.json"):
+        try:
+            if f.stat().st_mtime < cut: f.unlink(); n += 1
+        except OSError: pass
+    return emit(a,"receipts",{"_text":f"removed {n} receipts","removed":n})
+
 def do_agents(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     if a.sub=="doctor":
-        probes = dict(PROBES); probes["cursor"] = [_cursor_bin(),"--version"]; probes["opencode"] = [_opencode_bin(),"--version"]
-        rows = []
-        for b,probe in probes.items():
-            try:
-                p = subprocess.run(probe,capture_output=True,text=True,timeout=15)
-                ok = p.returncode==0
-                ver = (p.stdout or p.stderr or "").strip().splitlines()[0][:60] if ok else (p.stderr or "")[:120]
-                hint = ""
-                if not ok and b=="codex": hint = "reinstall: npm i -g @openai/codex"
-                if b=="gemini" and ok: hint = "free tier retired; needs Antigravity or API key"
-                if b=="echo" and ok: hint = "local plumbing-test backend"
-                rows.append({"backend":b,"ok":ok,"version":ver,"hint":hint})
-            except FileNotFoundError:
-                rows.append({"backend":b,"ok":False,"version":"","hint":"not on PATH"})
-            except Exception as e:
-                rows.append({"backend":b,"ok":False,"version":"","hint":str(e)[:100]})
+        bs = ["claude","opencode","gemini","codex","echo","cursor"]
+        snap = providers_snapshot(bs, refresh=getattr(a,"refresh",False), deadline=12)
+        rows = [snap.get(b) or {"backend":b,"installed":False,"ok":False,"version":"","compat":"unknown","auth":"unknown","hint":"probe timed out"} for b in bs]
         # rtk coverage: claude/opencode via their global hook/plugin, the rest via prompt hint
         def _has_rtk(*paths):
             for p in paths:
@@ -6197,8 +6311,8 @@ def do_agents(a):
                 "hint":(f"no hook for {','.join(miss)} (rtk init -g)" if miss else "hooks: claude,opencode")+"; prompt hint: "+",".join(RTK_NOHOOK)})
         else:
             rows.append({"backend":"rtk","ok":False,"version":"","hint":"off (AG_RTK=0)" if shutil.which("rtk") else "not on PATH (optional)"})
-        if getattr(a,"json",False): return emit(a,"agents",{"backends":rows})
-        txt = "\n".join(f'{"ok " if r["ok"] else "BAD"} {r["backend"]:9} {r["version"]} {r["hint"]}' for r in rows)
+        if getattr(a,"json",False): return emit(a,"agents",{"backends":[{**r,"installed":r.get("installed",r.get("ok"))} for r in rows]})
+        txt = "\n".join(f'{"ok " if r["ok"] else "BAD"} {r["backend"]:9} {r["version"]:28} compat={r.get("compat","-"):8} auth={r.get("auth","-"):8} {r["hint"]}'.rstrip() if "compat" in r else f'{"ok " if r["ok"] else "BAD"} {r["backend"]:9} {r["version"]} {r["hint"]}' for r in rows)
         return emit(a,"agents",{"_text":txt})
     rows = load_agents(sdir)
     if a.sub=="list":
@@ -6849,6 +6963,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if command and backend != "opencode":
             _release_agent_turn(_turn_lock); _turn_lock = None
             return {"error":f"--command is opencode-only (agent {name} runs {backend})"}
+        if not _rs and (_pe := preflight_auth(backend)): _release_agent_turn(_turn_lock); _turn_lock = None; return {"error":_pe}
         meta = load_chat_meta(sdir,name,agent=a)
         sids = meta.get("sids") or {}
         sid = sids.get(backend, "")
@@ -7229,8 +7344,10 @@ def do_chat(a):
                 hint="ag chat send NAME --timeout 300 TEXT")
         live = not getattr(a,"json",False)
         if getattr(a,"job",None): _event(sdir,"chat_job",a.name,job=a.job)
+        _rc, _h = _rcpt(a, sdir, "chat", a.name, json.dumps([text,cmd]))
+        if _rc is not None: return _rc
         r = run_turn(sdir,a.name,text,command=cmd,timeout_s=timeout_s,
-            on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
+            on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None)); _rcpt_done(_h, r)
         if "error" in r and not r.get("timed_out"):
             return emit(a,"chat",error=r["error"])
         if r.get("slash") and r.get("exit") and getattr(a,"json",False):
@@ -7296,8 +7413,10 @@ def do_wake(a):
             return emit(a,"wake",error=f"no such agent: {notify}",hint="ag agents list")
     ck, cerr = _cohort_kw(sdir, a)
     if cerr: return emit(a,"wake",error=cerr,hint="ag agents list")
+    _rc, _h = _rcpt(a, sdir, "wake", agent, json.dumps([text,notify,on_done,timeout_s,max_runtime_s,ck.get("cohort")],default=str))
+    if _rc is not None: return _rc
     r = launch_wake_chat(sdir,agent,text,notify=notify,on_done=on_done,timeout_s=timeout_s,
-        max_runtime_s=max_runtime_s,job_type=getattr(a,"job",None),**ck)
+        max_runtime_s=max_runtime_s,job_type=getattr(a,"job",None),**ck); _rcpt_done(_h, r)
     if "error" in r: return emit(a,"wake",error=r["error"],hint="ag agents list")
     grp = ck.get("cohort",{}).get("group")
     if getattr(a,"json",False):
@@ -9523,14 +9642,17 @@ def do_delegate(a):
     if timeout_s is None:
         return emit(a,"delegate",error="invalid --timeout: need finite seconds >= 0 (0 = unlimited)",
             hint="ag delegate AGENT --timeout 300 TASK")
+    _rc, _h = _rcpt(a, sdir, "delegate", a.agent, json.dumps([task, getattr(a,"parent",None), getattr(a,"group",None)]) if getattr(a,"parent",None) else task)
+    if _rc is not None: return _rc
     if getattr(a,"parent",None):
         ck, cerr = _cohort_kw(sdir, a)
         r = {"error": cerr} if cerr else launch_wake_chat(sdir,a.agent,task,max_runtime_s=timeout_s,job_type=getattr(a,"job",None),**ck)
+        _rcpt_done(_h, r)
         if "error" in r: return emit(a,"delegate",error=r["error"])
         return emit(a,"delegate",{"_text":f'delegated to {a.agent} (background job {r["job"]}, group {ck["cohort"]["group"]})',"job":r["job"],"group":ck["cohort"]["group"],"agent":a.agent})
     live = not getattr(a,"json",False)
     r = delegate_task(sdir,a.agent,task,timeout_s=timeout_s,job=getattr(a,"job",None),
-        on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None))
+        on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None)); _rcpt_done(_h, r)
     if "error" in r and not r.get("timed_out"):
         return emit(a,"delegate",error=r["error"])
     if getattr(a,"json",False):
@@ -10057,6 +10179,7 @@ def do_selfcheck(a):
     assert classify_turn_failure("claude",1,"Authentication required",False) is None
     secret_selfcheck()
     _setup_selfcheck()
+    assert compat_verdict("claude","2.1.10")=="graceful" and compat_verdict("claude","2.1.289")=="ok" and auth_parse("codex","Not logged in")=="no"
     print(f"selfcheck ok ({td})")
     return 0
 
@@ -10485,7 +10608,7 @@ def build():
     aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
     ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)')
-    ags.add_parser("doctor")
+    ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     ro = sub.add_parser("roles",help="behavior presets (system prompts) for agents"); ros=ro.add_subparsers(dest="sub",required=True)
     ros.add_parser("list")
     roa=ros.add_parser("add"); roa.add_argument("name"); roa.add_argument("--system",default=None); roa.add_argument("--file",default=None)
@@ -10496,7 +10619,7 @@ def build():
     ch = sub.add_parser("chat",help="talk to an agent headless"); chs=ch.add_subparsers(dest="sub",required=True)
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
     chs2.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); chs2.add_argument("--command",default=None,help="opencode native custom command (message becomes its args)")
-    chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded")
+    chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); chs2.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result")
     chu=chs.add_parser("usage",help="last-turn + total provider token usage"); chu.add_argument("name")
     chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--limit",type=int,default=20)
     chd=chs.add_parser("diff",help="patch of one turn's changes (git checkpoints)"); chd.add_argument("name"); chd.add_argument("--turn",type=int,default=None); chd.add_argument("--stat",action="store_true")
@@ -10508,7 +10631,7 @@ def build():
     ata=sub.add_parser("attach",help="jump into a live session terminal (Ctrl-] detaches)"); ata.add_argument("sess")
     fgt=sub.add_parser("forget",help="wipe a session's logs (auth traces)"); fgt.add_argument("sess")
     sub.add_parser("keys",help="control cheat-sheet")
-    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); dg.add_argument("--parent",default=None,help="run as background wake; auto-wake PARENT when its cohort finishes"); dg.add_argument("--group",default=None); dg.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded")
+    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); dg.add_argument("--parent",default=None,help="run as background wake; auto-wake PARENT when its cohort finishes"); dg.add_argument("--group",default=None); dg.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); dg.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result")
     cx=sub.add_parser("context",help="scoped guidance + persistent memory"); cxs=cx.add_subparsers(dest="ctxsub",required=False)
     cxs.add_parser("init",help="non-destructive scaffold of context state")
     cxa=cxs.add_parser("assign",help="assign agent to project scope + brief"); cxa.add_argument("cname"); cxa.add_argument("--scope",default=""); cxa.add_argument("--project-root",default=None); cxa.add_argument("--task",default=None); cxa.add_argument("--acceptance",default=None); cxa.add_argument("--file",dest="cfile",action="append",default=[]); cxa.add_argument("--brief",default=None); cxa.add_argument("--brief-file",default=None)
@@ -10518,7 +10641,8 @@ def build():
     cmc=cms.add_parser("config",help="role defaults / per-agent override"); cmc.add_argument("--role",dest="cprole",default=None,choices=["orchestrator","sub"]); cmc.add_argument("--agent",dest="cpagent",default=None); cmc.add_argument("--enable",dest="cpenable",action="store_true",default=None); cmc.add_argument("--disable",dest="cpdisable",action="store_true"); cmc.add_argument("--max-turns",dest="cpmax",type=int,default=None); cmc.add_argument("--tokens",dest="cptokens",type=int,default=None); cmc.add_argument("--keep",dest="cpkeep",type=int,default=None); cmc.add_argument("--timeout",dest="cptimeout",type=int,default=None); cmc.add_argument("--clear",dest="cpclear",action="store_true")
     cmsh=cms.add_parser("show",help="effective settings + stats"); cmsh.add_argument("cpname",nargs="?",default="")
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
-    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired")
+    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)")
+    rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50); ws.add_argument("--wait",default=None); ws.add_argument("--timeout",type=int,default=30); ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)")
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
     hosts=sub.add_parser("hosts",help="outbound SSH host and project mappings"); hsub=hosts.add_subparsers(dest="hostsub",required=True)
@@ -11048,7 +11172,7 @@ def main(argv=None):
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
         "delegate":do_delegate,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
-        "models":do_models,"route":do_route,"setup":do_setup}[a.subcmd]
+        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)
 

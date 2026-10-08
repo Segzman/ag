@@ -3,15 +3,15 @@
 `ag` is a single-file Python CLI (stdlib only, POSIX) with two halves:
 
 - **CLI** — logged commands with approvals, non-blocking PTY sessions, secret prompts, notes/todos, live model discovery, a TUI.
-- **Agents** — drives coding-CLI backends (`claude`, `opencode`, `codex`, `gemini`, `cursor`, plus a keyless `echo`): headless turns, background wakes, per-job model routing, worktree isolation, per-turn checkpoints, scoped context handoff.
+- **Agents** — drives coding-CLI backends (`claude`, `opencode`, `codex`, `gemini`, `cursor`, plus a keyless `echo`, or any ACP agent): headless turns, background wakes and cohorts, a visible turn queue with stop/steer, scheduled wakes, per-job model routing, permission modes, per-agent env, worktree isolation, per-turn checkpoints, scoped context handoff.
 
 State lives in `./.agent/` (override: `--dir`, `$AGENT_CLI_DIR`). Every command takes `--json`.
 
 ## Contents
 
 - [Quickstart](#quickstart) · [Capability matrix](#capability-matrix)
-- [Part 1 — CLI](#part-1--cli): [Install](#install) · [State dir](#state-dir) · [Sessions](#sessions-pty) · [run / approvals / rtk](#run-approvals-rtk) · [Secrets](#secrets) · [Notes / todos](#notes-and-todos) · [Models](#models) · [Setup](#setup) · [TUI](#tui)
-- [Part 2 — Agents](#part-2--agents): [Roster](#roster-and-backends) · [Routing](#routing) · [Delegation / wake](#delegation-and-wake) · [Scheduled tasks](#scheduled-tasks) · [Reliability](#reliability) · [Isolation](#isolation-worktree-per-agent) · [Checkpoints](#checkpoints) · [Usage](#usage) · [Context](#context-and-handoff) · [Harness profiles](#harness-profiles) · [Roles](#roles)
+- [Part 1 — CLI](#part-1--cli): [Install and updates](#install) · [State dir](#state-dir) · [Sessions](#sessions-pty) · [run / approvals / rtk](#run-approvals-rtk) · [Secrets](#secrets) · [Notes / todos](#notes-and-todos) · [Models](#models) · [Setup](#setup) · [TUI](#tui)
+- [Part 2 — Agents](#part-2--agents): [Roster and env](#roster-and-backends) · [Capabilities / modes](#capabilities-and-permission-modes) · [ACP](#acp-transport) · [Routing](#routing) · [Delegation / wake](#delegation-and-wake) · [Cohorts](#delegated-completion-cohorts) · [Queue / stop / steer](#queue-stop-steer) · [Scheduled tasks](#scheduled-tasks) · [Reliability](#reliability) · [Reap / ps](#reap-lost-wakes-process-view) · [Isolation](#isolation-worktree-per-agent) · [Checkpoints](#checkpoints) · [Usage](#usage) · [Context](#context-and-handoff) · [Multi-host](#multi-host) · [Harness profiles](#harness-profiles) · [Roles](#roles)
 - [Docs](#docs) · [Limitations](#limitations-honest)
 
 ## Quickstart
@@ -19,7 +19,7 @@ State lives in `./.agent/` (override: `--dir`, `$AGENT_CLI_DIR`). Every command 
 ```sh
 git clone https://github.com/Segzman/ag.git && cd ag
 ./install.sh                      # -> ~/.local/bin/ag (single file; no sudo, no network)
-ag setup                          # routing + skills editor (macOS dialogs / full-screen; --ui plain)
+ag setup                          # routing + per-backend defaults + skills (macOS window / curses; --ui plain)
 ag --dir "$PWD/.agent" agents doctor     # which backends are installed
 ag --dir "$PWD/.agent" agents list
 ag --dir "$PWD/.agent" chat send claude "hi"
@@ -39,16 +39,16 @@ JOB="$(./ag --dir "$STATE" --json wake smoke "summarize this" | python3 -c 'impo
 
 ## Capability matrix
 
-| backend | resume | rtk | skills | MCP | profile config |
-|---|---|---|---|---|---|
-| claude | session id | own hook | `--plugin-dir` | `--mcp-config` | argv only |
-| opencode | session id | own plugin | `OPENCODE_CONFIG_DIR/skills` | translated `mcp` | `OPENCODE_CONFIG` |
-| codex | `exec --json` resume | prompt hint | mirrored in scoped `CODEX_HOME/skills` | `[mcp_servers.*]` | `CODEX_HOME` |
-| cursor | session id | prompt hint | prompt only (reported) | reported unsupported | — |
-| gemini | stateless (history replay) | prompt hint | prompt only (reported) | reported unsupported | — |
-| echo | stateless | — | — | — | — |
+| backend | resume | rtk | skills | MCP | profile config | ACP (`--transport acp`) |
+|---|---|---|---|---|---|---|
+| claude | session id | own hook | `--plugin-dir` | `--mcp-config` | argv only | no |
+| opencode | session id | own plugin | `OPENCODE_CONFIG_DIR/skills` | translated `mcp` | `OPENCODE_CONFIG` | yes (verified) |
+| codex | `exec --json` resume | prompt hint | mirrored in scoped `CODEX_HOME/skills` | `[mcp_servers.*]` | `CODEX_HOME` | no |
+| cursor | session id | prompt hint | prompt only (reported) | reported unsupported | — | yes (needs login) |
+| gemini | stateless (history replay) | prompt hint | prompt only (reported) | reported unsupported | — | yes (needs auth) |
+| echo | stateless | — | — | — | — | no |
 
-Native command flag (`chat send --command`) is opencode-only; others reject it. Backend CLIs are installed/authenticated by you; `ag agents doctor` only reports.
+Per-backend permission modes and capability flags: `ag agents caps` ([Capabilities](#capabilities-and-permission-modes)). `--backend acp --acp-cmd CMD` runs any ACP agent. Native command flag (`chat send --command`) is opencode-only; others reject it. Backend CLIs are installed/authenticated by you; `ag agents doctor` only reports.
 
 ---
 
@@ -206,6 +206,20 @@ ag agents env w [--json]                                     # effective env dif
 
 Merge order: `os.environ` -> profile backend env -> profile env -> agent env -> subscription strip -> opencode mode overlay / askpass. Same per-agent part for headless turns, `ag handoff`/native and compaction. Keys matching `*KEY*|*TOKEN*|*SECRET*|*PASSWORD*` must be refs (`--env OPENAI_API_KEY='${MY_KEY}'` or `{env:MY_KEY}`), literals are rejected; an unresolved ref drops the var with one tool note, never the literal `${...}`. `HOME`/`USERPROFILE`/`PATH` are refused (prepend with `--env PATH+=dir`). `~` expands for `CLAUDE_CONFIG_DIR`/`CODEX_HOME`. codex agents get their system prompt via `-c developer_instructions=...` (verified: honored by `codex exec` and `exec resume`) instead of a first-turn prepend.
 
+## Capabilities and permission modes
+
+`ag agents caps [BACKEND]` (`--json`) prints the per-backend capability table (`CAPS`: resume, system/mcp flag, skills, interrupt, usage, plan, supported `modes`, `native_enforce`).
+`ag agents add|set NAME --mode ro|edits|auto|full [--plan|--no-plan]` sets a per-agent permission mode (`--mode ""` clears; unset = backend default, unchanged). Mapping: claude `--permission-mode` (dontAsk/acceptEdits/auto/bypassPermissions, `plan`), codex `-s` read-only/workspace-write/danger-full-access, gemini `--approval-mode` (plan/auto_edit/yolo; no `auto`), cursor `--mode ask|plan` / `--force [--sandbox enabled|disabled]`, opencode a `permission` block merged into a scoped `OPENCODE_CONFIG` (`.agent/modes/<agent>/opencode.json`; profile config kept). Codex/opencode emulate `--plan` with read-only. A mode a backend cannot enforce (echo, gemini `auto`) prints one `[mode] ...` warning line on `add` and each turn and runs with the backend default.
+
+## ACP transport
+
+Opt-in per agent: `ag agents add|set W --transport acp|cli` (gemini/cursor/opencode) speaks the Agent Client Protocol (JSON-RPC over stdio) instead of the headless CLI; `ag agents add W --backend acp --acp-cmd "my-agent --acp"` runs any ACP agent. `AG_ACP=0` turns it off globally (ACP-only agents then error). Launch: `gemini --acp [-m M]`, `agent acp`, `opencode acp --cwd DIR`.
+- Per turn: `initialize` (protocol 1, no fs/terminal client caps) → stored sid + `loadSession` ? `session/load` (replayed history dropped) : `session/new` → model via `session/set_config_option` (category `model`) or `session/set_model` → `session/prompt`. Streams `agent_message_chunk`/`agent_thought_chunk`/`tool_call*`/`usage_update` into the normal timeline; plan/commands/mode updates ignored.
+- Permissions are answered by ag from the agent's mode (unset = `edits`, `--plan` = `ro`): read/search/think/fetch allow; edit/delete/move allow at ≥edits only if every location realpaths inside the agent dir (no locations / broken symlink = deny); execute/other only at auto/full; `full` allows all. Never `*_always`. Denials log `[acp] denied <kind> <title> (mode=X)`. `fs/*`, `terminal/*`, unknown requests → `-32601`.
+- Failure: agent dies / no `initialize` in 15s / `session/new` fails / model cannot be set, all before `session/prompt` → `[acp] fallback to cli: <reason>` and the turn reruns once on the normal CLI argv. Never after the prompt was sent. Auth errors (`-32000`) fail with `acp auth required: ... (ag agents doctor)`. A failed/unsupported `session/load` takes the stale-session path (fresh session + history replay).
+- Timeout / `ag stop`: `session/cancel`, ≤1.5s grace, then the agent's process group is killed. Runs in a private `_acp` bridge process so run_turn's guard, queue pid, retry and usage paths apply unchanged.
+- Verified 2026-10-08: opencode 1.18.31 full round-trip (new, load replay, set_config_option, tools, usage); cursor `agent acp` and gemini 0.45.2 `--acp` initialize fine but `session/new` returns `-32000` here (cursor logged out; gemini personal OAuth retired).
+
 ## Routing
 
 Pick a **job type**, then use the routed model. Fixed keys: `mechanical` (scripts, rote edits, boilerplate, lookups), `implement` (clear spec), `review` (review, verification), `debug` (failing tests, root cause), `plan` (design, architecture), `hardest` (ambiguous, high-stakes, security).
@@ -251,22 +265,8 @@ ag chat send w --command review "path"          # opencode native command only
 
 - `--request-id K` on `wake`/`delegate`/`chat send` makes the call idempotent: receipt `<state>/receipts/<sha1(cmd+agent+K)>.json` (O_EXCL). Same payload replays the original result (wake: same job + `replayed:true`; others: stored reply, or `status:in_progress` + ref while running); different payload = `request id conflict`; a failed original replays its failure. `ag receipts gc [--days 7]` prunes.
 
-## Scheduled tasks
-
-```sh
-ag schedule add w (--every 15m|2h|1d | --at 09:00 [--days mon-fri|mon,wed,fri|daily|weekends]) "msg" \
-   [--max-runtime S] [--notify X] [--on-done CMD] [--job J] [--overlap skip|queue] [--catch-up] [--disabled] [--id NAME]
-ag schedule list [--all] | rm ID | pause ID | resume ID | run ID
-ag schedule tick [--all] [--now ISO] [--reap] [--dry-run]
-ag schedule install [--write] [--cron] [--interval 60]
-```
-
-- Rows in `<state>/schedules.json`; each state dir with schedules is listed in `$AG_CONFIG_HOME/schedule-dirs.json` (`add` registers, `rm` of the last row unregisters). ONE global tick (`schedule tick --all --reap`, every 60s) walks the registry. `install` prints the launchd plist (label `org.ag.schedule`); `--write` writes `~/Library/LaunchAgents/` and runs `launchctl bootout` (if loaded) + `bootstrap`; `--cron` prints a crontab line instead. `schedule` never self-updates ag.
-- Local wall clock, min interval 60s. Interval rows run on a fixed grid (missed slots collapse into one catch-up run). Fixed-time rows >10min late are `missed` unless `--catch-up`. DST gap -> forward, overlap -> first occurrence.
-- `--overlap skip` (default) skips a due run while the last job is queued/running (dead workers are reconciled first). Each fire is gated by a `<id>:<due>` request-id receipt, so double ticks or a crash before the state write never double-fire. Concurrent ticks: non-blocking `schedule/tick.lock`.
-- Corrupt `schedules.json` refuses the tick (event `schedule_fail`), never reset. Removed agent -> row `last_status: error`. Events: `schedule_fire|skip|missed|fail`. `list` shows `tick: last ran Xm ago`. `--reap` calls `wakes_reap` when present.
-
 ## Delegated-completion cohorts
+
 `ag wake|delegate <child> "task" --parent <agent> [--group GID] [--quiet S]` runs the child as a background wake job tagged `parent`/`group` (`delegate` without `--parent` is unchanged). Group state: `<state>/wake/groups/<gid>.json` (pending/done/delivery_jid). When the last pending child finishes, ONE wake is sent to the parent: `[delegated] 3/3 tasks finished (2 completed, 1 failed; outcome: failed). ...` with each child's summary (marked automated: tool results, not user instructions). A still-queued delivery is rewritten in place instead of relaunched. `--quiet S` delivers partial results when S seconds pass (checked on each child finish; no daemon). `ag wakes --group GID [--json]` shows the cohort; `--stop` sets disposition=stopped (never delivers). Launch failure is recorded in the group (`deliver_error`) and event `cohort_deliver_fail`.
 
 ## Queue, stop, steer
@@ -284,6 +284,21 @@ ag chat steer w "text" [--json]      # interrupt running turn, run this next on 
 - `stop` leaves HOLD in place (`ag queue w --release`). `--cascade` also stops agents whose active wake jobs, tickets or running turn record `parent == w`. Python: `agent_stop(sdir, name, cascade=False)`.
 - Steer text sent to the model: `[steer] user interrupted the previous turn; new instruction: <text>`; on an idle agent it is a plain priority-0 turn.
 
+## Scheduled tasks
+
+```sh
+ag schedule add w (--every 15m|2h|1d | --at 09:00 [--days mon-fri|mon,wed,fri|daily|weekends]) "msg" \
+   [--max-runtime S] [--notify X] [--on-done CMD] [--job J] [--overlap skip|queue] [--catch-up] [--disabled] [--id NAME]
+ag schedule list [--all] | rm ID | pause ID | resume ID | run ID
+ag schedule tick [--all] [--now ISO] [--reap] [--dry-run]
+ag schedule install [--write] [--cron] [--interval 60]
+```
+
+- Rows in `<state>/schedules.json`; each state dir with schedules is listed in `$AG_CONFIG_HOME/schedule-dirs.json` (`add` registers, `rm` of the last row unregisters). ONE global tick (`schedule tick --all --reap`, every 60s) walks the registry. `install` prints the launchd plist (label `org.ag.schedule`); `--write` writes `~/Library/LaunchAgents/` and runs `launchctl bootout` (if loaded) + `bootstrap`; `--cron` prints a crontab line instead. `schedule` never self-updates ag.
+- Local wall clock, min interval 60s. Interval rows run on a fixed grid (missed slots collapse into one catch-up run). Fixed-time rows >10min late are `missed` unless `--catch-up`. DST gap -> forward, overlap -> first occurrence.
+- `--overlap skip` (default) skips a due run while the last job is queued/running (dead workers are reconciled first). Each fire is gated by a `<id>:<due>` request-id receipt, so double ticks or a crash before the state write never double-fire. Concurrent ticks: non-blocking `schedule/tick.lock`.
+- Corrupt `schedules.json` refuses the tick (event `schedule_fail`), never reset. Removed agent -> row `last_status: error`. Events: `schedule_fire|skip|missed|fail`. `list` shows `tick: last ran Xm ago`. `--reap` calls `wakes_reap` when present.
+
 ## Reliability
 
 - **Stale-session recovery:** if the backend no longer knows the stored session id (`Session not found`, `No conversation found`, `no rollout found`), ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`.
@@ -297,20 +312,6 @@ ag chat steer w "text" [--json]      # interrupt running turn, run this next on 
 `ag wakes --reap [--dry-run] [--include-running] [--agent A] [--max-attempts 3]` relaunches wake jobs whose worker died (`lost_status` recorded when reconcile fails a dead job). Default: only jobs lost while `queued`; `--include-running` also relaunches jobs lost mid-turn, prefixing the message `[reap] previous attempt was interrupted mid-turn; verify state before redoing.` The retry carries `retry_of` + `attempts+1`; the old job gets `reaped_by`. Double/concurrent reap launches once (O_EXCL claim in `wake/reap/`).
 
 `ag agents ps [--tree] [--json]`: per agent state (turn/wake/handoff), pids, procs, %CPU, RSS MB, elapsed, backend. One `ps` call; descendants by ppid + same pgid; records that predate the process start (pid reuse) are ignored.
-
-## Capabilities and permission modes
-
-`ag agents caps [BACKEND]` (`--json`) prints the per-backend capability table (`CAPS`: resume, system/mcp flag, skills, interrupt, usage, plan, supported `modes`, `native_enforce`).
-`ag agents add|set NAME --mode ro|edits|auto|full [--plan|--no-plan]` sets a per-agent permission mode (`--mode ""` clears; unset = backend default, unchanged). Mapping: claude `--permission-mode` (dontAsk/acceptEdits/auto/bypassPermissions, `plan`), codex `-s` read-only/workspace-write/danger-full-access, gemini `--approval-mode` (plan/auto_edit/yolo; no `auto`), cursor `--mode ask|plan` / `--force [--sandbox enabled|disabled]`, opencode a `permission` block merged into a scoped `OPENCODE_CONFIG` (`.agent/modes/<agent>/opencode.json`; profile config kept). Codex/opencode emulate `--plan` with read-only. A mode a backend cannot enforce (echo, gemini `auto`) prints one `[mode] ...` warning line on `add` and each turn and runs with the backend default.
-
-## ACP transport
-
-Opt-in per agent: `ag agents add|set W --transport acp|cli` (gemini/cursor/opencode) speaks the Agent Client Protocol (JSON-RPC over stdio) instead of the headless CLI; `ag agents add W --backend acp --acp-cmd "my-agent --acp"` runs any ACP agent. `AG_ACP=0` turns it off globally (ACP-only agents then error). Launch: `gemini --acp [-m M]`, `agent acp`, `opencode acp --cwd DIR`.
-- Per turn: `initialize` (protocol 1, no fs/terminal client caps) → stored sid + `loadSession` ? `session/load` (replayed history dropped) : `session/new` → model via `session/set_config_option` (category `model`) or `session/set_model` → `session/prompt`. Streams `agent_message_chunk`/`agent_thought_chunk`/`tool_call*`/`usage_update` into the normal timeline; plan/commands/mode updates ignored.
-- Permissions are answered by ag from the agent's mode (unset = `edits`, `--plan` = `ro`): read/search/think/fetch allow; edit/delete/move allow at ≥edits only if every location realpaths inside the agent dir (no locations / broken symlink = deny); execute/other only at auto/full; `full` allows all. Never `*_always`. Denials log `[acp] denied <kind> <title> (mode=X)`. `fs/*`, `terminal/*`, unknown requests → `-32601`.
-- Failure: agent dies / no `initialize` in 15s / `session/new` fails / model cannot be set, all before `session/prompt` → `[acp] fallback to cli: <reason>` and the turn reruns once on the normal CLI argv. Never after the prompt was sent. Auth errors (`-32000`) fail with `acp auth required: ... (ag agents doctor)`. A failed/unsupported `session/load` takes the stale-session path (fresh session + history replay).
-- Timeout / `ag stop`: `session/cancel`, ≤1.5s grace, then the agent's process group is killed. Runs in a private `_acp` bridge process so run_turn's guard, queue pid, retry and usage paths apply unchanged.
-- Verified 2026-10-08: opencode 1.18.31 full round-trip (new, load replay, set_config_option, tools, usage); cursor `agent acp` and gemini 0.45.2 `--acp` initialize fine but `session/new` returns `-32000` here (cursor logged out; gemini personal OAuth retired).
 
 ## Isolation: worktree per agent
 
@@ -353,7 +354,19 @@ ag compact show|config|run      # auto-summaries (docs/AUTO_COMPACTION.md)
 ag handoff w [--spawn|--exec]    # native backend TUI argv + profile env; --exec needs a TTY
 ```
 
-Same scope inherits the prior `HANDOFF.md`; sibling scopes are isolated. Native TUI gets no auto-inject. Handoff argv never carries auto-approve flags; `claude`/`cursor` keep `--resume SID`, others launch bare. Multi-host portable snapshots: [docs/MULTI_HOST.md](docs/MULTI_HOST.md) (`hosts`, `sync`; no automatic failover).
+Same scope inherits the prior `HANDOFF.md`; sibling scopes are isolated. Native TUI gets no auto-inject. Handoff argv never carries auto-approve flags; `claude`/`cursor` keep `--resume SID`, others launch bare. Multi-host snapshots: [Multi-host](#multi-host).
+
+## Multi-host
+
+Outbound-SSH snapshot handoff, no automatic failover (full runbook: [docs/MULTI_HOST.md](docs/MULTI_HOST.md)):
+
+```sh
+ag hosts add mac --ssh-json '["ssh","-o","BatchMode=yes","MAC_ALIAS"]' --remote-ag /abs/ag --remote-state /abs/.agent --remote-project /abs/proj --local-project ~/proj
+ag hosts list | check mac [--timeout S]
+ag sync pull mac worker [--file F]... [--message M] [--watch S] [--timeout S]   # snapshot of agent + context + chosen files
+ag sync list
+ag sync resume SNAPSHOT --name N --project P [--source-stopped] [--run] [--backend B] [--model M] [--timeout S] [--max-runtime S]
+```
 
 ## Harness profiles
 
@@ -381,13 +394,16 @@ System-prompt presets per agent: `ag roles list|show|add|set|rm|reset NAME`. Bui
 
 ## Limitations (honest)
 
-- Wake is at-most-once *launch*, not completion: a crash between claim and enqueue, or `kill -9` of a worker, can lose/stall it. Check `events` for a missing `wake` after `exit`, `wakes` for dead sessions. No retry scheduler (transient-error retry is per turn only).
+- Wake is at-most-once *launch*, not completion: a crash between claim and enqueue, or `kill -9` of a worker, marks the job lost. `wakes --reap` (also run by the scheduler tick with `--reap`) relaunches lost jobs, only on request or tick: there is no always-on supervisor. Mid-turn losses are relaunched only with `--include-running` and may redo work. Transient-error retry is per turn only.
 - Daemon `kill -9`: sessions go `stale` (`exit=-1`); the pending wake fires once on the next reconcile (exactly-once via `wake.claimed`).
-- While a turn runs its agent's guard is held: other turns on that agent block; backend/profile/model switches refuse. No queue fairness/priority/FIFO.
+- While a turn runs its agent's guard is held: other turns on that agent queue (FIFO within priority, steer first); backend/profile/model switches refuse. Interrupted turns (`stop`/`steer`) are never retried.
+- Scheduler needs the global tick installed (`schedule install --write` or cron); with no tick, nothing fires. Local wall clock, 60s minimum, no sub-minute or cron-expression schedules.
+- ACP is opt-in and experimental: only opencode is verified end to end; cursor/gemini need a working login; `fs/*` and `terminal/*` client requests are refused.
+- Auto-update is fast-forward only and never touches a dirty or ahead checkout; copy installs replace the single file from `master`.
 - Message cap 4000 chars (truncated). `wake/jobs` is never pruned by `forget`.
 - POSIX only (`spawn`/workers need the pty daemon; TUI needs curses). Secret popup is macOS only.
 - `ag run echo --json` treats `--json` as global; use `ag run -- echo --json`.
 - Atomic writes only for `status.json`, wake jobs and `ag setup` outputs; other state JSON can corrupt on crash (agents/todos fall back to defaults). Back up `.agent/` before risky ops. Logs never rotate.
 - Checkpoints/revert act on the whole git repo; non-git dirs have none. Worktree agents leave their branch behind; ag does not merge.
-- Model lists for claude/gemini are static aliases; discovery depends on each backend CLI.
+- Model lists for claude/gemini are static aliases; discovery depends on each backend CLI. Provider probe auth for gemini is `unknown` (proceeds).
 - Rendering is cell-based (CJK/ZWJ safe); below 40x16 the TUI asks for a resize; mouse is best-effort.

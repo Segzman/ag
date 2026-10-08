@@ -1,6 +1,6 @@
 ---
 name: ag-cli
-description: Use when driving the `ag` CLI itself (not delegating to agents) — state dir/--dir rules, non-blocking PTY sessions (spawn/snap/send/wait/kill), logged `run` + approvals, secret prompts (sudo/ssh passphrase/OTP), notes/todos, `ag models`, `ag setup`, or when a command creates a stray .agent/ dir or a session seems to hang.
+description: Use when driving the `ag` CLI itself (not delegating to agents) — state dir/--dir rules, non-blocking PTY sessions (spawn/snap/send/wait/kill), logged `run` + approvals, secret prompts (sudo/ssh passphrase/OTP), notes/todos, `ag models`, `ag setup`, `ag update`, the global schedule tick (`schedule install`), or when a command creates a stray .agent/ dir or a session seems to hang.
 ---
 
 # ag CLI (scope: {{SCOPE}})
@@ -34,7 +34,7 @@ Need a real TTY, hang the tool call: `tui`, `attach`, `shell`, `handoff --exec`.
 {{AG}} --dir <state> sessions | status | events --limit 20
 ```
 
-`spawn` returns instantly; poll with `snap` (offset comes from prior output). `spawn --name N --cwd D --env K=V --on-exit CMD`. Daemon `kill -9` -> session `stale` (`exit=-1`), attached wake does NOT fire. `forget <id>` wipes logs (auth traces). `spawn --wake` = follow-up when session ends: see `ag-agents`.
+`spawn` returns instantly; poll with `snap` (offset comes from prior output). `spawn --name N --cwd D --env K=V --on-exit CMD`. Daemon `kill -9` -> session `stale` (`exit=-1`); its pending wake fires once on next reconcile (`sessions`/`snap`/`wait`/`kill`). `forget <id>` wipes logs (auth traces). `spawn --wake` = follow-up when session ends: see `ag-agents`.
 
 ## run, approvals, audit
 
@@ -65,21 +65,46 @@ Backend turns and spawned sessions get `SUDO_ASKPASS`/`SSH_ASKPASS`/`GIT_ASKPASS
 
 `ag note "..."` / `ag notes` · `ag todo add|list|done|clear` · `ag history` · `ag events`.
 
+## Update
+
+ag auto-checks GitHub once a day in a detached process; applies on next run. Git checkout: `fetch` + `merge --ff-only`, only if clean, tracking, not ahead. Copy install: download `master`, compile check, atomic swap.
+
+```sh
+{{AG}} update                  # run now
+{{AG}} update --status         # state
+{{AG}} update --auto off|on    # toggle (~/.config/ag/config.json)
+```
+
+`AG_AUTO_UPDATE=0` disables per shell (use it in scripts/tests). Log `~/.cache/ag/update.log`.
+
 ## Models
 
 ```sh
 {{AG}} models [--backend B] [--refresh] [--json]
 ```
 
-Live list per backend (opencode, codex, cursor discovered; claude/gemini static aliases). Cache `~/.cache/ag/models.json`, TTL 24h, auto-refresh when stale; `--refresh` forces. A failing source keeps its last good list and records `error`. Use it to pick valid model ids before `agents add --model`.
+Live list per backend (opencode, codex, cursor discovered; claude/gemini static aliases). Cache `~/.cache/ag/models.json`, TTL 24h, auto-refresh when stale; `--refresh` forces. A failing source keeps its last good list and records `error`. Use it to pick valid model ids before `agents add --model`. `{{AG}} route [JOB] [--json]` shows effective job routing (see `ag-agents`).
 
 ## Setup
 
 ```sh
-{{AG}} setup [--scope global|project] [--harness claude,opencode,codex|all] [--preset cost-first|balanced|quality-first] [--set JOB=claude:ALIAS] [--set JOB=ag:BACKEND/MODEL] [--claude-md|--no-claude-md] [--yes] [--dry-run]
+{{AG}} setup [--scope global|project] [--harness claude,opencode,codex|all] [--preset cost-first|balanced|quality-first] [--set JOB=claude:ALIAS] [--set JOB=ag:BACKEND/MODEL] [--set backend.B.enabled=true|false] [--set backend.B.model=ID] [--set backend.B.mode=ro|edits|auto|full|unset] [--set backend.B.plan=true|false] [--claude-md|--no-claude-md] [--yes] [--dry-run] [--ui mac|cli|plain]
 ```
 
-Interactive on a TTY (ask the user to run it); scriptable with flags. Writes routing config + renders the `ag-cli`/`ag-agents` skills into harness skill dirs (+ routing block in `~/.claude/CLAUDE.md` for claude/global). Atomic writes, never deletes; `--dry-run` prints a diff. Routing is explained in `ag-agents`.
+Ask the user to run it bare (interactive). Agent context: pass flags + `--yes` (or `--dry-run` first). `--ui` / `AG_SETUP_UI`: `mac` = native window (Jobs tab: Claude alias + ag target per job; one tab per backend: enabled, default model, default mode, plan; auto on local macOS), `cli` = curses (jobs table + Backends table, needs 60x23), `plain` = prompts. Writes `routing.json` (jobs + per-backend defaults that feed `agents add`), renders `ag-cli`/`ag-agents` skills into harness skill dirs, routing block in `~/.claude/CLAUDE.md` (claude/global). Atomic, never deletes. Job routed to a disabled backend: error, no save.
+
+## Schedule tick (mechanics)
+
+Scheduled wakes live in `ag-agents`. One global launchd job drives all state dirs:
+
+```sh
+{{AG}} schedule install                 # print launchd plist (label org.ag.schedule)
+{{AG}} schedule install --write         # write ~/Library/LaunchAgents + bootstrap
+{{AG}} schedule install --cron          # print crontab line instead
+{{AG}} schedule tick --all --reap       # what the job runs every 60s; --dry-run, --now ISO
+```
+
+Registry `$AG_CONFIG_HOME/schedule-dirs.json`. Concurrent ticks are lock-safe; corrupt `schedules.json` refuses the tick.
 
 ## Sanity
 

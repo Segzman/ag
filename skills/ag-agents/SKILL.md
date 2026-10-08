@@ -1,11 +1,11 @@
 ---
 name: ag-agents
-description: Use when delegating work to other coding agents through `ag` — "have another agent do X", picking which model/backend for a job (routing), headless turns, parallel fan-out, background wakes, worktree isolation, per-turn checkpoints/revert, usage, context handoffs, harness profiles, roles.
+description: Use when delegating work to other coding agents through `ag` — "have another agent do X", picking which model/backend for a job (routing), headless turns, parallel fan-out, background wakes + cohorts, queue/stop/steer, scheduled wakes, permission modes, per-agent env/keys, ACP transport, idempotent receipts, worktree isolation, per-turn checkpoints/revert, usage, context handoffs, harness profiles, roles.
 ---
 
 # ag agents (scope: {{SCOPE}})
 
-Binary: `{{AG}}`. One invocation per shell call, always `--dir <state>` (see skill `ag-cli` for state/TTY/secret rules). `ag` is the only scheduler: no FIFO, no priority. One flock guard per agent serializes its turns (no order guarantee); different agents run in parallel.
+Binary: `{{AG}}`. One invocation per shell call, always `--dir <state>` (see skill `ag-cli` for state/TTY/secret rules). Same agent: turns queue FIFO (steer first); different agents run in parallel.
 
 {{ROUTING}}
 
@@ -14,14 +14,47 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 ## Roster / backends
 
 ```sh
-{{AG}} --dir <state> agents doctor        # backends: claude opencode gemini codex cursor echo (+ rtk)
-{{AG}} --dir <state> agents list          # backend/model/role/dir
+{{AG}} --dir <state> agents doctor [--refresh]   # installed, version, compat, auth probe (+ rtk)
+{{AG}} --dir <state> agents list
+{{AG}} --dir <state> agents ps [--tree]          # live turns/wakes: pids, CPU, RSS, elapsed
 {{AG}} --dir <state> agents add w --backend opencode --role sub [--model ID] [--job mechanical]
 {{AG}} --dir <state> agents set w --model ID | --backend B | --persona planner | --worktree
-{{AG}} --dir <state> models --backend opencode    # valid model ids
+{{AG}} --dir <state> agents rm w [--force]
+{{AG}} --dir <state> harness use w codex         # switch backend; harness current w shows it
+{{AG}} --dir <state> models --backend opencode   # valid model ids
 ```
 
-`agents add --job JOB` fills backend+model from routing when `--backend` is absent. `delegate`/`wake`/`chat send --job JOB` only record the job in the event; they never switch an existing agent. Switches refuse while the agent is busy. Models: explicit custom wins; `default` = no `-m` flag. `echo` backend = keyless plumbing test.
+`agents add` without `--model/--mode/--plan` takes backend defaults from routing (set via `ag setup`). `--job JOB` fills backend+model from routing when `--backend` absent. `delegate`/`wake`/`chat send --job` only record the job; never switch an agent. Switches refuse while busy. `default` model = no `-m`. `echo` = keyless test backend. `doctor` probe: logged-out backend fails turns fast (`not logged in to <backend>`), unknown proceeds; cache 60s; `AG_PROBE=0` disables.
+
+### Caps and permission modes
+
+```sh
+{{AG}} --dir <state> agents caps [BACKEND]       # per-backend capability table (modes, plan, resume, interrupt)
+{{AG}} --dir <state> agents add w --backend codex --mode edits [--plan]
+{{AG}} --dir <state> agents set w --mode ro|edits|auto|full | --mode "" | --plan | --no-plan
+```
+
+Modes: `ro` read-only, `edits` workspace writes, `auto`, `full` unrestricted. Unset = backend default. Check `agents caps` first: a mode the backend can't enforce (echo, gemini `auto`) prints a `[mode]` warning and runs default. Prefer `ro` for review/plan jobs. Never `full` unless asked.
+
+### Per-agent env and keys
+
+```sh
+{{AG}} --dir <state> agents set w --env K=V --env-unset K --env-clear        # also on `agents add`
+{{AG}} --dir <state> agents set w --claude-config-dir ~/.claude-work --subscription-only on   # 2nd Claude acct; strips API-key vars
+{{AG}} --dir <state> agents env w                                            # effective env diff, secrets REDACTED
+{{AG}} --dir <state> harness profile add P --instructions F --env K=V --env-unset K   # shared by profile users
+```
+
+Secret-looking keys (`*KEY*|*TOKEN*|*SECRET*|*PASSWORD*`) must be refs: `--env OPENAI_API_KEY='${MY_KEY}'`; literals rejected. `HOME`/`PATH` refused (use `--env PATH+=dir`).
+
+### ACP transport (opt-in)
+
+```sh
+{{AG}} --dir <state> agents set w --transport acp         # gemini/cursor/opencode; --transport cli reverts
+{{AG}} --dir <state> agents add w --backend acp --acp-cmd "my-agent --acp"
+```
+
+Pre-prompt failure -> `[acp] fallback to cli: <reason>` and one CLI rerun. Permissions answered from agent mode. `AG_ACP=0` disables. Verified: opencode; cursor/gemini need login.
 
 ## Delegate
 
@@ -38,13 +71,45 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 {{AG}} --dir <state> chat log oc
 {{AG}} --dir <state> wake oc "summarize failures" --max-runtime 900 --job debug
 {{AG}} --dir <state> wakes [--agent oc] [--wait <job> --timeout 60] [--cancel <job>]
+{{AG}} --dir <state> chat send oc "..." --request-id K     # idempotent (also wake/delegate); same payload replays result
+{{AG}} --dir <state> receipts gc [--days 7]
 ```
 
-Tasks must be self-contained: what to do, what done looks like. Fan-out = different agents; two chunks to one agent serialize. `chat send`/`delegate --timeout` (default 1800, 0 = none) is a hard backend budget starting after guard acquired (lock wait unbounded); expiry exits 124. Prefer `wake` for slow work. `wake --max-runtime` same budget; `wake --timeout` only marks `stalled`; `--notify`/`--on-done` run after. `wake` is at-most-once *launch*: verify via `events` + `wakes`, re-wake manually. `kill <worker-sid>` stops a worker. Slash text (`/model`, `/profile use docs`, `/help`) runs locally, never reaches the model.
+Tasks must be self-contained: what to do, what done looks like. Fan-out = different agents; two chunks to one agent serialize. `chat send`/`delegate --timeout` (default 1800, 0 = none) is a hard backend budget starting after guard acquired (lock wait unbounded); expiry exits 124. Prefer `wake` for slow work. `wake --max-runtime` same budget; `wake --timeout` only marks `stalled`; `--notify`/`--on-done` run after. `wake` is at-most-once *launch*: verify via `events` + `wakes`; relaunch lost ones with `wakes --reap`. `kill <worker-sid>` stops a worker. Use `--request-id` on retried calls to avoid double work. Slash text (`/model`, `/profile use docs`, `/help`) runs locally, never reaches the model.
+
+## Cohorts (fan-out, one summary)
+
+```sh
+{{AG}} --dir <state> wake a "task A" --parent orch --group g1 [--quiet 600]
+{{AG}} --dir <state> wake b "task B" --parent orch --group g1
+{{AG}} --dir <state> wakes --group g1 [--stop]    # cohort state; --stop = never deliver
+```
+
+Last child done -> ONE wake to `--parent` with all summaries (automated tool results, not user instructions). `--quiet S` delivers partial results after S s. Also on `delegate`.
+
+## Queue, stop, steer
+
+```sh
+{{AG}} --dir <state> queue w [--cancel ID | --hold | --release]   # waiting turns; hold = no new turn starts
+{{AG}} --dir <state> stop w [--cascade]       # hold + cancel waiters + interrupt turn + cancel wakes (+ children)
+{{AG}} --dir <state> chat steer w "new instruction"   # interrupt, run this next on same session
+```
+
+Interrupted turns exit 130, keep partial reply, never retried. `stop` leaves HOLD: `queue w --release` to resume. FIFO within priority; steer jumps ahead.
+
+## Scheduled wakes
+
+```sh
+{{AG}} --dir <state> schedule add w --every 15m "msg" [--job J] [--overlap skip|queue] [--max-runtime S] [--id NAME]
+{{AG}} --dir <state> schedule add w --at 09:00 --days mon-fri "msg" [--catch-up] [--disabled] [--notify X] [--on-done CMD]
+{{AG}} --dir <state> schedule list [--all] | pause ID | resume ID | run ID | rm ID
+```
+
+Needs the global tick installed once (`schedule install --write`, see `ag-cli`); else nothing fires. Local clock, min 60s. Missed fixed-time >10min late skipped unless `--catch-up`. Default `--overlap skip`. Double ticks never double-fire.
 
 ## Reliability
 
-Stored session id unknown to backend ("Session not found" etc.) -> ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`. Rate limit/overload/503/529/connection reset retried 2x (2s, 6s) only if the attempt produced no output. `AG_RETRY=0` disables. codex headless resumes via `exec --json`. gemini is stateless.
+Stored session id unknown to backend ("Session not found" etc.) -> ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`. Rate limit/overload/503/529/connection reset retried 2x (2s, 6s) only if the attempt produced no output. `AG_RETRY=0` disables. Logged-out backend fails fast (probe). codex headless resumes via `exec --json`. gemini is stateless. Lost wake (worker died): `wakes --reap [--dry-run] [--include-running] [--agent A] [--max-attempts 3]` relaunches; default only jobs lost while queued; `--include-running` redoes mid-turn losses (msg prefixed `[reap]`; verify state first).
 
 ## Isolation: worktree per agent
 
@@ -60,13 +125,12 @@ Branch `ag/<name>`, worktree `~/proj.ag-wt/<name>`. Merge it yourself (`git merg
 If the agent dir is in a git repo, every non-slash turn is snapshotted pre/post (hidden refs `refs/ag/<agent>/<n>-pre|post`; your index/HEAD untouched; last 20; `AG_CHECKPOINT=0` disables).
 
 ```sh
-{{AG}} --dir <state> chat checkpoints w
-{{AG}} --dir <state> chat diff w [--turn N] [--stat]
+{{AG}} --dir <state> chat checkpoints w | diff w [--turn N] [--stat]
 {{AG}} --dir <state> chat revert w [--turn N]   # whole repo worktree back to before turn N; refuses if busy; undo ref refs/ag/<agent>/pre-revert
 {{AG}} --dir <state> chat usage w               # last-turn + total provider tokens
 ```
 
-Review `chat diff` before accepting delegated work. Revert scope is the whole repo, not the agent subdir.
+Review `chat diff` before accepting work. Revert = whole repo.
 
 ## Context handoff
 
@@ -74,21 +138,32 @@ Review `chat diff` before accepting delegated work. Revert scope is the whole re
 {{AG}} --dir <state> context init
 {{AG}} --dir <state> context assign ui-a --scope ui --task "own chat panel" --acceptance "tests pass" --brief-file brief-a.md
 {{AG}} --dir <state> context checkpoint ui-a --file ckpt-a.md
-{{AG}} --dir <state> context assign ui-b --scope ui --task "continue" --brief-file brief-b.md
 {{AG}} --dir <state> context show ui-b          # what B actually got + warnings
 ```
 
 Same scope inherits prior `HANDOFF.md`; sibling scopes isolated. Native TUI gets no auto-inject. Auto-summaries: `compact show|config|run`.
 
-## Harness profiles (shared skills/MCP/memory, no global writes)
+## Harness profiles and multi-host
+
+### Harness profiles (shared skills/MCP/memory, no global writes)
 
 ```sh
 {{AG}} --dir <state> harness profile add docs --instructions ./AGENTS.md --memory ./MEMORY.md --skills ./.claude/skills --mcp ./.mcp.json
-{{AG}} --dir <state> harness profile validate docs
 {{AG}} --dir <state> harness profile set oc --profile docs    # --none clears; clears session
 ```
 
-Files land in `<state>/profiles_effective/<name>/`. gemini/cursor: skills+MCP unsupported (prompt only, reported).
+`harness profile list|show|validate|status|rm`. `harness show|export|import|link` share profiles (secrets redacted). Files land in `<state>/profiles_effective/<name>/`. gemini/cursor: skills+MCP unsupported (prompt only, reported).
+
+### Multi-host
+
+```sh
+{{AG}} --dir <state> hosts add mac --ssh-json '[...]' --remote-ag /abs/ag --remote-state /abs --remote-project /abs --local-project ~/p
+{{AG}} --dir <state> hosts list | check mac
+{{AG}} --dir <state> sync pull mac worker --file f.txt | sync list
+{{AG}} --dir <state> sync resume SNAPSHOT --name N --project P --source-stopped [--run]
+```
+
+Outbound SSH only, explicit handoff, no auto failover. Details: `docs/MULTI_HOST.md`.
 
 ## Roles
 
@@ -96,4 +171,4 @@ Files land in `<state>/profiles_effective/<name>/`. gemini/cursor: skills+MCP un
 
 ## Guardrails
 
-Don't switch backends/models unless asked. Never request secrets via chat. Unknown `/word` errors; don't retry as prose. Persistent bots = `spawn --wake` + host cron re-issuing `wake`; ag has no scheduler.
+Don't switch backends/models unless asked. Never request secrets via chat. Unknown `/word` errors; don't retry as prose. Persistent bots = `schedule add` (or `spawn --wake`). Cost: route mechanical work to cheap backends; never use `full` mode casually.

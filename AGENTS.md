@@ -17,6 +17,7 @@ Skills: templates in `skills/ag-cli` (CLI/PTY/secrets/setup) and `skills/ag-agen
 
 - Absolute path to this clone (`<repo>/ag`), one invocation per shell call. No `;`/`&&` chains around it.
 - Never `tui` / `attach` / `shell` / `handoff --exec` from agent context (needs TTY). `spawn` + `snap` instead.
-- Delegate via `ag` (`chat send`, `delegate`, `wake`, `spawn --wake`, `context assign/show/checkpoint`). Same agent serializes (flock, no order); different agents parallelize. `wake` is at-most-once launch — verify via `events` + `wakes`.
+- Delegate via `ag` (`chat send`, `delegate`, `wake`, `spawn --wake`, `context assign/show/checkpoint`). Same agent queues FIFO (steer first); different agents parallelize. `wake` is at-most-once launch — verify via `events` + `wakes`.
 - Harness profiles share skills/MCP/memory via scoped files under `.agent/profiles_effective/` — never write home/global config.
+- Every feature commit updates README.md and the relevant skills/ template in the same commit; tests/test_ag_doc_coverage.py enforces command coverage.
 - Surgical changes only; match existing style. Verify with `./ag selfcheck` and `python3 tests/<relevant>.py`.

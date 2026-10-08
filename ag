@@ -7267,6 +7267,60 @@ def _ckpt_selfcheck():
         try: shutil.rmtree(sd, ignore_errors=True)
         except NameError: pass
 
+# --- run_turn seams: each turn feature edits ONE helper ---
+def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
+    """Prompt for one turn. Returns (prompt, sys_txt, prof_name): history replay
+    / bare command, profile+context+rtk+secret additions, system-role prepend."""
+    name = a.get("name", "")
+    if command:
+        # native custom command: message text is command args, sent bare.
+        prompt = text
+    else:
+        hist = _rs["hist"] if _rs and "hist" in _rs else "" if (sid and backend in ("claude","opencode","cursor","codex")) else recent_history(sdir,name)
+        prompt = (hist+"\n\n---\n"+text) if hist else text
+    sys_txt = eff_system(sdir, a)
+    # harness profile: instructions/memory/skills context must reach backend
+    # (scoped files under profiles_effective/, no global config writes).
+    prof_name = (a.get("profile") or "").strip()
+    prof_extra = profile_system_extra(sdir, prof_name) if prof_name else ""
+    if prof_extra:
+        sys_txt = ((sys_txt + "\n\n---\nprofile context ---\n" + prof_extra)
+            if sys_txt else prof_extra)[:20000]
+    if not command:
+        # scoped agent context: custom.md chain + explicit files + memory.
+        # Prompt-only (history stores raw text), refreshed every turn.
+        try: _ctx = get_agent_context(sdir, a.get("name",""))
+        except Exception: _ctx = {"text": ""}
+        if _ctx.get("text"):
+            prompt = ("[background context — labeled sources; memory notes are "
+                "fallible and may be stale]\n" + _ctx["text"][:CTX_TOTAL] +
+                "\n\n---\n[current request — answer this]:\n" + prompt)
+    if backend in RTK_NOHOOK and not command and rtk_on():
+        sys_txt = (sys_txt + "\n\n" + RTK_HINT) if sys_txt else RTK_HINT
+    if not command and secret_enabled(): sys_txt = (sys_txt + "\n\n" + SECRET_HINT) if sys_txt else SECRET_HINT
+    if sys_txt and backend!="claude" and not sid and not command:
+        # backends without a native system flag: lead the first turn with the role block
+        prompt = f'[system role: {a.get("persona") or "custom"}]\n{sys_txt}\n\n---\n{prompt}'
+    return prompt, sys_txt, prof_name
+
+def _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, prof_name):
+    """backend_argv (+mode/plan kwargs only when set) + profile extras. May raise ValueError."""
+    argv = backend_argv(backend,model=model,workdir=workdir,sid=sid,prompt=prompt,
+        system=sys_txt if backend=="claude" else "",command=command or "",
+        **({"mode":a.get("mode") or "","plan":bool(a.get("plan"))} if a.get("mode") or a.get("plan") else {}))
+    if prof_name: argv = list(argv) + backend_argv_extra(backend, sdir, prof_name)
+    return argv
+
+def _turn_env(sdir, a, backend, prof):
+    """Full child env: os.environ + scoped profile env (OPENCODE_CONFIG/DIR,
+    CODEX_HOME) + opencode mode overlay + secret askpass wiring."""
+    penv = mode_env(sdir, a, backend_env_for_profile(sdir, a, prof) if prof else {})
+    return secret_env(sdir, dict(os.environ, **penv))
+
+def _turn_source(p):
+    """Iterator of backend stdout lines."""
+    return p.stdout
+
 def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0,_rs=None):
     """One prompt turn. on_event(name,kind,text). Returns {sid,exit,reply} or {error}.
     command: opencode-only native custom command (opencode run --command);
@@ -7350,45 +7404,13 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             sid = sids.get(backend, "")
             if not sid and meta.get("backend", backend) == backend:
                 sid = meta.get("sid","")
-        if command:
-            # native custom command: message text is command args, sent bare.
-            prompt = text
-        else:
-            hist = _rs["hist"] if _rs and "hist" in _rs else "" if (sid and backend in ("claude","opencode","cursor","codex")) else recent_history(sdir,name)
-            prompt = (hist+"\n\n---\n"+text) if hist else text
-        sys_txt = eff_system(sdir, a)
-        # harness profile: instructions/memory/skills context must reach backend
-        # (scoped files under profiles_effective/, no global config writes).
-        prof_name = (a.get("profile") or "").strip()
-        prof_extra = profile_system_extra(sdir, prof_name) if prof_name else ""
-        if prof_extra:
-            sys_txt = ((sys_txt + "\n\n---\nprofile context ---\n" + prof_extra)
-                if sys_txt else prof_extra)[:20000]
-        if not command:
-            # scoped agent context: custom.md chain + explicit files + memory.
-            # Prompt-only (history stores raw text), refreshed every turn.
-            try: _ctx = get_agent_context(sdir, a.get("name",""))
-            except Exception: _ctx = {"text": ""}
-            if _ctx.get("text"):
-                prompt = ("[background context — labeled sources; memory notes are "
-                    "fallible and may be stale]\n" + _ctx["text"][:CTX_TOTAL] +
-                    "\n\n---\n[current request — answer this]:\n" + prompt)
-        if backend in RTK_NOHOOK and not command and rtk_on():
-            sys_txt = (sys_txt + "\n\n" + RTK_HINT) if sys_txt else RTK_HINT
-        if not command and secret_enabled(): sys_txt = (sys_txt + "\n\n" + SECRET_HINT) if sys_txt else SECRET_HINT
-        if sys_txt and backend!="claude" and not sid and not command:
-            # backends without a native system flag: lead the first turn with the role block
-            prompt = f'[system role: {a.get("persona") or "custom"}]\n{sys_txt}\n\n---\n{prompt}'
+        prompt, sys_txt, prof_name = _turn_prompt(sdir, a, backend, sid, text, command, _rs)
         try:
-            argv = backend_argv(backend,model=model,workdir=workdir,sid=sid,prompt=prompt,
-                system=sys_txt if backend=="claude" else "",command=command or "",
-                **({"mode":a.get("mode") or "","plan":bool(a.get("plan"))} if a.get("mode") or a.get("plan") else {}))
+            argv = _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, prof_name)
             _mw = mode_warning(backend, a.get("mode") or "", bool(a.get("plan")))
             if _mw and not _rs:
                 _event(sdir, "mode_warn", name, warning=_mw)
                 if on_event: on_event(name, "tool", _mw)
-            if prof_name:
-                argv = list(argv) + backend_argv_extra(backend, sdir, prof_name)
         except ValueError as e: return {"error":str(e)}
         user_eid = tl_new_id()
         user_persist_ok = True
@@ -7405,13 +7427,11 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         chunks, sid_new, rc, err = [], "", 0, ""
         _usage, _fresh = {}, not sid
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
-        penv = mode_env(sdir, a, backend_env_for_profile(sdir, a, prof_name) if prof_name else {})
+        env = _turn_env(sdir, a, backend, prof_name)
         _timed_out = {"hit": False}
         _watch_stop = threading.Event()
         _watcher = None
         try:
-            import os as _os
-            env = secret_env(sdir, dict(_os.environ, **penv))
             p = subprocess.Popen(argv,cwd=workdir,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,text=True,bufsize=1,env=env,
                 start_new_session=(os.name == "posix"))
@@ -7441,7 +7461,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                     pass
             et = threading.Thread(target=_drain, daemon=True)
             et.start()
-            for line in p.stdout:
+            for line in _turn_source(p):
                 tl_ops = parse_timeline(backend,line,scope=buf.tl_scope)
                 # pure-delta/flush lines (fixture deltas, claude stream_event)
                 # are owned by the timeline engine; the legacy raw-line

@@ -43,7 +43,7 @@ class AgSetup(unittest.TestCase):
             (self.skills/n).mkdir(parents=True); (self.skills/n/"SKILL.md").write_text(t)
         self.env = dict(os.environ, AG_HOME=str(self.home), AG_CONFIG_HOME=str(self.cfg),
             AG_CACHE_HOME=str(self.cache), AG_SKILLS_DIR=str(self.skills), FAKE_DIR=str(self.fake),
-            AGENT_CLI_DIR=str(self.state), AG_HARNESS="claude", PATH=f"{self.fake}:/usr/bin:/bin", HOME=str(self.home))
+            AGENT_CLI_DIR=str(self.state), AG_HARNESS="claude", AG_MODELSDEV_URL="http://127.0.0.1:1/api.json", PATH=f"{self.fake}:/usr/bin:/bin", HOME=str(self.home))
 
     def ag(self, *args, env=None):
         return subprocess.run([sys.executable, AG, *args], capture_output=True, text=True, timeout=60,
@@ -116,9 +116,10 @@ class AgSetup(unittest.TestCase):
 
     def test_setup_dry_run_writes_nothing(self):
         (self.home/".claude").mkdir()
-        before = sorted(p for p in self.root.rglob("*"))
+        snap = lambda: sorted(p for p in self.root.rglob("*") if not {self.cache, self.fake} & {p, *p.parents})  # catalog picks may fill the cache / call the fake opencode
+        before = snap()
         d = self.agj("setup", "--yes", "--dry-run", "--harness", "all")["data"]
-        self.assertEqual(sorted(p for p in self.root.rglob("*")), before)
+        self.assertEqual(snap(), before)
         self.assertTrue(d["dry_run"] and all(f["status"] == "new" for f in d["files"]))
         self.assertTrue(any("+| mechanical" in (f.get("diff") or "") for f in d["files"]))
 

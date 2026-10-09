@@ -23,6 +23,7 @@ class SetupForm(unittest.TestCase):
 
     # ---- --set backend.* ----
     def test_set_backend_flags(self):
+        self.env["AG_HARNESS"] = "opencode"  # opencode profile routes every job to opencode
         o = self.agj("setup", "--yes", "--harness", "none", "--set", "backend.opencode.model=anthropic/c",
             "--set", "backend.codex.mode=edits", "--set", "backend.gemini.enabled=false", "--set", "backend.claude.plan=true")
         self.assertEqual(o["data"]["backends"]["codex"]["mode"], "edits")
@@ -74,6 +75,7 @@ class SetupForm(unittest.TestCase):
             "gemini": {"enabled": False}})
 
     def test_cli_disabled_backend_blocks_save(self):
+        self.env["AG_HARNESS"] = "opencode"  # opencode profile routes every job to opencode
         code, out = self.pty_run(["--ui", "cli", "--harness", "none"], [UP, UP, UP, UP, LEFT, ENTER, "s", "x", "q", "y"])
         self.assertEqual(code, 0, out[-1500:]); self.assertIn("Can't save yet", out); self.assertIn("cancelled", out)
         self.assertFalse((self.cfg/"routing.json").exists())

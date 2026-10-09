@@ -79,7 +79,8 @@ class Web(unittest.TestCase):
         self.assertEqual(s, 200, d); self.assertTrue(r["ok"]); self.assertTrue(all("path" in f for f in r["files"]))
         out, _ = self.p.communicate(timeout=15); self.assertEqual(self.p.returncode, 0)
         doc = json.loads((self.cfg/"routing.json").read_text())
-        self.assertEqual(doc["jobs"]["review"]["ag"], {"backend": "codex", "model": "gpt-x"})
+        self.assertEqual(doc["profiles"]["default"]["jobs"]["review"]["ag"], {"backend": "codex", "model": "gpt-x"})
+        self.assertEqual(doc["version"], 2); self.assertNotIn("jobs", doc); self.assertEqual(list(doc["profiles"]), ["default"])   # sparse: only the edited profile
         self.assertEqual(doc["backends"], {"codex": {"mode": "edits", "plan": True}, "gemini": {"enabled": False}})
         self.assertTrue((self.home/".claude"/"skills"/"ag-agents"/"SKILL.md").exists())
         self.assertIn("wrote", out)
@@ -129,19 +130,29 @@ class Web(unittest.TestCase):
         p = self.ag("setup", "--ui", "mac", "--dry-run", "--harness", "none", env={"AG_SETUP_NO_OPEN": "1", "AG_SETUP_WEB_IDLE": "1", "AG_PROBE": "0"})
         self.assertIn("ag setup form: http://127.0.0.1:", p.stderr); self.assertIn("idle timeout", p.stdout)
 
-    def test_v2_shape_with_stub_profiles_api(self):
+    def test_v2_save_sparse_keeps_project_and_unknown_keys(self):
         import test_ag_setup_ui as ui
-        m = ui.load_ag(); m.routing_load = lambda scope: {"version": 2, "profiles": {"opencode": {"jobs": {}}}, "project": {"answered": "x"}}
+        m = ui.load_ag()
         os.environ.update(AG_HOME=str(self.home), AG_CONFIG_HOME=str(self.cfg), AG_CACHE_HOME=str(self.cache), AG_SKILLS_DIR=str(self.skills))
-        self.cfg.mkdir(parents=True, exist_ok=True); (self.cfg/"routing.json").write_text(json.dumps({"version": 2, "project": {"answered": "x"}}))
-        st = m.setup_state_from("global", None, None, [], None, proj=str(self.proj), existing={"global": {}, "project": {}})
+        self.cfg.mkdir(parents=True, exist_ok=True); self.proj.joinpath(".agent").mkdir(exist_ok=True)
+        doc0 = {"version": 2, "project": {"answered": "x", "harnesses": ["claude"]}, "catalog": {"aa_key_ref": "${K}"},
+            "profiles": {"opencode": {"jobs": {"plan": {"claude": "opus", "ag": {"backend": "opencode", "model": "m"}}}}}}
+        (self.proj/".agent"/"routing.json").write_text(json.dumps(doc0))
+        ex = {"global": {}, "project": doc0}
+        st = m.setup_state_from("project", None, None, [], None, proj=str(self.proj), existing=ex)
         pl = m.setup_web_payload(st); self.assertEqual(pl["profile_names"], ["claude", "opencode", "codex", "default"])
-        b = {"scope": "global", "harnesses": [], "backends": {}, "profiles": {p: {"jobs": v["jobs"]} for p, v in pl["scopes"]["global"]["profiles"].items()}}
+        pj = pl["scopes"]["project"]["profiles"]
+        self.assertEqual(pj["opencode"]["jobs"]["plan"]["ag"]["model"], "m")             # project overlay shown in the project tab
+        self.assertNotEqual(pl["scopes"]["global"]["profiles"]["opencode"]["jobs"]["plan"]["ag"]["model"], "m")   # not in the global tab
+        b = {"scope": "project", "harnesses": [], "backends": {}, "profiles": {p: {"jobs": v["jobs"]} for p, v in pj.items()}}
         b["profiles"]["codex"]["jobs"]["plan"]["ag"] = {"backend": "codex", "model": "gpt-x"}
         e, st2, profs = m.setup_web_apply(st, b); self.assertFalse(e, e)
         doc = json.loads(m.setup_web_plan(st2, profs)["plan"][0][1])
-        self.assertEqual(doc["version"], 2); self.assertEqual(doc["project"], {"answered": "x"}); self.assertNotIn("jobs", doc)
-        self.assertEqual(doc["profiles"]["codex"]["jobs"]["plan"]["ag"]["model"], "gpt-x"); self.assertEqual(set(doc["profiles"]), set(m.WEB_PROFILES))
+        self.assertEqual(doc["version"], 2); self.assertEqual(doc["project"], doc0["project"]); self.assertEqual(doc["catalog"], doc0["catalog"]); self.assertNotIn("jobs", doc)
+        self.assertEqual(doc["profiles"]["codex"]["jobs"]["plan"]["ag"]["model"], "gpt-x")
+        self.assertEqual(doc["profiles"]["opencode"]["jobs"]["plan"]["ag"]["model"], "m")
+        self.assertEqual(set(doc["profiles"]), {"codex", "opencode"})                      # inherited profiles are not frozen into the file
+        self.assertEqual(set(doc["profiles"]["codex"]["jobs"]), {"plan"})
 
 
 if __name__ == "__main__":

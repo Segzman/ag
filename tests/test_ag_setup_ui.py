@@ -28,7 +28,7 @@ class SetupState(unittest.TestCase):
     def st(self, **kw):
         ex = kw.pop("existing", {"global": {}, "project": {}})
         return self.m.setup_state_from(kw.pop("scope", "global"), kw.pop("preset", None), kw.pop("sets", None),
-            kw.pop("harn", ["claude"]), kw.pop("claude_md", None), proj="/p", existing=ex)
+            kw.pop("harn", ["claude"]), kw.pop("claude_md", None), proj="/p", existing=ex, profile=kw.pop("profile", "claude"))
 
     def test_preset_apply_and_custom_edits(self):
         m, s = self.m, self.st()
@@ -52,13 +52,13 @@ class SetupState(unittest.TestCase):
     def test_rows(self):
         m, s = self.m, self.st(harn=["claude", "opencode"])
         rows = m.setup_rows(s)
-        self.assertEqual([k for k, _ in rows], ["scope", "harnesses", "preset", "claude_md"] + [f"job:{j}" for j in m.JOB_KEYS]
+        self.assertEqual([k for k, _ in rows], ["scope", "profile", "harnesses", "preset", "claude_md"] + [f"job:{j}" for j in m.JOB_KEYS]
             + [f"bk:{b}" for b in m.BACKEND_TABS])
-        self.assertEqual(rows[1][1], "Harnesses: claude, opencode")
-        self.assertEqual(rows[3][1], "Write CLAUDE.md: yes (auto)")
-        self.assertEqual(rows[4][1], f"mechanical — Claude: haiku · ag: opencode/{m.OPENCODE_MODEL_DEFAULT}")
+        self.assertEqual(rows[2][1], "Harnesses: claude, opencode")
+        self.assertEqual(rows[4][1], "Write CLAUDE.md: yes (auto)")
+        self.assertEqual(rows[5][1], "mechanical — Claude: haiku · ag: claude/haiku")
         s["claude_md"] = False; s["harnesses"] = []
-        self.assertEqual(m.setup_rows(s)[1:4:2], [("harnesses", "Harnesses: none"), ("claude_md", "Write CLAUDE.md: no")])
+        self.assertEqual(m.setup_rows(s)[2:5:2], [("harnesses", "Harnesses: none"), ("claude_md", "Write CLAUDE.md: no")])
 
     def test_targets(self):
         import tempfile
@@ -77,7 +77,7 @@ class SetupState(unittest.TestCase):
                 m.setup_set_scope(s, "project")
                 t = m.setup_targets(s)
                 self.assertEqual(str(t["plan"][0][0]), "/p/.agent/routing.json")
-                self.assertEqual(json.loads(t["plan"][0][1])["jobs"], s["jobs"])
+                self.assertEqual(json.loads(t["plan"][0][1])["profiles"]["claude"]["jobs"], s["jobs"])
             finally:
                 for k, v in old.items():
                     if v is None: os.environ.pop(k, None)
@@ -90,7 +90,7 @@ class SetupUIs(unittest.TestCase):
     # ---- curses in a real pty ----
     def pty_run(self, args, keys, size=(24, 80), after_start=None):
         self.agj("models")
-        env = {**self.env, "TERM": "xterm-256color", "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8", "AG_AUTO_UPDATE": "0"}
+        env = {**self.env, "TERM": "xterm-256color", "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8", "AG_AUTO_UPDATE": "0", "AG_HARNESS": self.env.get("AG_HARNESS", "claude")}
         env.pop("NO_COLOR", None); env.pop("AG_SETUP_UI", None)
         pid, fd = pty.fork()
         if pid == 0:
@@ -120,7 +120,7 @@ class SetupUIs(unittest.TestCase):
         return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
 
     def test_cli_editor_session(self):
-        keys = [DOWN, ENTER, " ", ENTER,                    # harnesses: + claude (opencode, codex detected)
+        keys = [DOWN, DOWN, ENTER, " ", ENTER,                    # harnesses: + claude (opencode, codex detected)
             DOWN, "\x1b[B", DOWN, "\x1b[B", DOWN, RIGHT, ENTER, "openc", ENTER, "anth", ENTER,   # review ag (CSI + SS3 arrows)
             DOWN, ENTER, ENTER, "\t", "\x15", "my/custom-1", ENTER,                      # debug ag model: custom id
             LEFT, ENTER, "hai", ENTER,                      # debug claude -> haiku
@@ -129,7 +129,7 @@ class SetupUIs(unittest.TestCase):
         self.assertEqual(code, 0, out[-1500:])
         self.assertIn("ag setup", out); self.assertIn("Writes (global)", out)
         self.assertIn("wrote", out)
-        rt = json.loads((self.cfg/"routing.json").read_text())["jobs"]
+        rt = json.loads((self.cfg/"routing.json").read_text())["profiles"]["claude"]["jobs"]
         self.assertEqual(rt["review"]["ag"], {"backend": "opencode", "model": "anthropic/c"})
         self.assertEqual(rt["debug"], {"claude": "haiku", "ag": {"backend": "claude", "model": "my/custom-1"}})
         for d in (self.home/".claude", self.home/".config"/"opencode"):

@@ -133,13 +133,16 @@ ag setup [--scope global|project] [--harness claude,opencode,codex|all]
          [--set JOB=claude:ALIAS] [--set JOB=ag:BACKEND/MODEL]
          [--set backend.B.enabled=true|false] [--set backend.B.model=ID]
          [--set backend.B.mode=ro|edits|auto|full|unset] [--set backend.B.plan=true|false]
+         [--profile claude|opencode|codex|default] [--answers JSON]
          [--claude-md|--no-claude-md] [--yes] [--dry-run] [--ui web|cli|plain]
 ```
+
+`--profile` picks which harness profile's job table is edited (default: the detected harness; see [Routing](#routing)); the cli UI has a Profile row. `--answers JSON` is the non-interactive per-project setup an agent runs after `ag route --check` (project scope only; see Routing).
 
 Interactive front-ends (flags pre-fill them; `--ui` or env `AG_SETUP_UI` picks one; `--yes`/`--dry-run`/no TTY stay non-interactive):
 
 - `web` (default on a local macOS desktop; `mac` is an alias): `ag` serves one page on `127.0.0.1:<random port>` (stdlib `http.server`, inline HTML/CSS/JS, no external assets, dark/light) and opens it with `open`/`xdg-open` (`AG_SETUP_NO_OPEN=1` only prints the URL, `http://127.0.0.1:PORT/TOKEN/`). Header: scope select, detected-harness badge, Save, Cancel (Ctrl/Cmd+S saves). Tabs: one per profile (Claude Code / opencode / codex / Default when routing v2 profiles are present, else just Default) with a jobs table: real `<select>` dropdowns with an `<optgroup>` per enabled backend, options `model — tier · ctx · free/$in/$out · score` in catalog rank order (plain model lists until the catalog lands), plus `custom…` (type `backend/model`); the Claude profile also has a Claude subagent select. A side panel shows the capabilities of the focused model. **Backends** tab: enabled, default model, mode (from CAPS, `advisory` where not enforced), plan, probe status. **Models** tab: ranked table with backend/tier/free/new/search filters and Refresh. **Skills** tab: harness checkboxes + write the CLAUDE.md block. Save validates server-side with the same helpers (400 + inline errors, form stays up), writes, shows the written paths (`--dry-run`: the diff) and exits; Cancel or 15 min idle (`AG_SETUP_WEB_IDLE` seconds) exits writing nothing. Security: loopback only, random one-time token as the first URL path segment (else 403), `Host` must be `127.0.0.1:<port>`/`localhost:<port>`, `Origin` (if sent) must match, POSTs must be `application/json`, no CORS headers, strict CSP, no-store. Endpoints under `/<token>/`: `GET /` page, `POST save|refresh|cancel`.
-- `cli` (default elsewhere on a TTY): one curses screen: settings, the 6-job table (Job | Claude | ag backend/model, `*` = differs from preset), target files. `↑↓` move, `←→`/Tab pick the Claude or ag column, `Enter` edits in a popup (type to filter, Backspace, Esc cancels, Space toggles harnesses, Tab = custom id), `s` reviews + writes, `q` quits, `?` help. A **Backends** table follows the jobs (On / Default model / Mode / Plan): `←→` picks the field, `Enter` toggles or opens the picker. The ag backend picker lists enabled backends only; `s` refuses to save while a job targets a disabled backend. Needs 60x23; smaller falls back to `plain`.
+- `cli` (default elsewhere on a TTY): one curses screen: settings, the 6-job table (Job | Claude | ag backend/model, `*` = differs from preset), target files. `↑↓` move, `←→`/Tab pick the Claude or ag column, `Enter` edits in a popup (type to filter, Backspace, Esc cancels, Space toggles harnesses, Tab = custom id), `s` reviews + writes, `q` quits, `?` help. A **Backends** table follows the jobs (On / Default model / Mode / Plan): `←→` picks the field, `Enter` toggles or opens the picker. The ag backend picker lists enabled backends only; `s` refuses to save while a job targets a disabled backend. Needs 60x24; smaller falls back to `plain`.
 - `plain`: the original prompt sequence.
 
 Stale model lists refresh in the background; the next model picker sees the fresh list. Applying a preset in `cli` over custom picks asks first. It writes:
@@ -230,22 +233,28 @@ Pick a **job type**, then use the routed model. Fixed keys: `mechanical` (script
 
 Each job maps to a Claude alias (for Claude Code subagents' `model:`) and an ag backend/model (for ag sub-agents). Preset `cost-first` (default):
 
+Profiles (routing v2): `ag` detects the calling harness and uses that harness's job table. `detect_harness()` order: `AG_HARNESS` env override (claude|opencode|codex|cursor|gemini|none) > the innermost ancestor process that is claude / opencode / codex / cursor-agent / gemini (walks `ps` parents, max 25 hops; node/bun/python/shell wrappers match on their args) > env fallback (`OPENCODE=1`, `CODEX_SANDBOX`/`CODEX_CI`, `CLAUDECODE`; env leaks through nesting, so it is last). `ag route` prints `harness: <name> (via process|env|override)  profile: <name>`. The profile is the harness's name (claude, opencode, codex) or `default` (cursor/gemini/none); `--profile NAME` or `AG_PROFILE` override it on `route`, `agents add --job` and `setup`. Built-ins: claude = the table below; opencode = every job on opencode with a free model auto-picked per tier from the catalog (mechanical small, implement/review balanced, debug/plan/hardest big; fallback `opencode/muse-spark-1.3-contributor-free`); codex = every job on codex (catalog pick per tier, fallback `default`); default = claude's. Skills render the profile of the harness they are installed into; the CLAUDE.md block is the claude profile.
+
 | job | claude | ag |
 |---|---|---|
-| mechanical | haiku | opencode / opencode/muse-spark-1.3-contributor-free |
+| mechanical | haiku | claude / haiku |
 | implement | sonnet | claude / sonnet |
 | review, debug, plan | opus | claude / opus |
 | hardest | fable | claude / fable |
 
-Also `balanced` (review -> sonnet) and `quality-first` (mechanical sonnet, implement opus, rest fable). Unset ag entries fall back to opencode muse-spark.
+Also `balanced` (review -> sonnet) and `quality-first` (mechanical sonnet, implement opus, rest fable). Presets apply to the claude/default profiles. Unset ag entries fall back to opencode muse-spark.
 
-Storage: global `~/.config/ag/routing.json`; project `<git toplevel or cwd>/.agent/routing.json`; shape `{"version":1,"preset":"cost-first","jobs":{job:{"claude":...,"ag":{"backend":...,"model":...}}},"backends":{b:{"enabled":bool,"model":str,"mode":str,"plan":bool}}}`. Effective routing = global overlaid per job by project; `backends` overlays per field (only non-default fields are written).
+Storage: global `~/.config/ag/routing.json`; project `<git toplevel or cwd>/.agent/routing.json`; shape `{"version":2,"preset":"cost-first","profiles":{"claude|opencode|codex|default":{"jobs":{job:{"claude":...,"ag":{"backend":...,"model":...}}}}},"backends":{b:{"enabled":bool,"model":str,"mode":str,"plan":bool}},"project":{"answered":iso,"harnesses":[...]}}`. v1 files (top-level `jobs`) load as `profiles.default` and `profiles.claude` and are rewritten as v2 on the next save. The web form saves sparsely: only jobs that differ from what a profile inherits are written (so opencode/codex catalog picks stay live), `project.answered` and unknown keys (e.g. `catalog`) are preserved. Effective routing = built-in/preset < global < project, per profile per job per field; `backends` overlays per field (only non-default fields are written).
 
 Backend defaults: `ag agents add N --backend B` without `--model`/`--mode`/`--plan` takes B's default model/mode/plan; `--job` still picks backend+model from routing (a routed `default` model falls to the backend default), mode/plan from the backend. Disabled backends vanish from every setup picker; `ag route` flags a job routed to one (`! backend disabled`, `warnings` in `--json`, which also carries `backends`); `agents add` on one warns. The ag-agents skill gets a compact line: `Backend defaults (...): opencode: <model> (mode edits) · gemini: off`.
 
+Per-project setup (driven by the agent, inside its harness; ag never prompts in a terminal for this): `ag route --check [--json]` -> `{"configured": bool, "project", "harness", "profile", "questions": [...], "answers_format"}`; configured = the project `routing.json` has `project.answered`. Questions are for the harness's own question tool: `use` (inherit my `<profile>` profile / cheap / strong / custom), `other_harnesses` (multi), and, for `custom`, one `job.<JOB>` question each (top catalog picks per tier). `ag setup --scope project --answers '{"use":"cheap","other_harnesses":["codex"],"jobs":{"review":"claude/opus"}}'` applies them (`jobs` only for custom; value `backend/model`, bare model = the harness's backend): inherit = mark answered, no overrides; cheap/strong = overrides for each chosen harness's profile from the catalog's smallest/biggest tier (claude: haiku / opus+fable; opencode cheap = free only); custom = per-job. It installs the project skills (`.claude/skills`, `.opencode/skills`, `.agents/skills`) for the current + other harnesses and prints the written paths.
+
 ```sh
 ag setup                      # create/change routing (+ skills)
-ag route [JOB] [--json]       # effective routing + source of each entry (global/project/preset-default)
+ag route [JOB] [--profile P] [--json]   # detected harness + profile, effective routing + source of each entry
+ag route --check [--json]     # per-project setup: {configured, project, harness, profile, questions[]}
+ag setup --scope project --answers '{"use":"inherit","other_harnesses":["codex"]}'   # apply the answers
 ag agents add w --job mechanical        # backend+model from routing when --backend omitted
 ag chat send w "task" --job implement   # delegate / wake / chat send: records `job` only, no backend switch
 ```

@@ -1,269 +1,167 @@
 #!/usr/bin/env python3
-"""Persisted harness profile tests (live ag).
-
-Opt-in named sources (instructions/memory/skills/MCP + backend config),
-shared across agents, scoped runtime files, no global writes.
-Fake fixtures only; echo backend; no real models/connectors.
-No secrets in CLI output (fixture marker asserted absent).
-
-Run: python3 tests/test_ag_profiles.py
+"""Harness detection, routing v2 profiles (+v1 migration), `route --check`, `setup --answers`.
+Same isolation as test_ag_setup (temp AG_HOME etc.). Run: python3 tests/test_ag_profiles.py
 """
-import importlib.machinery
-import json
-import os
-import subprocess
-import sys
-import tempfile
+import json, os, subprocess, sys, unittest
 from pathlib import Path
 
-AG = os.environ.get("AG_BIN", str(Path(__file__).resolve().parent.parent / "ag"))
-assert os.path.exists(AG), f"ag missing: {AG}"
-SECRET = "FIXTURE-SECRET-9f8e7d6c5b"
-assert SECRET not in Path(AG).read_text(), "secret marker must not be in ag"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import test_ag_setup as base  # noqa: E402
+import test_ag_setup_ui as ui  # noqa: E402
+
+AG = base.AG
 
 
-def load_mod():
-    return importlib.machinery.SourceFileLoader("agmod", AG).load_module()
+class Profiles(unittest.TestCase):
+    setUp, ag, agj = base.AgSetup.setUp, base.AgSetup.ag, base.AgSetup.agj
 
+    def noharness(self): self.env.pop("AG_HARNESS", None); self.env.pop("CLAUDECODE", None)
+    def rt(self, scope="global"):
+        return json.loads(((self.cfg if scope == "global" else self.proj/".agent")/"routing.json").read_text())
 
-def run_ag(args, state, timeout=30):
-    env = dict(os.environ, AGENT_CLI_DIR=str(state))
-    return subprocess.run([sys.executable, AG] + args, capture_output=True,
-                          text=True, timeout=timeout, env=env)
+    # ---- A: detection ----
+    def test_override_and_none(self):
+        for h in ("claude", "opencode", "codex", "none"):
+            d = self.agj("route", env={"AG_HARNESS": h})["data"]
+            self.assertEqual((d["harness"], d["via"]), (h, "override"))
+        self.assertIn("harness: codex (via override)", self.ag("route", env={"AG_HARNESS": "codex"}).stdout)
 
+    def test_process_walk_innermost_wins_and_env_is_fallback(self):
+        self.noharness()
+        for name in ("opencode", "claude"):   # wrapper scripts named like the harness: comm=sh, args name them
+            w = self.root/name; w.write_text(f'#!/bin/sh\n"$@"\n'); w.chmod(0o755)
+        py = [sys.executable, AG, "--json", "route"]
+        run = lambda *wrap, env=None: json.loads(subprocess.run([*wrap, *py], capture_output=True, text=True, cwd=self.proj,
+            env={**self.env, **(env or {})}, stdin=subprocess.DEVNULL).stdout)["data"]
+        d = run(str(self.root/"opencode"))
+        self.assertEqual((d["harness"], d["via"], d["profile"]), ("opencode", "process", "opencode"))
+        # opencode launched from claude (env leaks CLAUDECODE): innermost process wins over env
+        d = run(str(self.root/"claude"), str(self.root/"opencode"), env={"CLAUDECODE": "1"})
+        self.assertEqual((d["harness"], d["via"]), ("opencode", "process"))
+        # no matching ancestor (stubbed ps): env fallback, then none
+        m = ui.load_ag(); none = lambda pid: None
+        self.assertEqual(m.detect_harness({"CODEX_CI": "1"}, 5, none), ("codex", "env"))
+        self.assertEqual(m.detect_harness({"OPENCODE": "1", "CLAUDECODE": "1"}, 5, none), ("opencode", "env"))
+        self.assertEqual(m.detect_harness({}, 5, none)[0], "none")
+        self.assertEqual(m.detect_harness({"AG_HARNESS": "bogus"}, 5, none)[0], "none")   # invalid override ignored
 
-def run_json(args, state, timeout=30):
-    p = run_ag(args, state, timeout=timeout)
-    try:
-        return p, json.loads(p.stdout)
-    except Exception:
-        raise AssertionError(
-            f"not JSON for {args}: rc={p.returncode} out={p.stdout!r} err={p.stderr!r}")
+    # ---- B: profiles ----
+    def test_builtin_profiles(self):
+        c = self.agj("route", env={"AG_HARNESS": "claude"})["data"]["jobs"]
+        self.assertEqual((c["mechanical"]["claude"], c["mechanical"]["ag"]["backend"], c["hardest"]["ag"]["model"]), ("haiku", "claude", "fable"))
+        o = self.agj("route", env={"AG_HARNESS": "opencode"})["data"]["jobs"]
+        self.assertTrue(all(e["ag"]["backend"] == "opencode" for e in o.values()))
+        x = self.agj("route", env={"AG_HARNESS": "codex"})["data"]["jobs"]
+        self.assertTrue(all(e["ag"]["backend"] == "codex" for e in x.values()))
+        d = self.agj("route", env={"AG_HARNESS": "cursor"})["data"]
+        self.assertEqual(d["profile"], "default")
+        self.assertEqual(self.agj("route", "--profile", "codex")["data"]["profile"], "codex")
+        self.assertEqual(self.agj("route", env={"AG_PROFILE": "opencode"})["data"]["profile"], "opencode")
 
+    def test_v1_file_migrates_and_project_overlays_per_profile(self):
+        self.cfg.mkdir()
+        (self.cfg/"routing.json").write_text(json.dumps({"version": 1, "preset": "cost-first",
+            "jobs": {"plan": {"claude": "haiku", "ag": {"backend": "codex", "model": "gpt-x"}}}}))
+        for h in ("claude", "cursor"):   # claude + default pick up v1 jobs; opencode does not
+            e = self.agj("route", "plan", env={"AG_HARNESS": h})["data"]["jobs"]["plan"]
+            self.assertEqual((e["claude"], e["ag"]["backend"], e["source"]["ag"]), ("haiku", "codex", "global"))
+        self.assertEqual(self.agj("route", "plan", env={"AG_HARNESS": "opencode"})["data"]["jobs"]["plan"]["ag"]["backend"], "opencode")
+        (self.proj/".agent").mkdir()
+        (self.proj/".agent"/"routing.json").write_text(json.dumps({"version": 2, "profiles": {"claude": {"jobs": {"plan": {"ag": {"backend": "claude", "model": "opus"}}}}}}))
+        e = self.agj("route", "plan", env={"AG_HARNESS": "claude"})["data"]["jobs"]["plan"]
+        self.assertEqual((e["claude"], e["ag"]["model"], e["source"]), ("haiku", "opus", {"claude": "global", "ag": "project"}))
+        # saving rewrites as v2, keeping migrated profiles
+        self.agj("setup", "--yes", "--harness", "none", env={"AG_HARNESS": "opencode"})
+        doc = self.rt()
+        self.assertEqual(doc["version"], 2); self.assertNotIn("jobs", doc)
+        self.assertEqual(set(doc["profiles"]), {"default", "claude", "opencode"})
+        self.assertEqual(doc["profiles"]["claude"]["jobs"]["plan"]["claude"], "haiku")
 
-def fixtures():
-    src = Path(tempfile.mkdtemp(prefix="ag-prof-src-"))
-    (src / "skills" / "demo-skill").mkdir(parents=True)
-    (src / "skills" / "demo-skill" / "SKILL.md").write_text(
-        "---\nname: demo-skill\ndescription: fixture skill for profile tests\n---\n"
-        "# demo\nUse me for fixtures.\n")
-    (src / "INSTR.md").write_text("# instructions\nFollow repo style.\n")
-    (src / "MEM.md").write_text("# memory\nRemember fixture context.\n")
-    (src / "mcp.json").write_text(json.dumps({
-        "mcpServers": {
-            "local-one": {"command": "npx", "args": ["-y", "mcp-demo"],
-                          "env": {"DEMO_KEY": SECRET}},
-            "web-one": {"url": "https://mcp.example.com/mcp",
-                        "headers": {"Authorization": "Bearer t",
-                                    "X-Api-Key": "{env:FIXTURE_API_KEY}"}},
-            "web-embedded": {"url": "https://mcp.example.com/other",
-                             "headers": {"Authorization": "Bearer {env:FIXTURE_EMBEDDED}"}},
-        }}))
-    (src / "opencode.json").write_text(json.dumps(
-        {"$schema": "https://opencode.ai/config.json",
-         "model": "fixture/model"}))
-    (src / "codex.toml").write_text('model = "fixture-model"\n')
-    state = Path(tempfile.mkdtemp(prefix="ag-prof-state-"))
-    return src, state
+    def test_agents_add_job_uses_active_profile(self):
+        self.agj("agents", "add", "w1", "--job", "review", env={"AG_HARNESS": "codex"})
+        self.agj("agents", "add", "w2", "--job", "review", "--profile", "claude", env={"AG_HARNESS": "codex"})
+        ag = {x["name"]: x for x in self.agj("agents", "list")["data"]["agents"]}
+        self.assertEqual((ag["w1"]["backend"], ag["w2"]["backend"], ag["w2"]["model"]), ("codex", "claude", "opus"))
 
+    def test_skills_render_profile_of_each_harness(self):
+        self.agj("setup", "--yes", "--scope", "global", "--harness", "claude,opencode,codex")
+        for base_, prof in ((".claude", "claude"), (".config/opencode", "opencode"), (".codex", "codex")):
+            t = (self.home/base_/"skills"/"ag-agents"/"SKILL.md").read_text()
+            self.assertIn(f"Profile: {prof}.", t)
+            self.assertEqual("Claude subagent" in t, prof == "claude")
 
-def check(name, fn):
-    try:
-        fn()
-    except Exception as e:
-        print(f"FAIL {name}: {e}")
-        return False
-    print(f"PASS {name}")
-    return True
+    def test_setup_profile_flag_edits_only_that_profile(self):
+        self.agj("setup", "--yes", "--harness", "none", "--profile", "opencode", "--set", "review=ag:codex/gpt-x")
+        doc = self.rt()
+        self.assertEqual(doc["profiles"]["opencode"]["jobs"]["review"]["ag"], {"backend": "codex", "model": "gpt-x"})
+        self.assertNotIn("claude", doc["profiles"])
+        self.assertEqual(self.agj("route", "review", env={"AG_HARNESS": "opencode"})["data"]["jobs"]["review"]["ag"]["backend"], "codex")
 
+    def test_state_profile_switch_keeps_edits(self):
+        m = ui.load_ag()
+        s = m.setup_state_from("global", None, None, [], None, proj="/p", existing={"global": {}, "project": {}}, profile="claude")
+        m.setup_edit_job(s, "plan", claude="haiku")
+        m.setup_set_profile(s, "opencode"); m.setup_edit_job(s, "debug", ag={"backend": "codex", "model": "g"})
+        self.assertEqual(s["jobs"]["plan"]["claude"], "sonnet")           # claude edit not visible in opencode
+        m.setup_set_profile(s, "claude"); self.assertEqual(s["jobs"]["plan"]["claude"], "haiku")
+        doc = json.loads(m.setup_targets(s)["plan"][0][1])["profiles"]
+        self.assertEqual((doc["claude"]["jobs"]["plan"]["claude"], doc["opencode"]["jobs"]["debug"]["ag"]["backend"]), ("haiku", "codex"))
 
-def t_add_validate_show():
-    src, st = fixtures()
-    m = load_mod()
-    p, o = run_json(["--json", "harness", "profile", "add", "demo",
-                     "--instructions", str(src / "INSTR.md"),
-                     "--memory", str(src / "MEM.md"),
-                     "--skills", str(src / "skills"),
-                     "--mcp", str(src / "mcp.json"),
-                     "--opencode-config", str(src / "opencode.json"),
-                     "--codex-config", str(src / "codex.toml")], st)
-    assert o["ok"], o
-    assert SECRET not in p.stdout + p.stderr, "secret leaked in add output"
-    v = m.profile_validate(st, "demo")
-    assert v["ok"], v
-    assert any("codex" in u and "env ref" in u for u in v["unsupported"]), v  # embedded ref bounded
-    p, o = run_json(["--json", "harness", "profile", "show", "demo"], st)
-    assert o["ok"], o
-    assert SECRET not in p.stdout, "secret leaked in show output"
-    files = o["data"]["effective"]["files"]
-    assert "opencode_config" in files and "codex_config" in files, files
-    # codex scoped home keeps skills access: profile skill mirrored in
-    eff = m.ensure_effective_profile(st, "demo")
-    assert (Path(eff["dir"]) / "codex-home" / "skills" / "demo-skill" / "SKILL.md").is_file(), eff
+    def test_routing_load_save_roundtrip(self):
+        m = ui.load_ag()
+        old = {k: os.environ.get(k) for k in ("AG_CONFIG_HOME", "AG_HOME")}
+        os.environ.update(AG_CONFIG_HOME=str(self.cfg), AG_HOME=str(self.home))
+        try:
+            p = m.routing_save("global", {"profiles": {"codex": {"jobs": {"plan": {"ag": {"backend": "codex", "model": "m"}}}}}}, sdir=self.proj/".agent")
+            self.assertEqual(p, self.cfg/"routing.json")
+            self.assertEqual(m.routing_load("global", self.proj/".agent")["profiles"]["codex"]["jobs"]["plan"]["ag"]["model"], "m")
+            self.assertEqual(m.routing_load("effective", self.proj/".agent")["profiles"]["codex"]["jobs"]["plan"]["ag"]["model"], "m")
+            self.assertEqual(m.active_profile(self.proj/".agent", "codex")[1]["plan"]["ag"]["model"], "m")
+            for bad in ({"profiles": {"nope": {}}}, {"profiles": {"codex": {"jobs": {"zzz": {}}}}}):
+                with self.assertRaises(ValueError): m.routing_save("global", bad)
+        finally:
+            for k, v in old.items():
+                if v is None: os.environ.pop(k, None)
+                else: os.environ[k] = v
 
+    # ---- D: per-project setup ----
+    def test_route_check_and_answers(self):
+        c = self.agj("route", "--check", env={"AG_HARNESS": "claude"})["data"]
+        self.assertFalse(c["configured"]); self.assertEqual(c["harness"], "claude")
+        ids = [q["id"] for q in c["questions"]]
+        self.assertEqual(ids[:2], ["use", "other_harnesses"]); self.assertEqual(len(ids), 8)
+        self.assertEqual([o["value"] for o in c["questions"][1]["options"]], ["opencode", "codex"])
+        self.assertEqual([o["value"] for o in c["questions"][0]["options"]], ["inherit", "cheap", "strong", "custom"])
+        self.assertIn("claude profile", c["questions"][0]["options"][0]["label"])
+        t = self.ag("route", "--check", "--json", env={"AG_HARNESS": "claude"}); self.assertTrue(json.loads(t.stdout)["data"]["questions"])
+        env = {"AG_HARNESS": "claude"}
+        o = self.agj("setup", "--scope", "project", "--answers", json.dumps({"use": "inherit", "other_harnesses": ["codex"]}), env=env)["data"]
+        self.assertEqual(o["harnesses"], ["claude", "codex"])
+        doc = self.rt("project")
+        self.assertTrue(doc["project"]["answered"]); self.assertEqual(doc["project"]["harnesses"], ["claude", "codex"])
+        self.assertFalse(doc["profiles"])                                  # inherit = no overrides
+        for sub in (".claude", ".agents"): self.assertTrue((self.proj/sub/"skills"/"ag-agents"/"SKILL.md").exists())
+        self.assertFalse((self.proj/".opencode").exists())
+        c = self.agj("route", "--check", env=env)["data"]
+        self.assertEqual((c["configured"], c["questions"]), (True, []))
 
-def t_opencode_translation():
-    src, st = fixtures()
-    m = load_mod()
-    run_json(["--json", "harness", "profile", "add", "demo",
-              "--mcp", str(src / "mcp.json"),
-              "--skills", str(src / "skills"),
-              "--instructions", str(src / "INSTR.md")], st)
-    eff = m.ensure_effective_profile(st, "demo")
-    oc = json.loads(Path(eff["files"]["opencode_config"]).read_text())
-    assert oc["mcp"]["local-one"]["type"] == "local", oc
-    assert oc["mcp"]["local-one"]["command"] == ["npx", "-y", "mcp-demo"], oc
-    assert oc["mcp"]["local-one"]["environment"]["DEMO_KEY"] == SECRET
-    assert oc["mcp"]["web-one"]["type"] == "remote", oc
-    assert oc["mcp"]["web-one"]["url"] == "https://mcp.example.com/mcp", oc
-    assert oc["mcp"]["web-one"]["headers"]["Authorization"] == "Bearer t", oc
-    assert any("INSTRUCTIONS.md" in i for i in oc.get("instructions", [])), oc
-
-
-def t_codex_translation():
-    src, st = fixtures()
-    m = load_mod()
-    run_json(["--json", "harness", "profile", "add", "demo",
-              "--mcp", str(src / "mcp.json")], st)
-    eff = m.ensure_effective_profile(st, "demo")
-    toml = Path(eff["files"]["codex_config"]).read_text()
-    assert '[mcp_servers."local-one"]' in toml, toml
-    assert 'command = "npx"' in toml, toml
-    assert SECRET in toml  # env value preserved in scoped file
-    assert '[mcp_servers."web-one"]' in toml and "https://mcp.example.com/mcp" in toml, toml
-    # shared connectors work: literal -> http_headers, exact env ref -> env_http_headers
-    assert 'http_headers = { "Authorization" = "Bearer t" }' in toml, toml
-    assert 'env_http_headers = { "X-Api-Key" = "FIXTURE_API_KEY" }' in toml, toml
-    assert any("codex" in u and "env ref" in u for u in eff["unsupported"]), eff
-    assert SECRET not in " ".join(eff["unsupported"])
-
-
-def t_claude_argv():
-    src, st = fixtures()
-    m = load_mod()
-    run_json(["--json", "harness", "profile", "add", "demo",
-              "--mcp", str(src / "mcp.json"),
-              "--skills", str(src / "skills")], st)
-    extra = m.backend_argv_extra("claude", st, "demo")
-    assert "--mcp-config" in extra and "--plugin-dir" in extra, extra
-    cfg = json.loads(Path(extra[extra.index("--mcp-config") + 1]).read_text())
-    assert cfg["mcpServers"]["local-one"]["command"] == "npx", cfg
-    assert cfg["mcpServers"]["local-one"]["env"]["DEMO_KEY"] == SECRET
-
-
-def t_reaches_backend_and_shared():
-    src, st = fixtures()
-    run_json(["--json", "harness", "profile", "add", "demo",
-              "--instructions", str(src / "INSTR.md"),
-              "--memory", str(src / "MEM.md")], st)
-    for a in ("w1", "w2"):
-        p, o = run_json(["--json", "agents", "add", a,
-                         "--backend", "echo", "--role", "sub"], st)
-        assert o["ok"], o
-        p, o = run_json(["--json", "harness", "profile", "set", a,
-                         "--profile", "demo"], st)
-        assert o["ok"] and o["data"]["profile"] == "demo", o
-    p, o = run_json(["--json", "chat", "send", "w1", "hi"], st)
-    assert o["ok"], o
-    assert "Follow repo style" in o["data"]["reply"], o
-    assert "Remember fixture context" in o["data"]["reply"], o
-
-
-def t_sid_invalidated_persona_kept():
-    src, st = fixtures()
-    m = load_mod()
-    run_json(["--json", "harness", "profile", "add", "demo",
-              "--instructions", str(src / "INSTR.md")], st)
-    run_json(["--json", "agents", "add", "w1", "--backend", "echo",
-              "--role", "sub"], st)
-    m.save_chat_meta(st, "w1", {"sid": "ses-fake", "sids": {"echo": "ses-fake"}})
-    p, o = run_json(["--json", "harness", "profile", "set", "w1",
-                     "--profile", "demo"], st)
-    assert o["ok"] and o["data"]["sid_cleared"] is True, o
-    got = m.load_chat_meta(st, "w1")
-    assert got.get("sid") == "" and got.get("sids") == {}, got
-    r = [x for x in m.load_agents(st) if x["name"] == "w1"][0]
-    assert r["dir"] == "." and r["role"] == "sub", r
-
-
-def t_scoped_no_globals():
-    src, st = fixtures()
-    m = load_mod()
-    run_json(["--json", "harness", "profile", "add", "demo",
-              "--mcp", str(src / "mcp.json"),
-              "--skills", str(src / "skills")], st)
-    env = m.backend_env_for_profile(st, {"backend": "opencode"}, "demo")
-    assert env["OPENCODE_CONFIG"].startswith(str(st)), env
-    assert env["OPENCODE_CONFIG_DIR"].startswith(str(st)), env
-    assert Path.home().as_posix() not in env["OPENCODE_CONFIG"], env
-    assert "~/.config" not in env["OPENCODE_CONFIG"], env
-    cenv = m.backend_env_for_profile(st, {"backend": "codex"}, "demo")
-    assert cenv.get("CODEX_HOME", "").startswith(str(st)), cenv
-
-
-def t_no_secret_in_status():
-    src, st = fixtures()
-    run_json(["--json", "harness", "profile", "add", "demo",
-              "--mcp", str(src / "mcp.json"),
-              "--skills", str(src / "skills"),
-              "--instructions", str(src / "INSTR.md")], st)
-    for args in (["harness", "profile", "list"],
-                 ["harness", "profile", "show", "demo"],
-                 ["harness", "profile", "validate", "demo"],
-                 ["harness", "profile", "status"]):
-        p = run_ag(args, st)
-        assert SECRET not in p.stdout + p.stderr, f"leak in {args}"
-        p, o = run_json(["--json"] + args, st)
-        assert o["ok"], o
-        assert SECRET not in p.stdout, f"leak in --json {args}"
-
-
-def t_invalid_and_rm_guard():
-    src, st = fixtures()
-    p, o = run_json(["--json", "harness", "profile", "add", "bad name!",
-                     "--instructions", str(src / "INSTR.md")], st)
-    assert not o["ok"], o
-    p, o = run_json(["--json", "harness", "profile", "add", "demo",
-                     "--mcp", str(src / "nope.json")], st)
-    assert not o["ok"], o
-    run_json(["--json", "harness", "profile", "add", "demo",
-              "--instructions", str(src / "INSTR.md")], st)
-    run_json(["--json", "agents", "add", "w1", "--backend", "echo",
-              "--role", "sub"], st)
-    run_json(["--json", "harness", "profile", "set", "w1",
-              "--profile", "demo"], st)
-    p, o = run_json(["--json", "harness", "profile", "rm", "demo"], st)
-    assert not o["ok"] and "in use" in o["error"], o
-    p, o = run_json(["--json", "harness", "profile", "rm", "demo", "--force"], st)
-    assert o["ok"], o
-
-
-def t_existing_harness_unaffected():
-    _, st = fixtures()
-    p = run_ag(["harness", "show"], st)
-    assert p.returncode == 0, p.stderr
-    src, _ = fixtures()
-    (st / "fakehome" / ".claude" / "skills").mkdir(parents=True)
-    (st / "fakehome" / ".claude" / "skills" / "s.md").write_text("hi")
-    p = run_ag(["harness", "show", "--home", str(st / "fakehome")], st)
-    assert p.returncode == 0, p.stderr
-    p = run_ag(["harness", "link", "--to", str(st / "linked"),
-                "--home", str(st / "fakehome")], st)
-    assert p.returncode == 0, p.stderr
+    def test_answers_cheap_strong_custom_and_errors(self):
+        env = {"AG_HARNESS": "codex"}
+        self.agj("setup", "--answers", json.dumps({"use": "cheap", "other_harnesses": ["claude"]}), env=env)
+        pr = self.rt("project")["profiles"]
+        self.assertEqual(pr["claude"]["jobs"]["plan"]["ag"], {"backend": "claude", "model": "haiku"})
+        self.assertEqual(pr["codex"]["jobs"]["plan"]["ag"]["backend"], "codex")
+        self.agj("setup", "--answers", json.dumps({"use": "strong"}), env={"AG_HARNESS": "claude"})
+        self.assertEqual(self.rt("project")["profiles"]["claude"]["jobs"]["hardest"]["ag"]["model"], "fable")
+        self.assertEqual(self.agj("route", "plan", env={"AG_HARNESS": "claude"})["data"]["jobs"]["plan"]["ag"]["model"], "opus")
+        self.agj("setup", "--answers", json.dumps({"use": "custom", "jobs": {"review": "codex/gpt-x", "debug": "sonnet"}}), env={"AG_HARNESS": "claude"})
+        j = self.agj("route", env={"AG_HARNESS": "claude"})["data"]["jobs"]
+        self.assertEqual(j["review"]["ag"], {"backend": "codex", "model": "gpt-x"}); self.assertEqual(j["debug"]["ag"], {"backend": "claude", "model": "sonnet"})
+        self.assertFalse((self.cfg/"routing.json").exists())
+        for bad in ("{", '{"use":"zzz"}', '{"use":"custom","jobs":{"nope":"x"}}', '{"other_harnesses":["vim"]}', "[]"):
+            self.agj("setup", "--answers", bad, ok=False, env=env)
+        self.agj("setup", "--scope", "global", "--answers", "{}", ok=False, env=env)
 
 
 if __name__ == "__main__":
-    oks = [
-        check("add_validate_show", t_add_validate_show),
-        check("opencode_translation", t_opencode_translation),
-        check("codex_translation", t_codex_translation),
-        check("claude_argv", t_claude_argv),
-        check("reaches_backend_and_shared", t_reaches_backend_and_shared),
-        check("sid_invalidated_persona_kept", t_sid_invalidated_persona_kept),
-        check("scoped_no_globals", t_scoped_no_globals),
-        check("no_secret_in_status", t_no_secret_in_status),
-        check("invalid_and_rm_guard", t_invalid_and_rm_guard),
-        check("existing_harness_unaffected", t_existing_harness_unaffected),
-    ]
-    print(f"{sum(oks)}/{len(oks)} profile tests passed")
-    sys.exit(0 if all(oks) else 1)
+    unittest.main()

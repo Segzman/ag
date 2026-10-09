@@ -80,10 +80,10 @@ ag auto-checks GitHub once a day in a detached process; applies on next run. Git
 ## Models
 
 ```sh
-{{AG}} models [--backend B] [--refresh] [--rank] [--tier small|balanced|big] [--free] [--json]
+{{AG}} models [--backend B] [--refresh] [--rank] [--sort intel|coding|speed|popular] [--tier small|balanced|big] [--free] [--auto on|off] [--status] [--json]
 ```
 
-Live list per backend (opencode, codex, cursor discovered; claude/gemini static aliases). Cache `~/.cache/ag/models.json`, TTL 24h, auto-refresh when stale; `--refresh` forces. A failing source keeps its last good list and records `error`. Use it to pick valid model ids before `agents add --model`. `--rank` adds tier (small/balanced/big), context, reasoning/tools, price or `free`, release date, `new` badge from models.dev (+ Artificial Analysis score/speed when `AG_AA_KEY` is set); `--tier T`/`--free` filter. Small-fast vs big-smart: `models --backend opencode --free --tier big`. `{{AG}} route [JOB] [--json]` shows effective job routing (see `ag-agents`).
+Live list per backend (opencode, codex, cursor discovered; claude/gemini static aliases). Cache `~/.cache/ag/models.json`, TTL 24h, auto-refresh when stale; `--refresh` forces. A failing source keeps its last good list and records `error`. Use it to pick valid model ids before `agents add --model`. `--rank` shows Artificial Analysis scores (intelligence/coding/agentic) + tok/s + latency from openrouter.ai/rankings, plus ctx, price/`free`, release date, `new`/`fast` badges. Tier is derived from the intelligence score (big >= 40, balanced 20-40, small < 20); `tier~` = no score, guessed from the name. Sorted by intelligence per backend; `--sort intel|coding|speed|popular`; `--tier T`/`--free` filter; `--json` has every field + `sources` fetch times. Source: "scores: Artificial Analysis via openrouter.ai/rankings". `AG_AA_KEY` adds the official AA API as an override. Stale caches refresh in a detached background run (never blocks); `{{AG}} models --auto on|off` toggles it (also the daily update's catalog refresh), `--status` shows last fetch per source. Small-fast vs big-smart: `models --backend opencode --free --tier big`, `--sort speed`. `{{AG}} route [JOB] [--json]` shows effective job routing (see `ag-agents`).
 
 ## Setup
 

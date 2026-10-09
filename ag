@@ -11164,6 +11164,8 @@ def do_selfcheck(a):
         assert do_chat(mk(sub="log",name="t1",limit=5))==0
         _ckpt_selfcheck()
         assert _etime_s("1-02:03:04")==93784 and _etime_s("05:09")==309 and _ps_tree({1:{"ppid":0,"pgid":1},2:{"ppid":1,"pgid":1},3:{"ppid":2,"pgid":3}},1)==[1,2,3]
+        assert _or_key("opencode/claude-opus-4-5-free")==_or_key("anthropic/claude-4.5-opus-20251124") and _or_key("x/muse-spark-1.3-contributor-free",1)==_or_key("meta/muse-spark-1.3-20260902",1)
+        assert (_tier_of("x",None,48.1),_tier_of("x",None,39.9),_tier_of("x",None,19.9),_tier_of("x/spark-sol",None,None),_tier_of("x/foo-flash",None,None))==("big","balanced","small","balanced","small")
         assert do_agents(mk(sub="rm",name="t1",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
         append_chat(td,"t1","user","hello")
         assert "user: hello" in recent_history(td,"t1")
@@ -11638,11 +11640,24 @@ def model_choices(backend):
     return base + [m for m in cached if isinstance(m, str) and m and m not in base]
 
 def do_models(a):
-    bs = [a.backend] if a.backend else list(MODEL_BACKENDS)
-    cache = models_load(bs, refresh=a.refresh)
-    if a.rank or a.tier or a.free:
-        rows = [r for r in catalog_rows(a.backend, refresh=a.refresh) if (not a.tier or r["tier"] == a.tier) and (not a.free or r["free"])]
-        return emit(a, "models", {"rank": True, "models": rows, "_text": catalog_rank_text(rows) if rows else "no models match"})
+    if a.bg: catalog_refresh_all(); return 0   # detached background refresh (catalog_bg_refresh / update --quiet)
+    if a.auto or a.status:
+        if a.auto:
+            c = _ag_conf(); c["catalog_auto"] = a.auto == "on"; p = _ag_conf_path(); p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp"); tmp.write_text(json.dumps(c, indent=2) + "\n"); os.replace(tmp, p)
+        src = catalog_sources(); fa = lambda v: f"fetched {_ago(v)}" if v else "never fetched"; o = src["openrouter_rankings"]
+        t = [f'catalog auto-refresh {"on" if src["auto"] else "off"} (`ag models --auto on|off`, env AG_CATALOG_AUTO=0)',
+            f'  openrouter rankings  {fa(o["fetched_at"])}' + "".join(f'; {k} {_ago(v)}' for k, v in o["parts"].items()) + (f'; error: {o["error"]}' if o["error"] else ""),
+            f'  models.dev           {fa(src["models.dev"]["fetched_at"])}',
+            f'  artificial analysis  {"api key set, " + fa(src["artificial_analysis_api"]["fetched_at"]) if src["artificial_analysis_api"]["enabled"] else "no AG_AA_KEY (optional)"}']
+        t += [f"  {b} model list".ljust(23) + fa(v) for b, v in src["model_lists"].items()]
+        return emit(a, "models", {"status": True, "sources": src, "_text": "\n".join(t)})
+    cache = models_load(bs := [a.backend] if a.backend else list(MODEL_BACKENDS), refresh=a.refresh)
+    if a.rank or a.tier or a.free or a.sort:
+        rows = [r for r in catalog_rows(a.backend, refresh=a.refresh, sort=a.sort or "intel") if (not a.tier or r["tier"] == a.tier) and (not a.free or r["free"])]
+        src = catalog_sources()
+        return emit(a, "models", {"rank": True, "sort": a.sort or "intel", "models": rows, "sources": src,
+            "_text": catalog_rank_text(rows, src) if rows else "no models match"})
     data = {"fetched_at": cache.get("fetched_at", ""), "path": str(models_cache_path()),
         "backends": {b: cache["backends"].get(b, {}) for b in bs}}
     if getattr(a, "json", False): return emit(a, "models", data)
@@ -11660,8 +11675,8 @@ MODELSDEV_URL = "https://models.dev/api.json"
 AA_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 _MD_FIELDS = ("id", "name", "family", "reasoning", "tool_call", "release_date", "open_weights", "canonical_model_id")
 TIER_ORDER = ("big", "balanced", "small")
-_SMALL_RE = re.compile(r"flash|mini|nano|lite|haiku|small|fast|lightning|luna|spark|(?<![\w.])[1-9]b(?![\w])", re.I)
-_BIG_RE = re.compile(r"pro|ultra|opus|max|large|405b|fable|big|sol|mythos", re.I)
+_SMALL_RE = re.compile(r"(?<![a-z])(?:flash|mini|nano|lite|haiku)(?![a-z])", re.I)   # last-resort name guess only (no score)
+_BIG_RE = re.compile(r"(?<![a-z])(?:opus|ultra|pro|max)(?![a-z])", re.I)
 
 def modelsdev_path(): return ag_cache_home()/"modelsdev.json"
 def aa_cache_path(): return ag_cache_home()/"aa.json"
@@ -11729,6 +11744,165 @@ def aa_load(refresh=False):
         return res
     return (_cached_remote(aa_cache_path(), fetch, refresh) or {}).get("data") or {}
 
+# ---- OpenRouter rankings: Artificial Analysis indices (intelligence/coding/agentic) + live speed + usage, via openrouter.ai/rankings frontend JSON ----
+OR_RANK_URL = "https://openrouter.ai/api/frontend/v1/rankings"   # undocumented frontend endpoints; AG_OPENROUTER_RANKINGS_URL overrides (off|0 disables)
+OR_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+OR_BUDGET_S = 20       # a blocking fetch never exceeds this
+BG_STAMP_S = 600       # min gap between detached refreshes / retries after a failed fetch
+# Tier cutoffs on the AA intelligence index. Distribution of the 346 ranked models: max 57.6, p90 37, p67 18.6 (top third), median 11.1.
+# big >= 40 (frontier, ~top 7%); small < 20 (~ the top-third line, i.e. everything below it is the bottom two thirds); balanced between.
+TIER_BIG, TIER_SMALL = 40.0, 20.0
+_OR_PARTS = (("bench", "benchmarks"), ("perf", "performance"), ("pop", "models"))
+_OR_DROPS = (frozenset({"free"}), frozenset({"free", "latest", "preview", "contributor", "beta"}),
+    frozenset({"free", "latest", "preview", "contributor", "beta", "fast", "high", "medium", "low", "xhigh", "reasoning", "thinking"}))
+
+def or_rankings_path(): return ag_cache_home()/"openrouter-rankings.json"
+def catalog_auto_on(): return os.environ.get("AG_CATALOG_AUTO", "1") != "0" and _ag_conf().get("catalog_auto", True) is not False
+
+def _or_trim(part, raw):
+    if part == "bench":
+        aa = ((raw or {}).get("data") or {}).get("aaData") or {}; out = {}
+        for k in ("intelligence", "coding", "agentic"):
+            o = out[k] = {}
+            for r in aa.get(k) or []:
+                sl, sc = r.get("permaslug") or r.get("uid"), r.get("score")
+                if sl and isinstance(sc, (int, float)) and (sl not in o or sc > o[sl][0]): o[sl] = [sc, r.get("aa_name") or ""]
+        return out
+    if part == "perf": return {r["slug"]: [r.get("p50_throughput"), r.get("p50_latency")] for r in (raw or {}).get("data") or [] if r.get("slug")}
+    o = {}
+    for r in (raw or {}).get("data") or []:
+        sl = r.get("model_permaslug")
+        if sl: o[sl] = o.get(sl, 0) + int(r.get("total_completion_tokens") or 0) + int(r.get("total_prompt_tokens") or 0)
+    return o
+
+def _or_fetch_all(base):
+    """{part: trimmed | Exception}; 3 parallel fetches, 15s each, joined within OR_BUDGET_S (missing key = timed out)."""
+    res = {}
+    def run(k, path):
+        try: res[k] = _or_trim(k, _http_json(f"{base}/{path}", {"User-Agent": OR_UA, "Accept": "application/json"}, 15))
+        except Exception as e: res[k] = e
+    ts = [threading.Thread(target=run, args=p, daemon=True) for p in _OR_PARTS]
+    for t in ts: t.start()
+    end = time.time() + OR_BUDGET_S
+    for t in ts: t.join(max(0.0, end - time.time()))
+    return dict(res)
+
+def catalog_bg_refresh():
+    """Fire a detached `ag models --bg` (stamp-guarded, BG_STAMP_S). False when off/guarded/failed; never blocks or raises."""
+    if not catalog_auto_on(): return False
+    try:
+        st = ag_cache_home()/"catalog-bg"
+        if st.exists() and time.time() - st.stat().st_mtime < BG_STAMP_S: return False
+        st.parent.mkdir(parents=True, exist_ok=True); st.touch()
+        subprocess.Popen([sys.executable, ag_script_path(), "models", "--bg"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except Exception: return False
+
+def rankings_load(refresh=False):
+    """{bench:{intelligence,coding,agentic: {permaslug:[score,aa_name]}}, perf:{slug:[tok/s,ms]}, pop:{permaslug:tokens}, fast_tps, fetched:{part:iso},
+    fetched_at, error} or {}. Cache 24h at openrouter-rankings.json, last good kept per part. Stale cache -> returned at once + detached refresh
+    (when catalog auto is on); no cache -> one blocking fetch (<= OR_BUDGET_S); refresh=True forces a blocking fetch."""
+    base = (os.environ.get("AG_OPENROUTER_RANKINGS_URL") or OR_RANK_URL).rstrip("/")
+    if base.lower() in ("0", "off", "none"): return {}
+    p = or_rankings_path(); d = _json_or_empty(p); have = bool((d.get("bench") or {}).get("intelligence"))
+    if not refresh:
+        if have and _age_s(d.get("fetched_at")) <= MODELS_TTL_S: return d
+        if have: catalog_bg_refresh(); return d
+        if _age_s(d.get("attempted_at")) < BG_STAMP_S: return {}    # recent failed attempt: degrade, don't re-block
+    res = _or_fetch_all(base); now = now_iso(); errs = []; d.setdefault("fetched", {})
+    for k, _ in _OR_PARTS:
+        v = res.get(k)
+        if v is None or isinstance(v, Exception) or (k == "bench" and not v.get("intelligence")): errs.append(f"{k}: {'timeout' if v is None else str(v)[:80] or 'empty'}")
+        else: d[k] = v; d["fetched"][k] = now
+    tps = sorted(v[0] for v in (d.get("perf") or {}).values() if v[0])
+    d["fast_tps"] = tps[int(len(tps) * 0.75)] if tps else None   # fast = top quartile throughput
+    d["attempted_at"] = now; d["error"] = "; ".join(errs)
+    if not errs: d["fetched_at"] = now
+    try: _put_file(p, json.dumps(d) + "\n")
+    except OSError: pass
+    return d if (d.get("bench") or {}).get("intelligence") else {}
+
+def _or_key(s, lvl=0):
+    """(words, version digits) of a model id: provider prefix + date suffix stripped, alpha/digit split, word order ignored
+    ('claude-opus-4-5' == 'claude-4.5-opus-20251124'). lvl 0 drops 'free'; 1 also preview/contributor/...; 2 also speed/effort words."""
+    s = re.sub(r"[-_]?(?:\d{8}|\d{4}-\d{2}-\d{2})$", "", (s or "").lower().rsplit("/", 1)[-1]); t = re.findall(r"[a-z]+|\d+", s)
+    return tuple(sorted(w for w in t if w.isalpha() and w not in _OR_DROPS[lvl])), tuple(w for w in t if w.isdigit())
+
+def _or_date(slug):
+    m = re.search(r"-(\d{8})$", slug); return m.group(1) if m else ""
+
+def _or_ix(rk):
+    if "_ix" not in rk:
+        src = {"intel": rk["bench"].get("intelligence") or {}, "coding": rk["bench"].get("coding") or {}, "agentic": rk["bench"].get("agentic") or {},
+            "perf": rk.get("perf") or {}, "pop": rk.get("pop") or {}}
+        rk["_ix"] = {k: [{} for _ in _OR_DROPS] for k in src}
+        for k, m in src.items():
+            for sl in m:
+                for l in range(len(_OR_DROPS)): rk["_ix"][k][l].setdefault(_or_key(sl, l), []).append(sl)
+    return rk["_ix"]
+
+def _or_find(rk, src, model, best):
+    for l in range(len(_OR_DROPS)):
+        c = _or_ix(rk)[src][l].get(_or_key(model, l))
+        if c: return max(c, key=best), l
+    w, v = _or_key(model, 1); c = []   # last resort: ag words within the slug's, ag version digits a prefix of the slug's (kimi-k2.5 ~ kimi-k2.5-0127)
+    if v:
+        for (w2, v2), sl in ((k, x) for k, xs in _or_ix(rk)[src][0].items() for x in xs):
+            if set(w) <= set(w2) and v2[:len(v)] == v and len(w2) - len(w) <= 3: c.append((len(w2) - len(w), sl))
+    if c: m = min(e for e, _ in c); return max((sl for e, sl in c if e == m), key=best), 3
+    return None, None
+
+def rankings_match(rk, backend, model):
+    """Scores for an ag model id from the OpenRouter rankings: {score, coding, agentic, variant, slug, speed, latency_ms, fast, popularity, how} or {}.
+    Provider prefix/-free/-preview/-contributor/date ignored, author ignored; claude aliases = newest anthropic family entry; ties = highest score."""
+    if not rk or not model or model == "default": return {}
+    ben, perf = rk["bench"], rk.get("perf") or {}; intel = ben.get("intelligence") or {}
+    sc = lambda sl: intel[sl][0]; new = lambda sl: (_or_date(sl), sl)
+    slug = how = None; ref = model
+    if backend == "claude" and model in SETUP_CLAUDE_ALIASES:
+        c = [x for x in intel if x.startswith("anthropic/") and model in _or_key(x)[0]]
+        if c: slug, how, ref = max(c, key=new), "alias", max(c, key=new)
+    else: slug, l = _or_find(rk, "intel", model, lambda x: (sc(x), new(x))); how = ("exact", "loose", "wide", "prefix")[l] if slug else None
+    g = lambda k: (ben.get(k) or {}).get(slug) if slug else None
+    cod, ag_ = g("coding"), g("agentic")
+    if not slug:
+        cs, _ = _or_find(rk, "coding", model, new); as_, _ = _or_find(rk, "agentic", model, new)
+        cod, ag_ = (ben["coding"][cs] if cs else None), (ben["agentic"][as_] if as_ else None)
+    ps, pl = _or_find(rk, "perf", ref, new); pp = _or_find(rk, "pop", ref, new)[0]
+    pf = perf.get(ps) if ps else None
+    if not (slug or cod or ag_ or pf): return {}
+    sp = pf[0] if pf and pf[0] else None; fast = rk.get("fast_tps")
+    return {"score": intel[slug][0] if slug else None, "variant": intel[slug][1] if slug else None, "slug": slug or ps, "how": how or "perf",
+        "coding": cod[0] if cod else None, "agentic": ag_[0] if ag_ else None, "speed": sp, "latency_ms": pf[1] if pf else None,
+        "fast": bool(sp and fast and sp >= fast), "popularity": (rk.get("pop") or {}).get(pp) if pp else None}
+
+def catalog_refresh():
+    """Re-fetch the remote catalog sources (models.dev, OpenRouter rankings, AA API if keyed); each failure keeps its last cache, never raises."""
+    for f in (modelsdev_load, rankings_load, aa_load):
+        try: f(True)
+        except Exception: pass
+
+def catalog_refresh_all():
+    """catalog_refresh + the live per-backend model lists. Used by `ag models --bg` and the daily `ag update --quiet`."""
+    try: models_load(refresh=True)
+    except Exception: pass
+    catalog_refresh()
+
+def catalog_sources():
+    rk, md, aa, ml = (_json_or_empty(f()) for f in (or_rankings_path, modelsdev_path, aa_cache_path, models_cache_path))
+    return {"openrouter_rankings": {"url": os.environ.get("AG_OPENROUTER_RANKINGS_URL") or OR_RANK_URL, "fetched_at": rk.get("fetched_at"), "parts": rk.get("fetched") or {},
+            "error": rk.get("error") or None, "what": "Artificial Analysis indices + speed + usage via openrouter.ai/rankings"},
+        "models.dev": {"url": os.environ.get("AG_MODELSDEV_URL") or MODELSDEV_URL, "fetched_at": md.get("fetched_at")},
+        "artificial_analysis_api": {"enabled": bool(aa_key()), "fetched_at": aa.get("fetched_at")},
+        "model_lists": {b: (e or {}).get("checked_at") for b, e in (ml.get("backends") or {}).items()}, "auto": catalog_auto_on()}
+
+def catalog_attribution(src):
+    o = src["openrouter_rankings"]
+    return (f'scores: Artificial Analysis via openrouter.ai/rankings (fetched {_ago(o["fetched_at"])})' if o["fetched_at"]
+        else "scores: unavailable (openrouter.ai/rankings not fetched); tiers guessed from names, marked ~")
+
+
 def _md_norm(s):
     s = re.sub(r"^[^/]*/", "", (s or "").lower())
     s = re.sub(r"[-_]?(free|latest|preview)$", "", s)
@@ -11769,8 +11943,8 @@ def catalog_resolve(backend, model, md=None, ix=None):
     return None, "none"
 
 def _tier_of(mid, e, score):
-    """Heuristic tier. Score (AA intelligence index) wins when present."""
-    if score is not None: return "big" if score >= 50 else "small" if score < 30 else "balanced"
+    """Tier from the AA intelligence score (TIER_BIG/TIER_SMALL cutoffs); name/price guess only when there is no score."""
+    if score is not None: return "big" if score >= TIER_BIG else "small" if score < TIER_SMALL else "balanced"
     name = re.sub(r"^[^/]*/", "", mid)
     t = "small" if _SMALL_RE.search(name) else "big" if _BIG_RE.search(name) else "balanced"
     if e:
@@ -11782,67 +11956,79 @@ def _tier_of(mid, e, score):
         elif t == "small" and co and co >= 15: t = "balanced"
     return t
 
-def catalog_info(backend, model, _md=None, _ix=None, _aa=None):
+def catalog_info(backend, model, _md=None, _ix=None, _aa=None, _rk=None):
+    """tier/tier_source (score|aa-api|guess), score (=AA intelligence), coding, agentic, speed (tok/s), latency_ms, fast, popularity (recent tokens),
+    variant (AA variant name), or_slug, plus models.dev ctx/price/release. Score precedence: AA API (AG_AA_KEY) > OpenRouter rankings > name guess."""
     md = _md if _md is not None else modelsdev_load(); ix = _ix if _ix is not None else _md_index(md)
-    aa = _aa if _aa is not None else aa_load()
+    aa = _aa if _aa is not None else aa_load(); rk = _rk if _rk is not None else rankings_load()
     e, how = catalog_resolve(backend, model, md, ix)
-    sc = sp = None
+    r = rankings_match(rk, backend, model)
+    sc, sp, ts = r.get("score"), r.get("speed"), "score"
+    if sc is None: ts = "guess"
     if aa:
         for k in ((e or {}).get("id"), (e or {}).get("name"), (e or {}).get("canonical_model_id"), model):
             a = aa.get(_aa_norm(re.sub(r"^[^/]*/", "", k or ""))) if k else None
-            if a: sc, sp = a.get("score"), a.get("speed"); break
+            if a and a.get("score") is not None: sc, ts, sp = a["score"], "aa-api", a.get("speed") or sp; break
     e = e or {}
     ci, co = e.get("cost_in"), e.get("cost_out")
     free = (ci == 0 and co == 0) or (not e and model.lower().endswith("-free"))
     rel = e.get("release_date") or ""
     try: new = (datetime.now(timezone.utc) - datetime.fromisoformat(rel).replace(tzinfo=timezone.utc)).days <= 30
     except ValueError: new = False
-    return {"tier": _tier_of(model, e or None, sc), "reasoning": e.get("reasoning"), "tools": e.get("tool_call"),
-        "context": e.get("context"), "cost_in": ci, "cost_out": co, "free": bool(free), "released": rel or None,
-        "new": new, "score": sc, "speed": sp, "source": ("models.dev:" + how) if e else "heuristic"}
+    fast = r.get("fast", False) if sp == r.get("speed") else bool(sp and rk and rk.get("fast_tps") and sp >= rk["fast_tps"])
+    return {"tier": _tier_of(model, e or None, sc), "tier_source": ts, "reasoning": e.get("reasoning"), "tools": e.get("tool_call"),
+        "context": e.get("context"), "cost_in": ci, "cost_out": co, "free": bool(free), "released": rel or None, "new": new,
+        "score": sc, "coding": r.get("coding"), "agentic": r.get("agentic"), "speed": sp, "latency_ms": r.get("latency_ms"), "fast": fast,
+        "popularity": r.get("popularity"), "variant": r.get("variant"), "or_slug": r.get("slug"), "rank_match": r.get("how"),
+        "source": ("models.dev:" + how) if e else "heuristic"}
 
-def _rank_key(i):
-    return (-(i["score"] or 0), -(bool(i["reasoning"]) + bool(i["tools"])), _neg_str(i["released"] or ""), -(i["context"] or 0))
 def _neg_str(s): return tuple(-ord(c) for c in s)
+_SORT_ATTR = {"intel": "score", "coding": "coding", "speed": "speed", "popular": "popularity"}
 
-def catalog_rows(backend=None, refresh=False):
-    """[{backend, id, **catalog_info}] sorted big->small then best-first; for --rank and the web form."""
-    bs = [backend] if backend else list(MODEL_BACKENDS)
-    cache = models_load(bs); md = modelsdev_load(refresh); ix = _md_index(md); aa = aa_load(refresh)
+def catalog_rows(backend=None, refresh=False, sort="intel"):
+    """[{backend, id, **catalog_info}] per backend, best first by `sort` (intel|coding|speed|popular; unscored last, then tier, intel, speed, newest)."""
+    bs = [backend] if backend else list(MODEL_BACKENDS); at = _SORT_ATTR.get(sort, "score")
+    cache = models_load(bs); md = modelsdev_load(refresh); ix = _md_index(md); aa = aa_load(refresh); rk = rankings_load(refresh)
     rows = []
     for b in bs:
         for m in (cache["backends"].get(b) or {}).get("models") or []:
             if m == "default": continue
-            rows.append({"backend": b, "id": m, **catalog_info(b, m, md, ix, aa)})
-    rows.sort(key=lambda r: (bs.index(r["backend"]), TIER_ORDER.index(r["tier"]), r["source"] == "heuristic", *_rank_key(r), r["id"]))
+            rows.append({"backend": b, "id": m, **catalog_info(b, m, md, ix, aa, rk)})
+    rows.sort(key=lambda r: (bs.index(r["backend"]), r[at] is None, -(r[at] or 0), TIER_ORDER.index(r["tier"]), r["source"] == "heuristic",
+        -(r["score"] or 0), -(r["speed"] or 0), _neg_str(r["released"] or ""), -(r["context"] or 0), r["id"]))
     return rows
 
-def catalog_pick(backend, tier, free_only=False):
-    """Best model id of the tier for a backend (score, reasoning+tools, newest, context); None if none."""
-    for r in catalog_rows(backend):
-        if r["tier"] == tier and (r["free"] or not free_only): return r["id"]
-    return None
+def catalog_pick(backend, tier, free_only=False, job=None):
+    """Best model id of the tier for a backend: highest intelligence (coding score for job implement/debug), then speed; unscored last; None if none."""
+    k = "coding" if job in ("implement", "debug") else "score"
+    c = [r for r in catalog_rows(backend) if r["tier"] == tier and (r["free"] or not free_only)]
+    c.sort(key=lambda r: (r[k] is None, -(r[k] or 0), r["score"] is None, -(r["score"] or 0), -(r["speed"] or 0)))
+    return c[0]["id"] if c else None
 
 def _fmt_ctx(n): return "-" if not n else f"{n/1000000:.3g}M" if n >= 1000000 else f"{round(n/1000)}k"
 def _fmt_cost(r): return "free" if r["free"] else "-" if r["cost_in"] is None else f'${r["cost_in"]:g}/${r["cost_out"]:g}'
 
-def catalog_rank_text(rows):
-    out = []; yn = lambda v: "-" if v is None else "y" if v else "n"
+def catalog_rank_text(rows, sources=None):
+    n = lambda v, f="{:g}": "-" if v is None else f.format(v)
+    out = [catalog_attribution(sources if sources is not None else catalog_sources())] if sources is not False else []
     for b in dict.fromkeys(r["backend"] for r in rows):
         rs = [r for r in rows if r["backend"] == b]; w = max(len(r["id"]) for r in rs)
-        out += [f"{b} ({len(rs)})", f'  {"id".ljust(w)}  tier      ctx   reas  tools  $in/$out    released    score  tok/s']
+        out += [f"{b} ({len(rs)})", f'  {"id".ljust(w)}  tier      intel  coding  agentic  tok/s  latency  ctx   $in/$out    released    flags']
         for r in rs:
-            sc = "-" if r["score"] is None else f'{r["score"]:g}'; sp = "-" if r["speed"] is None else f'{r["speed"]:.0f}'
-            out.append(f'  {r["id"].ljust(w)}  {r["tier"].ljust(8)}  {_fmt_ctx(r["context"]).rjust(4)}  {yn(r["reasoning"]).center(4)}  {yn(r["tools"]).center(5)}  '
-                f'{_fmt_cost(r).ljust(10)}  {(r["released"] or "-").ljust(10)}  {sc.rjust(5)}  {sp.rjust(5)}' + ("  new" if r["new"] else ""))
-    return "\n".join(out)
+            lat = "-" if r["latency_ms"] is None else f'{r["latency_ms"]/1000:.1f}s'
+            out.append(f'  {r["id"].ljust(w)}  {(r["tier"] + ("~" if r["tier_source"] == "guess" else "")).ljust(8)}  {n(r["score"]).rjust(5)}  {n(r["coding"]).rjust(6)}  '
+                f'{n(r["agentic"]).rjust(7)}  {n(r["speed"], "{:.0f}").rjust(5)}  {lat.rjust(7)}  {_fmt_ctx(r["context"]).rjust(4)}  {_fmt_cost(r).ljust(10)}  '
+                f'{(r["released"] or "-").ljust(10)}  ' + " ".join(x for x, f in (("new", r["new"]), ("fast", r["fast"])) if f))
+    return "\n".join(x.rstrip() for x in out)
 
 def catalog_stats(backend):
-    md = modelsdev_load(); ix = _md_index(md)
+    md = modelsdev_load(); ix = _md_index(md); rk = rankings_load()
     ids = [m for m in ((models_load([backend])["backends"].get(backend) or {}).get("models") or []) if m != "default"]
     hows = {m: catalog_resolve(backend, m, md, ix)[1] for m in ids}
+    ranked = {m: rankings_match(rk, backend, m) for m in ids}
     return {"total": len(ids), "matched": sum(h != "none" for h in hows.values()), "unmatched": [m for m, h in hows.items() if h == "none"],
-        "by_how": {h: list(hows.values()).count(h) for h in set(hows.values())}}
+        "by_how": {h: list(hows.values()).count(h) for h in set(hows.values())},
+        "ranked": sum(1 for v in ranked.values() if v.get("score") is not None), "unranked": [m for m, v in ranked.items() if v.get("score") is None]}
 
 def project_root(cwd=None):
     cwd = Path(cwd or Path.cwd())
@@ -13025,7 +13211,7 @@ def build():
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
-    mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by tier/capability (models.dev + optional AG_AA_KEY scores)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only")
+    mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by Artificial Analysis intelligence/coding/agentic score, speed, tier (openrouter.ai/rankings + models.dev)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only"); mo.add_argument("--sort",choices=("intel","coding","speed","popular"),default=None,help="rank order (implies --rank)"); mo.add_argument("--auto",choices=("on","off"),default=None,help="toggle background catalog refresh (config.json catalog_auto)"); mo.add_argument("--status",action="store_true",help="last fetch per catalog source + auto state"); mo.add_argument("--bg",action="store_true",help=argparse.SUPPRESS)
     rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS)
     st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL | backend.B.(enabled|model|mode|plan)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
     return p
@@ -13485,6 +13671,12 @@ def self_update(src=None):
         return "error", f"install: {e}"
     return "updated", f"replaced {src}"
 
+def _update_catalog():
+    """Daily piggyback: refresh live model lists, models.dev, OpenRouter rankings (+AA API). Off via `ag models --auto off`; never affects the update result."""
+    try:
+        if catalog_auto_on(): catalog_refresh_all()
+    except Exception: pass
+
 def do_update(a):
     if a.auto:
         c = _ag_conf(); c["auto_update"] = a.auto == "on"
@@ -13501,6 +13693,7 @@ def do_update(a):
         lg = _update_stamp().with_name("update.log"); lg.parent.mkdir(parents=True, exist_ok=True)
         with open(lg, "a") as f: f.write(f"{now_iso()} {status} {detail}\n")
     except Exception: pass
+    if a.quiet: _update_catalog()
     if a.quiet: return 0 if status != "error" else 1
     if status == "error": return emit(a, "update", error=detail)
     return emit(a, "update", {"_text": f"{status}: {detail}", "status": status, "detail": detail})

@@ -43,7 +43,7 @@ class AgSetup(unittest.TestCase):
             (self.skills/n).mkdir(parents=True); (self.skills/n/"SKILL.md").write_text(t)
         self.env = dict(os.environ, AG_HOME=str(self.home), AG_CONFIG_HOME=str(self.cfg),
             AG_CACHE_HOME=str(self.cache), AG_SKILLS_DIR=str(self.skills), FAKE_DIR=str(self.fake),
-            AGENT_CLI_DIR=str(self.state), PATH=f"{self.fake}:/usr/bin:/bin", HOME=str(self.home))
+            AGENT_CLI_DIR=str(self.state), AG_HARNESS="claude", PATH=f"{self.fake}:/usr/bin:/bin", HOME=str(self.home))
 
     def ag(self, *args, env=None):
         return subprocess.run([sys.executable, AG, *args], capture_output=True, text=True, timeout=60,
@@ -131,13 +131,15 @@ class AgSetup(unittest.TestCase):
         old_skill.write_text("old")
         d = self.agj("setup", "--yes", "--scope", "global", "--harness", "claude,opencode,codex")["data"]
         rt = json.loads((self.cfg/"routing.json").read_text())
-        self.assertEqual((rt["version"], rt["preset"]), (1, "cost-first"))
-        self.assertEqual(rt["jobs"]["hardest"], {"claude": "fable", "ag": {"backend": "claude", "model": "fable"}})
+        self.assertEqual((rt["version"], rt["preset"]), (2, "cost-first"))
+        self.assertEqual(rt["profiles"]["claude"]["jobs"]["hardest"], {"claude": "fable", "ag": {"backend": "claude", "model": "fable"}})
         for base in (self.home/".claude", self.home/".config"/"opencode", self.home/".codex"):
             cli = (base/"skills"/"ag-cli"/"SKILL.md").read_text()
             self.assertEqual(cli, f"---\nname: ag-cli\n---\nrun {Path(AG).resolve()} models (global) keep {{{{OTHER}}}}\n")
             ags = (base/"skills"/"ag-agents"/"SKILL.md").read_text()
-            self.assertIn("| review — code review, verification | opus | claude / opus |", ags)
+            self.assertIn("| review — code review, verification | opus | claude / opus |" if base.name == ".claude"
+                else "| review — code review, verification | " + ("opencode / opencode/" if base.name == "opencode" else "codex / "), ags)
+            self.assertIn(f"Profile: {'claude' if base.name == '.claude' else base.name.lstrip('.')}.", ags)
             self.assertNotIn("{{ROUTING}}", ags); self.assertNotIn("{{AG}}", ags)
         self.assertEqual(old_skill.read_text(), "old")
         self.assertTrue(any("using-ag" in n for n in d["notes"]))
@@ -174,8 +176,8 @@ class AgSetup(unittest.TestCase):
         d = self.agj("setup", "--yes", "--scope", "project", "--harness", "all", "--preset", "quality-first",
             "--set", "mechanical=ag:opencode/opencode/a", "--set", "plan=claude:opus")["data"]
         rt = json.loads((self.proj/".agent"/"routing.json").read_text())
-        self.assertEqual(rt["jobs"]["mechanical"], {"claude": "sonnet", "ag": {"backend": "opencode", "model": "opencode/a"}})
-        self.assertEqual(rt["jobs"]["plan"]["claude"], "opus")
+        self.assertEqual(rt["profiles"]["claude"]["jobs"]["mechanical"], {"claude": "sonnet", "ag": {"backend": "opencode", "model": "opencode/a"}})
+        self.assertEqual(rt["profiles"]["claude"]["jobs"]["plan"]["claude"], "opus")
         for sub in (".claude", ".opencode", ".agents"):
             self.assertIn("(project)", (self.proj/sub/"skills"/"ag-cli"/"SKILL.md").read_text())
         self.assertFalse((self.home/".claude").exists() or (self.cfg/"routing.json").exists())

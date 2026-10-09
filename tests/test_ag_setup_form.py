@@ -65,7 +65,7 @@ class SetupForm(unittest.TestCase):
         self.assertEqual(set(pl["status"]), set(pl["backend_order"]))
         self.assertEqual(pl["preset_jobs"]["balanced"]["review"]["claude"], "sonnet")
         doc = self.routing()
-        self.assertEqual(doc["jobs"]["review"], {"claude": "opus", "ag": {"backend": "codex", "model": "gpt-x"}})
+        self.assertEqual(doc["profiles"]["claude"]["jobs"]["review"], {"claude": "opus", "ag": {"backend": "codex", "model": "gpt-x"}})
         self.assertEqual(doc["backends"], {"opencode": {"model": "anthropic/c"}, "codex": {"mode": "edits", "plan": True},
             "gemini": {"enabled": False}})                    # sparse: only non-default fields
         sk = (self.home/".claude"/"skills"/"ag-agents"/"SKILL.md").read_text()
@@ -80,6 +80,7 @@ class SetupForm(unittest.TestCase):
         self.assertFalse((self.cfg/"routing.json").exists() or (self.home/".claude").exists())
 
     def test_form_disabled_backend_rejected(self):
+        self.env["AG_HARNESS"] = "opencode"  # opencode profile routes every job to opencode
         p, _ = self.form({"backends": {"opencode": {"enabled": False}}}, "--json")
         o = json.loads(p.stdout)
         self.assertFalse(o["ok"]); self.assertIn("mechanical: ag target opencode is disabled", o["error"])
@@ -93,6 +94,7 @@ class SetupForm(unittest.TestCase):
     # ---- real JXA: construction + serialization, never modal ----
     @unittest.skipUnless(gui_ok(), "needs macOS GUI session (osascript + WindowServer)")
     def test_jxa_selftest(self):
+        self.env["AG_HARNESS"] = "opencode"  # opencode profile routes every job to opencode
         m = ui.load_ag()
         src = self.root/"form.js"; src.write_text(m._JXA_FORM)
         c = subprocess.run(["osacompile", "-l", "JavaScript", "-o", str(self.root/"form.scpt"), str(src)], capture_output=True, text=True)
@@ -100,10 +102,10 @@ class SetupForm(unittest.TestCase):
         p = self.ag("--json", "setup", "--ui", "mac", "--dry-run", "--harness", "none",
             env={"AG_FORM_SELFTEST": "1", "AG_PROBE": "0", "PATH": f"{self.fake}:/usr/bin:/bin"})
         o = json.loads(p.stdout)
-        self.assertTrue(o["ok"], (p.stdout, p.stderr)); self.assertEqual(o["data"]["routing"]["review"]["claude"], "opus")
+        self.assertTrue(o["ok"], (p.stdout, p.stderr)); self.assertEqual(o["data"]["routing"]["review"]["claude"], "sonnet")
         self.assertEqual(o["data"]["backends"]["opencode"]["enabled"], True)
-        st = m.setup_state_from("global", None, None, ["claude"], None, proj="/p", existing={"global": {}, "project": {}},
-            bsets={"gemini": {"mode": "ro"}, "opencode": {"enabled": False}})
+        st = m.setup_state_from("global", None, {"mechanical": {"ag": {"backend": "opencode", "model": "x"}}}, ["claude"], None, proj="/p", existing={"global": {}, "project": {}},
+            bsets={"gemini": {"mode": "ro"}, "opencode": {"enabled": False}}, profile="claude")
         r = subprocess.run(["osascript", "-l", "JavaScript", "-e", m._JXA_FORM, json.dumps(m.setup_form_payload(st))],
             capture_output=True, text=True, env={**os.environ, "AG_FORM_SELFTEST": "1"}, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -114,6 +116,7 @@ class SetupForm(unittest.TestCase):
 
     # ---- --set backend.* ----
     def test_set_backend_flags(self):
+        self.env["AG_HARNESS"] = "opencode"  # opencode profile routes every job to opencode
         o = self.agj("setup", "--yes", "--harness", "none", "--set", "backend.opencode.model=anthropic/c",
             "--set", "backend.codex.mode=edits", "--set", "backend.gemini.enabled=false", "--set", "backend.claude.plan=true")
         self.assertEqual(o["data"]["backends"]["codex"]["mode"], "edits")
@@ -165,6 +168,7 @@ class SetupForm(unittest.TestCase):
             "gemini": {"enabled": False}})
 
     def test_cli_disabled_backend_blocks_save(self):
+        self.env["AG_HARNESS"] = "opencode"  # opencode profile routes every job to opencode
         code, out = self.pty_run(["--ui", "cli", "--harness", "none"], [UP, UP, UP, UP, LEFT, ENTER, "s", "x", "q", "y"])
         self.assertEqual(code, 0, out[-1500:]); self.assertIn("Can't save yet", out); self.assertIn("cancelled", out)
         self.assertFalse((self.cfg/"routing.json").exists())

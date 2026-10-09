@@ -6617,7 +6617,7 @@ def do_agents(a):
         be, mod, job = a.backend, getattr(a,"model",None), getattr(a,"job",None)
         if not be:
             if not job: return emit(a,"agents",error="need --backend or --job",hint=f"ag agents add NAME --backend opencode  |  --job {'|'.join(JOB_KEYS)}")
-            ra = routing_now()[0][job]["ag"]; be = ra["backend"]; mod = mod or (ra["model"] if ra["model"] not in ("","default") else "")
+            ra = routing_now(profile=getattr(a, "profile", None))[0][job]["ag"]; be = ra["backend"]; mod = mod or (ra["model"] if ra["model"] not in ("","default") else "")
             if be not in NATIVE_ORDER: return emit(a,"agents",error=f"routing for {job} names unknown backend {be!r}",hint="ag route; ag setup")
         bkd = backends_now().get(be) if be in BACKEND_TABS else None  # per-backend defaults from routing.json (ag setup)
         if bkd:
@@ -11533,7 +11533,7 @@ JOB_DESC = {"mechanical": "scripts, rote edits, boilerplate, lookups",
     "debug": "debugging, failing tests, root cause", "plan": "planning, design, architecture",
     "hardest": "ambiguous, high-stakes, security-sensitive"}
 def _rj(c, b, m): return {"claude": c, "ag": {"backend": b, "model": m}}
-_ROUTE_COST = {"mechanical": _rj("haiku", "opencode", OPENCODE_MODEL_DEFAULT),
+_ROUTE_COST = {"mechanical": _rj("haiku", "claude", "haiku"),
     "implement": _rj("sonnet", "claude", "sonnet"), "review": _rj("opus", "claude", "opus"),
     "debug": _rj("opus", "claude", "opus"), "plan": _rj("opus", "claude", "opus"),
     "hardest": _rj("fable", "claude", "fable")}
@@ -11660,16 +11660,89 @@ def project_root(cwd=None):
 def routing_paths(proj=None):
     return ag_config_home()/"routing.json", Path(proj or project_root())/".agent"/"routing.json"
 
-def routing_effective(glob=None, proj=None):
-    """Per-job effective routing: preset < global < project (per field). Pure."""
-    glob, proj = glob or {}, proj or {}
-    base = ROUTING_PRESETS.get(proj.get("preset") or glob.get("preset") or "cost-first", _ROUTE_COST)
+# ---- harness detection + routing v2 profiles (spec: per-harness job tables) ----
+HARNESS_NAMES = ("claude", "opencode", "codex", "cursor", "gemini", "none")
+ROUTE_PROFILES = ("claude", "opencode", "codex", "default")
+JOB_TIER = {"mechanical": "small", "implement": "balanced", "review": "balanced", "debug": "big", "plan": "big", "hardest": "big"}
+_HARNESS_COMM = {"claude": "claude", "opencode": "opencode", "codex": "codex", "agent": "cursor", "cursor-agent": "cursor", "gemini": "gemini"}
+_HARNESS_ARGS = (("claude", ("claude", "@anthropic-ai/claude-code")), ("opencode", ("opencode", ".opencode")),
+    ("codex", ("codex", "@openai/codex")), ("gemini", ("gemini", "@google/gemini-cli")))
+def _harness_from_proc(comm, args):
+    """Harness for one process (basename comm; wrappers node/bun/python match args tokens). Pure."""
+    b = os.path.basename((comm or "").strip().lstrip("-"))
+    if b in _HARNESS_COMM: return _HARNESS_COMM[b]
+    if b.split(".")[0] in ("node", "bun", "python", "python3", "deno", "sh", "bash", "zsh"):
+        toks = (args or "").split()[1:4]
+        for h, keys in _HARNESS_ARGS:
+            for t in toks:
+                if t.startswith("-"): continue
+                if os.path.basename(t).rsplit(".", 1)[0] in keys or any(k.startswith("@") and k in t for k in keys): return h
+    return None
+def _ps_row(pid):
+    """(ppid, comm, args) via ps; comm = args' first token, None when the pid is gone."""
+    p = subprocess.run(["ps", "-o", "ppid=,comm=,args=", "-p", str(pid)], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    ln = p.stdout.strip("\n").lstrip()
+    if p.returncode != 0 or not ln: return None
+    ppid, _, rest = ln.partition(" "); rest = rest.lstrip()
+    comm, _, args = rest.partition(" ")  # comm is truncated on macOS: prefer args' first token
+    return (int(ppid) if ppid.isdigit() else 0), args.lstrip().partition(" ")[0] or comm, args.lstrip()
+def detect_harness(env=None, ppid=None, ps=None):
+    """(name, via): AG_HARNESS override > innermost matching ancestor process > env fallback. name in HARNESS_NAMES."""
+    env = os.environ if env is None else env
+    ov = (env.get("AG_HARNESS") or "").strip().lower()
+    if ov in HARNESS_NAMES: return ov, "override"
+    ps, pid = ps or _ps_row, ppid if ppid is not None else os.getppid()
+    for _ in range(25):
+        if pid <= 1: break
+        try: row = ps(pid)
+        except Exception: row = None
+        if not row: break
+        pp, comm, args = row
+        h = _harness_from_proc(comm, args)
+        if h: return h, "process"
+        if pp == pid: break
+        pid = pp
+    if env.get("OPENCODE") == "1": return "opencode", "env"
+    if env.get("CODEX_SANDBOX") or env.get("CODEX_CI"): return "codex", "env"
+    if env.get("CLAUDECODE"): return "claude", "env"
+    return "none", "none"
+
+_PICK_MEMO = {}
+def _pick(backend, tier, free_only=False):
+    """catalog_pick (may hit the network on a stale cache) memoized per process; None when absent/failing."""
+    k = (backend, tier, free_only)
+    if k not in _PICK_MEMO:
+        f = globals().get("catalog_pick")
+        try: _PICK_MEMO[k] = f(backend, tier, free_only=free_only) if f else None
+        except Exception: _PICK_MEMO[k] = None
+    return _PICK_MEMO[k]
+def builtin_profile(name):
+    """Built-in job table for a profile name; opencode/codex models come from the catalog. Pure given the catalog."""
+    if name == "opencode":
+        return {j: _rj("haiku" if j == "mechanical" else "sonnet", "opencode", _pick("opencode", JOB_TIER[j], True) or OPENCODE_MODEL_DEFAULT) for j in JOB_KEYS}
+    if name == "codex":
+        return {j: _rj("sonnet", "codex", _pick("codex", JOB_TIER[j]) or "default") for j in JOB_KEYS}
+    return _ROUTE_COST
+def _rt_v2(doc):
+    """Normalize a routing doc to v2 shape; v1 top-level jobs become profiles.default + claude (unless present). Pure."""
+    doc = doc if isinstance(doc, dict) else {}
+    pr = {k: v for k, v in (doc.get("profiles") or {}).items() if isinstance(v, dict)} if isinstance(doc.get("profiles"), dict) else {}
+    if isinstance(doc.get("jobs"), dict) and doc["jobs"]:
+        for k in ("default", "claude"): pr.setdefault(k, {"jobs": doc["jobs"]})
+    return {**{k: v for k, v in doc.items() if k not in ("jobs", "profiles")}, "version": 2, "profiles": pr}
+def profile_for(harness): return harness if harness in ROUTE_PROFILES else "default"
+def routing_effective(glob=None, proj=None, profile="default"):
+    """Per-job effective routing for a profile: base (preset | built-in) < global < project (per field). Pure."""
+    glob, proj = _rt_v2(glob), _rt_v2(proj)
+    profile = profile if profile in ROUTE_PROFILES else "default"
+    if profile in ("claude", "default"): base = ROUTING_PRESETS.get(proj.get("preset") or glob.get("preset") or "cost-first", _ROUTE_COST)
+    else: base = builtin_profile(profile)
     out = {}
     for j in JOB_KEYS:
         e = {"claude": base[j]["claude"], "ag": dict(base[j]["ag"]),
             "source": {"claude": "preset-default", "ag": "preset-default"}}
         for src, d in (("global", glob), ("project", proj)):
-            je = (d.get("jobs") or {}).get(j)
+            je = ((d["profiles"].get(profile) or {}).get("jobs") or {}).get(j)
             if not isinstance(je, dict): continue
             if je.get("claude"): e["claude"] = str(je["claude"]); e["source"]["claude"] = src
             ga = je.get("ag")
@@ -11680,9 +11753,39 @@ def routing_effective(glob=None, proj=None):
         out[j] = e
     return out
 
-def routing_now(cwd=None):
+def _proj_of(sdir):
+    if not sdir: return project_root()
+    p = Path(sdir); return p.parent if p.name == ".agent" else p
+def active_profile(sdir=None, harness=None):
+    """(profile name, effective jobs) for the detected (or given) harness; AG_PROFILE overrides. Spec B."""
+    name = (os.environ.get("AG_PROFILE") or "").strip() or profile_for(harness or detect_harness()[0])
+    gp, pp = routing_paths(_proj_of(sdir))
+    return name, routing_effective(_json_or_empty(gp), _json_or_empty(pp), name)
+def routing_load(scope="effective", sdir=None):
+    """v2 doc: 'global'|'project' = file normalized to v2; 'effective' = merged jobs per profile + effective backends."""
+    gp, pp = routing_paths(_proj_of(sdir))
+    if scope == "global": return _rt_v2(_json_or_empty(gp))
+    if scope == "project": return _rt_v2(_json_or_empty(pp))
+    g, p = _json_or_empty(gp), _json_or_empty(pp)
+    prof = {n: {"jobs": {j: {"claude": e["claude"], "ag": e["ag"]} for j, e in routing_effective(g, p, n).items()}} for n in ROUTE_PROFILES}
+    return {"version": 2, "profiles": prof, "backends": backends_effective(g, p), "project": _rt_v2(p).get("project") or {}}
+def routing_save(scope, data, sdir=None):
+    """Write a v2 doc to the global|project routing.json; returns the Path. Raises ValueError on a bad shape."""
+    if scope not in ("global", "project"): raise ValueError(f"bad scope {scope!r}")
+    d = _rt_v2(data)
+    for n, pr in d["profiles"].items():
+        if n not in ROUTE_PROFILES: raise ValueError(f"unknown profile {n!r} ({','.join(ROUTE_PROFILES)})")
+        for j, je in (pr.get("jobs") or {}).items():
+            if j not in JOB_KEYS or not isinstance(je, dict): raise ValueError(f"profile {n}: bad job {j!r}")
+            b = (je.get("ag") or {}).get("backend")
+            if b and b not in NATIVE_ORDER: raise ValueError(f"profile {n}/{j}: unknown backend {b!r}")
+    gp, pp = routing_paths(_proj_of(sdir)); p = gp if scope == "global" else pp
+    _put_file(p, json.dumps(d, indent=2) + "\n"); return p
+
+def routing_now(cwd=None, profile=None):
     gp, pp = routing_paths(project_root(cwd))
-    return routing_effective(_json_or_empty(gp), _json_or_empty(pp)), gp, pp
+    name = profile or (os.environ.get("AG_PROFILE") or "").strip() or profile_for(detect_harness()[0])
+    return routing_effective(_json_or_empty(gp), _json_or_empty(pp), name), gp, pp
 
 def _route_model(ag_): return eff_model(ag_["backend"], ag_["model"]) or ag_["model"]
 
@@ -11742,14 +11845,19 @@ def parse_backend_sets(items):
         out.setdefault(b, {})[f] = val
     return rest, out
 
-def routing_block(eff, bk=None):
-    """Markdown routing block (spec §5); bk adds the compact backend-defaults line (skills). Pure."""
-    rows = [f'| {j} — {JOB_DESC[j]} | {eff[j]["claude"]} | {eff[j]["ag"]["backend"]} / {_route_model(eff[j]["ag"])} |'
+def routing_block(eff, bk=None, profile=None):
+    """Markdown routing block (spec §5); bk adds the compact backend-defaults line (skills); profile (opencode|codex|...)
+    drops the Claude-subagent column and adds the harness-detection line. Pure."""
+    cl = profile in (None, "claude")
+    rows = [f'| {j} — {JOB_DESC[j]} | ' + (f'{eff[j]["claude"]} | ' if cl else "") + f'{eff[j]["ag"]["backend"]} / {_route_model(eff[j]["ag"])} |'
         for j in JOB_KEYS]
     bl = ["", f"Backend defaults (`ag agents add NAME --backend B` without --model/--mode): {backends_line(bk)}"] if bk else []
+    pl = ["", f"Profile: {profile}. ag detects the calling harness (claude|opencode|codex) from its parent processes and uses that profile; "
+        "`ag route` prints it, `AG_HARNESS`/`AG_PROFILE` override."] if profile else []
     return "\n".join(["## Model routing (generated by `ag setup` — change it with `ag setup`, not by hand)", "",
         "Default to the cheapest model that can do the job; escalate only when it gets stuck or the job turns out to need judgment.", "",
-        "| Job | Claude subagent (`model:`) | ag agent (backend / model) |", "|---|---|---|", *rows, *bl, "",
+        "| Job | Claude subagent (`model:`) | ag agent (backend / model) |" if cl else "| Job | ag agent (backend / model) |",
+        "|---|---|---|" if cl else "|---|---|", *rows, *bl, *pl, "",
         "Unsure which job it is? Start one tier lower; escalate on failure. Effective config: `ag route`."])
 
 def routing_md_insert(text, block, append=True):
@@ -11815,15 +11923,41 @@ def _ask_pick(prompt, opts, default):
     v = _ask(prompt, default)
     return opts[int(v)-1] if v.isdigit() and 1 <= int(v) <= min(len(opts), MODELS_SHOW) else v
 
+def route_check(harness, profile, proj=None):
+    """Per-project setup check (spec D): configured iff the project routing.json has project.answered. Questions for the agent's question tool."""
+    proj = Path(proj or project_root()); pdoc = _json_or_empty(routing_paths(proj)[1])
+    done = bool((pdoc.get("project") or {}).get("answered"))
+    hn = harness if harness != "none" else "your agent harness"
+    others = [h for h in SETUP_HARNESSES if h != harness]
+    qs = []
+    if not done:
+        qs = [{"id": "use", "multi": False, "question": f"How should ag pick agents in this project when you're in {hn}?", "options": [
+                {"value": "inherit", "label": f"Use my {profile} profile (Recommended)"},
+                {"value": "cheap", "label": "Cheapest/free models"}, {"value": "strong", "label": "Strongest models"},
+                {"value": "custom", "label": "Customize per job"}]},
+            {"id": "other_harnesses", "multi": True, "question": "Also set up ag for other harnesses in this project?",
+                "options": [{"value": h, "label": h} for h in others]}]
+        be = harness if harness in SETUP_HARNESSES else "claude"
+        cands = list(dict.fromkeys(m for m in (_pick(be, t, be == "opencode") for t in ("small", "balanced", "big")) if m)) or \
+            ({"claude": ["haiku", "sonnet", "opus"], "opencode": [OPENCODE_MODEL_DEFAULT], "codex": ["default"]}[be])
+        qs += [{"id": f"job.{j}", "when": {"use": "custom"}, "multi": False, "question": f"Model for {j} ({JOB_DESC[j]})?",
+            "options": [{"value": f"{be}/{m}", "label": m} for m in cands]} for j in JOB_KEYS]
+    return {"configured": done, "project": str(proj), "harness": harness, "profile": profile, "questions": qs,
+        "answers_format": '{"use": "inherit|cheap|strong|custom", "other_harnesses": ["codex"], "jobs": {"review": "claude/opus"}}  (jobs only for use=custom)'}
+
 def do_route(a):
-    eff, gp, pp = routing_now()
+    hn, via = detect_harness()
+    prof = getattr(a, "profile", None) or (os.environ.get("AG_PROFILE") or "").strip() or profile_for(hn)
+    if getattr(a, "check", False): return emit(a, "route", route_check(hn, prof))
+    eff, gp, pp = routing_now(profile=prof)
     jobs = {a.job: eff[a.job]} if a.job else eff
     bk = backends_effective(_json_or_empty(gp), _json_or_empty(pp))
     warn = [f"{j}: routed to disabled backend {b} (ag setup: enable {b} or re-route {j})" for j, b in routing_disabled(jobs, bk)]
-    data = {"jobs": jobs, "backends": bk, "warnings": warn, "global": str(gp), "project": str(pp)}
+    data = {"harness": hn, "via": via, "profile": prof, "jobs": jobs, "backends": bk, "warnings": warn, "global": str(gp), "project": str(pp)}
     if getattr(a, "json", False): return emit(a, "route", data)
     off = dict(routing_disabled(jobs, bk))
-    out = [f'{j:10} claude={e["claude"]:7} ({e["source"]["claude"]})  ag={e["ag"]["backend"]}/{_route_model(e["ag"])} ({e["source"]["ag"]})'
+    out = [f"harness: {hn} (via {via})  profile: {prof}"]
+    out += [f'{j:10} claude={e["claude"]:7} ({e["source"]["claude"]})  ag={e["ag"]["backend"]}/{_route_model(e["ag"])} ({e["source"]["ag"]})'
         + ("  ! backend disabled" if j in off else "") for j, e in jobs.items()]
     if not a.job:
         out += [f'backend {b:9} ' + (f'model={eff_model(b, e["model"]) or "default"} mode={e["mode"] or "-"}{" plan" if e["plan"] else ""}'
@@ -11837,17 +11971,26 @@ SETUP_UIS = ("mac", "cli", "plain")
 SETUP_CLAUDE_ALIASES = ("haiku", "sonnet", "opus", "fable")
 SETUP_PRESET_DESC = {"cost-first": "cheapest model that can do each job (default)",
     "balanced": "cost-first, but review on sonnet", "quality-first": "sonnet floor, opus implements, fable for the rest"}
-SETUP_MIN = (23, 60)          # curses floor (rows, cols); smaller at start -> plain prompts
+SETUP_MIN = (24, 60)          # curses floor (rows, cols); smaller at start -> plain prompts
+
+def _setup_base(st, profile=None):
+    """Job table a profile starts from (preset for claude/default, built-in otherwise). Pure."""
+    profile = profile or st["profile"]
+    return ROUTING_PRESETS.get(st["preset"], _ROUTE_COST) if profile in ("claude", "default") else builtin_profile(profile)
+def _setup_jobs(st, profile, edits, sets=None):
+    """Jobs of one profile = base (+ that scope's on-disk picks when its file uses the same preset and the preset
+    wasn't forced) < --set < edits. Pure."""
+    cur = st["existing"].get(st["scope"]) or {}
+    keep = {} if st["forced"] or st["preset"] != (cur.get("preset") or "cost-first") else {"profiles": _rt_v2(cur)["profiles"]}
+    eff = routing_effective({"preset": st["preset"], **keep}, None, profile)
+    jobs = {j: {"claude": eff[j]["claude"], "ag": dict(eff[j]["ag"])} for j in JOB_KEYS}
+    for src in (sets or {}, edits):
+        for j, upd in src.items(): jobs[j].update({k: dict(v) if isinstance(v, dict) else v for k, v in upd.items()})
+    return jobs
 
 def _setup_rebase(st):
-    """jobs = preset (+ that scope's on-disk picks when its file uses the same preset and the preset
-    wasn't forced) < --set < UI edits. Mutates + returns st. Pure."""
-    cur = st["existing"].get(st["scope"]) or {}
-    keep = {} if st["forced"] or st["preset"] != (cur.get("preset") or "cost-first") else cur
-    eff = routing_effective({"preset": st["preset"], "jobs": keep.get("jobs") or {}})
-    st["jobs"] = {j: {"claude": eff[j]["claude"], "ag": dict(eff[j]["ag"])} for j in JOB_KEYS}
-    for src in (st["sets"], st["edits"]):
-        for j, upd in src.items(): st["jobs"][j].update({k: dict(v) if isinstance(v, dict) else v for k, v in upd.items()})
+    """st["jobs"] = active profile's jobs; backends = effective < --set < edits. Mutates + returns st. Pure."""
+    st["jobs"] = _setup_jobs(st, st["profile"], st["edits"], st["sets"])
     ex = st["existing"]  # backends: effective for the scope (project sees global under it) < --set backend.* < UI edits
     bk = backends_effective(ex.get("global") or {}, (ex.get("project") or {}) if st["scope"] == "project" else {})
     st["backends"] = {b: {k: e[k] for k in BK_DEFAULT} for b, e in bk.items()}
@@ -11855,7 +11998,7 @@ def _setup_rebase(st):
         for b, upd in src.items(): st["backends"][b].update(upd)
     return st
 
-def setup_state_from(scope="global", preset=None, sets=None, harn=None, claude_md=None, proj=None, existing=None, bsets=None):
+def setup_state_from(scope="global", preset=None, sets=None, harn=None, claude_md=None, proj=None, existing=None, bsets=None, profile=None):
     """Shared setup state {scope, harnesses, preset, forced, jobs, backends, claude_md (None=auto), proj, existing,
     sets, edits, bsets, bedits}. A given preset is forced (drops on-disk per-job picks). Pure when proj + existing are given."""
     proj = Path(proj or project_root())
@@ -11865,9 +12008,14 @@ def setup_state_from(scope="global", preset=None, sets=None, harn=None, claude_m
     return _setup_rebase({"scope": scope, "harnesses": list(harn or []),
         "preset": preset or (existing.get(scope) or {}).get("preset") or "cost-first", "forced": bool(preset),
         "jobs": {}, "claude_md": claude_md, "proj": str(proj), "existing": existing, "sets": dict(sets or {}), "edits": {},
-        "backends": {}, "bsets": {b: dict(v) for b, v in (bsets or {}).items()}, "bedits": {}})
+        "backends": {}, "bsets": {b: dict(v) for b, v in (bsets or {}).items()}, "bedits": {},
+        "profile": profile or (os.environ.get("AG_PROFILE") or "").strip() or profile_for(detect_harness()[0]), "pedits": {}, "pjobs": {}, "no_jobs": False, "meta": None})
 
 def setup_set_scope(st, scope): st["scope"] = scope; return _setup_rebase(st)
+def setup_set_profile(st, profile):
+    """Switch the edited profile; unsaved edits of the old one are kept and still written. Pure."""
+    st["pedits"][st["profile"]] = st["edits"]; st["profile"] = profile; st["edits"] = st["pedits"].pop(profile, {})
+    return _setup_rebase(st)
 def setup_apply_preset(st, preset):
     """Preset wins outright (drops --set + UI edits); callers confirm first when setup_custom_jobs(st). Pure."""
     st.update(preset=preset, forced=True, sets={}, edits={}); return _setup_rebase(st)
@@ -11884,14 +12032,14 @@ def setup_validate(st):
     return [f"{j}: ag target {b} is disabled (enable {b} or pick another target)" for j, b in routing_disabled(st["jobs"], st["backends"])]
 def setup_custom_jobs(st):
     """Jobs whose picks differ from the preset table (what applying a preset would overwrite). Pure."""
-    p = ROUTING_PRESETS.get(st["preset"], _ROUTE_COST)
+    p = _setup_base(st)
     return [j for j in JOB_KEYS if st["jobs"][j] != {"claude": p[j]["claude"], "ag": dict(p[j]["ag"])}]
 def setup_claude_md_on(st): return st["claude_md"] if st["claude_md"] is not None else "claude" in st["harnesses"]
 def setup_rows(st):
     """[(key, label)] for the mac hub / cli screen: 4 settings, then one row per job. Pure."""
     cm = "n/a (global scope only)" if st["scope"] != "global" else \
         ("yes" if setup_claude_md_on(st) else "no") + (" (auto)" if st["claude_md"] is None else "")
-    rows = [("scope", f'Scope: {st["scope"]}'), ("harnesses", "Harnesses: " + (", ".join(st["harnesses"]) or "none")),
+    rows = [("scope", f'Scope: {st["scope"]}'), ("profile", f'Profile: {st["profile"]}'), ("harnesses", "Harnesses: " + (", ".join(st["harnesses"]) or "none")),
         ("preset", f'Preset: {st["preset"]}' + (" (custom picks)" if setup_custom_jobs(st) else "")),
         ("claude_md", f"Write CLAUDE.md: {cm}")]
     return rows + [(f"job:{j}", f'{j} — Claude: {e["claude"]} · ag: {e["ag"]["backend"]}/{e["ag"]["model"]}')
@@ -11912,8 +12060,16 @@ def setup_targets(st):
     gp, pp = routing_paths(proj)
     under = backends_effective(st["existing"].get("global") or {}) if scope == "project" else backends_effective()
     bks = {b: d for b, d in ((b, {k: v for k, v in st["backends"][b].items() if v != under[b][k]}) for b in BACKEND_TABS) if d}
-    doc = {"version": 1, "preset": st["preset"], "jobs": jobs, **({"backends": bks} if bks else {})}
-    eff = routing_effective(doc) if scope == "global" else routing_effective(st["existing"].get("global") or {}, doc)
+    ex = _rt_v2(st["existing"].get(scope) or {}); pj = {}
+    if not st["no_jobs"]: pj[st["profile"]] = jobs
+    pj.update({p: _setup_jobs(st, p, e) for p, e in st["pedits"].items() if e})
+    pj.update(st["pjobs"])
+    doc = {"version": 2, **({"preset": ex["preset"]} if st["no_jobs"] and ex.get("preset") else {} if st["no_jobs"] else {"preset": st["preset"]}), "profiles": {**ex["profiles"], **{p: {"jobs": j} for p, j in pj.items()}},
+        **({"backends": bks} if bks else {}), **({"project": st["meta"]} if st["meta"] else {})}
+    if scope == "project" and not st["meta"] and ex.get("project"): doc["project"] = ex["project"]
+    gl = st["existing"].get("global") or {}
+    ef = lambda h: routing_effective(doc, None, profile_for(h)) if scope == "global" else routing_effective(gl, doc, profile_for(h))
+    eff = ef("claude")
     block = routing_block(eff)
     writes = [(gp if scope == "global" else pp, json.dumps(doc, indent=2) + "\n")]
     tdir, tpls, skill_err, notes = skill_templates_dir(), {}, "", []
@@ -11924,7 +12080,8 @@ def setup_targets(st):
     if not skill_err:
         for h in harn:
             sd = harness_skills_dir(h, scope, proj)
-            writes += [(sd/n/"SKILL.md", render_skill(tpls[n], routing_block(eff, st["backends"]), scope)) for n in SKILL_NAMES]
+            hp = profile_for(h)
+            writes += [(sd/n/"SKILL.md", render_skill(tpls[n], routing_block(ef(h), st["backends"], hp), scope)) for n in SKILL_NAMES]
             notes += [f"left alone: old skill {sd/o} (remove by hand once ag-cli/ag-agents replace it)"
                 for o in OLD_SKILLS if (sd/o).exists()]
     if setup_claude_md_on(st) and scope == "global":
@@ -12342,19 +12499,19 @@ def _setup_cli_draw(scr, st, S, bg):
     B, R, D = curses.A_BOLD, curses.A_REVERSE, getattr(curses, "A_DIM", 0)
     _sput(scr, 0, 0, _setup_cli_head(), B)
     rows, y = setup_rows(st), 2
-    for i, (_, lab) in enumerate(rows[:4]):
+    for i, (_, lab) in enumerate(rows[:5]):
         name, _, val = lab.partition(": "); on = S["sel"] == i
         _sput(scr, y, 0, f'{G("›") if on else " "} {name:<16}', B if on else 0); _sput(scr, y, 19, val, R if on else 0); y += 1
     custom = setup_custom_jobs(st)
     _sput(scr, y + 1, 2, f'{"Job":<12}{"Claude":<10}ag backend / model', B | curses.A_UNDERLINE); y += 2
     for n, j in enumerate(JOB_KEYS):
-        e, on = st["jobs"][j], S["sel"] == 4 + n
+        e, on = st["jobs"][j], S["sel"] == 5 + n
         _sput(scr, y, 0, f'{G("›") if on else " "} {j + ("*" if j in custom else ""):<11}', B if on else 0)
         _sput(scr, y, 14, e["claude"], R if on and S["col"] == 0 else 0)
         _sput(scr, y, 24, f'{e["ag"]["backend"]} / {e["ag"]["model"]}', R if on and S["col"] >= 1 else 0); y += 1
     _sput(scr, y + 1, 2, f'{"Backend":<12}{"On":<5}{"Default model":<32}{"Mode":<8}Plan', B | curses.A_UNDERLINE); y += 2
     for n, b in enumerate(BACKEND_TABS):
-        e, on = st["backends"][b], S["sel"] == 10 + n
+        e, on = st["backends"][b], S["sel"] == 11 + n
         _sput(scr, y, 0, f'{G("›") if on else " "} {b:<11}', B if on else 0)
         for c, (x, v) in enumerate(((14, "yes" if e["enabled"] else "no"), (19, (e["model"] or "default")[:30]),
                 (51, e["mode"] or "-"), (59, ("yes" if e["plan"] else "no") if CAPS[b]["plan"] else "n/a"))):
@@ -12383,6 +12540,9 @@ def _setup_cli_edit(scr, redraw, st, key, col):
     if key == "scope":
         r = pk("Scope", ["global", "project"], cur=st["scope"], info="where routing.json + skills go")
         if r and r != st["scope"]: setup_set_scope(st, r); return True
+    elif key == "profile":
+        r = pk("Profile", list(ROUTE_PROFILES), cur=st["profile"], info="job table edited here; ag uses the one matching the calling harness")
+        if r in ROUTE_PROFILES and r != st["profile"]: setup_set_profile(st, r); return True
     elif key == "harnesses":
         r = pk("Harnesses", list(SETUP_HARNESSES), multi=True, chosen=st["harnesses"], info="install ag-cli + ag-agents skills for")
         if r is not None and r != st["harnesses"]: st["harnesses"] = r; return True
@@ -12461,7 +12621,40 @@ def setup_ui_cli(st, bg=None):
     except locale.Error: pass
     return curses.wrapper(_setup_cli_main, st, bg)
 
+def setup_apply_answers(st, ans, harness):
+    """Apply `route --check` answers to a project-scope state (spec D). Returns an error string or None. Mutates st."""
+    use = ans.get("use", "inherit")
+    if use not in ("inherit", "cheap", "strong", "custom"): return f"bad answers.use {use!r}: inherit|cheap|strong|custom"
+    oth = ans.get("other_harnesses") or []
+    if not isinstance(oth, list) or [h for h in oth if h not in SETUP_HARNESSES]: return f"bad answers.other_harnesses: list of {','.join(SETUP_HARNESSES)}"
+    harn = list(dict.fromkeys(([harness] if harness in SETUP_HARNESSES else []) + oth))
+    st.update(harnesses=harn, no_jobs=True, meta={"answered": datetime.now(timezone.utc).isoformat(timespec="seconds"), "harnesses": harn})
+    if use in ("cheap", "strong"):
+        for h in harn:
+            tier = "small" if use == "cheap" else "big"
+            if h == "claude": jobs = {j: _rj(a_, "claude", a_) for j in JOB_KEYS for a_ in ["haiku" if use == "cheap" else "fable" if j == "hardest" else "opus"]}
+            else: jobs = {j: _rj("haiku" if use == "cheap" else "opus", h, _pick(h, tier, h == "opencode" and use == "cheap")
+                or (OPENCODE_MODEL_DEFAULT if h == "opencode" else "default")) for j in JOB_KEYS}
+            st["pjobs"][h] = jobs
+    elif use == "custom":
+        be, jobs = harness if harness in SETUP_HARNESSES else "claude", {}
+        for j, v in (ans.get("jobs") or {}).items():
+            if j not in JOB_KEYS: return f"bad answers.jobs key {j!r} ({','.join(JOB_KEYS)})"
+            if isinstance(v, dict): jobs[j] = {k: v[k] for k in ("claude", "ag") if k in v}; continue
+            b, sl, m = str(v).partition("/"); b, m = (b, m) if sl and b in NATIVE_ORDER else (be, str(v))
+            jobs[j] = {"ag": {"backend": b, "model": m or "default"}}
+        cur = st["profile"]; base = routing_effective({"profiles": {cur: {"jobs": jobs}}}, None, cur)
+        st["pjobs"][cur] = {j: {"claude": e["claude"], "ag": dict(e["ag"])} for j, e in base.items()}
+    return None
+
 def do_setup(a):
+    if getattr(a, "answers", None) is not None:
+        try:
+            ans = json.loads(a.answers)
+            if not isinstance(ans, dict): raise ValueError("not an object")
+        except ValueError as e: return emit(a, "setup", error=f"bad --answers JSON: {e}", hint="ag route --check --json shows answers_format")
+        if a.scope not in (None, "project"): return emit(a, "setup", error="--answers is project scope only")
+        a.scope, a.yes = "project", True
     want = (getattr(a, "ui", None) or os.environ.get("AG_SETUP_UI") or "").strip().lower()
     if want and want not in SETUP_UIS: return emit(a, "setup", error=f"bad --ui/AG_SETUP_UI {want!r}: {'|'.join(SETUP_UIS)}")
     osa = _setup_osa_bin()
@@ -12489,7 +12682,13 @@ def do_setup(a):
         det = ",".join(detect_harnesses()) or "none"
         try: harn = parse_harness_list(_ask("install skills for (claude,opencode,codex|all|none)", det) if ui == "plain" else det)
         except ValueError as e: return emit(a, "setup", error=str(e))
-    st = setup_state_from(scope, a.preset, sets, harn, a.claude_md, bsets=bsets)
+    if getattr(a, "profile", None) and a.profile not in ROUTE_PROFILES: return emit(a, "setup", error=f"bad profile {a.profile!r}: {'|'.join(ROUTE_PROFILES)}")
+    st = setup_state_from(scope, a.preset, sets, harn, a.claude_md, bsets=bsets, profile=getattr(a, "profile", None))
+    if getattr(a, "answers", None) is not None:
+        if a.harness is None: st["harnesses"] = []
+        err = setup_apply_answers(st, ans, detect_harness()[0])
+        if err: return emit(a, "setup", error=err)
+        if a.harness is not None: st["harnesses"] = harn
     if ui == "plain" and not a.preset:
         p = _ask("preset (cost-first|balanced|quality-first)", st["preset"])
         if p != st["preset"]: st["preset"] = p; _setup_rebase(st)
@@ -12532,7 +12731,7 @@ def do_setup(a):
             out.append(f"{'wrote' if st_ != 'unchanged' else 'unchanged'} {p}")
         files.append(rec)
     out += notes
-    data = {"scope": scope, "harnesses": harn, "preset": preset, "routing": jobs, "backends": st["backends"], "files": files,
+    data = {"scope": scope, "profile": st["profile"], "harnesses": harn, "preset": preset, "routing": jobs, "backends": st["backends"], "files": files,
         "dry_run": bool(a.dry_run), "notes": notes}
     if ui == "mac" and not a.dry_run:
         wrote = [Path(f["path"]).name for f in files if f["status"] != "unchanged"]
@@ -12555,7 +12754,12 @@ def _setup_selfcheck():
     assert e["review"]["claude"] == "sonnet" and e["review"]["source"]["claude"] == "preset-default"
     assert e["debug"]["ag"] == {"backend": "codex", "model": "default"} and e["debug"]["source"] == {"claude": "preset-default", "ag": "project"}
     b = routing_block(routing_effective())
-    assert "| mechanical — scripts, rote edits, boilerplate, lookups | haiku | opencode / " + OPENCODE_MODEL_DEFAULT + " |" in b
+    assert "| mechanical — scripts, rote edits, boilerplate, lookups | haiku | claude / haiku |" in b
+    assert detect_harness({"AG_HARNESS": "codex"}) == ("codex", "override") and detect_harness({"CLAUDECODE": "1"}, ppid=0) == ("claude", "env")
+    rows = {10: (9, "/bin/zsh", "zsh"), 9: (8, "node", "node /x/bin/opencode run"), 8: (7, "claude", "claude"), 7: (1, "x", "x")}
+    assert detect_harness({}, 10, rows.get) == ("opencode", "process")  # innermost wins
+    assert _rt_v2({"jobs": {"plan": {"claude": "x"}}})["profiles"].keys() == {"default", "claude"}
+    assert routing_effective({"profiles": {"opencode": {"jobs": {"plan": {"ag": {"backend": "codex"}}}}}}, None, "opencode")["plan"]["ag"]["backend"] == "codex"
     t = routing_md_insert("top\n", "B1")
     assert t.startswith("top\n\n" + ROUTING_MARKERS[0]) and routing_md_insert(t, "B2") == t.replace("B1", "B2")
     assert routing_md_insert("x", "B", append=False) is None
@@ -12565,12 +12769,12 @@ def _setup_selfcheck():
     ex = {"global": {"preset": "balanced", "jobs": {"plan": {"claude": "sonnet"}}}, "project": {}}
     s = setup_state_from("global", None, {"debug": {"claude": "haiku"}}, ["claude"], None, proj="/x", existing=ex)
     assert s["preset"] == "balanced" and s["jobs"]["plan"]["claude"] == "sonnet" and s["jobs"]["debug"]["claude"] == "haiku"
-    assert setup_custom_jobs(s) == ["debug", "plan"] and setup_rows(s)[2][1] == "Preset: balanced (custom picks)"
+    assert setup_custom_jobs(s) == ["debug", "plan"] and setup_rows(s)[3][1] == "Preset: balanced (custom picks)"
     setup_edit_job(s, "review", ag={"backend": "codex", "model": "gpt-x"}); setup_set_scope(s, "project")
     assert s["jobs"]["plan"]["claude"] == "opus" and s["jobs"]["debug"]["claude"] == "haiku" and s["jobs"]["review"]["ag"]["model"] == "gpt-x"
-    assert setup_rows(s)[3][1] == "Write CLAUDE.md: n/a (global scope only)"
+    assert setup_rows(s)[4][1] == "Write CLAUDE.md: n/a (global scope only)"
     setup_apply_preset(s, "cost-first")
-    assert setup_custom_jobs(s) == [] and s["edits"] == {} and setup_rows(s)[6] == ("job:review", "review — Claude: opus · ag: claude/opus")
+    assert setup_custom_jobs(s) == [] and s["edits"] == {} and setup_rows(s)[7] == ("job:review", "review — Claude: opus · ag: claude/opus")
     assert setup_filter(["opencode/a", "anthropic/Claude-x"], "an CLA") == ["anthropic/Claude-x"]
     # per-backend config
     r, bs = parse_backend_sets(["plan=claude:opus", "backend.codex.mode=edits", "backend.gemini.enabled=false", "backend.opencode.model=default"])
@@ -12581,9 +12785,9 @@ def _setup_selfcheck():
     bk = backends_effective({"backends": {"codex": {"mode": "ro", "model": "g"}}}, {"backends": {"codex": {"mode": "edits"}, "x": 1}})
     assert bk["codex"] == {"enabled": True, "model": "g", "mode": "edits", "plan": False, "source": "project"} and bk["claude"]["source"] == "default"
     bk["opencode"]["enabled"] = False
-    assert routing_disabled(routing_effective(), bk) == [("mechanical", "opencode")]
+    assert routing_disabled(routing_effective({"jobs": {"mechanical": {"ag": {"backend": "opencode", "model": "m"}}}}), bk) == [("mechanical", "opencode")]
     assert "opencode: off" in backends_line(bk) and "codex: g (mode edits)" in backends_line(bk)
-    s = setup_state_from("global", None, None, [], None, proj="/x", existing={"global": {}, "project": {}}, bsets={"opencode": {"enabled": False}})
+    s = setup_state_from("global", None, None, [], None, proj="/x", existing={"global": {}, "project": {}}, bsets={"opencode": {"enabled": False}}, profile="opencode")
     assert setup_validate(s) and "opencode" not in setup_enabled_backends(s)
     setup_edit_backend(s, "opencode", enabled=True); assert not setup_validate(s)
     assert setup_ui_pick("", "darwin", {}, "/o") == "mac" and setup_ui_pick("", "darwin", {"SSH_TTY": "x"}, "/o") == "cli"
@@ -12649,7 +12853,7 @@ def build():
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp')
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp')
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
     ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None)
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
@@ -12718,8 +12922,8 @@ def build():
     sub.add_parser("selfcheck",help="run built-in checks")
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
     mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now")
-    rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS)
-    st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL | backend.B.(enabled|model|mode|plan)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: mac (native dialogs) | cli (full-screen) | plain (prompts); default auto, env AG_SETUP_UI")
+    rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS); rt.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile to show (default: detected harness)"); rt.add_argument("--json",action="store_true",default=argparse.SUPPRESS); rt.add_argument("--check",action="store_true",help="per-project setup check: configured? + questions to ask the user")
+    st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL | backend.B.(enabled|model|mode|plan)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: mac (native dialogs) | cli (full-screen) | plain (prompts); default auto, env AG_SETUP_UI")
     return p
 
 # ---- portable task snapshots (outbound SSH, no native runtime migration) ----

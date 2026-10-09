@@ -88,10 +88,10 @@ Live list per backend (opencode, codex, cursor discovered; claude/gemini static 
 ## Setup
 
 ```sh
-{{AG}} setup [--scope global|project] [--harness claude,opencode,codex|all] [--preset cost-first|balanced|quality-first] [--set JOB=claude:ALIAS] [--set JOB=ag:BACKEND/MODEL] [--set backend.B.enabled=true|false] [--set backend.B.model=ID] [--set backend.B.mode=ro|edits|auto|full|unset] [--set backend.B.plan=true|false] [--claude-md|--no-claude-md] [--yes] [--dry-run] [--ui mac|cli|plain]
+{{AG}} setup [--scope global|project] [--harness claude,opencode,codex|all] [--preset cost-first|balanced|quality-first] [--set JOB=claude:ALIAS] [--set JOB=ag:BACKEND/MODEL] [--set backend.B.enabled=true|false] [--set backend.B.model=ID] [--set backend.B.mode=ro|edits|auto|full|unset] [--set backend.B.plan=true|false] [--claude-md|--no-claude-md] [--yes] [--dry-run] [--ui web|cli|plain]
 ```
 
-Ask the user to run it bare (interactive). Agent context: pass flags + `--yes` (or `--dry-run` first). `--ui` / `AG_SETUP_UI`: `mac` = native window (Jobs tab: Claude alias + ag target per job; one tab per backend: enabled, default model, default mode, plan; auto on local macOS), `cli` = curses (jobs table + Backends table, needs 60x23), `plain` = prompts. Writes `routing.json` (jobs + per-backend defaults that feed `agents add`), renders `ag-cli`/`ag-agents` skills into harness skill dirs, routing block in `~/.claude/CLAUDE.md` (claude/global). Atomic, never deletes. Job routed to a disabled backend: error, no save.
+Ask the user to run it bare (interactive). Agent context: pass flags + `--yes` (or `--dry-run` first). `--ui` / `AG_SETUP_UI`: `web` (alias `mac`; auto on a local macOS desktop) = local browser form on 127.0.0.1 (random port + one-time token URL; `AG_SETUP_NO_OPEN=1` prints the URL instead of opening; Jobs per profile with grouped model dropdowns + capability panel, Backends, ranked Models, Skills; Save/Cancel, 15 min idle exits writing nothing), `cli` = curses (jobs table + Backends table, needs 60x23), `plain` = prompts. Writes `routing.json` (jobs + per-backend defaults that feed `agents add`), renders `ag-cli`/`ag-agents` skills into harness skill dirs, routing block in `~/.claude/CLAUDE.md` (claude/global). Atomic, never deletes. Job routed to a disabled backend: error, no save.
 
 ## Schedule tick (mechanics)
 

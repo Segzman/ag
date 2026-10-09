@@ -80,10 +80,10 @@ ag auto-checks GitHub once a day in a detached process; applies on next run. Git
 ## Models
 
 ```sh
-{{AG}} models [--backend B] [--refresh] [--json]
+{{AG}} models [--backend B] [--refresh] [--rank] [--tier small|balanced|big] [--free] [--json]
 ```
 
-Live list per backend (opencode, codex, cursor discovered; claude/gemini static aliases). Cache `~/.cache/ag/models.json`, TTL 24h, auto-refresh when stale; `--refresh` forces. A failing source keeps its last good list and records `error`. Use it to pick valid model ids before `agents add --model`. `{{AG}} route [JOB] [--json]` shows effective job routing (see `ag-agents`).
+Live list per backend (opencode, codex, cursor discovered; claude/gemini static aliases). Cache `~/.cache/ag/models.json`, TTL 24h, auto-refresh when stale; `--refresh` forces. A failing source keeps its last good list and records `error`. Use it to pick valid model ids before `agents add --model`. `--rank` adds tier (small/balanced/big), context, reasoning/tools, price or `free`, release date, `new` badge from models.dev (+ Artificial Analysis score/speed when `AG_AA_KEY` is set); `--tier T`/`--free` filter. Small-fast vs big-smart: `models --backend opencode --free --tier big`. `{{AG}} route [JOB] [--json]` shows effective job routing (see `ag-agents`).
 
 ## Setup
 

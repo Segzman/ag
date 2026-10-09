@@ -116,10 +116,12 @@ ag spawn --no-secret-popup -- ... # opt out per session; AG_SECRET_POPUP=0 globa
 ## Models
 
 ```sh
-ag models [--backend B] [--refresh] [--json]
+ag models [--backend B] [--refresh] [--rank] [--tier small|balanced|big] [--free] [--json]
 ```
 
 Live discovery: opencode (`opencode models`), codex (`~/.codex/models_cache.json`), cursor (`agent --list-models`); claude and gemini are static aliases (their CLIs have no list command). Cache `~/.cache/ag/models.json`, TTL 24h, refreshed automatically when stale; `--refresh` forces. A failing source keeps its last good list and records `error`. The built-in static list stays as fallback; pickers prefer the cache. `default` model = no `-m` flag, except opencode where it means `opencode/muse-spark-1.3-contributor-free` everywhere ag launches opencode (details: [docs/HARNESS_ROLES.md](docs/HARNESS_ROLES.md)).
+
+**Ranking.** `--rank` enriches each id from [models.dev](https://models.dev/api.json) (cache `~/.cache/ag/modelsdev.json`, 24h, 15s fetch cap, last cache kept on failure): tier (small/balanced/big from name hints, adjusted by reasoning flag, context, output price), context, reasoning/tools flags, `$in/$out` per Mtok or `free`, release date, `new` badge (<=30 days). Mapping: `provider/id` exact, claude aliases = newest anthropic model of that family, codex slugs = openai id, then normalized/fuzzy match (`source` shows `models.dev:<how>` or `heuristic`). Set `AG_AA_KEY` (or routing.json `catalog.aa_key_ref` = `${VAR}`; the key is never stored) to add Artificial Analysis intelligence score + tokens/s, which then override the tier heuristic (>=50 big, <30 small). `--tier`/`--free` filter (imply `--rank`). Python helpers: `catalog_info`, `catalog_pick(backend, tier, free_only)`, `catalog_rows`.
 
 ## Setup
 

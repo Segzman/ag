@@ -5,6 +5,7 @@ Fake claude behaviour is driven by env FAKE_MODE and a counter file:
 - stale:     --resume given -> stderr 'No conversation found...', exit 1; fresh -> ok
 - transient: first call 429 + exit 1; later calls ok
 - afteroutput: prints assistant text then 429 + exit 1 (must NOT retry)
+- ocfree (fake `opencode`): first call = JSON error event (free-tier 403, real 2026-10-09 shape) + exit 1; later ok
 Every invocation appends its argv to calls.jsonl.
 Run: python3 tests/test_ag_retry.py
 """
@@ -34,6 +35,12 @@ if mode == "transient":
 if mode == "afteroutput":
     print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "PARTIAL"}]}}))
     sys.stderr.write("API Error: 429 rate_limit_error\n"); sys.exit(1)
+if mode == "ocfree":
+    if n == 1:
+        print(json.dumps({"type": "error", "timestamp": 1, "sessionID": "ses-1", "error": {"name": "APIError", "data": {
+            "message": "OpenCode's free tier can only be used from within OpenCode", "statusCode": 403, "isRetryable": False}}}))
+        sys.exit(1)
+    print(json.dumps({"type": "text", "timestamp": 2, "sessionID": "ses-1", "part": {"type": "text", "text": "FAKE_OK"}})); sys.exit(0)
 '''
 
 
@@ -44,8 +51,9 @@ class RetryE2E(unittest.TestCase):
         (self.td / "bin").mkdir()
         (self.td / "bin" / "claude").write_text(FAKE)
         (self.td / "bin" / "claude").chmod(0o755)
+        shutil.copy(self.td / "bin" / "claude", self.td / "bin" / "opencode")
         self.env = dict(os.environ, PATH=str(self.td / "bin") + os.pathsep + os.environ["PATH"],
-                        FAKE_DIR=str(self.td))
+                        FAKE_DIR=str(self.td), AG_PROBE="0", AG_AUTO_UPDATE="0")
         self.env.pop("AG_RETRY", None)
         self.ag("agents", "add", "r1", "--backend", "claude", "--role", "sub", "--dir", str(self.td))
 
@@ -95,6 +103,13 @@ class RetryE2E(unittest.TestCase):
     def test_failure_after_output_not_retried(self):
         p = self.ag("--json", "chat", "send", "r1", "hello", mode="afteroutput")
         self.assertEqual(len(self.calls()), 1)
+
+    def test_opencode_error_event_retried(self):
+        self.ag("agents", "add", "o1", "--backend", "opencode", "--role", "sub", "--dir", str(self.td))
+        p = self.ag("--json", "chat", "send", "o1", "hello", mode="ocfree")
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        self.assertEqual(len([c for c in self.calls() if "hello" in " ".join(c)]), 2)
+        self.assertIn("FAKE_OK", p.stdout)
 
     def test_opt_out(self):
         self.env["AG_RETRY"] = "0"

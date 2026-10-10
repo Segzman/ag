@@ -113,7 +113,7 @@ Needs the global tick installed once (`schedule install --write`, see `ag-cli`);
 
 ## Reliability
 
-Stored session id unknown to backend ("Session not found" etc.) -> ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`. Rate limit/overload/503/529/connection reset retried 2x (2s, 6s) only if the attempt produced no output. `AG_RETRY=0` disables. Logged-out backend fails fast (probe). codex headless resumes via `exec --json`. gemini is stateless. Lost wake (worker died): `wakes --reap [--dry-run] [--include-running] [--agent A] [--max-attempts 3]` relaunches; default only jobs lost while queued; `--include-running` redoes mid-turn losses (msg prefixed `[reap]`; verify state first).
+Stored session id unknown to backend ("Session not found" etc.) -> ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`. Rate limit/overload/503/529/connection reset/opencode free-tier 403 retried 2x (2s, 6s) only if the attempt produced no output (provider error events do not count). `AG_RETRY=0` disables. Logged-out backend fails fast (probe). codex headless resumes via `exec --json`. gemini is stateless. Lost wake (worker died): `wakes --reap [--dry-run] [--include-running] [--agent A] [--max-attempts 3]` relaunches; default only jobs lost while queued; `--include-running` redoes mid-turn losses (msg prefixed `[reap]`; verify state first).
 
 ## Isolation: worktree per agent
 

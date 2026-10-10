@@ -8201,7 +8201,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             err = (err + f"\nmax-runtime {timeout_s:g}s exceeded (backend killed)").strip()
         if _intr: rc = 130; _event(sdir, "interrupted", name)
         full = "\n".join(c for c in chunks if c).strip()
-        _nx = None if command else _retry_plan(sdir,name,backend,sid,rc,err,_timed_out["hit"] or _intr,bool(full) or any(r.get("role")!="user" for r in buf.rows.values()),_rs,_turn_lock,_t_guard,timeout_s,on_event)
+        _erows = "\n".join(str(r.get("text","")) for r in buf.rows.values() if r.get("role")=="error")  # opencode reports provider errors as JSON events, not stderr
+        _nx = None if command else _retry_plan(sdir,name,backend,sid,rc,(err+"\n"+_erows).strip(),_timed_out["hit"] or _intr,bool(full) or any(r.get("role") not in ("user","error") for r in buf.rows.values()),_rs,_turn_lock,_t_guard,timeout_s,on_event)
         if _nx: _nx["ck"] = _ck
         if _nx: return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs=_nx)
         if rc != 0 and not _intr:
@@ -8267,7 +8268,8 @@ _RESUME_MISSING_RE = re.compile(
     r"|invalid session", re.I)
 _TRANSIENT_RE = re.compile(
     r"\b429\b|rate.?limit|too many requests|overloaded|\b529\b|\b503\b|service unavailable"
-    r"|econnreset|stream (?:closed|ended|disconnected)|connection reset", re.I)
+    r"|econnreset|stream (?:closed|ended|disconnected)|connection reset"
+    r"|free tier can only be used from within opencode", re.I)  # opencode zen 403, seen transient 2026-10-09
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 def classify_turn_failure(backend, rc, stderr, got_output):
@@ -11503,7 +11505,8 @@ def do_selfcheck(a):
             ("codex","Error: thread/resume: thread/resume failed: no rollout found for thread id 0000 (code -32600)")):
         assert classify_turn_failure(_b,1,_e,False)=="resume_missing", _b
         assert classify_turn_failure(_b,1,_e,True) is None and classify_turn_failure(_b,0,_e,False) is None
-    for _e in ("API Error: 429 rate_limit_error","Overloaded","HTTP 529","503 Service Unavailable","read ECONNRESET","stream closed unexpectedly"):
+    for _e in ("API Error: 429 rate_limit_error","Overloaded","HTTP 529","503 Service Unavailable","read ECONNRESET","stream closed unexpectedly",
+            "{'name': 'APIError', 'data': {'message': \"OpenCode's free tier can only be used from within OpenCode\", 'statusCode': 403"):
         assert classify_turn_failure("claude",1,_e,False)=="transient", _e
     assert classify_turn_failure("claude",1,"Authentication required",False) is None
     # turn queue: steer prio first, FIFO by seq within prio; dead-pid tickets reaped

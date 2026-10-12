@@ -66,7 +66,7 @@ class T(unittest.TestCase):
 
     def test_quiet_partial(self):
         m, sd = load()
-        a = kid(m, sd, "a", quiet=0.05); b = kid(m, sd, "b")
+        a = kid(m, sd, "a", quiet=0.5); b = kid(m, sd, "b")
         m._wake_finish(sd, a, "done", reply="r-a")   # too early
         self.assertEqual(parent_jobs(m, sd), [])
         g = m._cohort_read(sd, "g1")
@@ -74,10 +74,10 @@ class T(unittest.TestCase):
 
     def test_quiet_partial_after_wait(self):
         m, sd = load()
-        a = kid(m, sd, "a", quiet=0.05); b = kid(m, sd, "b"); c = kid(m, sd, "c")
+        a = kid(m, sd, "a", quiet=0.5); b = kid(m, sd, "b"); c = kid(m, sd, "c")  # 0.5s window: 50ms flaked under load
         m._wake_finish(sd, a, "done", reply="r-a")
         self.assertEqual(parent_jobs(m, sd), [])
-        time.sleep(0.1); m._wake_finish(sd, b, "done", reply="r-b")
+        time.sleep(0.6); m._wake_finish(sd, b, "done", reply="r-b")
         pj = parent_jobs(m, sd); self.assertEqual(len(pj), 1)
         self.assertIn("2/3", pj[0]["message"]); self.assertEqual(m._cohort_read(sd, "g1")["pending"], [c])
 

@@ -75,6 +75,12 @@ Backend turns and spawned sessions get `SUDO_ASKPASS`/`SSH_ASKPASS`/`GIT_ASKPASS
 
 `${keychain:NAME}` works wherever `${VAR}` refs work (agent/profile env); resolved at spawn into child env only, redacted in `agents env`. Providers live in `$AG_CONFIG_HOME/providers.json` (refs only); ag merges an opencode fragment (`"apiKey": "{env:AG_KEY_<ID>}"`) into the scoped `OPENCODE_CONFIG` and injects `AG_KEY_<ID>` into the child env only (never global `~/.config/opencode/opencode.json`). Privacy feeds the work-guard; max_concurrent feeds ratelimit slots for `<provider>/*`.
 
+```sh
+{{AG}} --dir <state> agents add v --backend api --model PROVIDER/MODEL   # direct OpenAI-compat chat, no tools (e.g. groq/llama-3.3-70b-versatile); history AG_API_BUDGET tokens (default 2000)
+```
+
+`api` is for small-limit providers (Groq free 8K TPM, below opencode's first request): bounded history, streamed SSE reply, usage to the ledger, same slots/cooldowns/privacy/access/budgets as other backends. Opencode `ContextOverflowError` (`Request too large ... Limit 8000, Requested N`) kills the turn non-retryably with `use a backend=api agent`.
+
 ## Notes / todos
 
 `ag note "..."` / `ag notes` · `ag todo add|list|done|clear` · `ag history` · `ag events`.

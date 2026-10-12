@@ -2905,6 +2905,8 @@ def native_launch(sdir, name, backend=""):
         return {"ok": False, "error": f"unknown backend: {b} (ag agents doctor)"}
     if b == "echo":
         return {"ok": False, "error": "echo is a local plumbing-test backend: no native TUI to hand off to."}
+    if b == "api":
+        return {"ok": False, "error": "api is a direct HTTP backend: no native TUI to hand off to."}
     sid = _slash_sid(sdir, name, a, b)
     try:
         argv, cwd = native_handoff_argv(b, sid=sid, workdir=a.get("dir", ".") or ".",
@@ -2941,6 +2943,8 @@ def native_handoff_text(sdir, name, backend=""):
         return (False, f"unknown backend: {b} (ag agents doctor)")
     if b == "echo":
         return (False, "echo is a local plumbing-test backend: no native TUI to hand off to.")
+    if b == "api":
+        return (False, "api is a direct HTTP backend: no native TUI to hand off to.")
     try:
         argv, cwd = native_handoff_argv(b, sid=_slash_sid(sdir, name, a, b),
             workdir=a.get("dir", ".") or ".", model=a.get("model", "") or "")
@@ -3076,6 +3080,7 @@ def update_agent_settings(sdir, name, updates):
         try:
             if (_ae := access_error(new, model, _pd, sdir=sdir)): return (False, _ae)
         except Exception: pass
+        if (_ave := api_validate(new, model)): return (False, _ave)
         sids = dict(meta.get("sids") or {})
         if meta.get("sid"):
             # A stale meta backend may differ from the roster: the SID still
@@ -6623,7 +6628,7 @@ def do_agents_fork(a, sdir):
     if any(r["name"] == new for r in rows): return emit(a, "agents", error=f"exists: {new}")
     if agent_busy(sdir, src): return emit(a, "agents", error=f"{src} is busy (turn or handoff running); retry when idle.")
     be = getattr(a, "backend", None) or scol.get("backend", "claude")
-    if be not in ("claude", "opencode", "gemini", "codex", "cursor", "echo", "acp"):
+    if be not in ("claude", "opencode", "gemini", "codex", "cursor", "echo", "acp", "api"):
         return emit(a, "agents", error=f"unknown backend: {be} ({'/'.join(NATIVE_ORDER)}/acp)")
     mod = getattr(a, "model", None) if getattr(a, "model", None) is not None else scol.get("model", "default") or "default"
     eff = getattr(a, "effort", None) if getattr(a, "effort", None) is not None else scol.get("effort", "")
@@ -6841,6 +6846,7 @@ def do_agents(a):
         try:
             if (_axe := access_error(be, mod, data, sdir=sdir)): return emit(a,"agents",error=_axe,hint="ag access show")
         except Exception: pass
+        if (_ave := api_validate(be, mod)): return emit(a,"agents",error=_ave,hint="ag providers list")
         wt, adir = None, a.adir or "."
         if getattr(a,"worktree",False):
             wt, err, hint = wt_create(a.name, adir, getattr(a,"base",None))
@@ -8266,6 +8272,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         return {"sid":meta2.get("sid",""),"exit":0 if ok else 1,"reply":reply,"slash":cmd}
     backend = a.get("backend","claude")
     model = a.get("model","default") or "default"
+    if backend == "api":
+        return _api_turn(sdir, name, text, on_event=on_event, command=command, on_start=on_start, timeout_s=timeout_s, _rs=_rs, force=force)
     workdir = os.path.abspath(a.get("dir",".") or ".")
     if command and backend != "opencode":
         return {"error":f"--command is opencode-only (agent {name} runs {backend})"}
@@ -8476,6 +8484,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             try: _stall_s = _rl_stall_s(backend)
             except Exception: _stall_s = 0
             _stalled = {"hit": False}; _last_out = [time.monotonic()]; _stall_stop = threading.Event(); _stall_thr = None
+            _ctx_overflow = {"hit": False, "msg": ""}
             if _stall_s and _stall_s > 0:
                 def _stall_watch():
                     while not _stall_stop.is_set():
@@ -8518,6 +8527,13 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             et.start()
             for line in _turn_source(p):
                 try: _last_out[0] = time.monotonic()
+                except Exception: pass
+                try:
+                    if ctx_overflow_hit(line):
+                        _ctx_overflow = {"hit": True, "msg": ctx_overflow_msg(backend, model, line)}
+                        try: _kill_tree(p)
+                        except Exception: pass
+                        break
                 except Exception: pass
                 tl_ops = parse_timeline(backend,line,scope=buf.tl_scope)
                 # pure-delta/flush lines (fixture deltas, claude stream_event)
@@ -8594,6 +8610,14 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             _backend_clear(); _intr = _queue_running(sdir, name, None)
             mark_running(name,False)
         try:
+            if _ctx_overflow.get("hit"):
+                rc = 1
+                err = (err + "\n" + _ctx_overflow["msg"]).strip()
+                try: buf.error(_ctx_overflow["msg"]); _event(sdir, "overflow", name, error=_ctx_overflow["msg"][:160])
+                except Exception: pass
+                if on_event:
+                    try: on_event(name, "tool", _ctx_overflow["msg"])
+                    except Exception: pass
             if _stalled.get("hit") and not _timed_out.get("hit"):
                 if not rc: rc = 1
                 err = (err + f"\nstalled: no output for {_stall_s:g}s (backend killed)").strip()
@@ -8699,6 +8723,9 @@ def classify_turn_failure(backend, rc, stderr, got_output):
     """Pure. -> "resume_missing" | "ratelimit" | "transient" | None. Output already produced = None."""
     if not rc or got_output: return None
     t = _ANSI_RE.sub("", stderr or "")
+    try:
+        if ctx_overflow_hit(t): return None
+    except Exception: pass
     if _RESUME_MISSING_RE.search(t): return "resume_missing"
     if _RATELIMIT_RE.search(t): return "ratelimit"
     if _TRANSIENT_RE.search(t): return "transient"
@@ -8708,6 +8735,9 @@ def _retry_plan(sdir,name,backend,sid,rc,err,timed_out,got_output,rs,lock,t0,tim
     """Decide + prepare a relaunch. Returns next run_turn _rs dict or None. Never raises."""
     try:
         if os.environ.get("AG_RETRY","1").strip() == "0" or timed_out: return None
+        try:
+            if ctx_overflow_hit(err): return None
+        except Exception: pass
         kind = classify_turn_failure(backend, rc, err, got_output)
         rs = rs or {"lock":lock,"t0":t0,"n":0,"resumed":False}
         nx = dict(rs)
@@ -9038,6 +9068,434 @@ def do_ratelimit(a):
             lines.append(f"cooldown {k}: {c['remaining']}s remaining (hits {c['hits']})")
     else: lines.append("cooldowns: none")
     return emit(a, "ratelimit", {**data, "_text": "\n".join(lines)})
+
+# ---- api backend + opencode context-overflow guard (one block) ----
+# api: direct OpenAI-compat chat for small-limit providers (Groq 8K TPM etc, no
+# tools/harness prompt). History bounded by AG_API_BUDGET tokens (default 2000,
+# handoff-style chars/4). Key from providers.json key_ref in-process only (never
+# env/argv/log). Overflow: opencode loops compaction on ContextOverflowError
+# (still logs, stall watchdog blind) -> kill tree now, fail non-retryably.
+# Limits/privacy presets: /Users/sekun/swarm-research/free-providers.md (groq 8K
+# TPM verified 2026-10-12; cerebras/cloudflare zdr-ish unverified, marked (*)).
+if "api" not in MODELS: MODELS["api"] = ["default"]
+if "api" not in CAPS: CAPS["api"] = {**_CAP_BASE, "usage": True}
+if "api" not in NATIVE_ORDER: NATIVE_ORDER = (*NATIVE_ORDER, "api")
+_CTX_OVERFLOW_RE = re.compile(r"ContextOverflowError|Request too large", re.I)
+_CTX_LIMIT_RE = re.compile(r"Limit\s*(\d+)[^\d]{0,30}Requested\s*(\d+)", re.I | re.S)
+def ctx_overflow_hit(line):
+    """True when a backend line is a context-overflow event. Pure."""
+    try: return bool(line and _CTX_OVERFLOW_RE.search(line if isinstance(line, str) else ""))
+    except Exception: return False
+def ctx_overflow_detail(text):
+    """' (limit 8000, requested 12345)' when parsed, else ''. Pure."""
+    try:
+        m = _CTX_LIMIT_RE.search(text or "")
+        if m: return f" (limit {m.group(1)}, requested {m.group(2)})"
+    except Exception: pass
+    return ""
+def ctx_overflow_msg(backend, model, text):
+    """Non-retryable error row for an over-limit provider request. Pure."""
+    try: disp = eff_model(backend, model) or model or "default"
+    except Exception: disp = model or "default"
+    return (f"[provider] {disp} request too large for its limits{ctx_overflow_detail(text)}; "
+        "use a backend=api agent or a model with a bigger TPM")
+def api_budget():
+    """History budget in tokens (AG_API_BUDGET overrides, default 2000). Pure."""
+    try: v = int((os.environ.get("AG_API_BUDGET") or "").strip() or 0)
+    except Exception: v = 0
+    return v if v > 0 else 2000
+def api_max_tokens():
+    """max_tokens per turn (AG_API_MAX_TOKENS overrides, default 1024). Pure."""
+    try: v = int((os.environ.get("AG_API_MAX_TOKENS") or "").strip() or 0)
+    except Exception: v = 0
+    return v if v > 0 else 1024
+def api_split_model(model):
+    """(provider, model_id) for 'PROVIDER/MODEL', else (None, None). Pure."""
+    m = (model or "").strip()
+    if not m or m == "default": return None, None
+    if m.startswith("opencode/"): m = m[len("opencode/"):]
+    if "/" not in m: return None, None
+    pid, mid = m.split("/", 1)
+    pid, mid = pid.strip(), mid.strip()
+    return (pid, mid) if pid and mid else (None, None)
+def api_resolve_key(entry):
+    """Secret for a provider entry (keychain ref or ${VAR}); None when unresolved. Never logged."""
+    try:
+        kr = (entry.get("key_ref") or "").strip() if isinstance(entry, dict) else ""
+        if not kr: return None
+        if _normalize_key_ref(kr):
+            v, _ = keychain_get(_normalize_key_ref(kr).split(":", 1)[1])
+            return v or None
+        vr = _codex_env_ref(kr)
+        if vr: return os.environ.get(vr) or None
+    except Exception: pass
+    return None
+def api_history_rows(sdir, name, budget):
+    """Prior user/agent (role, text) oldest-first within budget tokens (~chars/4). Pure of backend I/O."""
+    try: b = int(budget)
+    except Exception: b = 0
+    if b <= 0: b = api_budget()
+    cap = b * 4
+    try: rows = load_chat_log(sdir, name)
+    except Exception: rows = []
+    rows = [r for r in rows if r.get("role") in ("user", "agent")]
+    sel, used = [], 0
+    for r in reversed(rows):
+        t = r.get("text") or ""
+        if not sel and len(t) > cap: t = "…" + t[-cap:]
+        if sel and used + len(t) > cap: break
+        sel.append((r.get("role"), t)); used += len(t)
+    sel.reverse()
+    return sel
+def api_cooldown_s(headers):
+    """Seconds from 429 headers (Retry-After | x-ratelimit-reset-tokens), else None. Pure."""
+    try:
+        g = (lambda k: (headers.get(k) if hasattr(headers, "get") else None) or (headers.get(k.lower()) if hasattr(headers, "get") else None)) if headers is not None else (lambda k: None)
+        for k in ("Retry-After", "retry-after", "x-ratelimit-reset-tokens", "X-Ratelimit-Reset-Tokens"):
+            try: v = g(k)
+            except Exception: v = None
+            if not v: continue
+            m = re.search(r"(\d+(?:\.\d+)?)", str(v))
+            if m:
+                f = float(m.group(1))
+                if f > 0: return min(f, 600.0)
+    except Exception: pass
+    return None
+def api_validate(backend, model):
+    """Error string when an api agent row is unusable, else None. Never raises."""
+    try:
+        if backend != "api": return None
+        pid, mid = api_split_model(model)
+        if not pid: return "need --model PROVIDER/MODEL (e.g. groq/llama-3.3-70b-versatile; ag providers list)"
+        try: ps = providers_load()
+        except Exception: ps = {}
+        if not isinstance(ps, dict) or pid not in ps: return f"no such provider: {pid} (ag providers list)"
+    except Exception: pass
+    return None
+def _api_http_once(base_url, key, model_id, messages, timeout_s, stream=True):
+    """One POST /chat/completions. Returns (text, usage, ratelimit_s|None, err). Key never logged."""
+    import urllib.request, urllib.error
+    url = (base_url or "").strip().rstrip("/") + "/chat/completions"
+    body = {"model": model_id, "messages": messages, "max_tokens": api_max_tokens(), "stream": bool(stream)}
+    if stream: body["stream_options"] = {"include_usage": True}
+    try: data = json.dumps(body).encode()
+    except Exception as e: return "", {}, None, f"api: cannot encode request: {e}"
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json",
+        "Authorization": "Bearer " + (key or ""), "User-Agent": "ag-cli", "Accept": "text/event-stream"}, method="POST")
+    try: resp = urllib.request.urlopen(req, timeout=(timeout_s or 60) if (timeout_s or 0) > 0 else 60)
+    except urllib.error.HTTPError as h:
+        if h.code == 429:
+            try: rs = api_cooldown_s(h.headers)
+            except Exception: rs = None
+            return "", {}, (rs if rs else -1), "429"
+        try: eb = h.read().decode("utf-8", "replace")[:300]
+        except Exception: eb = ""
+        return "", {}, None, f"api: HTTP {h.code} {eb or 'request failed'}".strip()[:300]
+    except Exception as e: return "", {}, None, f"api: {type(e).__name__}: {str(e)[:200]}"
+    parts, usage = [], {}
+    try:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            line = line.strip()
+            if not line or line.startswith(":"): continue
+            payload = line[5:].strip() if line.startswith("data:") else line
+            if payload == "[DONE]": break
+            try: o = json.loads(payload)
+            except Exception: continue
+            if not isinstance(o, dict): continue
+            if isinstance(o.get("usage"), dict):
+                try:
+                    u = o["usage"]
+                    if isinstance(u.get("prompt_tokens"), (int, float)): usage["in"] = int(u["prompt_tokens"])
+                    if isinstance(u.get("completion_tokens"), (int, float)): usage["out"] = int(u["completion_tokens"])
+                except Exception: pass
+            for ch in (o.get("choices") or []):
+                if not isinstance(ch, dict): continue
+                piece = ((ch.get("delta") or {}) if isinstance(ch.get("delta"), dict) else {}).get("content") or ""
+                if not piece:
+                    m = ch.get("message") if isinstance(ch.get("message"), dict) else {}
+                    piece = (m.get("content") or "") if isinstance(m, dict) else ""
+                if not piece and isinstance(ch.get("text"), str): piece = ch["text"]
+                if piece: parts.append(piece)
+        try: resp.close()
+        except Exception: pass
+    except Exception as e: return "".join(parts), usage, None, f"api: {type(e).__name__}: {str(e)[:200]}"
+    return "".join(parts).strip(), usage, None, ""
+def _api_turn(sdir, name, text, on_event=None, command=None, on_start=None, timeout_s=0, _rs=None, force=False):
+    """Direct OpenAI-compat turn (no subprocess, no tools). Returns run_turn-shaped dict. Never raises."""
+    try:
+        agents = {x["name"]: x for x in load_agents(sdir)}
+        if name not in agents: return {"error": f"no such agent: {name} (ag agents list)"}
+        a = agents[name]
+        backend = a.get("backend", "claude")
+        if backend != "api": return {"error": f"_api_turn for {backend}"}
+        model = a.get("model", "default") or "default"
+        if command: return {"error": f"--command is opencode-only (agent {name} runs {backend})"}
+        if (_pve := privacy_error(backend, model, agent_data(a))):
+            try: append_chat(sdir, name, "error", _pve); _event(sdir, "privacy", name, backend=backend, model=model)
+            except Exception: pass
+            if on_event:
+                try: on_event(name, "tool", _pve)
+                except Exception: pass
+            try: _ms = load_chat_meta(sdir, name, agent=a).get("sid", "")
+            except Exception: _ms = ""
+            return {"error": _pve, "exit": 2, "sid": _ms, "reply": _pve}
+        try:
+            if (_ave := access_error(backend, model, agent_data(a), sdir=sdir)):
+                try: append_chat(sdir, name, "error", _ave); _event(sdir, "access", name, backend=backend, model=model)
+                except Exception: pass
+                if on_event:
+                    try: on_event(name, "tool", _ave)
+                    except Exception: pass
+                try: _ms = load_chat_meta(sdir, name, agent=a).get("sid", "")
+                except Exception: _ms = ""
+                return {"error": _ave, "exit": 2, "sid": _ms, "reply": _ave}
+        except Exception: pass
+        _force = bool(force or (_rs or {}).get("force"))
+        if not _force:
+            try:
+                _berr, _bw = budget_check(backend, model)
+                if _berr:
+                    try: append_chat(sdir, name, "error", _berr); _event(sdir, "budget", name, backend=backend)
+                    except Exception: pass
+                    if on_event:
+                        try: on_event(name, "tool", _berr)
+                        except Exception: pass
+                    try: _ms = load_chat_meta(sdir, name, agent=a).get("sid", "")
+                    except Exception: _ms = ""
+                    return {"error": _berr, "exit": 2, "sid": _ms, "reply": _berr}
+                if _bw:
+                    try: append_chat(sdir, name, "tool", _bw)
+                    except Exception: pass
+                    if on_event:
+                        try: on_event(name, "tool", _bw)
+                        except Exception: pass
+            except Exception: pass
+        if (_avd := api_validate(backend, model)):
+            try: append_chat(sdir, name, "error", _avd); _event(sdir, "api_error", name, error=_avd[:160])
+            except Exception: pass
+            if on_event:
+                try: on_event(name, "tool", _avd)
+                except Exception: pass
+            return {"error": _avd, "exit": 2, "sid": "", "reply": _avd}
+        try: timeout_s = _valid_runtime(timeout_s) or 0
+        except Exception: timeout_s = 0
+        try: _lock = _rs["lock"] if _rs else _queued_acquire(sdir, name, text, "wake" if on_start else None)
+        except QueueCancelled: return {"error": "cancelled from queue"}
+        t0 = (_rs or {}).get("t0") or time.monotonic()
+        _extra_wait = [0.0]
+        try:
+            if on_start is not None and not _rs:
+                try: on_start()
+                except Exception: pass
+            agents = {x["name"]: x for x in load_agents(sdir)}
+            if name not in agents: return {"error": f"no such agent: {name} (ag agents list)"}
+            a = agents[name]
+            backend = a.get("backend", "claude")
+            model = a.get("model", "default") or "default"
+            if (_pve := privacy_error(backend, model, agent_data(a))):
+                try: append_chat(sdir, name, "error", _pve)
+                except Exception: pass
+                return {"error": _pve, "exit": 2, "sid": "", "reply": _pve}
+            try:
+                if (_ave := access_error(backend, model, agent_data(a), sdir=sdir)):
+                    try: append_chat(sdir, name, "error", _ave)
+                    except Exception: pass
+                    return {"error": _ave, "exit": 2, "sid": "", "reply": _ave}
+            except Exception: pass
+            if not _force:
+                try:
+                    _berr, _ = budget_check(backend, model)
+                    if _berr:
+                        try: append_chat(sdir, name, "error", _berr)
+                        except Exception: pass
+                        return {"error": _berr, "exit": 2, "sid": "", "reply": _berr}
+                except Exception: pass
+            try:
+                _mw = mode_warning(backend, a.get("mode") or "", bool(a.get("plan")))
+                if _mw:
+                    try: append_chat(sdir, name, "tool", _mw); _event(sdir, "mode_warn", name, warning=_mw)
+                    except Exception: pass
+                    if on_event:
+                        try: on_event(name, "tool", _mw)
+                        except Exception: pass
+            except Exception: pass
+            pid, mid = api_split_model(model)
+            try: provs = providers_load()
+            except Exception: provs = {}
+            ent = provs.get(pid) if isinstance(provs, dict) else None
+            if not isinstance(ent, dict):
+                _e = f"no such provider: {pid} (ag providers list)"
+                try: append_chat(sdir, name, "error", _e)
+                except Exception: pass
+                return {"error": _e, "exit": 2, "sid": "", "reply": _e}
+            base = (ent.get("base_url") or "").strip()
+            if not base:
+                _e = f"provider {pid} has no base-url (ag providers show {pid})"
+                try: append_chat(sdir, name, "error", _e)
+                except Exception: pass
+                return {"error": _e, "exit": 2, "sid": "", "reply": _e}
+            key = api_resolve_key(ent)
+            if not key:
+                _e = f"provider {pid}: key ref unresolved (ag keys set NAME; ag providers show {pid})"
+                try: append_chat(sdir, name, "error", _e); _event(sdir, "api_error", name, error="key unresolved")
+                except Exception: pass
+                if on_event:
+                    try: on_event(name, "tool", _e)
+                    except Exception: pass
+                return {"error": _e, "exit": 2, "sid": "", "reply": _e}
+            key = str(key)
+            try: sys_txt = eff_system(sdir, a)
+            except Exception: sys_txt = ""
+            try:
+                _prof = (a.get("profile") or "").strip()
+                _px = profile_system_extra(sdir, _prof) if _prof else ""
+                if _px: sys_txt = ((sys_txt + "\n\n---\nprofile context ---\n" + _px) if sys_txt else _px)[:20000]
+            except Exception: pass
+            hist = api_history_rows(sdir, name, api_budget())
+            msgs = []
+            if (sys_txt or "").strip(): msgs.append({"role": "system", "content": sys_txt.strip()[:8000]})
+            for role, t in hist:
+                if role == "user": msgs.append({"role": "user", "content": t[:8000]})
+                elif role == "agent": msgs.append({"role": "assistant", "content": t[:8000]})
+            msgs.append({"role": "user", "content": text})
+            try: user_eid = tl_new_id(); append_chat(sdir, name, "user", text, event_id=user_eid)
+            except Exception: user_eid = tl_new_id()
+            buf = TimelineBuffer(sdir, name, on_event)
+            try: buf.user_row(text, user_eid)
+            except Exception: pass
+            mark_running(name, True)
+            try: _cw = _rl_wait_cooldown(backend, model, sdir, name, on_event)
+            except Exception: _cw = 0.0
+            if _cw: _extra_wait[0] += _cw; t0 += _cw
+            try: _slot, _sw = _rl_acquire_slot(backend, model, sdir, name, on_event)
+            except Exception: _slot, _sw = None, 0.0
+            if _sw: _extra_wait[0] += _sw; t0 += _sw
+            full, usage, rl_hits, cur = "", {}, 0, model
+            try:
+                while True:
+                    if timeout_s and time.monotonic() >= t0 + timeout_s:
+                        _e = f"max-runtime {timeout_s:g}s exceeded (backend killed)"
+                        try: buf.error(_e)
+                        except Exception: pass
+                        return {"error": _e, "exit": 124, "sid": "", "reply": _e, "timed_out": True}
+                    cpid, cmid = api_split_model(cur)
+                    cent = (provs.get(cpid) if isinstance(provs, dict) else None) if cpid else None
+                    ckey = api_resolve_key(cent) if isinstance(cent, dict) else key
+                    cbase = ((cent.get("base_url") or "").strip() if isinstance(cent, dict) else "") or base
+                    if not ckey:
+                        _e = f"provider {cpid}: key ref unresolved"
+                        try: buf.error(_e); append_chat(sdir, name, "error", _e)
+                        except Exception: pass
+                        return {"error": _e, "exit": 2, "sid": "", "reply": _e}
+                    ckey = str(ckey)
+                    txt, us, rls, err = _api_http_once(cbase, ckey, cmid or mid, msgs, 0, stream=True)
+                    if err == "429":
+                        rl_hits += 1
+                        try: kh = _rl_key(backend, cur)
+                        except Exception: kh = f"{backend}/{cur}"
+                        secs = rls if isinstance(rls, (int, float)) and rls and rls > 0 else None
+                        try:
+                            if secs: _rl_write_cooldown(kh, 1); p = _rl_cooldown_path(kh); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(json.dumps({"until": time.time() + float(secs), "hits": (_rl_read_cooldown(kh).get("hits") or 0) + 1}))
+                            else: _rl_write_cooldown(kh, (_rl_read_cooldown(kh).get("hits") or 0) + 1)
+                        except Exception: pass
+                        try:
+                            rem = (_rl_read_cooldown(kh).get("remaining") or 0)
+                            _m = cur
+                            _rl_tool_note(sdir, name, f"[ratelimit] cooling down {_m} {int(rem + 0.999)}s", on_event, ev="ratelimit_cooldown", model=str(_m))
+                        except Exception: pass
+                        if rl_hits >= 2:
+                            try: pick = _rl_pick_fallback(a, backend, model)
+                            except Exception: pick = ""
+                            if pick and pick != cur:
+                                try:
+                                    _pp, _pm = api_split_model(pick)
+                                    if _pp and _pp in (provs or {}):
+                                        note = f"[ratelimit] {model} limited; using fallback {pick}"
+                                        try: append_chat(sdir, name, "tool", note); _event(sdir, "ratelimit_fallback", name, primary=model, fallback=pick)
+                                        except Exception: pass
+                                        if on_event:
+                                            try: on_event(name, "tool", note)
+                                            except Exception: pass
+                                        cur = pick
+                                        continue
+                                except Exception: pass
+                        try: w = (_rl_read_cooldown(kh).get("remaining") or 0)
+                        except Exception: w = 0
+                        if w > 0:
+                            if timeout_s and time.monotonic() + w >= t0 + timeout_s:
+                                _e = f"max-runtime {timeout_s:g}s exceeded (backend killed)"
+                                return {"error": _e, "exit": 124, "sid": "", "reply": _e, "timed_out": True}
+                            try: time.sleep(min(w, 0.2) if w > 0.2 else w)
+                            except Exception: pass
+                            _extra_wait[0] += w
+                            continue
+                        continue
+                    if err:
+                        try: buf.error(err[:500]); append_chat(sdir, name, "error", err[:500]); _event(sdir, "api_error", name, error=err[:160])
+                        except Exception: pass
+                        if on_event:
+                            try: on_event(name, "tool", err[:500])
+                            except Exception: pass
+                        return {"error": err[:500], "exit": 1, "sid": "", "reply": err[:500]}
+                    full, usage = (txt or "").strip(), dict(us or {})
+                    for piece in [full[i:i + 2000] for i in range(0, len(full), 2000)]:
+                        if piece:
+                            try: buf.assistant_delta("api", piece)
+                            except Exception: pass
+                            if on_event:
+                                try: on_event(name, "text", piece)
+                                except Exception: pass
+                    break
+            finally:
+                try: _rl_release_slot(_slot)
+                except Exception: pass
+                mark_running(name, False)
+            try: buf.finalize()
+            except Exception: pass
+            if not full: full = "(no output)"
+            try: agent_row = append_chat(sdir, name, "agent", full, event_id=tl_new_id(), extra={"timeline_summary": True} if buf.had_assistant else None)
+            except Exception: agent_row = {"ts": now_iso(), "role": "agent", "text": full[:8000]}
+            if on_event:
+                try: on_event(name, "timeline", dict(agent_row))
+                except Exception: pass
+            try: _event(sdir, "chat", name, exit=0)
+            except Exception: pass
+            if on_event:
+                try: on_event(name, "exit", "0")
+                except Exception: pass
+            out = {"sid": "", "exit": 0, "reply": full}
+            if usage:
+                try: usage_record(sdir, name, backend, "", True, dict(usage))
+                except Exception: pass
+                try: out["usage"] = usage_short(usage)
+                except Exception: pass
+            try: usage_log_turn(sdir, name, backend, cur, usage, 0)
+            except Exception: pass
+            try:
+                _rows = load_agents(sdir)
+                _a = next((r for r in _rows if r["name"] == name), None)
+                if _a is not None and _a.pop("pending_handoff", None) is not None: save_agents(sdir, _rows)
+            except Exception: pass
+            try: _rl_clear_cooldown(_rl_key(backend, cur))
+            except Exception: pass
+            return out
+        finally:
+            if not _rs:
+                try: _release_agent_turn(_lock)
+                except Exception: pass
+    except Exception as e: return {"error": f"api: {type(e).__name__}: {str(e)[:200]}", "exit": 1, "sid": "", "reply": f"api: {type(e).__name__}: {str(e)[:200]}"}
+def api_selfcheck():
+    assert ctx_overflow_hit('{"type":"error","error":{"name":"ContextOverflowError"}}') and ctx_overflow_hit("Request too large for model") and not ctx_overflow_hit("hello")
+    assert ctx_overflow_detail("Limit 8000, Requested 12345") == " (limit 8000, requested 12345)" and ctx_overflow_detail("no numbers") == ""
+    assert "backend=api" in ctx_overflow_msg("opencode", "groq/m", "Limit 8000, Requested 9000")
+    assert api_split_model("groq/llama-3") == ("groq", "llama-3") and api_split_model("default") == (None, None) and api_split_model("nonslash") == (None, None)
+    assert api_budget() == 2000
+    try:
+        os.environ["AG_API_BUDGET"] = "7"; assert api_budget() == 7
+    finally: os.environ.pop("AG_API_BUDGET", None)
+    assert api_max_tokens() == 1024 and api_cooldown_s({"Retry-After": "3"}) == 3.0 and api_cooldown_s({}) is None
+    assert "api" in MODELS and "api" in CAPS and "api" in NATIVE_ORDER and CAPS["api"]["modes"] == []
 
 def do_handoff(a):
     """Native interactive handoff reachable from CLI.
@@ -12311,7 +12769,7 @@ def do_selfcheck(a):
         assert parse_slash("C:\\path\\x") is None
         assert parse_slash("\\nonsense here") is None
         assert parse_slash("// comment") is None
-        assert tui_backend_opts()==["claude","opencode","gemini","codex","cursor","echo"]
+        assert tui_backend_opts()==["claude","opencode","gemini","codex","cursor","echo","api"]
         for _b in ("claude","opencode","gemini","codex","cursor"):
             _av,_cw = native_handoff_argv(_b,sid="s1")
             assert not any(t in BYPASS_FLAGS for t in _av), _av
@@ -12822,6 +13280,7 @@ def do_selfcheck(a):
     assert queue_list(td,"qa")==[] and not list(_qd.glob("[0-9]-*")) and not queue_held(td,"qa")
     secret_selfcheck()
     keys_selfcheck()
+    api_selfcheck()
     _setup_selfcheck()
     _acp_selfcheck(str(td))
     assert compat_verdict("claude","2.1.10")=="graceful" and compat_verdict("claude","2.1.289")=="ok" and auth_parse("codex","Not logged in")=="no"
@@ -15489,10 +15948,10 @@ def build():
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model")
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
-    agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)')
+    agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)')
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)

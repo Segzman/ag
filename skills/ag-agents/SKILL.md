@@ -110,7 +110,7 @@ Tasks must be self-contained: what to do, what done looks like. Fan-out = differ
 {{AG}} --dir <state> crosscheck cheap zdr "is this a real bug? <evidence>" [--judge orch]
 ```
 
-Pair a cheap Claude (haiku, mechanical/review job) with a zero-retention free model for an independent second read; verdict-like replies (`OK`/`BUG:`/`PASS`/`FAIL`/`yes`/`no`, JSON `verdict`) report `AGREE`/`DISAGREE` (exit 0/3), prose reports a unified diff + similarity ratio. `--judge <third>` asks one more agent which answer is right and why (one turn). Tasks must be self-contained (both agents see only the task + their own history). Suggested pairs:
+Pair a cheap Claude (haiku, mechanical/review job) with a zero-retention free model for an independent second read; verdict-like replies (`OK`/`BUG:`/`PASS`/`FAIL`/`yes`/`no`, JSON `verdict`) report `AGREE`/`DISAGREE` (exit 0/3), prose reports a unified diff + similarity ratio. `--judge <third>` asks one more agent which answer is right and why (one turn). Tasks must be self-contained (both agents see only the task + their own history). When opencode overflows a small tier (Groq 8K TPM: `ContextOverflowError`, non-retryable `use a backend=api agent`), use an `api` agent instead: `agents add v --backend api --model groq/<id>` (direct chat, no tools, history `AG_API_BUDGET` tokens default 2000). Suggested pairs:
 
 | Cheap Claude | ZDR free second | Use for |
 |---|---|---|

@@ -534,13 +534,21 @@ def _valid_runtime(v):
     if f != f or f in (float("inf"), float("-inf")) or f < 0: return None
     return f
 
+def _agent_hint(sdir, name):
+    """Close-name hint for no-such-agent errors. Pure-ish (reads roster)."""
+    try: names = [r.get("name") for r in load_agents(sdir) if r.get("name")]
+    except Exception: names = []
+    close = difflib.get_close_matches(name or "", names, n=3, cutoff=0.6)
+    base = "ag agents list"
+    if close: return f"did you mean: {', '.join(close)}? {base}"
+    return base
+
 def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
         notify="", on_done="", timeout_s=0, max_runtime_s=0, job_type=None, cohort=None, extra=None):
     """Enqueue one wake job + spawn tracked worker. Returns {job,session} or {error}."""
     try: rows = load_agents(sdir)
     except Exception: rows = []
     if agent not in [r.get("name") for r in rows]:
-        _event(sdir, "wake_fail", trigger, agent=agent, exit=exit_code, reason="no such agent")
         return {"error": f"no such agent: {agent}"}
     try:
         _ar = next(r for r in rows if r.get("name") == agent)
@@ -1636,9 +1644,9 @@ def do_spawn(a):
     try: roster = [r.get("name") for r in load_agents(sdir)]
     except Exception: roster = []
     if wake_agent and wake_agent not in roster:
-        return emit(a,"spawn",error=f"no such agent: {wake_agent}",hint="ag agents list")
+        return emit(a,"spawn",error=f"no such agent: {wake_agent}",hint=_agent_hint(sdir, wake_agent))
     if wake_agent and wake_notify and wake_notify not in roster:
-        return emit(a,"spawn",error=f"no such agent: {wake_notify}",hint="ag agents list")
+        return emit(a,"spawn",error=f"no such agent: {wake_notify}",hint=_agent_hint(sdir, wake_notify))
     if a.cmd[0]=="--": a.cmd=a.cmd[1:]
     if not a.cmd:
         return emit(a,"spawn",error="no command given",hint="ag spawn -- bash")
@@ -8495,7 +8503,9 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if _nx: return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs=_nx)
         if rc != 0 and not _intr:
             # record failure even when prose already streamed; never fake ok.
-            buf.error(f"(exit {rc}) " + ((err.strip().splitlines()[-3:] or [""])[-1][:300] or "turn failed"))
+            _emsg = f"(exit {rc}) " + ((err.strip().splitlines()[-3:] or [""])[-1][:300] or "turn failed")
+            if _timed_out["hit"]: _emsg += " (raise --max-runtime or split the task)"
+            buf.error(_emsg)
         buf.finalize()
         # finalize first: delta-only fallback reads final snapshots, so the
         # canonical reply concatenates finalized segment texts (prose after
@@ -9056,20 +9066,25 @@ def do_wake(a):
             hint="ag wake <agent> --max-runtime 60 <message>")
     if not agent: return emit(a,"wake",error="no agent given",hint="ag wake <agent> <message>")
     if not text: return emit(a,"wake",error="empty message",hint="ag wake <agent> <message>")
-    if notify:
-        try: names = [r.get("name") for r in load_agents(sdir)]
-        except Exception: names = []
-        if notify not in names:
-            return emit(a,"wake",error=f"no such agent: {notify}",hint="ag agents list")
+    try: names = [r.get("name") for r in load_agents(sdir)]
+    except Exception: names = []
+    if notify and notify not in names:
+        return emit(a,"wake",error=f"no such agent: {notify}",hint=_agent_hint(sdir, notify))
     ck, cerr = _cohort_kw(sdir, a)
-    if cerr: return emit(a,"wake",error=cerr,hint="ag agents list")
+    if cerr:
+        parent = (getattr(a, "parent", None) or "").strip()
+        return emit(a,"wake",error=cerr,hint=_agent_hint(sdir, parent))
     _rc, _h = _rcpt(a, sdir, "wake", agent, json.dumps([text,notify,on_done,timeout_s,max_runtime_s,ck.get("cohort")],default=str))
     if _rc is not None: return _rc
+    if agent not in names:  # after _rcpt: failure stays replayable, still no job file / spawn
+        r = {"error": f"no such agent: {agent}"}
+        _rcpt_done(_h, r)
+        return emit(a,"wake",error=r["error"],hint=_agent_hint(sdir, agent))
     r = launch_wake_chat(sdir,agent,text,notify=notify,on_done=on_done,timeout_s=timeout_s,
         max_runtime_s=max_runtime_s,job_type=getattr(a,"job",None),**ck); _rcpt_done(_h, r)
     if "error" in r:
         if r.get("exit") == 2: emit(a,"wake",error=r["error"]); return 2
-        return emit(a,"wake",error=r["error"],hint="ag agents list")
+        return emit(a,"wake",error=r["error"],hint=_agent_hint(sdir, agent))
     grp = ck.get("cohort",{}).get("group")
     if getattr(a,"json",False):
         return emit(a,"wake",{"agent":agent,"launched":True,
@@ -11566,18 +11581,28 @@ def do_delegate(a):
     if _rc is not None: return _rc
     if getattr(a,"parent",None):
         ck, cerr = _cohort_kw(sdir, a)
-        r = {"error": cerr} if cerr else launch_wake_chat(sdir,a.agent,task,max_runtime_s=timeout_s,job_type=getattr(a,"job",None),**ck)
+        if cerr:
+            r = {"error": cerr}
+            _rcpt_done(_h, r)
+            return emit(a,"delegate",error=r["error"],hint=_agent_hint(sdir, (getattr(a, "parent", None) or "").strip()))
+        try: names = [r2.get("name") for r2 in load_agents(sdir)]
+        except Exception: names = []
+        if a.agent not in names:
+            r = {"error": f"no such agent: {a.agent}"}
+            _rcpt_done(_h, r)
+            return emit(a,"delegate",error=r["error"],hint=_agent_hint(sdir, a.agent))
+        r = launch_wake_chat(sdir,a.agent,task,max_runtime_s=timeout_s,job_type=getattr(a,"job",None),**ck)
         _rcpt_done(_h, r)
         if "error" in r:
             if isinstance(r, dict) and r.get("exit") == 2: emit(a,"delegate",error=r["error"]); return 2
-            return emit(a,"delegate",error=r["error"])
+            return emit(a,"delegate",error=r["error"],hint=_agent_hint(sdir, a.agent))
         return emit(a,"delegate",{"_text":f'delegated to {a.agent} (background job {r["job"]}, group {ck["cohort"]["group"]})',"job":r["job"],"group":ck["cohort"]["group"],"agent":a.agent})
     live = not getattr(a,"json",False)
     r = delegate_task(sdir,a.agent,task,timeout_s=timeout_s,job=getattr(a,"job",None),
         on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None)); _rcpt_done(_h, r)
     if "error" in r and not r.get("timed_out"):
         if r.get("exit") == 2: emit(a,"delegate",error=r["error"]); return 2
-        return emit(a,"delegate",error=r["error"])
+        return emit(a,"delegate",error=r["error"],hint=_agent_hint(sdir, a.agent))
     if getattr(a,"json",False):
         data = {"reply":r["reply"],"exit":r["exit"],"agent":a.agent}
         if r.get("timed_out"):
@@ -12374,6 +12399,11 @@ def do_selfcheck(a):
     _setup_selfcheck()
     _acp_selfcheck(str(td))
     assert compat_verdict("claude","2.1.10")=="graceful" and compat_verdict("claude","2.1.289")=="ok" and auth_parse("codex","Not logged in")=="no"
+    assert do_agents(mk(sub="add",name="alpha",backend="echo",model="default",adir=".",role="sub",persona=None,system=None))==0
+    assert "ag agents list" in _agent_hint(td, "alpah") and "alpha" in _agent_hint(td, "alpah")
+    assert "ag agents list" in _agent_hint(td, "zzz-no-match")
+    assert "error" in launch_wake_chat(td, "zzz-no-match", "hi")
+    assert do_agents(mk(sub="rm",name="alpha",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
     print(f"selfcheck ok ({td})")
     return 0
 

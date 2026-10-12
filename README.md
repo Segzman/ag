@@ -291,7 +291,8 @@ ag chat send w --command review "path"          # opencode native command only
 ```
 
 - Same agent serializes (flock + FIFO ticket queue, see below); different agents run in parallel. Fan-out = different agents.
-- `--timeout` (default 1800, `0` = none) is a hard backend budget starting after guard acquisition (lock wait excluded); expiry kills the backend group and exits 124. `wake --max-runtime` is the same for background turns; `wake --timeout` only marks `stalled`.
+- `--timeout` (default 1800, `0` = none) is a hard backend budget starting after guard acquisition (lock wait excluded); expiry kills the backend group and exits 124. `wake --max-runtime` is the same for background turns; `wake --timeout` only marks `stalled`. A max-runtime kill leaves a chat error row ending `(raise --max-runtime or split the task)`.
+- `wake`/`delegate` to an unknown agent fail at call time (`error: no such agent: X`, hint with close names + `ag agents list`); no job file, no spawn, no `wake_fail` event.
 - A wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session `__wake-<agent>-<id>`. `queued` = guard not yet acquired. `kill <worker-sid>` or `wakes --cancel` stops one (job `failed`).
 - `spawn --wake` fires at most once per session (exit/kill/force-kill all count); worker completion never re-fires. Messages are argv, never shell-interpreted. Trail: `events` (`wake`, `wake_done`, `wake_fail`).
 - Always-on bots: `spawn --wake` plus `ag schedule` (below) or host cron/launchd re-issuing `ag wake`.

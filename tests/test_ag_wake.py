@@ -101,13 +101,17 @@ def test_validation():
     run(td, "agents", "add", "v", "--backend", "echo", "--role", "sub")
     p = run(td, "wake", "nosuch", "hi")
     assert p.returncode != 0 and "no such agent" in (p.stderr or p.stdout)
+    assert "ag agents list" in (p.stderr or p.stdout), (p.stdout, p.stderr)
     p = run(td, "spawn", "--wake", "nosuch", "--", "echo hi")
     assert p.returncode != 0 and "no such agent" in (p.stderr or p.stdout)
     p = run(td, "wake", "v")
     assert p.returncode != 0 and "empty message" in (p.stderr or p.stdout)
     _, o = run_json(td, "wake", "nosuch", "hi")
     assert o.get("ok") is False
-    assert any(e["type"] == "wake_fail" for e in events(td)), events(td)
+    assert "no such agent" in (o.get("error") or ""), o
+    assert "ag agents list" in (o.get("hint") or ""), o
+    assert not any(e["type"] in ("wake", "wake_fail") for e in events(td)), events(td)
+    assert list((td / "wake" / "jobs").glob("*.json")) == [] if (td / "wake" / "jobs").exists() else True
     print("ok test_validation")
 
 def test_no_duplicate():

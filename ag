@@ -1994,7 +1994,10 @@ def do_harness(a):
         sdir = state_dir(a.dir); ensure_state(sdir)
         message = ""
         if a.sub == "use":
-            ok, message = switch_backend(sdir, a.agent, a.backend, a.model)
+            try: _b = None if getattr(a, "budget", None) in (None, "") else int(getattr(a, "budget"))
+            except (TypeError, ValueError): return emit(a, "harness", error=f"bad --budget: {getattr(a, 'budget')}")
+            if _b is not None and _b <= 0: return emit(a, "harness", error=f"bad --budget: {_b} (positive tokens)")
+            ok, message = switch_backend(sdir, a.agent, a.backend, a.model, _b)
             if not ok: return emit(a, "harness", error=message)
         data = harness_current(sdir, a.agent)
         if "error" in data: return emit(a, "harness", error=data["error"])
@@ -2959,6 +2962,32 @@ def harness_current(sdir, name):
         "persona": a.get("persona", ""), "profile": a.get("profile", ""),
         "sid": _slash_sid(sdir, name, a, backend)}
 
+HANDOFF_BUDGET_DEFAULT = 4000  # tokens; tokens ~ chars/4
+
+def handoff_default_budget():
+    """Default handoff replay budget (tokens). AG_HANDOFF_BUDGET overrides. Pure."""
+    try: v = int((os.environ.get("AG_HANDOFF_BUDGET") or "").strip() or 0)
+    except Exception: v = 0
+    return v if v > 0 else HANDOFF_BUDGET_DEFAULT
+
+def handoff_history(sdir, name, budget, old):
+    """Bounded replay for a backend switch: newest-first user/agent rows until
+    budget (tokens ~ chars/4), oldest-dropped, chronological, prefixed. Pure of backend I/O."""
+    try: b = int(budget)
+    except Exception: b = 0
+    if b <= 0: b = handoff_default_budget()
+    cap = b * 4  # char budget (tokens ~ chars/4)
+    rows = [r for r in load_chat_log(sdir, name) if r.get("role") in ("user", "agent")]
+    sel, used = [], 0
+    for r in reversed(rows):
+        line = f'{r.get("role", "")}: {r.get("text", "")}'
+        if not sel and len(line) > cap: line = "…" + line[-cap:]  # newest row alone over budget: keep its tail
+        if sel and used + len(line) > cap: break
+        sel.append(line); used += len(line)
+    sel.reverse()
+    body = "\n".join(sel)
+    return f"[handoff from {old}]\n{body}" if body else f"[handoff from {old}]"
+
 def update_agent_settings(sdir, name, updates):
     """Apply settings under the same guard as turns, refusing rather than waiting.
     Models and native SIDs belong to their backend, including custom model IDs.
@@ -2984,6 +3013,10 @@ def update_agent_settings(sdir, name, updates):
         rows = load_agents(sdir)
         a = next((r for r in rows if r["name"] == name), None)
         if a is None: return (False, f"no such agent: {name} (ag agents list)")
+        if "mode" in updates or "plan" in updates:  # dispatch mode ceiling: explicit escalation refused
+            if (_mce := _mode_ceiling_err(updates.get("mode", a.get("mode") or ""),
+                    updates.get("plan", bool(a.get("plan"))))):
+                return (False, f"{_mce} (parent {_mode_ceiling()[0]}; AG_MODE_CEILING=off disables, unsafe)")
         old = a.get("backend", "claude")
         new = new or old
         meta = load_chat_meta(sdir, name, agent=a)
@@ -3007,10 +3040,14 @@ def update_agent_settings(sdir, name, updates):
         if updates.pop("_clear_claude_sid", False):
             sids.pop("claude", None)
             if (meta.get("backend") or old) == "claude": meta["sid"] = ""
+        try: _hb = int(updates.pop("_handoff_budget", None) or 0)
+        except (TypeError, ValueError): _hb = 0
         a.update(updates)
         a.update({"backend": new, "model": model})
         models[new] = model
         a["models"] = models
+        if new != old:
+            a["pending_handoff"] = {"from": old, "budget": _hb if _hb > 0 else handoff_default_budget()}
         save_agents(sdir, rows)
         meta.update({"backend": new, "model": model,
             "sid": sids.get(new, ""), "sids": sids})
@@ -3018,15 +3055,17 @@ def update_agent_settings(sdir, name, updates):
         if new != old:
             _event(sdir, "harness", name, backend=new, model=model)
             sid_note = f"resumes {sids[new]}" if sids.get(new) else "fresh session"
-            return (True, f"backend {old} -> {new} ({model}, {sid_note}).")
+            _ph = a.get("pending_handoff") or {}
+            return (True, f"backend {old} -> {new} ({model}, {sid_note}; handoff replay {_ph.get('budget', handoff_default_budget())} tokens next turn).")
         return (True, f"updated {name} [{new}] ({model}).")
     finally:
         _release_agent_turn(guard)
 
-def switch_backend(sdir, name, new_backend, model=None):
+def switch_backend(sdir, name, new_backend, model=None, budget=None):
     """Shared CLI/slash/TUI switch: preserve identity, backend models and SIDs."""
     updates = {"backend": (new_backend or "").strip().lower()}
     if model is not None: updates["model"] = model
+    if budget is not None: updates["_handoff_budget"] = budget
     return update_agent_settings(sdir, name, updates)
 
 def slash_help_text(sdir, name):
@@ -4429,6 +4468,33 @@ def mode_env(sdir, agent, env):
 def caps_rows(backend=None):
     names = [backend] if backend else list(CAPS)
     return [{"backend": b, **CAPS[b], "advisory": [m for m in MODES if m not in CAPS[b]["modes"]]} for b in names]
+
+# --- dispatch mode ceiling: a turn's children may not exceed the parent's mode ---
+# Order: plan/ro < edits < auto < full; unset (= backend default) counts as edits.
+def _mode_rank(mode="", plan=False):
+    """Pure: privilege rank of (mode, plan). plan and ro share the floor."""
+    if plan or (mode or "") in ("plan", "ro"): return 0
+    return {"": 1, "edits": 1, "auto": 2, "full": 3}.get(mode or "", 1)
+def _mode_ceiling():
+    """(parent, ceiling) when running inside an ag-launched turn, else None.
+    Marker is set by _turn_env; AG_MODE_CEILING=off disables (unsafe)."""
+    if (os.environ.get("AG_MODE_CEILING") or "").strip().lower() == "off": return None
+    p = (os.environ.get("AG_PARENT_AGENT") or "").strip()
+    if not p: return None
+    pm = (os.environ.get("AG_PARENT_MODE") or "").strip()
+    return (p, pm if pm in ("plan",) + MODES else "edits")
+def _mode_ceiling_err(mode, plan=False):
+    """Pure: 'mode X exceeds parent ceiling Y' or ''. Clearing ("") and plan never exceed."""
+    mc = _mode_ceiling()
+    if not mc or not (mode or ""): return ""
+    if _mode_rank(mode, plan) > _mode_rank(mc[1]): return f"mode {mode} exceeds parent ceiling {mc[1]}"
+    return ""
+def _mode_clamp(a):
+    """Ceiling string to clamp this agent's turn to, or ''."""
+    mc = _mode_ceiling()
+    if not mc: return ""
+    if _mode_rank(a.get("mode") or "", bool(a.get("plan"))) > _mode_rank(mc[1]): return mc[1]
+    return ""
 
 def do_caps(a):
     be = getattr(a, "backend", None)
@@ -6626,19 +6692,28 @@ def do_agents(a):
         if any(r["name"]==a.name for r in rows):
             return emit(a,"agents",error=f"exists: {a.name}")
         if getattr(a,"mode",None) and a.mode not in MODES: return emit(a,"agents",error=f"bad mode: {a.mode}",hint="|".join(MODES))
+        if (_mce := _mode_ceiling_err(getattr(a, "mode", None) or "", bool(getattr(a, "plan", None)))):
+            return emit(a,"agents",error=_mce,hint=f"parent {_mode_ceiling()[0]} (AG_MODE_CEILING=off disables, unsafe)")
         pers = getattr(a,"persona",None) or ""
         if pers and pers not in [r["name"] for r in load_roles(sdir)]:
             return emit(a,"agents",error=f"no such role: {pers}",hint="ag roles list")
         be, mod, job = a.backend, getattr(a,"model",None), getattr(a,"job",None)
+        ra_eff = ""
         if not be:
             if not job: return emit(a,"agents",error="need --backend or --job",hint=f"ag agents add NAME --backend opencode  |  --job {'|'.join(JOB_KEYS)}")
-            ra = routing_now(profile=getattr(a, "profile", None))[0][job]["ag"]; be = ra["backend"]; mod = mod or (ra["model"] if ra["model"] not in ("","default") else "")
+            ra = routing_now(profile=getattr(a, "profile", None))[0][job]["ag"]; be = ra["backend"]; mod = mod or (ra["model"] if ra["model"] not in ("","default") else ""); ra_eff = ra.get("effort") or ""
             if be not in NATIVE_ORDER: return emit(a,"agents",error=f"routing for {job} names unknown backend {be!r}",hint="ag route; ag setup")
         bkd = backends_now().get(be) if be in BACKEND_TABS else None  # per-backend defaults from routing.json (ag setup)
         if bkd:
             mod = mod or bkd["model"]
             if getattr(a,"mode",None) is None and bkd["mode"]: a.mode = bkd["mode"]
             if getattr(a,"plan",None) is None and bkd["plan"]: a.plan = True
+            if getattr(a,"effort",None) is None: a.effort = ra_eff or bkd.get("effort") or None
+        elif getattr(a,"effort",None) is None and ra_eff: a.effort = ra_eff
+        if getattr(a,"effort",None):
+            try: _eff_validate(be, mod, _eff_norm(a.effort))
+            except ValueError as e: return emit(a,"agents",error=str(e))
+            if not _eff_norm(a.effort): a.effort = None
         mod = mod or "default"
         eup, eerr, _ = agent_env_updates(a, {})
         if eerr: return emit(a,"agents",error=eerr)
@@ -6709,6 +6784,11 @@ def do_agents(a):
             if cfg_changed: updates["_clear_claude_sid"] = True
         for k in ("transport", "acp_cmd", "effort"):
             if getattr(a, k, None) is not None: updates[k] = getattr(a, k)
+        if "effort" in updates and updates["effort"]:
+            _er = next((r for r in rows if r["name"] == a.name), {})
+            _eb = updates.get("backend") or _er.get("backend", "claude")
+            try: _eff_validate(_eb, updates.get("model", _er.get("model", "default")), _eff_norm(updates["effort"]))
+            except ValueError as e: return emit(a, "agents", error=str(e))
         if "transport" in updates or "acp_cmd" in updates:
             cur = next((r for r in rows if r["name"] == a.name), {})
             if (_ae := acp_check(updates.get("backend") or cur.get("backend", "claude"), updates.get("transport", cur.get("transport", "")), updates.get("acp_cmd", cur.get("acp_cmd")))): return emit(a, "agents", error=_ae)
@@ -6723,7 +6803,7 @@ def do_agents(a):
             updates.update({"dir": wt["path"], "worktree": wt})
         ok, message = update_agent_settings(sdir, a.name, updates)
         if not ok: return emit(a, "agents", error=message,
-            hint="ag roles list" if "no such role" in message else None)
+            hint="ag roles list" if "no such role" in message else ("AG_MODE_CEILING=off disables (unsafe)" if "parent ceiling" in message else None))
         if updates.get("worktree"): return emit(a, "agents", {"_text": f"updated {a.name}  branch {updates['worktree']['branch']}  worktree {updates['dir']}", "worktree": updates["worktree"]})
         return emit(a, "agents", {"_text": f"updated {a.name}"})
 
@@ -7953,8 +8033,16 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
     if command:
         # native custom command: message text is command args, sent bare.
         prompt = text
+    elif _rs and "hist" in _rs:
+        hist = _rs["hist"]
+        prompt = (hist+"\n\n---\n"+text) if hist else text
+    elif (ph := a.get("pending_handoff")) and isinstance(ph, dict):
+        # cross-backend handoff: bounded replay of the old backend's turns,
+        # even when the new backend already has a session id.
+        hist = handoff_history(sdir, name, ph.get("budget"), ph.get("from", "?"))
+        prompt = (hist+"\n\n---\n"+text) if hist else text
     else:
-        hist = _rs["hist"] if _rs and "hist" in _rs else "" if (sid and (backend in ("claude","opencode","cursor","codex") or acp_on(a, backend, command))) else recent_history(sdir,name)
+        hist = "" if (sid and (backend in ("claude","opencode","cursor","codex") or acp_on(a, backend, command))) else recent_history(sdir,name)
         prompt = (hist+"\n\n---\n"+text) if hist else text
     sys_txt = eff_system(sdir, a)
     # harness profile: instructions/memory/skills context must reach backend
@@ -8003,6 +8091,8 @@ def _turn_env(sdir, a, backend, prof, notes=None):
     overlay + secret askpass wiring. `notes` collects unresolved-ref notes."""
     env = dict(os.environ, **(backend_env_for_profile(sdir, a, prof) if prof else {}))
     merge_agent_env(sdir, a, prof, env, notes)
+    env["AG_PARENT_AGENT"] = a.get("name", "") or ""  # dispatch mode ceiling: children inherit this turn's agent+mode
+    env["AG_PARENT_MODE"] = "plan" if a.get("plan") else (a.get("mode") or "")
     return secret_env(sdir, mode_env(sdir, a, env))
 
 def _turn_source(p):
@@ -8077,6 +8167,11 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             try: _ms = load_chat_meta(sdir,name,agent=a).get("sid","")
             except Exception: _ms = ""
             return {"error":_pve,"exit":2,"sid":_ms,"reply":_pve}
+        _ceil = "" if _rs else _mode_clamp(a)  # dispatch mode ceiling: over-privileged child runs clamped
+        _mc_parent = (os.environ.get("AG_PARENT_AGENT") or "").strip() if _ceil else ""
+        a_eff = dict(a)
+        if _ceil == "plan": a_eff["plan"] = True
+        elif _ceil: a_eff["mode"] = _ceil
         if not _rs and (_pe := preflight_auth(backend)): _release_agent_turn(_turn_lock); _turn_lock = None; return {"error":_pe}
         meta = load_chat_meta(sdir,name,agent=a)
         sids = meta.get("sids") or {}
@@ -8111,10 +8206,10 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             sid = sids.get(backend, "")
             if not sid and meta.get("backend", backend) == backend:
                 sid = meta.get("sid","")
-        prompt, sys_txt, prof_name = _turn_prompt(sdir, a, backend, sid, text, command, _rs)
+        prompt, sys_txt, prof_name = _turn_prompt(sdir, a_eff, backend, sid, text, command, _rs)
         try:
-            argv = _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, prof_name)
-            _mw = mode_warning(backend, a.get("mode") or "", bool(a.get("plan")))
+            argv = _turn_argv(sdir, a_eff, backend, model, workdir, sid, prompt, sys_txt, command, prof_name)
+            _mw = mode_warning(backend, a_eff.get("mode") or "", bool(a_eff.get("plan")))
             if _mw and not _rs:
                 _event(sdir, "mode_warn", name, warning=_mw)
                 if on_event: on_event(name, "tool", _mw)
@@ -8125,6 +8220,15 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             if not _rs: append_chat(sdir,name,"user",text,event_id=user_eid)
         except Exception:
             user_persist_ok = False
+        if _ceil and not _rs:
+            _note = f"[mode] clamped to {_ceil} by parent {_mc_parent}"
+            try: append_chat(sdir,name,"tool",_note)
+            except Exception: pass
+            try: _event(sdir,"mode_clamp",name,ceiling=_ceil,parent=_mc_parent)
+            except Exception: pass
+            if on_event:
+                try: on_event(name,"tool",_note)
+                except Exception: pass
         buf = TimelineBuffer(sdir,name,on_event)
         if not user_persist_ok:
             buf.persist_failed = True
@@ -8135,7 +8239,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         _usage, _fresh = {}, not sid
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
         _en = []
-        env = _turn_env(sdir, a, backend, prof_name, _en)
+        env = _turn_env(sdir, a_eff, backend, prof_name, _en)
         for _n in _en:
             if on_event: on_event(name, "tool", _n)
         _timed_out = {"hit": False}
@@ -8296,6 +8400,15 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             out["error"] = f"max-runtime {timeout_s:g}s exceeded (backend killed)"
         if buf.persist_failed or not agent_persist_ok:
             out["persist_error"] = True
+        if rc == 0 and not _intr and not _timed_out["hit"]:
+            # cross-backend handoff replay is one-shot: consume after the first
+            # successful turn (failures keep it for the next attempt). Never raises.
+            try:
+                _rows = load_agents(sdir)
+                _a = next((r for r in _rows if r["name"] == name), None)
+                if _a is not None and _a.pop("pending_handoff", None) is not None:
+                    save_agents(sdir, _rows)
+            except Exception: pass
         return out
     finally:
         if not _rs: _release_agent_turn(_turn_lock)
@@ -11040,6 +11153,7 @@ def do_delegate(a):
 
 def do_selfcheck(a):
     import tempfile
+    os.environ["AG_HARNESS"] = "claude"  # asserts assume the claude profile; detection would follow the calling harness (opencode/codex)
     td = Path(tempfile.mkdtemp(prefix="agent-check-"))
     class A: pass
     def mk(**k):
@@ -11181,11 +11295,41 @@ def do_selfcheck(a):
         assert _r["exit"]==0 and OPENCODE_MODEL_DEFAULT in _r["reply"], _r
         ok,_m = switch_backend(td,"sl","echo")
         assert ok and [x for x in load_agents(td) if x["name"]=="sl"][0]["backend"]=="echo"
+        assert [x for x in load_agents(td) if x["name"]=="sl"][0]["pending_handoff"]=={"from":"opencode","budget":4000}, "switch stores pending handoff"
+        assert do_agents(mk(sub="add",name="ho",backend="echo",model="default",adir=".",role="sub",persona=None,system=None))==0
+        ok,_m = switch_backend(td,"ho","opencode",None,50)
+        assert ok and [x for x in load_agents(td) if x["name"]=="ho"][0]["pending_handoff"]=={"from":"echo","budget":50}
+        append_chat(td,"ho","user","q1"); append_chat(td,"ho","agent","a1")
+        _hh = handoff_history(td,"ho",50,"echo")
+        assert _hh.startswith("[handoff from echo]") and "user: q1" in _hh and "agent: a1" in _hh, _hh
+        append_chat(td,"ho","user","x"*400)
+        _hh2 = handoff_history(td,"ho",10,"echo")
+        assert "q1" not in _hh2 and "x"*10 in _hh2 and len(_hh2) < 80, _hh2  # oldest-dropped; newest truncated to budget
+        assert handoff_history(td,"ho",0,"echo").startswith("[handoff from echo]")  # bad budget -> default
+        assert handoff_default_budget()==4000
+        os.environ["AG_HANDOFF_BUDGET"]="7"; assert handoff_default_budget()==7
+        os.environ["AG_HANDOFF_BUDGET"]="junk"; assert handoff_default_budget()==4000
+        del os.environ["AG_HANDOFF_BUDGET"]
+        assert do_agents(mk(sub="rm",name="ho",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
         oc_argv = backend_argv("opencode",model="",workdir=".",sid="",prompt="hi",command="rev")
         assert oc_argv[1:] == ["run","--format","json","--thinking","--command","rev","-m",OPENCODE_MODEL_DEFAULT,"--dir",".","hi"] and (oc_argv[0]=="opencode" or oc_argv[0].endswith("/opencode"))
         assert "--command" not in backend_argv("opencode",model="",workdir=".",sid="",prompt="hi")
         assert backend_argv("opencode",model="x",workdir=".",prompt="hi",effort="max")[-6:-1]==["x","--variant","max","--dir","."] and "--variant" not in backend_argv("opencode",prompt="hi")
         assert "--effort" in backend_argv("claude",prompt="hi",effort="high") and backend_argv("codex",prompt="hi",effort="low")[3:5]==["-c",'model_reasoning_effort="low"']
+        assert [_mode_rank(m) for m in MODES]==[0,1,2,3] and _mode_rank("",True)==0 and _mode_rank("plan")==0 and _mode_rank("")==1
+        _mpa, _mpm, _mmc = os.environ.get("AG_PARENT_AGENT"), os.environ.get("AG_PARENT_MODE"), os.environ.get("AG_MODE_CEILING")
+        try:
+            os.environ.pop("AG_PARENT_AGENT",None); assert _mode_ceiling() is None and _mode_ceiling_err("full")==""
+            os.environ.update(AG_PARENT_AGENT="p",AG_PARENT_MODE="ro")
+            assert _mode_ceiling()==("p","ro") and _mode_ceiling_err("full")=="mode full exceeds parent ceiling ro" and _mode_ceiling_err("ro")=="" and _mode_clamp({"mode":"full"})=="ro" and _mode_clamp({"mode":"ro"})==""
+            os.environ.pop("AG_PARENT_MODE",None); assert _mode_ceiling()==("p","edits")
+            os.environ["AG_MODE_CEILING"]="off"; assert _mode_ceiling() is None
+            _me = _turn_env(td,{"name":"par","backend":"echo","mode":"full"},"",None)
+            assert _me.get("AG_PARENT_AGENT")=="par" and _me.get("AG_PARENT_MODE")=="full"
+        finally:
+            for _k,_v in (("AG_PARENT_AGENT",_mpa),("AG_PARENT_MODE",_mpm),("AG_MODE_CEILING",_mmc)):
+                if _v is None: os.environ.pop(_k,None)
+                else: os.environ[_k]=_v
         _r = run_turn(td,"sl","hi",command="x")
         assert "error" in _r and "opencode-only" in _r["error"], _r
         assert set(TUI_MODE_TITLE) >= {"input","normal","setmodel","newname","newbackend","dagent","dtext","backendpick","profilepick"}
@@ -11588,7 +11732,28 @@ JOB_DESC = {"mechanical": "scripts, rote edits, boilerplate, lookups",
     "implement": "implement a clear spec / plan", "review": "code review, verification",
     "debug": "debugging, failing tests, root cause", "plan": "planning, design, architecture",
     "hardest": "ambiguous, high-stakes, security-sensitive"}
-def _rj(c, b, m): return {"claude": c, "ag": {"backend": b, "model": m}}
+def _rj(c, b, m, eff=""): return {"claude": c, "ag": {"backend": b, "model": m, **({"effort": eff} if eff else {})}}
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+EFFORT_OPTS = ("default", "highest") + CLAUDE_EFFORTS
+EFFORT_KEYWORDS = ("highest", "lowest")
+def _eff_norm(v):
+    """Normalize effort: ''/default/unset -> '' (backend default). Pure."""
+    v = (v or "").strip() if isinstance(v, str) else ""
+    return "" if v in ("", "default", "unset") else v
+def _eff_check(backend, eff):
+    """Raise ValueError on a bad claude effort; other backends pass through. Pure."""
+    if backend == "claude" and eff and eff not in CLAUDE_EFFORTS + EFFORT_KEYWORDS:
+        raise ValueError(f"bad effort {eff!r}: claude wants {'|'.join(CLAUDE_EFFORTS)}|highest (or default)")
+    return eff
+def _eff_validate(backend, model, eff):
+    """Validate routing effort through resolve_effort when present (variants feature), else claude-only. Pure-ish."""
+    if not eff: return eff
+    f = globals().get("resolve_effort")
+    if callable(f):
+        v, err = f(backend, model, eff)
+        if err: raise ValueError(err)
+        return eff
+    return _eff_check(backend, eff)
 _ROUTE_COST = {"mechanical": _rj("haiku", "claude", "haiku"),
     "implement": _rj("sonnet", "claude", "sonnet"), "review": _rj("opus", "claude", "opus"),
     "debug": _rj("opus", "claude", "opus"), "plan": _rj("opus", "claude", "opus"),
@@ -12281,9 +12446,9 @@ def _pick(backend, tier, free_only=False):
 def builtin_profile(name):
     """Built-in job table for a profile name; opencode/codex models come from the catalog. Pure given the catalog."""
     if name == "opencode":
-        return {j: _rj("haiku" if j == "mechanical" else "sonnet", "opencode", _pick("opencode", JOB_TIER[j], True) or OPENCODE_MODEL_DEFAULT) for j in JOB_KEYS}
+        return {j: _rj("haiku" if j == "mechanical" else "sonnet", "opencode", _pick("opencode", JOB_TIER[j], True) or OPENCODE_MODEL_DEFAULT, "highest" if JOB_TIER[j] == "big" else "") for j in JOB_KEYS}
     if name == "codex":
-        return {j: _rj("sonnet", "codex", _pick("codex", JOB_TIER[j]) or "default") for j in JOB_KEYS}
+        return {j: _rj("sonnet", "codex", _pick("codex", JOB_TIER[j]) or "default", "xhigh" if j == "hardest" else "") for j in JOB_KEYS}
     return _ROUTE_COST
 def _rt_v2(doc):
     """Normalize a routing doc to v2 shape; v1 top-level jobs become profiles.default + claude (unless present). Pure."""
@@ -12308,9 +12473,23 @@ def routing_effective(glob=None, proj=None, profile="default"):
             if not isinstance(je, dict): continue
             if je.get("claude"): e["claude"] = str(je["claude"]); e["source"]["claude"] = src
             ga = je.get("ag")
-            if isinstance(ga, dict) and ga.get("backend"):
-                e["ag"] = {"backend": str(ga["backend"]), "model": str(ga.get("model") or "default")}
-                e["source"]["ag"] = src
+            if isinstance(ga, dict):
+                hit = False
+                if ga.get("backend"):
+                    e["ag"] = {"backend": str(ga["backend"]), "model": str(ga.get("model") or "default")}
+                    if isinstance(ga.get("effort"), str) and _eff_norm(ga["effort"]): e["ag"]["effort"] = _eff_norm(ga["effort"])
+                    hit = True
+                else:
+                    if isinstance(ga.get("model"), str) and ga["model"].strip():
+                        e["ag"]["model"] = "" if ga["model"].strip() in ("", "default") else ga["model"].strip()
+                        if e["ag"]["model"] == "": e["ag"]["model"] = "default"
+                        hit = True
+                    if "effort" in ga and isinstance(ga.get("effort"), str):
+                        ne = _eff_norm(ga["effort"])
+                        if ne: e["ag"]["effort"] = ne
+                        else: e["ag"].pop("effort", None)
+                        hit = True
+                if hit: e["source"]["ag"] = src
         if not e["ag"].get("backend"): e["ag"] = dict(ROUTE_FALLBACK)
         out[j] = e
     return out
@@ -12342,8 +12521,12 @@ def routing_save(scope, data, sdir=None):
         if n not in ROUTE_PROFILES: raise ValueError(f"unknown profile {n!r} ({','.join(ROUTE_PROFILES)})")
         for j, je in (pr.get("jobs") or {}).items():
             if j not in JOB_KEYS or not isinstance(je, dict): raise ValueError(f"profile {n}: bad job {j!r}")
-            b = (je.get("ag") or {}).get("backend")
+            ga = je.get("ag") or {}
+            b = ga.get("backend")
             if b and b not in NATIVE_ORDER: raise ValueError(f"profile {n}/{j}: unknown backend {b!r}")
+            if isinstance(ga.get("effort"), str) and _eff_norm(ga["effort"]):
+                try: _eff_validate(b, ga.get("model") or "default", _eff_norm(ga["effort"]))
+                except ValueError as e: raise ValueError(f"profile {n}/{j}: {e}")
     gp, pp = routing_paths(_proj_of(sdir)); p = gp if scope == "global" else pp
     _put_file(p, json.dumps(d, indent=2) + "\n"); return p
 
@@ -12354,16 +12537,17 @@ def routing_now(cwd=None, profile=None):
 
 def _route_model(ag_): return eff_model(ag_["backend"], ag_["model"]) or ag_["model"]
 
-# per-backend defaults: routing.json "backends": {b: {enabled, model, mode, plan}}; project overlays global per field
+# per-backend defaults: routing.json "backends": {b: {enabled, model, mode, plan, effort}}; project overlays global per field
 BACKEND_TABS = ("claude", "opencode", "codex", "gemini", "cursor")
-BK_DEFAULT = {"enabled": True, "model": "", "mode": "", "plan": False}
+BK_DEFAULT = {"enabled": True, "model": "", "mode": "", "plan": False, "effort": ""}
 _BOOL = {"true": True, "yes": True, "on": True, "1": True, "false": False, "no": False, "off": False, "0": False}
 def _bk_clean(d):
-    """Valid fields of one routing.json backends entry ('default' model -> ''). Pure."""
+    """Valid fields of one routing.json backends entry ('default' model/effort -> ''). Pure."""
     if not isinstance(d, dict): return {}
     out = {k: d[k] for k in ("enabled", "plan") if isinstance(d.get(k), bool)}
     if isinstance(d.get("model"), str): out["model"] = "" if d["model"].strip() in ("", "default") else d["model"].strip()
     if d.get("mode") in ("",) + MODES: out["mode"] = d["mode"]
+    if isinstance(d.get("effort"), str): out["effort"] = _eff_norm(d["effort"])
     return out
 def backends_effective(glob=None, proj=None):
     """{b: {enabled, model, mode, plan, source}}: default < global < project, per field. Pure."""
@@ -12383,11 +12567,11 @@ def routing_disabled(eff, bk):
     """[(job, backend)] routed to a disabled backend. Pure."""
     return [(j, e["ag"]["backend"]) for j, e in eff.items() if not (bk.get(e["ag"]["backend"]) or BK_DEFAULT)["enabled"]]
 def backends_line(bk):
-    """'opencode: m (mode edits) · gemini: off' — compact skill line. Pure."""
+    """'opencode: m@effort (mode edits) · gemini: off' — compact skill line. Pure."""
     def one(b, e):
         if not e["enabled"]: return f"{b}: off"
-        x = ", ".join(([f'mode {e["mode"]}'] if e["mode"] else []) + (["plan"] if e["plan"] else []))
-        return f'{b}: {eff_model(b, e["model"]) or "default"}' + (f" ({x})" if x else "")
+        x = ", ".join(([f'mode {e["mode"]}'] if e["mode"] else []) + (["plan"] if e["plan"] else []) + ([f'effort {e["effort"]}'] if e.get("effort") else []))
+        return f'{b}: {eff_model(b, e["model"]) or "default"}{"@" + e["effort"] if e.get("effort") else ""}' + (f" ({x})" if x else "")
     return " · ".join(one(b, bk[b]) for b in BACKEND_TABS if b in bk)
 def parse_backend_sets(items):
     """Split --set items: backend.B.FIELD=V -> (other items, {b: {field: v}}). Raises ValueError. Pure."""
@@ -12397,7 +12581,7 @@ def parse_backend_sets(items):
         k, eq, v = it.partition("=")
         _, b, f = (k.strip().split(".", 2) + ["", ""])[:3]
         v = v.strip()
-        bad = f"bad --set {it!r}: want backend.BACKEND.(enabled|model|mode|plan)=VALUE, BACKEND in {','.join(BACKEND_TABS)}"
+        bad = f"bad --set {it!r}: want backend.BACKEND.(enabled|model|mode|plan|effort)=VALUE, BACKEND in {','.join(BACKEND_TABS)}"
         if not eq or b not in BACKEND_TABS or f not in BK_DEFAULT: raise ValueError(bad)
         if f in ("enabled", "plan"):
             if v.lower() not in _BOOL: raise ValueError(f"bad --set {it!r}: {f} wants true|false")
@@ -12406,6 +12590,10 @@ def parse_backend_sets(items):
         elif f == "mode":
             val = "" if v in ("", "unset") else v
             if val and val not in CAPS[b]["modes"]: raise ValueError(f"bad --set {it!r}: {b} modes are {'|'.join(CAPS[b]['modes'])} (or unset)")
+        elif f == "effort":
+            val = _eff_norm(v)
+            try: _eff_check(b, val)
+            except ValueError as e: raise ValueError(f"bad --set {it!r}: {e}")
         else: val = "" if v in ("", "default") else v
         out.setdefault(b, {})[f] = val
     return rest, out
@@ -12414,7 +12602,7 @@ def routing_block(eff, bk=None, profile=None):
     """Markdown routing block (spec §5); bk adds the compact backend-defaults line (skills); profile (opencode|codex|...)
     drops the Claude-subagent column and adds the harness-detection line. Pure."""
     cl = profile in (None, "claude")
-    rows = [f'| {j} — {JOB_DESC[j]} | ' + (f'{eff[j]["claude"]} | ' if cl else "") + f'{eff[j]["ag"]["backend"]} / {_route_model(eff[j]["ag"])} |'
+    rows = [f'| {j} — {JOB_DESC[j]} | ' + (f'{eff[j]["claude"]} | ' if cl else "") + f'{eff[j]["ag"]["backend"]} / {_route_model(eff[j]["ag"])}{"@" + eff[j]["ag"]["effort"] if eff[j]["ag"].get("effort") else ""} |'
         for j in JOB_KEYS]
     bl = ["", f"Backend defaults (`ag agents add NAME --backend B` without --model/--mode): {backends_line(bk)}"] if bk else []
     pl = ["", f"Profile: {profile}. ag detects the calling harness (claude|opencode|codex) from its parent processes and uses that profile; "
@@ -12453,18 +12641,28 @@ def detect_harnesses():
     return [x for x in SETUP_HARNESSES if shutil.which(x) or dirs[x].is_dir()]
 
 def parse_route_sets(items):
-    """--set JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL -> {job: {claude|ag}}. Raises ValueError. Pure."""
+    """--set JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] -> {job: {claude|ag}}. Raises ValueError. Pure."""
     out = {}
     for it in items or []:
         job, eq, rest = it.partition("=")
         kind, colon, val = rest.partition(":")
         job, kind, val = job.strip(), kind.strip(), val.strip()
         if not (eq and colon and val) or job not in JOB_KEYS or kind not in ("claude", "ag"):
-            raise ValueError(f"bad --set {it!r}: want JOB=claude:ALIAS or JOB=ag:BACKEND/MODEL, JOB in {','.join(JOB_KEYS)}")
+            raise ValueError(f"bad --set {it!r}: want JOB=claude:ALIAS or JOB=ag:BACKEND/MODEL[@EFFORT], JOB in {','.join(JOB_KEYS)}")
         if kind == "claude": out.setdefault(job, {})["claude"] = val; continue
-        b, _, m = val.partition("/")
+        body, at, eff = val.partition("@")
+        if at and "/" in eff.strip():
+            raise ValueError(f"bad --set {it!r}: want JOB=ag:BACKEND/MODEL[@EFFORT]")
+        b, _, m = body.partition("/")
+        b, m = b.strip(), m.strip()
         if b not in NATIVE_ORDER: raise ValueError(f"bad --set {it!r}: unknown backend {b!r} ({','.join(NATIVE_ORDER)})")
-        out.setdefault(job, {})["ag"] = {"backend": b, "model": m or "default"}
+        agv = {"backend": b, "model": m or "default"}
+        if at:
+            ne = _eff_norm(eff)
+            try: _eff_validate(b, m or "default", ne)
+            except ValueError as e: raise ValueError(f"bad --set {it!r}: {e}")
+            agv["effort"] = ne
+        out.setdefault(job, {})["ag"] = agv
     return out
 
 def parse_harness_list(v):
@@ -12524,10 +12722,10 @@ def do_route(a):
     if getattr(a, "json", False): return emit(a, "route", data)
     off = dict(routing_disabled(jobs, bk))
     out = [f"harness: {hn} (via {via})  profile: {prof}"]
-    out += [f'{j:10} claude={e["claude"]:7} ({e["source"]["claude"]})  ag={e["ag"]["backend"]}/{_route_model(e["ag"])} ({e["source"]["ag"]})'
+    out += [f'{j:10} claude={e["claude"]:7} ({e["source"]["claude"]})  ag={e["ag"]["backend"]}/{_route_model(e["ag"])}{"@" + e["ag"]["effort"] if e["ag"].get("effort") else ""} ({e["source"]["ag"]})'
         + ("  ! backend disabled" if j in off else "") for j, e in jobs.items()]
     if not a.job:
-        out += [f'backend {b:9} ' + (f'model={eff_model(b, e["model"]) or "default"} mode={e["mode"] or "-"}{" plan" if e["plan"] else ""}'
+        out += [f'backend {b:9} ' + (f'model={eff_model(b, e["model"]) or "default"}{"@" + e["effort"] if e.get("effort") else ""} mode={e["mode"] or "-"}{" plan" if e["plan"] else ""}'
             if e["enabled"] else "disabled") + f' ({e["source"]})' for b, e in bk.items()]
     out += [f"! {w}" for w in warn]
     out += [f'global:  {gp}{"" if gp.exists() else " (missing)"}', f'project: {pp}{"" if pp.exists() else " (missing)"}']
@@ -12546,13 +12744,28 @@ def _setup_base(st, profile=None):
     return ROUTING_PRESETS.get(st["preset"], _ROUTE_COST) if profile in ("claude", "default") else builtin_profile(profile)
 def _setup_jobs(st, profile, edits, sets=None):
     """Jobs of one profile = base (+ that scope's on-disk picks when its file uses the same preset and the preset
-    wasn't forced) < --set < edits. Pure."""
+    wasn't forced) < --set < edits. Pure. ag merges per field so @effort survives a model-only change."""
     cur = st["existing"].get(st["scope"]) or {}
     keep = {} if st["forced"] or st["preset"] != (cur.get("preset") or "cost-first") else {"profiles": _rt_v2(cur)["profiles"]}
     eff = routing_effective({"preset": st["preset"], **keep}, None, profile)
     jobs = {j: {"claude": eff[j]["claude"], "ag": dict(eff[j]["ag"])} for j in JOB_KEYS}
     for src in (sets or {}, edits):
-        for j, upd in src.items(): jobs[j].update({k: dict(v) if isinstance(v, dict) else v for k, v in upd.items()})
+        for j, upd in src.items():
+            if not isinstance(upd, dict) or j not in jobs: continue
+            if upd.get("claude"): jobs[j]["claude"] = upd["claude"]
+            ga = upd.get("ag")
+            if isinstance(ga, dict):
+                if ga.get("backend"):
+                    jobs[j]["ag"] = {"backend": str(ga["backend"]), "model": str(ga.get("model") or "default")}
+                    if isinstance(ga.get("effort"), str) and _eff_norm(ga["effort"]): jobs[j]["ag"]["effort"] = _eff_norm(ga["effort"])
+                    elif "effort" in ga: jobs[j]["ag"].pop("effort", None)
+                else:
+                    if isinstance(ga.get("model"), str) and ga["model"].strip():
+                        jobs[j]["ag"]["model"] = ga["model"].strip()
+                    if "effort" in ga and isinstance(ga.get("effort"), str):
+                        ne = _eff_norm(ga["effort"])
+                        if ne: jobs[j]["ag"]["effort"] = ne
+                        else: jobs[j]["ag"].pop("effort", None)
     return jobs
 
 def _setup_rebase(st):
@@ -12609,7 +12822,7 @@ def setup_rows(st):
     rows = [("scope", f'Scope: {st["scope"]}'), ("profile", f'Profile: {st["profile"]}'), ("harnesses", "Harnesses: " + (", ".join(st["harnesses"]) or "none")),
         ("preset", f'Preset: {st["preset"]}' + (" (custom picks)" if setup_custom_jobs(st) else "")),
         ("claude_md", f"Write CLAUDE.md: {cm}")]
-    return rows + [(f"job:{j}", f'{j} — Claude: {e["claude"]} · ag: {e["ag"]["backend"]}/{e["ag"]["model"]}')
+    return rows + [(f"job:{j}", f'{j} — Claude: {e["claude"]} · ag: {e["ag"]["backend"]}/{e["ag"]["model"]}{"@" + e["ag"]["effort"] if e["ag"].get("effort") else ""}')
         for j, e in ((j, st["jobs"][j]) for j in JOB_KEYS)] + [(f"bk:{b}", backends_line({b: st["backends"][b]})) for b in BACKEND_TABS]
 def setup_filter(ids, q):
     """Case-insensitive; every whitespace-separated term must be a substring. Pure."""
@@ -12633,9 +12846,10 @@ def setup_targets(st):
     pj.update(st["pjobs"])
     gl = st["existing"].get("global") or {}
     if st.get("sparse"):  # keep only jobs that differ from what the profile inherits (built-in/preset, or global under a project): catalog picks stay live
+        sets, prim = st.get("sets") or {}, st.get("profile")
         def sp(p, j):
             b = routing_effective({"preset": st["preset"]}, None, p) if scope == "global" else routing_effective(gl, {"preset": st["preset"]}, p)
-            return {k: v for k, v in j.items() if v != {"claude": b[k]["claude"], "ag": dict(b[k]["ag"])}}
+            return {k: v for k, v in j.items() if v != {"claude": b[k]["claude"], "ag": dict(b[k]["ag"])} or (p == prim and k in sets)}
         pj = {p: sp(p, j) for p, j in pj.items()}
     keep = {k: v for k, v in (st["existing"].get(scope) or {}).items() if k not in ("version", "jobs", "profiles", "preset", "backends", "project")}  # e.g. catalog
     profs = {**ex["profiles"], **{p: {"jobs": j} for p, j in pj.items() if j or not st.get("sparse")}}
@@ -12780,13 +12994,16 @@ function fill(sel,cur){sel.textContent='';const bs=enabled();if(!bs.includes(cur
  for(const b of bs){const g=h('optgroup',{label:b+(S().backends[b].enabled?'':' (disabled)')});const ids=(byB[b]||[]).map(r=>r.id);if(!ids.includes('default'))ids.unshift('default');if(cur.backend===b&&!ids.includes(cur.model))ids.unshift(cur.model);
   for(const id of ids){const r=ROW[b+'::'+id]||{id};g.append(h('option',{value:b+'::'+id,selected:b===cur.backend&&id===cur.model},label(r)))}sel.append(g)}
  sel.append(h('option',{value:'::custom'},'custom…'))}
+function effList(b,m){const k=b+'::'+m;if(D.variants&&D.variants[k])return D.variants[k];const e=D.efforts||['default','highest','low','medium','high','xhigh','max'];return e.filter(x=>x!=='default'&&x!=='highest')}
+function effSel(cur,getBM){const es=h('select',{'aria-label':'reasoning effort',onchange:ev=>{const v=ev.target.value;if(v)cur.effort=v;else delete cur.effort}});const ref=()=>{const bm=getBM();es.textContent='';es.append(h('option',{value:''},'effort: default'));es.append(h('option',{value:'highest',selected:cur.effort==='highest'},'highest'));for(const v of effList(bm[0],bm[1]))es.append(h('option',{value:v,selected:cur.effort===v},v));if(cur.effort&&cur.effort!=='highest'&&![...es.options].some(o=>o.value===cur.effort))es.append(h('option',{value:cur.effort,selected:true},cur.effort+' (current)'))};ref();es._refill=ref;return es}
 function targetCell(prof,job){const cur=S().profiles[prof].jobs[job].ag;const sel=h('select',{'aria-label':job+' ag agent ('+prof+')','data-ag':1});
  const cu=h('input',{type:'text',placeholder:'backend/model (e.g. opencode/my-model)',hidden:true,'aria-label':job+' custom target'});
  sel._cur=cur;fill(sel,cur);
- sel.addEventListener('change',()=>{if(sel.value==='::custom'){cu.hidden=false;cu.focus();return}cu.hidden=true;const i=sel.value.indexOf('::');cur.backend=sel.value.slice(0,i);cur.model=sel.value.slice(i+2);info(cur.backend,cur.model)});
+ const es=effSel(cur,()=>[cur.backend,cur.model]);
+ sel.addEventListener('change',()=>{if(sel.value==='::custom'){cu.hidden=false;cu.focus();return}cu.hidden=true;const i=sel.value.indexOf('::');cur.backend=sel.value.slice(0,i);cur.model=sel.value.slice(i+2);info(cur.backend,cur.model);es._refill()});
  sel.addEventListener('focus',()=>info(cur.backend,cur.model));
- cu.addEventListener('input',()=>{const t=cu.value.trim(),i=t.indexOf('/');if(i>0){cur.backend=t.slice(0,i);cur.model=t.slice(i+1)||'default'}});
- return h('div',{class:'tgt'},sel,cu)}
+ cu.addEventListener('input',()=>{const t=cu.value.trim(),i=t.indexOf('/');if(i>0){cur.backend=t.slice(0,i);cur.model=t.slice(i+1)||'default';es._refill()}});
+ return h('div',{class:'tgt'},sel,cu,h('label',{class:'mut',style:'font-size:12px'},'Effort ',es))}
 function claudeCell(prof,job){const e=S().profiles[prof].jobs[job];const al=[...D.aliases];if(!al.includes(e.claude))al.push(e.claude);
  return h('select',{'aria-label':job+' Claude subagent model','onchange':ev=>{e.claude=ev.target.value}},al.map(a=>h('option',{value:a,selected:a===e.claude},a)))}
 function profPanel(prof){const claude=prof==='claude';
@@ -12799,7 +13016,9 @@ function bkPanel(){const o=h('div',{class:'bk'});for(const b of D.backends){cons
   h('option',{value:'',selected:!e.model},'(default)'),(e.model&&!ids.includes(e.model)?[e.model]:[]).concat(ids).map(i=>h('option',{value:i,selected:i===e.model},label(ROW[b+'::'+i]||{id:i}))));
  const mode=h('select',{'aria-label':b+' default mode',onchange:ev=>{e.mode=ev.target.value}},h('option',{value:'',selected:!e.mode},'(unset)'),c.modes.map(m=>h('option',{value:m,selected:m===e.mode},m+(c.advisory?' (advisory)':''))));
  const pl=h('input',{type:'checkbox',checked:!!e.plan,disabled:!c.plan,onchange:ev=>{e.plan=ev.target.checked}});
- o.append(h('div',{class:'card'},h('div',{class:'row'},h('label',null,en,h('b',null,b)),h('span',{class:'mut'},D.status[b]||'')),h('label',{class:'f'},'Default model',mo),h('label',{class:'f'},'Default permission mode',mode),h('label',null,pl,'Plan mode'+(c.plan?' ('+c.plan+')':' (not supported)')),
+ const es=effSel(e,()=>[b,e.model||'default']);
+ mo.addEventListener('change',()=>es._refill());
+ o.append(h('div',{class:'card'},h('div',{class:'row'},h('label',null,en,h('b',null,b)),h('span',{class:'mut'},D.status[b]||'')),h('label',{class:'f'},'Default model',mo),h('label',{class:'f'},'Default permission mode',mode),h('label',{class:'f'},'Default effort',es),h('label',null,pl,'Plan mode'+(c.plan?' ('+c.plan+')':' (not supported)')),
   h('p',{class:'mut',style:'font-size:12px;margin:8px 0 0'},'Used by `ag agents add --backend '+b+'` when --model/--mode are omitted.')))}return o}
 const F={backend:'',tier:'',free:false,fresh:false,q:''};
 function modelsPanel(){const body=h('tbody');const draw=()=>{body.textContent='';let n=0;for(const r of D.rows){if(F.backend&&r.backend!==F.backend||F.tier&&r.tier!==F.tier||F.free&&!r.free||F.fresh&&!r.new)continue;if(F.q&&!(r.backend+' '+r.id).toLowerCase().includes(F.q))continue;if(++n>500)break;
@@ -12849,12 +13068,19 @@ def _web_rows():
     return out + [{k: None for k in _WEB_ROW_KEYS} | {"backend": b, "id": m} for b in BACKEND_TABS for m in model_choices(b) if (b, m) not in have]
 
 def _web_job_ok(e):
-    """Clean {claude, ag:{backend, model}} or None. Pure."""
+    """Clean {claude, ag:{backend, model, effort?}} or None. Pure."""
     if not isinstance(e, dict): return None
     ga = e.get("ag") if isinstance(e.get("ag"), dict) else {}
     ok = lambda v, n: isinstance(v, str) and 0 < len(v) <= n and v == v.strip() and not re.search(r"[\x00-\x1f\s]", v)
     if not (ok(e.get("claude"), 64) and ga.get("backend") in BACKEND_TABS and ok(ga.get("model"), 200)): return None
-    return {"claude": e["claude"], "ag": {"backend": ga["backend"], "model": ga["model"]}}
+    agv = {"backend": ga["backend"], "model": ga["model"]}
+    if isinstance(ga.get("effort"), str) and ga["effort"].strip():
+        ne = _eff_norm(ga["effort"])
+        if ne:
+            try: _eff_validate(ga["backend"], ga["model"], ne)
+            except ValueError: return None
+            agv["effort"] = ne
+    return {"claude": e["claude"], "ag": agv}
 
 def _web_profiles(st, scope):
     """{profile: {jobs}} for the form: per-scope effective jobs (global = built-in/preset < global; project = < project). v1/no-profiles: one 'default' from st. Reads."""
@@ -12878,10 +13104,20 @@ def setup_web_payload(st, status=None, dry=False):
     except Exception: harness = "none"
     names = list(WEB_PROFILES) if _web_v2() else ["default"]
     cm = list(dict.fromkeys(list(SETUP_CLAUDE_ALIASES) + [m for m in model_choices("claude") if m != "default"]))
+    mv = globals().get("model_variants")
+    variants = {}
+    if callable(mv):
+        try:
+            seen = {(b, (s["backends"][b].get("model") or "default")) for s in scopes.values() for b in BACKEND_TABS}
+            seen |= {(j["ag"]["backend"], j["ag"]["model"]) for s in scopes.values() for p in s["profiles"].values() for j in p["jobs"].values()}
+            for b, m in seen:
+                v = mv(b, m)
+                if v: variants[f"{b}::{m}"] = list(v)
+        except Exception: variants = {}
     return {"scope": st["scope"], "scopes": scopes, "harness": harness, "harnesses": list(st["harnesses"]), "harness_opts": list(SETUP_HARNESSES),
         "profile_names": names, "tab": harness if harness in names else names[0], "jobs": list(JOB_KEYS), "job_desc": JOB_DESC, "aliases": cm,
         "backends": list(BACKEND_TABS), "caps": {b: {"modes": list(CAPS[b]["modes"]), "advisory": not CAPS[b]["native_enforce"], "plan": CAPS[b]["plan"]} for b in BACKEND_TABS},
-        "status": status or {}, "rows": _web_rows(), "dry_run": bool(dry)}
+        "efforts": list(EFFORT_OPTS), "variants": variants, "status": status or {}, "rows": _web_rows(), "dry_run": bool(dry)}
 
 def setup_web_apply(st0, body, v2=None):
     """Validate the page's save body with the shared helpers. -> (errors, st, profiles|None). Pure given st0."""
@@ -12912,6 +13148,9 @@ def setup_web_apply(st0, body, v2=None):
             if b not in BACKEND_TABS or not isinstance(e, dict): errs.append(f"unknown backend {b!r}"); continue
             if e.get("mode") not in (None, "") and e["mode"] not in CAPS[b]["modes"]: errs.append(f"{b}: mode {e['mode']!r} not in {'|'.join(CAPS[b]['modes'])}"); continue
             if e.get("plan") is True and not CAPS[b]["plan"]: errs.append(f"{b}: no plan mode"); continue
+            if isinstance(e.get("effort"), str) and _eff_norm(e["effort"]):
+                try: _eff_check(b, _eff_norm(e["effort"]))
+                except ValueError as ex: errs.append(f"{b}: {ex}"); continue
             bk[b] = _bk_clean(e)
     pv = None
     if "privacy" in body:
@@ -13366,6 +13605,7 @@ def do_setup(a):
         except ValueError as e: return emit(a, "setup", error=str(e))
     if getattr(a, "profile", None) and a.profile not in ROUTE_PROFILES: return emit(a, "setup", error=f"bad profile {a.profile!r}: {'|'.join(ROUTE_PROFILES)}")
     st = setup_state_from(scope, a.preset, sets, harn, a.claude_md, bsets=bsets, profile=getattr(a, "profile", None))
+    st["sparse"] = True  # terminal/non-web path saves sparsely like the web form: only differing jobs/fields (+ --set) are written
     if getattr(a, "answers", None) is not None:
         if a.harness is None: st["harnesses"] = []
         err = setup_apply_answers(st, ans, detect_harness()[0])
@@ -13378,7 +13618,7 @@ def do_setup(a):
     if ui == "plain":
         for j in JOB_KEYS:
             e = st["jobs"][j]
-            _say(f'{j} — {JOB_DESC[j]}: claude={e["claude"]}  ag={e["ag"]["backend"]}/{e["ag"]["model"]}')
+            _say(f'{j} — {JOB_DESC[j]}: claude={e["claude"]}  ag={e["ag"]["backend"]}/{e["ag"]["model"]}{"@" + e["ag"]["effort"] if e["ag"].get("effort") else ""}')
             if _ask("  change? (y/N)", "n").lower()[:1] != "y": continue
             c = _ask_pick("  claude subagent alias", list(SETUP_CLAUDE_ALIASES), e["claude"])
             b = _ask_pick("  ag backend (enabled)", setup_enabled_backends(st), e["ag"]["backend"])
@@ -13463,7 +13703,7 @@ def _setup_selfcheck():
         try: parse_backend_sets([bad]); raise AssertionError(bad)
         except ValueError: pass
     bk = backends_effective({"backends": {"codex": {"mode": "ro", "model": "g"}}}, {"backends": {"codex": {"mode": "edits"}, "x": 1}})
-    assert bk["codex"] == {"enabled": True, "model": "g", "mode": "edits", "plan": False, "source": "project"} and bk["claude"]["source"] == "default"
+    assert bk["codex"] == {"enabled": True, "model": "g", "mode": "edits", "plan": False, "effort": "", "source": "project"} and bk["claude"]["source"] == "default"
     bk["opencode"]["enabled"] = False
     assert routing_disabled(routing_effective({"jobs": {"mechanical": {"ag": {"backend": "opencode", "model": "m"}}}}), bk) == [("mechanical", "opencode")]
     assert "opencode: off" in backends_line(bk) and "codex: g (mode edits)" in backends_line(bk)
@@ -13494,6 +13734,37 @@ def _setup_selfcheck():
     assert setup_apply_answers(_sa, {"use": "inherit", "data": "nope"}, "claude")
     _rc = route_check("claude", "claude", proj="/x")
     assert any(q["id"] == "data" for q in _rc["questions"]) and '"data": "work|public"' in _rc["answers_format"]
+    sp = setup_state_from("global", None, None, [], None, proj="/x", existing=ex, profile="claude"); sp["sparse"] = True
+    assert json.loads(setup_targets(sp)["plan"][0][1])["profiles"] == {}  # terminal saves sparsely: defaults inherited, not frozen
+    sp = setup_state_from("global", None, {"review": {"claude": "opus"}}, [], None, proj="/x", existing=ex, profile="claude"); sp["sparse"] = True
+    assert list(json.loads(setup_targets(sp)["plan"][0][1])["profiles"]["claude"]["jobs"]) == ["review"]  # --set kept even when equal
+    # route-effort: @EFFORT parse, per-field layering, built-in highest, display
+    assert parse_route_sets(["debug=ag:opencode/m@highest"]) == {"debug": {"ag": {"backend": "opencode", "model": "m", "effort": "highest"}}}
+    assert parse_route_sets(["debug=ag:codex@xhigh"]) == {"debug": {"ag": {"backend": "codex", "model": "default", "effort": "xhigh"}}}
+    assert parse_route_sets(["plan=ag:claude/opus@default"]) == {"plan": {"ag": {"backend": "claude", "model": "opus", "effort": ""}}}
+    for bad in ("debug=ag:claude/opus@ultra", "debug=ag:opencode/m@x/high"):
+        try: parse_route_sets([bad]); raise AssertionError(bad)
+        except ValueError: pass
+    assert _eff_norm("default") == "" and _eff_norm("max") == "max" and _eff_norm("highest") == "highest"
+    for bad in ("ultra",):
+        try: _eff_check("claude", bad); raise AssertionError(bad)
+        except ValueError: pass
+    assert _eff_check("opencode", "whatever") == "whatever" and _eff_check("claude", "highest") == "highest"
+    e2 = routing_effective({"profiles": {"default": {"jobs": {"debug": {"ag": {"backend": "codex", "model": "g", "effort": "high"}}}}}}, None)
+    assert e2["debug"]["ag"] == {"backend": "codex", "model": "g", "effort": "high"}
+    e3 = routing_effective({"profiles": {"default": {"jobs": {"debug": {"ag": {"effort": "low"}}}}}}, None)
+    assert e3["debug"]["ag"]["backend"] == "claude" and e3["debug"]["ag"]["effort"] == "low" and e3["debug"]["ag"]["model"] == "opus"
+    e4 = routing_effective({"profiles": {"default": {"jobs": {"debug": {"ag": {"backend": "codex", "model": "g", "effort": "high"}}}}}},
+        {"profiles": {"default": {"jobs": {"debug": {"ag": {"effort": ""}}}}}})
+    assert "effort" not in e4["debug"]["ag"] and e4["debug"]["ag"]["model"] == "g"
+    assert "| debug — debugging, failing tests, root cause | opus | claude / opus@high |" in routing_block(
+        {j: {"claude": "opus", "ag": {"backend": "claude", "model": "opus", **({"effort": "high"} if j == "debug" else {})}} for j in JOB_KEYS})
+    assert "effort high" in backends_line({"codex": {"enabled": True, "model": "g", "mode": "", "plan": False, "effort": "high"}})
+    r2, bs2 = parse_backend_sets(["backend.codex.effort=xhigh", "backend.opencode.effort=default"])
+    assert bs2 == {"codex": {"effort": "xhigh"}, "opencode": {"effort": ""}} and r2 == []
+    try: parse_backend_sets(["backend.claude.effort=ultra"]); raise AssertionError("claude effort")
+    except ValueError: pass
+    assert _bk_clean({"effort": "default"}) == {"effort": ""} and _bk_clean({"effort": "max"}) == {"effort": "max"}
 
 def build():
     p = argparse.ArgumentParser(prog="ag", description="CLI helper for autonomous agents")
@@ -13537,7 +13808,7 @@ def build():
     ev = sub.add_parser("events",help="pings: spawn/send/exit feed"); ev.add_argument("--limit",type=int,default=20); ev.add_argument("--session",default=None)
     dm = sub.add_parser("_daemon",help=argparse.SUPPRESS); dm.add_argument("sp")
     h = sub.add_parser("harness",help="select agent backends and share harness configuration"); hs=h.add_subparsers(dest="sub",required=True)
-    huse=hs.add_parser("use",help="switch an agent backend, remembering its model"); huse.add_argument("agent"); huse.add_argument("backend"); huse.add_argument("--model",default=None)
+    huse=hs.add_parser("use",help="switch an agent backend, remembering its model"); huse.add_argument("agent"); huse.add_argument("backend"); huse.add_argument("--model",default=None); huse.add_argument("--budget",default=None,help="handoff replay budget in tokens for the next turn (default 4000, AG_HANDOFF_BUDGET overrides)")
     hcur=hs.add_parser("current",help="show an agent's backend, model and persona"); hcur.add_argument("agent")
     hshow=hs.add_parser("show"); hshow.add_argument("--home",default=None)
     hexp=hs.add_parser("export"); hexp.add_argument("file",nargs="?",default=None); hexp.add_argument("--home",default=None)
@@ -13624,7 +13895,7 @@ def build():
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
     mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by Artificial Analysis intelligence/coding/agentic score, speed, tier (openrouter.ai/rankings + models.dev)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only"); mo.add_argument("--sort",choices=("intel","coding","speed","popular"),default=None,help="rank order (implies --rank)"); mo.add_argument("--auto",choices=("on","off"),default=None,help="toggle background catalog refresh (config.json catalog_auto)"); mo.add_argument("--status",action="store_true",help="last fetch per catalog source + auto state"); mo.add_argument("--zdr",action="store_true",help="zero-retention models only (data privacy)"); mo.add_argument("--bg",action="store_true",help=argparse.SUPPRESS)
     rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS); rt.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile to show (default: detected harness)"); rt.add_argument("--json",action="store_true",default=argparse.SUPPRESS); rt.add_argument("--check",action="store_true",help="per-project setup check: configured? + questions to ask the user")
-    st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL | backend.B.(enabled|model|mode|plan)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
+    st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] | backend.B.(enabled|model|mode|plan|effort)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
     return p
 
 # ---- portable task snapshots (outbound SSH, no native runtime migration) ----

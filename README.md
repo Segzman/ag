@@ -400,6 +400,22 @@ ag chat revert w [--turn N]      # whole repo worktree back to before turn N
 
 `ag chat usage w` prints last-turn and total provider token usage for the agent.
 
+```sh
+ag usage [--by provider|model|agent|project|day] [--since 1d|7d|30d] [--json]
+ag budget show
+ag budget set [--daily USD] [--monthly USD] [--provider P --rpd N]
+ag access show [--scope global|project] [--data work|public]
+ag access allow GLOB [--scope global|project] [--data work|public]
+ag access deny GLOB [--scope global|project] [--data work|public]
+ag access rm GLOB [--scope global|project] [--data work|public]
+ag chat send w "task" --force | ag wake w "task" --force | ag delegate w "task" --force
+```
+
+- **Access:** `routing.json` `access: {allow:[globs], deny:[globs]}` (global < project, unioned; per-data `access.work`/`access.public` unioned over base) matching `backend/model` and `provider/*` (deny wins). Enforced at `agents add/set` and at turn time (exit 2, error row, never sent).
+- **Ledger:** one JSON line per finished turn to `$AG_CACHE_HOME/usage.jsonl` (global): ts, agent, project, backend, model, provider, in/out/cache, requests=1, exit, cost (tokens x models.dev via `catalog_info`; free=$0; claude/codex=`subscription`, cost null).
+- **Usage:** totals + per-provider daily requests vs `providers.json` rpd with % used; `--by` groups, `--since` filters.
+- **Budgets:** daily/monthly USD + per-provider rpd; at turn start a breach refuses (exit 2) unless `--force`; at 80% one `[budget]` warning row.
+
 ## Context and handoff
 
 Scoped task + memory so the next agent continues, not restarts (details: [docs/AGENT_CONTEXT.md](docs/AGENT_CONTEXT.md)).

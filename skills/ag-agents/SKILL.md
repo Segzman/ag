@@ -218,3 +218,5 @@ Outbound SSH only, explicit handoff, no auto failover. Details: `docs/MULTI_HOST
 ## Guardrails
 
 Data privacy: work code only to zdr models (`space-bunny-free`, `longcat-2.5-preview-free`, `step-5-preview-free`); `agents add|set --data work|public` (default `work` from `routing.json` `privacy.default`); `work` refuses train/unknown models (exit 2); `AG_PRIVACY=off` disables (unsafe). Pair a cheap Claude (haiku) with a zdr free model for second opinions when the task is work. Don't switch backends/models unless asked. Never request secrets via chat. Unknown `/word` errors; don't retry as prose. Persistent bots = `schedule add` (or `spawn --wake`). Cost: route mechanical work to cheap backends; never use `full` mode casually.
+
+Access + budgets: `{{AG}} access show|allow GLOB|deny GLOB|rm GLOB [--scope global|project] [--data work|public]` (deny wins; `agents add/set` + turns refuse exit 2); `{{AG}} usage [--by provider|model|agent|project|day] [--since 1d|7d|30d]`; `{{AG}} budget show|set [--daily USD] [--monthly USD] [--provider P --rpd N]` (breach refuses unless `chat send|wake|delegate --force`).

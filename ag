@@ -2986,6 +2986,16 @@ def update_agent_settings(sdir, name, updates):
         if model is None:
             model = models.get(new, "default")
         model = eff_model(new, model) or "default"
+        warn = ""
+        if "effort" in updates:
+            ev = updates.pop("effort")
+            if ev not in ("", None):
+                try: updates["effort"], _ew = resolve_effort(new, model, ev); warn = _ew or ""
+                except ValueError as e: return (False, str(e))
+            else: a.pop("effort", None)
+        elif a.get("effort") and ("model" in updates or "backend" in updates):
+            try: resolve_effort(new, model, a["effort"])  # model/backend moved: stored effort may not exist there
+            except ValueError: warn = f"effort {a.pop('effort')!r} invalid for {new}/{model}; dropped"
         sids = dict(meta.get("sids") or {})
         if meta.get("sid"):
             # A stale meta backend may differ from the roster: the SID still
@@ -3005,8 +3015,8 @@ def update_agent_settings(sdir, name, updates):
         if new != old:
             _event(sdir, "harness", name, backend=new, model=model)
             sid_note = f"resumes {sids[new]}" if sids.get(new) else "fresh session"
-            return (True, f"backend {old} -> {new} ({model}, {sid_note}).")
-        return (True, f"updated {name} [{new}] ({model}).")
+            return (True, f"backend {old} -> {new} ({model}, {sid_note})." + (f" warning: {warn}" if warn else ""))
+        return (True, f"updated {name} [{new}] ({model})." + (f" warning: {warn}" if warn else ""))
     finally:
         _release_agent_turn(guard)
 
@@ -6631,6 +6641,10 @@ def do_agents(a):
         if eerr: return emit(a,"agents",error=eerr)
         if (_ae := acp_check(be, getattr(a,"transport",None) or "", getattr(a,"acp_cmd",None))): return emit(a,"agents",error=_ae)
         if be=="opencode" and mod in ("","default"): mod = OPENCODE_MODEL_DEFAULT
+        effw = ""
+        if getattr(a, "effort", None):
+            try: a.effort, _ew = resolve_effort(be, mod, a.effort); effw = _ew or ""
+            except ValueError as e: return emit(a, "agents", error=str(e), hint="ag models --json shows per-model variants")
         wt, adir = None, a.adir or "."
         if getattr(a,"worktree",False):
             wt, err, hint = wt_create(a.name, adir, getattr(a,"base",None))
@@ -6644,7 +6658,7 @@ def do_agents(a):
         rows[-1].update(eup)
         save_agents(sdir,rows)
         _mw = "\n".join(x for x in (mode_warning(be, getattr(a,"mode",None) or "", bool(getattr(a,"plan",None))),
-            f"[setup] backend {be} is disabled in routing (ag setup to enable)" if bkd and not bkd["enabled"] else "") if x)
+            f"[setup] backend {be} is disabled in routing (ag setup to enable)" if bkd and not bkd["enabled"] else "", effw) if x)
         if _mw and not wt: return emit(a,"agents",{"_text":f"added {a.name}\n{_mw}","warning":_mw})
         if wt: return emit(a,"agents",{"_text":f"added {a.name}  branch {wt['branch']}  worktree {wt['path']}","worktree":wt})
         return emit(a,"agents",{"_text":f"added {a.name}"})
@@ -6702,9 +6716,9 @@ def do_agents(a):
             updates.update({"dir": wt["path"], "worktree": wt})
         ok, message = update_agent_settings(sdir, a.name, updates)
         if not ok: return emit(a, "agents", error=message,
-            hint="ag roles list" if "no such role" in message else None)
+            hint="ag roles list" if "no such role" in message else ("ag models --json shows per-model variants" if "--effort" in message or "effort" in message else None))
         if updates.get("worktree"): return emit(a, "agents", {"_text": f"updated {a.name}  branch {updates['worktree']['branch']}  worktree {updates['dir']}", "worktree": updates["worktree"]})
-        return emit(a, "agents", {"_text": f"updated {a.name}"})
+        return emit(a, "agents", {"_text": f"updated {a.name}" + (f"\n{message}" if "warning: " in message else "")})
 
 def do_roles(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
@@ -8037,6 +8051,12 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if command and backend != "opencode":
             _release_agent_turn(_turn_lock); _turn_lock = None
             return {"error":f"--command is opencode-only (agent {name} runs {backend})"}
+        if a.get("effort"):  # catalog may have moved since the effort was stored: drop stale, never pass silently
+            _ee, _ew = effort_for_turn(backend, model, a["effort"])
+            if _ew:
+                _event(sdir, "effort_warn", name, warning=_ew)
+                if on_event: on_event(name, "tool", _ew)
+            if _ee != a["effort"]: a = dict(a, effort=_ee)
         if not _rs and (_pe := preflight_auth(backend)): _release_agent_turn(_turn_lock); _turn_lock = None; return {"error":_pe}
         meta = load_chat_meta(sdir,name,agent=a)
         sids = meta.get("sids") or {}
@@ -11140,6 +11160,28 @@ def do_selfcheck(a):
         assert "--command" not in backend_argv("opencode",model="",workdir=".",sid="",prompt="hi")
         assert backend_argv("opencode",model="x",workdir=".",prompt="hi",effort="max")[-6:-1]==["x","--variant","max","--dir","."] and "--variant" not in backend_argv("opencode",prompt="hi")
         assert "--effort" in backend_argv("claude",prompt="hi",effort="high") and backend_argv("codex",prompt="hi",effort="low")[3:5]==["-c",'model_reasoning_effort="low"']
+        # per-model variants: claude static, unknown passes through, opencode/codex from the model-list cache
+        assert model_variants("claude","sonnet")==["low","medium","high","xhigh","max"] and model_variants("gemini","x") is None
+        assert resolve_effort("claude","sonnet","highest")==("max",None) and resolve_effort("claude","s","lowest")==("low",None)
+        assert resolve_effort("gemini","x","whatever")==("whatever",None)
+        try: resolve_effort("claude","s","bogus"); assert False
+        except ValueError as _e: assert "allowed low|medium|high|xhigh|max" in str(_e), _e
+        assert _parse_opencode_verbose("opencode/m\n"+json.dumps({"variants":{"high":{},"minimal":{},"zzz":{}}}))=={"opencode/m":["minimal","high","zzz"]}
+        _och = os.environ.get("AG_CACHE_HOME"); os.environ["AG_CACHE_HOME"] = str(td/"vcache")
+        try:
+            _put_file(models_cache_path(), json.dumps({"backends":{"opencode":{"models":["opencode/m"],"variants":{"opencode/m":["low","high"]}},
+                "codex":{"models":["g-luna"],"variants":{"g-luna":[]}}}}) + "\n")
+            assert model_variants("opencode","default") is None and model_variants("opencode","opencode/m")==["low","high"]
+            assert resolve_effort("opencode","opencode/m","highest")==("high",None)
+            try: resolve_effort("opencode","opencode/m","max"); assert False
+            except ValueError as _e2: assert "allowed low|high" in str(_e2), _e2
+            try: resolve_effort("codex","g-luna","low"); assert False
+            except ValueError as _e3: assert "g-luna has no variants" in str(_e3), _e3
+            assert effort_for_turn("opencode","opencode/m","max")==("", "[effort] 'max' not in opencode/opencode/m variants (low|high); dropping")
+            assert effort_for_turn("codex","g-luna","low")==("", "[effort] model g-luna has no variants; dropping --effort 'low'")
+        finally:
+            if _och is None: os.environ.pop("AG_CACHE_HOME", None)
+            else: os.environ["AG_CACHE_HOME"] = _och
         _r = run_turn(td,"sl","hi",command="x")
         assert "error" in _r and "opencode-only" in _r["error"], _r
         assert set(TUI_MODE_TITLE) >= {"input","normal","setmodel","newname","newbackend","dagent","dtext","backendpick","profilepick"}
@@ -11628,6 +11670,11 @@ def models_refresh(backends=MODEL_BACKENDS, on_progress=None):
         prev = cache["backends"].get(b) or {}
         ent = {"models": prev.get("models", []) if err else ids, "source": src, "error": err,
             "fetched_at": prev.get("fetched_at", "") if err else now_iso(), "checked_at": now_iso()}
+        if b == "opencode":  # variants live in `models --verbose`, cached alongside the id list
+            _vv = _opencode_variants_fetch()
+            ent["variants"] = _vv if _vv is not None else prev.get("variants", {})
+        elif b == "codex":  # variants live in supported_reasoning_levels of the same cache file
+            ent["variants"] = _codex_variants() or prev.get("variants", {})
         cache["backends"][b] = ent
         if on_progress: on_progress(b, ent)
     cache["fetched_at"] = now_iso()
@@ -11646,6 +11693,93 @@ def model_choices(backend):
     base = list(MODELS.get(backend, ["default"]))
     cached = (_models_read()["backends"].get(backend) or {}).get("models") or []
     return base + [m for m in cached if isinstance(m, str) and m and m not in base]
+
+# ---- per-model reasoning variants (effort): checked for every provider ----
+# Sources (verified 2026-10-12): opencode `models --verbose` prints `<provider>/<id>`
+# then a JSON object with `"variants": {name: {...}}`; names differ per model
+# (opencode/muse-spark-1.3-contributor-free = minimal,low,medium,high,xhigh, NO max;
+# azure/claude-haiku-4-5 = high,max; opencode/mimo-v2.6-flash-free = none).
+# codex `~/.codex/models_cache.json` models[].supported_reasoning_levels[].effort.
+# claude CLI `--effort` accepts low|medium|high|xhigh|max for every model
+# (`claude --help`; models.dev anthropic entries all carry reasoning:true, and
+# opencode's azure/anthropic claude-* variants show the same per-model subsets).
+# gemini/cursor expose no verified effort flag -> unknown (pass through).
+EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+def _parse_opencode_verbose(out):
+    """{model_id: [variant names, EFFORT_ORDER first]} from `opencode models --verbose` stdout. Pure; unparseable -> {}."""
+    res, lines, i, n = {}, (out or "").splitlines(), 0, len((out or "").splitlines())
+    while i < n:
+        mid = lines[i].strip()
+        if mid and "/" in mid and i + 1 < n and lines[i + 1].strip().startswith("{"):
+            buf, depth, j, started = [], 0, i + 1, False
+            while j < n:
+                for ch in lines[j]:
+                    if ch == "{": depth += 1; started = True
+                    elif ch == "}": depth -= 1
+                buf.append(lines[j]); j += 1
+                if started and depth <= 0: break
+            try: v = json.loads("\n".join(buf)).get("variants") or {}
+            except ValueError: v = None
+            if isinstance(v, dict): res[mid] = [k for k in EFFORT_ORDER if k in v] + [k for k in v if k not in EFFORT_ORDER]
+            i = j
+        else: i += 1
+    return res
+def _opencode_variants_fetch():
+    """{id: [...]} via `opencode models --verbose`; None when missing/failing (caller keeps last cache)."""
+    for attempt in (0, 1):  # same sqlite-lock retry as _models_fetch
+        try: p = subprocess.run([_opencode_bin(), "models", "--verbose"], capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
+        except Exception: return None
+        if attempt == 0 and "database is locked" in ((p.stdout or "") + (p.stderr or "")): time.sleep(1); continue
+        break
+    return _parse_opencode_verbose(p.stdout) if p.returncode == 0 else None
+def _codex_variants():
+    """{slug: [effort levels]} from the codex models cache supported_reasoning_levels; {} when unreadable."""
+    out = {}
+    for m in (_json_or_empty(_ag_home()/".codex"/"models_cache.json").get("models") or []):
+        if not isinstance(m, dict) or not m.get("slug"): continue
+        eff = [e.get("effort") for e in (m.get("supported_reasoning_levels") or []) if isinstance(e, dict) and e.get("effort")]
+        out[m["slug"]] = [e for e in EFFORT_ORDER if e in eff] + [e for e in eff if e not in EFFORT_ORDER]
+    return out
+def _variants_from(mc, backend, model):
+    """model_variants over an already-read models cache (avoids a file read per row)."""
+    if backend == "claude": return list(CLAUDE_EFFORTS)
+    if backend == "opencode":
+        v = ((mc.get("backends") or {}).get("opencode") or {}).get("variants")
+        m = eff_model(backend, model) or "default"
+        return list(v[m]) if isinstance(v, dict) and isinstance(v.get(m), list) else None
+    if backend == "codex":
+        m = (model or "").strip()
+        if not m or m == "default": return None
+        v = ((mc.get("backends") or {}).get("codex") or {}).get("variants")
+        return list(v[m]) if isinstance(v, dict) and isinstance(v.get(m), list) else None
+    return None
+def model_variants(backend, model):
+    """Known reasoning-effort names for backend/model; [] = model has none; None = unknown (pass through, never error)."""
+    return _variants_from(_models_read(), backend, model)
+def _effort_disp(backend, model):
+    return (eff_model(backend, model) or model or "default") if backend == "opencode" else (model or "default")
+def resolve_effort(backend, model, effort):
+    """(stored_value, warning|None). highest/lowest -> top/bottom of model_variants. ValueError: unknown value (lists allowed) or a model with no variants."""
+    e = (effort or "").strip().lower()
+    vs, disp = model_variants(backend, model), _effort_disp(backend, model)
+    if vs is None:
+        return (e, f"unknown variants for {backend}/{disp}; storing {e!r} unresolved") if e in ("highest", "lowest") else (e, None)
+    if not vs: raise ValueError(f"model {disp} has no variants")
+    if e in ("highest", "lowest"): return (vs[-1] if e == "highest" else vs[0]), None
+    if e in vs: return e, None
+    raise ValueError(f"bad --effort {effort!r} for {backend}/{disp}: allowed {'|'.join(vs)} (or highest|lowest)")
+def effort_for_turn(backend, model, effort):
+    """(argv_effort, warning|None): stored effort re-checked against today's catalog; stale values drop with an [effort] warning instead of reaching the CLI."""
+    e = (effort or "").strip()
+    if not e: return "", None
+    el, vs, disp = e.lower(), model_variants(backend, model), _effort_disp(backend, model)
+    if vs is None:
+        return (e, f"[effort] unknown variants for {backend}/{disp}; passing {e!r} through") if el in ("highest", "lowest") else (e, None)
+    if not vs: return "", f"[effort] model {disp} has no variants; dropping --effort {e!r}"
+    if el in ("highest", "lowest"): return (vs[-1] if el == "highest" else vs[0]), None
+    if el in vs: return el, None
+    return "", f"[effort] {e!r} not in {backend}/{disp} variants ({'|'.join(vs)}); dropping"
 
 def do_models(a):
     if a.bg: catalog_refresh_all(); return 0   # detached background refresh (catalog_bg_refresh / update --quiet)
@@ -11667,7 +11801,8 @@ def do_models(a):
         return emit(a, "models", {"rank": True, "sort": a.sort or "intel", "models": rows, "sources": src,
             "_text": catalog_rank_text(rows, src) if rows else "no models match"})
     data = {"fetched_at": cache.get("fetched_at", ""), "path": str(models_cache_path()),
-        "backends": {b: cache["backends"].get(b, {}) for b in bs}}
+        "backends": {b: {**cache["backends"].get(b, {}),
+            "variants": {m: _variants_from(cache, b, m) for m in ((cache["backends"].get(b) or {}).get("models") or [])}} for b in bs}}
     if getattr(a, "json", False): return emit(a, "models", data)
     out = []
     for b in bs:
@@ -12001,7 +12136,7 @@ def catalog_rows(backend=None, refresh=False, sort="intel"):
     for b in bs:
         for m in (cache["backends"].get(b) or {}).get("models") or []:
             if m == "default": continue
-            rows.append({"backend": b, "id": m, **catalog_info(b, m, md, ix, aa, rk)})
+            rows.append({"backend": b, "id": m, "variants": _variants_from(cache, b, m), **catalog_info(b, m, md, ix, aa, rk)})
     rows.sort(key=lambda r: (bs.index(r["backend"]), r[at] is None, -(r[at] or 0), TIER_ORDER.index(r["tier"]), r["source"] == "heuristic",
         -(r["score"] or 0), -(r["speed"] or 0), _neg_str(r["released"] or ""), -(r["context"] or 0), r["id"]))
     return rows
@@ -12021,12 +12156,12 @@ def catalog_rank_text(rows, sources=None):
     out = [catalog_attribution(sources if sources is not None else catalog_sources())] if sources is not False else []
     for b in dict.fromkeys(r["backend"] for r in rows):
         rs = [r for r in rows if r["backend"] == b]; w = max(len(r["id"]) for r in rs)
-        out += [f"{b} ({len(rs)})", f'  {"id".ljust(w)}  tier      intel  coding  agentic  tok/s  latency  ctx   $in/$out    released    flags']
+        out += [f"{b} ({len(rs)})", f'  {"id".ljust(w)}  tier      intel  coding  agentic  tok/s  latency  ctx   $in/$out    released    variants  flags']
         for r in rs:
             lat = "-" if r["latency_ms"] is None else f'{r["latency_ms"]/1000:.1f}s'
             out.append(f'  {r["id"].ljust(w)}  {(r["tier"] + ("~" if r["tier_source"] == "guess" else "")).ljust(8)}  {n(r["score"]).rjust(5)}  {n(r["coding"]).rjust(6)}  '
                 f'{n(r["agentic"]).rjust(7)}  {n(r["speed"], "{:.0f}").rjust(5)}  {lat.rjust(7)}  {_fmt_ctx(r["context"]).rjust(4)}  {_fmt_cost(r).ljust(10)}  '
-                f'{(r["released"] or "-").ljust(10)}  ' + " ".join(x for x, f in (("new", r["new"]), ("fast", r["fast"])) if f))
+                f'{(r["released"] or "-").ljust(10)}  ' + ("|".join(r["variants"]) if r.get("variants") else "-") + "  " + " ".join(x for x, f in (("new", r["new"]), ("fast", r["fast"])) if f))
     return "\n".join(x.rstrip() for x in out)
 
 def catalog_stats(backend):
@@ -13342,9 +13477,9 @@ def build():
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort: claude --effort, opencode --variant (e.g. max), codex model_reasoning_effort ("" clears)')
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort')
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort: claude --effort, opencode --variant (e.g. max), codex model_reasoning_effort ("" clears)')
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort')
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)

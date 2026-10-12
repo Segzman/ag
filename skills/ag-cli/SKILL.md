@@ -121,6 +121,20 @@ Registry `$AG_CONFIG_HOME/schedule-dirs.json`. Concurrent ticks are lock-safe; c
 {{AG}} --dir <state> ratelimit clear [KEY]       # drop one/all cooldowns
 ```
 
+## Access, usage, budgets
+
+```sh
+{{AG}} --dir <state> access show [--scope global|project] [--data work|public]
+{{AG}} --dir <state> access allow GLOB [--scope global|project] [--data work|public]
+{{AG}} --dir <state> access deny GLOB [--scope global|project] [--data work|public]
+{{AG}} --dir <state> access rm GLOB [--scope global|project] [--data work|public]
+{{AG}} --dir <state> usage [--by provider|model|agent|project|day] [--since 1d|7d|30d] [--json]
+{{AG}} --dir <state> budget show
+{{AG}} --dir <state> budget set [--daily USD] [--monthly USD] [--provider P --rpd N]
+```
+
+`access` = `routing.json` allow/deny globs over `backend/model` + `provider/*` (deny wins; per-`--data work|public`). Ledger `$AG_CACHE_HOME/usage.jsonl`. `budget` refuses turns (exit 2) unless `--force`; 80% warns `[budget]`.
+
 ## Sanity
 
 `{{AG}} selfcheck` (regression checks, own temp dir) · `{{AG}} keys` (TUI cheat-sheet) · `{{AG}} agents doctor` (backends + rtk).

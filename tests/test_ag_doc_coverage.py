@@ -11,7 +11,8 @@ from importlib.machinery import SourceFileLoader
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY_FLAG_CMDS = [["setup"], ["models"], ["schedule", "add"], ["agents", "add"], ["agents", "set"], ["agents", "fork"], ["wake"],
-                 ["chat", "send"], ["queue"], ["stop"], ["harness", "use"], ["ratelimit"], ["crosscheck"]]
+                 ["chat", "send"], ["queue"], ["stop"], ["harness", "use"], ["ratelimit"], ["crosscheck"],
+                 ["access", "show"], ["access", "allow"], ["access", "deny"], ["access", "rm"], ["usage"], ["budget", "show"], ["budget", "set"]]
 SKIP_FLAGS = {"--help", "--json"}
 
 

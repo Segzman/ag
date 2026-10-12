@@ -36,6 +36,7 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 {{AG}} --dir <state> agents caps [BACKEND]       # per-backend capability table (modes, plan, resume, interrupt)
 {{AG}} --dir <state> agents add w --backend codex --mode edits [--plan]
 {{AG}} --dir <state> agents set w --mode ro|edits|auto|full | --mode "" | --plan | --no-plan
+{{AG}} --dir <state> agents set w --effort max            # reasoning effort: opencode --variant, claude --effort, codex model_reasoning_effort; "" clears
 ```
 
 Modes: `ro` read-only, `edits` workspace writes, `auto`, `full` unrestricted. Unset = backend default. Check `agents caps` first: a mode the backend can't enforce (echo, gemini `auto`) prints a `[mode]` warning and runs default. Prefer `ro` for review/plan jobs. Never `full` unless asked.

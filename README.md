@@ -218,6 +218,8 @@ Merge order: `os.environ` -> profile backend env -> profile env -> agent env -> 
 `ag agents caps [BACKEND]` (`--json`) prints the per-backend capability table (`CAPS`: resume, system/mcp flag, skills, interrupt, usage, plan, supported `modes`, `native_enforce`).
 `ag agents add|set NAME --mode ro|edits|auto|full [--plan|--no-plan]` sets a per-agent permission mode (`--mode ""` clears; unset = backend default, unchanged). Mapping: claude `--permission-mode` (dontAsk/acceptEdits/auto/bypassPermissions, `plan`), codex `-s` read-only/workspace-write/danger-full-access, gemini `--approval-mode` (plan/auto_edit/yolo; no `auto`), cursor `--mode ask|plan` / `--force [--sandbox enabled|disabled]`, opencode a `permission` block merged into a scoped `OPENCODE_CONFIG` (`.agent/modes/<agent>/opencode.json`; profile config kept). Codex/opencode emulate `--plan` with read-only. A mode a backend cannot enforce (echo, gemini `auto`) prints one `[mode] ...` warning line on `add` and each turn and runs with the backend default.
 
+`ag agents add|set NAME --effort LEVEL` sets reasoning effort per agent (`--effort ""` clears; unset = backend default). Mapping: claude `--effort` (low|medium|high|xhigh|max), opencode `--variant` (e.g. `max` = Muse Spark Max, the 48.1-scored variant), codex `-c model_reasoning_effort=`. Others ignore it.
+
 ## ACP transport
 
 Opt-in per agent: `ag agents add|set W --transport acp|cli` (gemini/cursor/opencode) speaks the Agent Client Protocol (JSON-RPC over stdio) instead of the headless CLI; `ag agents add W --backend acp --acp-cmd "my-agent --acp"` runs any ACP agent. `AG_ACP=0` turns it off globally (ACP-only agents then error). Launch: `gemini --acp [-m M]`, `agent acp`, `opencode acp --cwd DIR`.

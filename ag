@@ -12772,7 +12772,7 @@ def model_privacy(backend, model):
     m = (model or "").strip()
     if m in ("", "default"):
         if backend == "opencode": return model_privacy(backend, OPENCODE_MODEL_DEFAULT)
-        return "zdr" if backend == "echo" else "retain" if backend in ("claude", "codex", "gemini", "cursor") else "unknown"
+        return "zdr" if backend == "echo" else "retain"  # claude/codex/gemini/cursor/acp: the user's own account or agent
     if backend in ("claude", "codex"): return "retain"
     if backend == "echo": return "zdr"
     if backend in ("gemini", "cursor"): return "retain"
@@ -12787,6 +12787,8 @@ def model_privacy(backend, model):
     if low.startswith(("openai/", "anthropic/")) or "/openai" in low or "/anthropic" in low: return "retain"
     if "claude" in low or short in ("haiku", "sonnet", "opus", "fable") or "gpt" in low or "openai" in low: return "retain"
     if backend == "opencode" and "free" in low: return "train"
+    if backend == "opencode" and low.startswith("opencode/") and low != "opencode/big-pickle": return "retain"  # paid Zen: providers zero-retention except listed (OpenAI/Anthropic 30d)
+    if backend != "opencode" or not low.startswith("opencode/"): return "retain"  # own provider keys / ACP agent: user's account terms
     return "unknown"
 def privacy_off(): return os.environ.get("AG_PRIVACY", "1").strip().lower() in ("0", "off", "false", "no")
 def privacy_default(cwd=None):

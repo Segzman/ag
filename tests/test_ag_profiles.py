@@ -129,7 +129,7 @@ class Profiles(unittest.TestCase):
         c = self.agj("route", "--check", env={"AG_HARNESS": "claude"})["data"]
         self.assertFalse(c["configured"]); self.assertEqual(c["harness"], "claude")
         ids = [q["id"] for q in c["questions"]]
-        self.assertEqual(ids[:2], ["use", "other_harnesses"]); self.assertEqual(len(ids), 8)
+        self.assertEqual(ids[:2], ["use", "other_harnesses"]); self.assertEqual(len(ids), 9); self.assertIn("data", ids)
         self.assertEqual([o["value"] for o in c["questions"][1]["options"]], ["opencode", "codex"])
         self.assertEqual([o["value"] for o in c["questions"][0]["options"]], ["inherit", "cheap", "strong", "custom"])
         self.assertIn("claude profile", c["questions"][0]["options"][0]["label"])

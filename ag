@@ -11668,7 +11668,7 @@ def do_selfcheck(a):
             assert model_default_variant("codex","g-sol")=="low" and model_default_variant("codex","g-luna") is None
             assert model_default_variant("opencode","opencode/1")=="medium" and model_default_variant("opencode","opencode/m") is None
             assert model_default_variant("claude","opus") is None
-            assert effort_for_turn("opencode","opencode/m","max")==("", "[effort] 'max' not in opencode/opencode/m variants (low|high); dropping --effort")
+            assert effort_for_turn("opencode","opencode/m","max")==("", "[effort] 'max' not in opencode/m variants (low|high); dropping --effort")
             assert effort_for_turn("codex","g-sol","xhigh")==("low", "[effort] 'xhigh' not in codex/g-sol variants (low|high); using default 'low'")
             assert effort_for_turn("codex","g-luna","low")==("", "[effort] model g-luna has no variants; dropping --effort 'low'")
         finally:
@@ -12318,6 +12318,8 @@ def _claude_variants(model):
 def _variants_from(mc, backend, model):
     """model_variants over an already-read models cache (avoids a file read per row)."""
     if backend == "claude": return _claude_variants(model)
+    _bk = (mc.get("backends") or {}).get(backend)
+    if backend in ("opencode", "codex") and isinstance(_bk, dict) and "variants" not in _bk: catalog_bg_refresh()  # cache predates variants: refresh in background
     if backend == "opencode":
         v = ((mc.get("backends") or {}).get("opencode") or {}).get("variants")
         m = eff_model(backend, model) or "default"
@@ -12351,14 +12353,17 @@ def model_default_variant(backend, model):
     """Model default effort (-> flag value) or None (= backend default, pass no flag)."""
     return _defaults_from(_models_read(), backend, model)
 def _effort_disp(backend, model):
-    return (eff_model(backend, model) or model or "default") if backend == "opencode" else (model or "default")
+    if backend == "opencode":  # messages print backend/disp: drop the duplicate opencode/ provider prefix
+        d = eff_model(backend, model) or model or "default"
+        return d[len("opencode/"):] if d.startswith("opencode/") else d
+    return model or "default"
 def resolve_effort(backend, model, effort):
     """(stored_value, warning|None). highest/lowest -> top/bottom of model_variants. ValueError: unknown value (lists allowed) or a model with no variants."""
     e = (effort or "").strip().lower()
     vs, disp = model_variants(backend, model), _effort_disp(backend, model)
     if vs is None:
         return (e, f"unknown variants for {backend}/{disp}; storing {e!r} unresolved") if e in ("highest", "lowest") else (e, None)
-    if not vs: raise ValueError(f"model {disp} has no variants")
+    if not vs: raise ValueError(f"model {backend}/{disp} has no variants")
     if e in ("highest", "lowest"): return (vs[-1] if e == "highest" else vs[0]), None
     if e in vs: return e, None
     raise ValueError(f"bad --effort {effort!r} for {backend}/{disp}: allowed {'|'.join(vs)} (or highest|lowest)")

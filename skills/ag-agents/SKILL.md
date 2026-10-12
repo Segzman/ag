@@ -119,7 +119,7 @@ Pair a cheap Claude (haiku, mechanical/review job) with a zero-retention free mo
 | — (no paid tokens) | `space-bunny-free` + `longcat-2.5-preview-free` | free second opinion on work code; they fail differently (logic vs arithmetic/dates), so agreement is meaningful |
 | — (public/OSS code only) | `muse-spark-1.3-contributor-free` (xhigh) + `nemotron-3-ultra-free` | strongest free pair; both train/log on prompts, never work code |
 
-Benchmarked 2026-10-12 (12 auto-graded tasks x3; rerun with care: >2 concurrent free calls rate-limit the account). Avoid: `exo-free` (deprecated, 410), `ling-3.0-flash-fin-free` (unavailable), `ling-3.1-flash-free` (frequent empty replies). Don't trust nemotron/longcat alone on arithmetic or dates.
+Benchmarked 2026-10-12 (12 auto-graded tasks x3; probe: every live free model took 8 short concurrent calls; ~10 long agent turns at once did trip an account limit). Avoid: `exo-free` (deprecated, 410), `ling-3.0-flash-fin-free` (unavailable), `ling-3.1-flash-free` (frequent empty replies). Don't trust nemotron/longcat alone on arithmetic or dates.
 
 Per-agent privacy guard applies: `work` agents refuse train/unknown models.
 
@@ -155,7 +155,7 @@ Needs the global tick installed once (`schedule install --write`, see `ag-cli`);
 
 ## Reliability
 
-Stored session id unknown to backend ("Session not found" etc.) -> ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`. Overload/503/529/connection reset/opencode free-tier 403 retried 2x (2s, 6s) only if the attempt produced no output (provider error events do not count). `AG_RETRY=0` disables. Rate limits (429 / `Rate limit exceeded` / `Endpoint is unavailable` / stall) use shared cooldown + backoff with per-model slots (opencode free default 2; `AG_MAX_CONCURRENT`, `AG_STALL_S`); `agents add|set --fallback MODEL` (repeatable, `""` clears) keeps work moving after 2 hits. Logged-out backend fails fast (probe). codex headless resumes via `exec --json`. gemini is stateless. Lost wake (worker died): `wakes --reap [--dry-run] [--include-running] [--agent A] [--max-attempts 3]` relaunches; default only jobs lost while queued; `--include-running` redoes mid-turn losses (msg prefixed `[reap]`; verify state first).
+Stored session id unknown to backend ("Session not found" etc.) -> ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`. Overload/503/529/connection reset/opencode free-tier 403 retried 2x (2s, 6s) only if the attempt produced no output (provider error events do not count). `AG_RETRY=0` disables. Rate limits (429 / `Rate limit exceeded` / `Endpoint is unavailable` / stall) use shared cooldown + backoff with per-model slots (opencode free default 4; `AG_MAX_CONCURRENT`, `AG_STALL_S`); `agents add|set --fallback MODEL` (repeatable, `""` clears) keeps work moving after 2 hits. Logged-out backend fails fast (probe). codex headless resumes via `exec --json`. gemini is stateless. Lost wake (worker died): `wakes --reap [--dry-run] [--include-running] [--agent A] [--max-attempts 3]` relaunches; default only jobs lost while queued; `--include-running` redoes mid-turn losses (msg prefixed `[reap]`; verify state first).
 
 ## Isolation: worktree per agent
 

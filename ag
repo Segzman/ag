@@ -8772,7 +8772,7 @@ def _retry_plan(sdir,name,backend,sid,rc,err,timed_out,got_output,rs,lock,t0,tim
 
 # ---- rate-limit manager: slots + stall watchdog + shared cooldown + fallback (one block) ----
 # Key = backend+model. Slots: fcntl.flock on $AG_CACHE_HOME/ratelimit/slots/<key>/<i>.lock,
-# default 2 for opencode free models, unlimited otherwise. Cooldown: .../cooldown/<key>.json
+# default 4 for opencode free models, unlimited otherwise. Cooldown: .../cooldown/<key>.json
 # {until, hits}, backoff 30,60,120,240,480 capped 600 (AG_RATELIMIT_BASE_S overrides base
 # for tests). Stall: AG_STALL_S (default 240 opencode, 0 off others). Fallback: agent
 # `fallback` list, after 2 primary hits use first non-cooling entry. Never raises into turns.
@@ -8800,7 +8800,7 @@ def _rl_is_free(backend, model):
     except Exception: pass
     return False
 def _rl_limit(backend, model):
-    """Max concurrent slots; 0 = unlimited. Config globs, env, then default 2 for free. Pure-ish."""
+    """Max concurrent slots; 0 = unlimited. Config globs, env, then default 4 for free. Pure-ish."""
     try: m = (eff_model(backend, model) or (model or "")).strip()
     except Exception: m = (model or "").strip()
     key = f"{backend}/{m}"
@@ -8825,7 +8825,7 @@ def _rl_limit(backend, model):
             _lv = _pl(backend, model)
             if isinstance(_lv, int) and _lv >= 0: return _lv
         except Exception: pass
-    return 2 if _rl_is_free(backend, model) else 0
+    return 4 if _rl_is_free(backend, model) else 0  # probe 2026-10-12: every live free model took 8 short calls at once; long agent turns trip a volume limit sooner
 def _rl_backoff(hits):
     try: base = float((os.environ.get("AG_RATELIMIT_BASE_S") or "30").strip() or 30)
     except Exception: base = 30.0
@@ -12449,7 +12449,7 @@ def do_selfcheck(a):
         assert _rl_key("opencode","default")=="opencode/"+OPENCODE_MODEL_DEFAULT
         assert _rl_is_free("opencode","default") and not _rl_is_free("claude","opus")
         assert _rl_is_free("opencode","opencode/big-pickle") and _rl_limit("claude","opus")==0
-        assert _rl_limit("opencode","default")==2
+        assert _rl_limit("opencode","default")==4
         os.environ["AG_MAX_CONCURRENT"]="5"; assert _rl_limit("opencode","default")==5
         del os.environ["AG_MAX_CONCURRENT"]
         os.environ["AG_RATELIMIT_BASE_S"]="0.2"; assert abs(_rl_backoff(1)-0.2)<1e-9 and abs(_rl_backoff(2)-0.4)<1e-9

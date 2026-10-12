@@ -112,6 +112,7 @@ class RatelimitE2E(unittest.TestCase):
         self.assertIn("ratelimit", ev)
 
     def test_c_three_parallel_limit_two(self):
+        self.env["AG_MAX_CONCURRENT"] = "2"  # explicit cap (default for free models is 4)
         for n in ("c1", "c2", "c3"):
             self.ag("agents", "add", n, "--backend", "opencode", "--role", "sub", "--dir", str(self.td))
         if (self.td / "calls.jsonl").exists(): (self.td / "calls.jsonl").unlink()

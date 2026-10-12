@@ -104,7 +104,12 @@ Pair a cheap Claude (haiku, mechanical/review job) with a zero-retention free mo
 
 | Cheap Claude | ZDR free second | Use for |
 |---|---|---|
-| TODO(bench) | TODO(bench) | TODO(bench) — fill after benchmarks |
+| haiku | `opencode/step-5-preview-free` (high) | bug/no-bug verdicts, security review, quick-fix review (most reliable zdr: 97%, ~30s) |
+| haiku | `opencode/space-bunny-free` (max) | one-commit / rote-diff sanity checks (fastest zdr, ~9s; weak on subtle logic) |
+| — (no paid tokens) | `space-bunny-free` + `longcat-2.5-preview-free` | free second opinion on work code; they fail differently (logic vs arithmetic/dates), so agreement is meaningful |
+| — (public/OSS code only) | `muse-spark-1.3-contributor-free` (xhigh) + `nemotron-3-ultra-free` | strongest free pair; both train/log on prompts, never work code |
+
+Benchmarked 2026-10-12 (12 auto-graded tasks x3; rerun with care: >2 concurrent free calls rate-limit the account). Avoid: `exo-free` (deprecated, 410), `ling-3.0-flash-fin-free` (unavailable), `ling-3.1-flash-free` (frequent empty replies). Don't trust nemotron/longcat alone on arithmetic or dates.
 
 Per-agent privacy guard applies: `work` agents refuse train/unknown models.
 

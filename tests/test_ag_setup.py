@@ -133,7 +133,7 @@ class AgSetup(unittest.TestCase):
         d = self.agj("setup", "--yes", "--scope", "global", "--harness", "claude,opencode,codex")["data"]
         rt = json.loads((self.cfg/"routing.json").read_text())
         self.assertEqual((rt["version"], rt["preset"]), (2, "cost-first"))
-        self.assertEqual(rt["profiles"]["claude"]["jobs"]["hardest"], {"claude": "fable", "ag": {"backend": "claude", "model": "fable"}})
+        self.assertEqual(rt.get("profiles", {}), {})  # sparse: defaults are inherited, not frozen into the file
         for base in (self.home/".claude", self.home/".config"/"opencode", self.home/".codex"):
             cli = (base/"skills"/"ag-cli"/"SKILL.md").read_text()
             self.assertEqual(cli, f"---\nname: ag-cli\n---\nrun {Path(AG).resolve()} models (global) keep {{{{OTHER}}}}\n")

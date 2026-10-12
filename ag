@@ -4463,7 +4463,9 @@ def mode_flags(backend, mode="", plan=False):
 def opencode_permission(mode="", plan=False):
     """Pure: opencode `permission` config block for the mode ({} = leave backend default)."""
     m = "ro" if plan else mode
-    return {"ro": {"edit": "deny", "bash": "deny"}, "edits": {"edit": "allow", "bash": "deny"},
+    # "ask", not "deny": deny drops the tool from the request and opencode Zen's free tier then
+    # 403s ("can only be used from within OpenCode"). Headless `opencode run` auto-rejects asks.
+    return {"ro": {"edit": "ask", "bash": "ask"}, "edits": {"edit": "allow", "bash": "ask"},
             "auto": {"edit": "allow", "bash": "allow"}, "full": {"*": "allow"}}.get(m, {})
 
 def mode_env(sdir, agent, env):

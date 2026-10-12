@@ -8724,7 +8724,7 @@ def classify_turn_failure(backend, rc, stderr, got_output):
     if not rc or got_output: return None
     t = _ANSI_RE.sub("", stderr or "")
     try:
-        if ctx_overflow_hit(t): return None
+        if _CTX_OVERFLOW_RE.search(t): return None  # error text only (not stream): loose match OK, never retry overflow
     except Exception: pass
     if _RESUME_MISSING_RE.search(t): return "resume_missing"
     if _RATELIMIT_RE.search(t): return "ratelimit"
@@ -8736,7 +8736,7 @@ def _retry_plan(sdir,name,backend,sid,rc,err,timed_out,got_output,rs,lock,t0,tim
     try:
         if os.environ.get("AG_RETRY","1").strip() == "0" or timed_out: return None
         try:
-            if ctx_overflow_hit(err): return None
+            if _CTX_OVERFLOW_RE.search(err or ""): return None
         except Exception: pass
         kind = classify_turn_failure(backend, rc, err, got_output)
         rs = rs or {"lock":lock,"t0":t0,"n":0,"resumed":False}
@@ -9083,8 +9083,22 @@ if "api" not in NATIVE_ORDER: NATIVE_ORDER = (*NATIVE_ORDER, "api")
 _CTX_OVERFLOW_RE = re.compile(r"ContextOverflowError|Request too large", re.I)
 _CTX_LIMIT_RE = re.compile(r"Limit\s*(\d+)[^\d]{0,30}Requested\s*(\d+)", re.I | re.S)
 def ctx_overflow_hit(line):
-    """True when a backend line is a context-overflow event. Pure."""
-    try: return bool(line and _CTX_OVERFLOW_RE.search(line if isinstance(line, str) else ""))
+    """True only for a real context-overflow signal: a top-level JSON `error` event
+    (opencode) or an `level=ERROR` log line. Text inside tool output/prose (e.g. an agent
+    reading a spec that mentions the error) must never match. Pure."""
+    if not isinstance(line, str) or not line: return False
+    try:
+        for ln in line.splitlines():
+            s = ln.strip()
+            if s.startswith("{"):
+                try: o = json.loads(s)
+                except Exception: continue
+                if isinstance(o, dict) and o.get("type") == "error":
+                    e = o.get("error"); e = e if isinstance(e, dict) else {}
+                    d = e.get("data"); d = d if isinstance(d, dict) else {}
+                    if e.get("name") == "ContextOverflowError" or _CTX_OVERFLOW_RE.search(str(d.get("message") or "")): return True
+            elif "level=ERROR" in s and _CTX_OVERFLOW_RE.search(s): return True
+        return False
     except Exception: return False
 def ctx_overflow_detail(text):
     """' (limit 8000, requested 12345)' when parsed, else ''. Pure."""
@@ -9486,7 +9500,8 @@ def _api_turn(sdir, name, text, on_event=None, command=None, on_start=None, time
                 except Exception: pass
     except Exception as e: return {"error": f"api: {type(e).__name__}: {str(e)[:200]}", "exit": 1, "sid": "", "reply": f"api: {type(e).__name__}: {str(e)[:200]}"}
 def api_selfcheck():
-    assert ctx_overflow_hit('{"type":"error","error":{"name":"ContextOverflowError"}}') and ctx_overflow_hit("Request too large for model") and not ctx_overflow_hit("hello")
+    assert ctx_overflow_hit('{"type":"error","error":{"name":"ContextOverflowError"}}') and ctx_overflow_hit('ts=x level=ERROR msg="Request too large for model"') and not ctx_overflow_hit("hello")
+    assert not ctx_overflow_hit('{"type":"tool_use","part":{"state":{"output":"spec: ContextOverflowError / Request too large"}}}') and not ctx_overflow_hit("Request too large for model")  # tool output/prose never matches
     assert ctx_overflow_detail("Limit 8000, Requested 12345") == " (limit 8000, requested 12345)" and ctx_overflow_detail("no numbers") == ""
     assert "backend=api" in ctx_overflow_msg("opencode", "groq/m", "Limit 8000, Requested 9000")
     assert api_split_model("groq/llama-3") == ("groq", "llama-3") and api_split_model("default") == (None, None) and api_split_model("nonslash") == (None, None)

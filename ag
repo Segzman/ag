@@ -12452,9 +12452,10 @@ def setup_targets(st):
     pj.update(st["pjobs"])
     gl = st["existing"].get("global") or {}
     if st.get("sparse"):  # keep only jobs that differ from what the profile inherits (built-in/preset, or global under a project): catalog picks stay live
+        sets, prim = st.get("sets") or {}, st.get("profile")
         def sp(p, j):
             b = routing_effective({"preset": st["preset"]}, None, p) if scope == "global" else routing_effective(gl, {"preset": st["preset"]}, p)
-            return {k: v for k, v in j.items() if v != {"claude": b[k]["claude"], "ag": dict(b[k]["ag"])}}
+            return {k: v for k, v in j.items() if v != {"claude": b[k]["claude"], "ag": dict(b[k]["ag"])} or (p == prim and k in sets)}
         pj = {p: sp(p, j) for p, j in pj.items()}
     keep = {k: v for k, v in (st["existing"].get(scope) or {}).items() if k not in ("version", "jobs", "profiles", "preset", "backends", "project")}  # e.g. catalog
     profs = {**ex["profiles"], **{p: {"jobs": j} for p, j in pj.items() if j or not st.get("sparse")}}
@@ -13170,6 +13171,7 @@ def do_setup(a):
         except ValueError as e: return emit(a, "setup", error=str(e))
     if getattr(a, "profile", None) and a.profile not in ROUTE_PROFILES: return emit(a, "setup", error=f"bad profile {a.profile!r}: {'|'.join(ROUTE_PROFILES)}")
     st = setup_state_from(scope, a.preset, sets, harn, a.claude_md, bsets=bsets, profile=getattr(a, "profile", None))
+    st["sparse"] = True  # terminal/non-web path saves sparsely like the web form: only differing jobs/fields (+ --set) are written
     if getattr(a, "answers", None) is not None:
         if a.harness is None: st["harnesses"] = []
         err = setup_apply_answers(st, ans, detect_harness()[0])
@@ -13282,6 +13284,10 @@ def _setup_selfcheck():
     e, s1, _ = setup_web_apply(s0, pj(), v2=False); assert not e and s1["jobs"]["plan"]["ag"] == {"backend": "codex", "model": "m"}
     assert setup_web_apply(s0, pj(scope="x"), v2=False)[0] and setup_web_apply(s0, pj(backends={"codex": {"mode": "zzz"}}), v2=False)[0]
     assert setup_web_apply(s0, pj(backends={"codex": {"enabled": False}}), v2=False)[0] and setup_web_apply(s0, pj(profiles={"x": {}}), v2=False)[0]
+    sp = setup_state_from("global", None, None, [], None, proj="/x", existing=ex, profile="claude"); sp["sparse"] = True
+    assert json.loads(setup_targets(sp)["plan"][0][1])["profiles"] == {}  # terminal saves sparsely: defaults inherited, not frozen
+    sp = setup_state_from("global", None, {"review": {"claude": "opus"}}, [], None, proj="/x", existing=ex, profile="claude"); sp["sparse"] = True
+    assert list(json.loads(setup_targets(sp)["plan"][0][1])["profiles"]["claude"]["jobs"]) == ["review"]  # --set kept even when equal
 
 def build():
     p = argparse.ArgumentParser(prog="ag", description="CLI helper for autonomous agents")

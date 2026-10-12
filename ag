@@ -6706,6 +6706,8 @@ def do_agents(a):
         if eerr: return emit(a,"agents",error=eerr)
         if (_ae := acp_check(be, getattr(a,"transport",None) or "", getattr(a,"acp_cmd",None))): return emit(a,"agents",error=_ae)
         if be=="opencode" and mod in ("","default"): mod = OPENCODE_MODEL_DEFAULT
+        _fb = getattr(a, "fallback", None)
+        _fbl = [s.strip() for s in _fb if (s or "").strip() and (s or "").strip() != ""] if _fb is not None else None
         wt, adir = None, a.adir or "."
         if getattr(a,"worktree",False):
             wt, err, hint = wt_create(a.name, adir, getattr(a,"base",None))
@@ -6716,6 +6718,7 @@ def do_agents(a):
             "instructions":[s for s in (getattr(a,"instructions",None) or []) if (s or "").strip()],
             **({"mode":a.mode} if getattr(a,"mode",None) else {}),**({"plan":True} if getattr(a,"plan",None) else {}),
             **({"worktree":wt} if wt else {}),**{k:getattr(a,k) for k in ("transport","acp_cmd","effort") if getattr(a,k,None)}})
+        if _fbl is not None: rows[-1]["fallback"] = _fbl
         rows[-1].update(eup)
         save_agents(sdir,rows)
         _mw = "\n".join(x for x in (mode_warning(be, getattr(a,"mode",None) or "", bool(getattr(a,"plan",None))),
@@ -6763,6 +6766,8 @@ def do_agents(a):
             if cfg_changed: updates["_clear_claude_sid"] = True
         for k in ("transport", "acp_cmd", "effort"):
             if getattr(a, k, None) is not None: updates[k] = getattr(a, k)
+        if getattr(a, "fallback", None) is not None:
+            updates["fallback"] = [s.strip() for s in (a.fallback or []) if (s or "").strip() and (s or "").strip() != ""]
         if "effort" in updates and updates["effort"]:
             _er = next((r for r in rows if r["name"] == a.name), {})
             _eb = updates.get("backend") or _er.get("backend", "claude")
@@ -8123,6 +8128,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         a = agents[name]
         backend = a.get("backend","claude")
         model = a.get("model","default") or "default"
+        if _rs and _rs.get("fb"): model = _rs["fb"]  # ratelimit fallback: this attempt runs on the fallback model
         workdir = os.path.abspath(a.get("dir",".") or ".")
         if command and backend != "opencode":
             _release_agent_turn(_turn_lock); _turn_lock = None
@@ -8205,11 +8211,46 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         _timed_out = {"hit": False}
         _watch_stop = threading.Event()
         _watcher = None
+        _rl_slot = None  # ratelimit: cooldown + slot waits are excluded from the runtime budget
+        try:
+            try: _cw = _rl_wait_cooldown(backend, model, sdir, name, on_event)
+            except Exception: _cw = 0.0
+            if _cw:
+                _t_guard += _cw
+                if _rs is not None and "t0" in _rs:
+                    try: _rs["t0"] = _t_guard
+                    except Exception: pass
+            try: _rl_slot, _sw = _rl_acquire_slot(backend, model, sdir, name, on_event)
+            except Exception: _rl_slot, _sw = None, 0.0
+            if _sw:
+                _t_guard += _sw
+                if _rs is not None and "t0" in _rs:
+                    try: _rs["t0"] = _t_guard
+                    except Exception: pass
+        except Exception: pass
         try:
             p = subprocess.Popen(argv,cwd=workdir,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,text=True,bufsize=1,env=env,
                 start_new_session=(os.name == "posix"))
             _backend_note(p.pid); _queue_running(sdir, name, p.pid)
+            try: _stall_s = _rl_stall_s(backend)
+            except Exception: _stall_s = 0
+            _stalled = {"hit": False}; _last_out = [time.monotonic()]; _stall_stop = threading.Event(); _stall_thr = None
+            if _stall_s and _stall_s > 0:
+                def _stall_watch():
+                    while not _stall_stop.is_set():
+                        try: idle = time.monotonic() - _last_out[0]
+                        except Exception: return
+                        if idle >= _stall_s:
+                            _stalled["hit"] = True
+                            try: _kill_tree(p)
+                            except Exception: pass
+                            return
+                        try: _stall_stop.wait(min(0.2, max(0.05, _stall_s - idle)))
+                        except Exception: return
+                _stall_thr = threading.Thread(target=_stall_watch, daemon=True)
+                try: _stall_thr.start()
+                except Exception: _stall_thr = None
             if timeout_s > 0 and _t_guard is not None:
                 _deadline = _t_guard + timeout_s
                 def _watch():
@@ -8236,6 +8277,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             et = threading.Thread(target=_drain, daemon=True)
             et.start()
             for line in _turn_source(p):
+                try: _last_out[0] = time.monotonic()
+                except Exception: pass
                 tl_ops = parse_timeline(backend,line,scope=buf.tl_scope)
                 # pure-delta/flush lines (fixture deltas, claude stream_event)
                 # are owned by the timeline engine; the legacy raw-line
@@ -8298,14 +8341,28 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         finally:
             try: _watch_stop.set()
             except Exception: pass
+            try: _stall_stop.set()
+            except Exception: pass
             try:
                 if _watcher is not None: _watcher.join(timeout=5)
             except Exception: pass
+            try:
+                if _stall_thr is not None: _stall_thr.join(timeout=5)
+            except Exception: pass
+            try: _rl_release_slot(_rl_slot)
+            except Exception: pass
             _backend_clear(); _intr = _queue_running(sdir, name, None)
             mark_running(name,False)
+        try:
+            if _stalled.get("hit") and not _timed_out.get("hit"):
+                if not rc: rc = 1
+                err = (err + f"\nstalled: no output for {_stall_s:g}s (backend killed)").strip()
+        except Exception: pass
         if _timed_out["hit"]:
             rc = 124
             err = (err + f"\nmax-runtime {timeout_s:g}s exceeded (backend killed)").strip()
+            try: _rl_release_slot(_rl_slot)
+            except Exception: pass
         if _intr: rc = 130; _event(sdir, "interrupted", name)
         full = "\n".join(c for c in chunks if c).strip()
         _erows = "\n".join(str(r.get("text","")) for r in buf.rows.values() if r.get("role")=="error")  # opencode reports provider errors as JSON events, not stderr
@@ -8369,6 +8426,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                 if _a is not None and _a.pop("pending_handoff", None) is not None:
                     save_agents(sdir, _rows)
             except Exception: pass
+            try: _rl_clear_cooldown(_rl_key(backend, model))  # ratelimit hits reset after a success
+            except Exception: pass
         return out
     finally:
         if not _rs: _release_agent_turn(_turn_lock)
@@ -8383,16 +8442,19 @@ _RESUME_MISSING_RE = re.compile(
     r"|(?:conversation|thread|chat) not found|could not find (?:session|conversation)"
     r"|invalid session", re.I)
 _TRANSIENT_RE = re.compile(
-    r"\b429\b|rate.?limit|too many requests|overloaded|\b529\b|\b503\b|service unavailable"
+    r"overloaded|\b529\b|\b503\b|service unavailable"
     r"|econnreset|stream (?:closed|ended|disconnected)|connection reset"
-    r"|free tier can only be used from within opencode", re.I)  # opencode zen 403, seen transient 2026-10-09
+    r"|free tier can only be used from within opencode", re.I)  # 5xx/network only; 429/rate-limit lives in _RATELIMIT_RE
+_RATELIMIT_RE = re.compile(
+    r"\b429\b|rate.?limit|too many requests|endpoint is unavailable|stalled", re.I)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 def classify_turn_failure(backend, rc, stderr, got_output):
-    """Pure. -> "resume_missing" | "transient" | None. Output already produced = None."""
+    """Pure. -> "resume_missing" | "ratelimit" | "transient" | None. Output already produced = None."""
     if not rc or got_output: return None
     t = _ANSI_RE.sub("", stderr or "")
     if _RESUME_MISSING_RE.search(t): return "resume_missing"
+    if _RATELIMIT_RE.search(t): return "ratelimit"
     if _TRANSIENT_RE.search(t): return "transient"
     return None
 
@@ -8403,7 +8465,8 @@ def _retry_plan(sdir,name,backend,sid,rc,err,timed_out,got_output,rs,lock,t0,tim
         kind = classify_turn_failure(backend, rc, err, got_output)
         rs = rs or {"lock":lock,"t0":t0,"n":0,"resumed":False}
         nx = dict(rs)
-        if kind == "resume_missing" and sid and not rs["resumed"]:
+        if "rl" not in nx: nx["rl"] = 0
+        if kind == "resume_missing" and sid and not rs.get("resumed"):
             meta = load_chat_meta(sdir,name)
             (meta.get("sids") or {}).pop(backend, None)
             if meta.get("backend", backend) == backend: meta["sid"] = ""
@@ -8418,16 +8481,314 @@ def _retry_plan(sdir,name,backend,sid,rc,err,timed_out,got_output,rs,lock,t0,tim
             _event(sdir,"resume_recover",name,backend=backend,old_sid=sid)
             if on_event: on_event(name,"tool",note)
             return nx
-        if kind == "transient" and rs["n"] < len(RETRY_BACKOFF_S):
-            wait = RETRY_BACKOFF_S[rs["n"]]
+        if kind == "transient" and rs.get("n",0) < len(RETRY_BACKOFF_S):
+            wait = RETRY_BACKOFF_S[rs.get("n",0)]
             if timeout_s and time.monotonic() + wait >= t0 + timeout_s: return None
-            _event(sdir,"transient_retry",name,backend=backend,attempt=rs["n"]+1,wait=wait,exit=rc)
+            _event(sdir,"transient_retry",name,backend=backend,attempt=rs.get("n",0)+1,wait=wait,exit=rc)
             time.sleep(wait)
-            nx["n"] = rs["n"] + 1
+            nx["n"] = rs.get("n",0) + 1
+            return nx
+        if kind == "ratelimit":
+            try: t0v = nx.get("t0", t0)
+            except Exception: t0v = t0
+            if timeout_s and timeout_s > 0:
+                try:
+                    if time.monotonic() >= t0v + timeout_s: return None
+                except Exception: pass
+            try: rows = load_agents(sdir)
+            except Exception: rows = []
+            ag0 = next((r for r in rows if r.get("name") == name), None)
+            prim = nx.get("prim") or ((ag0.get("model","default") or "default") if ag0 else "default")
+            nx["prim"] = prim
+            cur = nx.get("fb") or prim
+            try:
+                _rl_write_cooldown(_rl_key(backend, cur), (_rl_read_cooldown(_rl_key(backend, cur)).get("hits") or 0) + 1)
+                _event(sdir,"ratelimit",name,backend=backend,model=cur)
+            except Exception: pass
+            if not nx.get("fb"): nx["rl"] = (rs.get("rl") or 0) + 1
+            if (nx.get("rl") or 0) >= 2 and ag0 is not None:
+                try: pick = _rl_pick_fallback(ag0, backend, prim)
+                except Exception: pick = ""
+                if pick and pick != cur:
+                    note = f"[ratelimit] {eff_model(backend,prim) or prim} limited; using fallback {eff_model(backend,pick) or pick}"
+                    try: append_chat(sdir,name,"tool",note)
+                    except Exception: pass
+                    try: _event(sdir,"ratelimit_fallback",name,primary=prim,fallback=pick)
+                    except Exception: pass
+                    if on_event:
+                        try: on_event(name,"tool",note)
+                        except Exception: pass
+                    nx["fb"] = pick
+                    return nx
+                if nx.get("fb"): return nx
+                return nx
             return nx
     except Exception:
         pass
     return None
+
+# ---- rate-limit manager: slots + stall watchdog + shared cooldown + fallback (one block) ----
+# Key = backend+model. Slots: fcntl.flock on $AG_CACHE_HOME/ratelimit/slots/<key>/<i>.lock,
+# default 2 for opencode free models, unlimited otherwise. Cooldown: .../cooldown/<key>.json
+# {until, hits}, backoff 30,60,120,240,480 capped 600 (AG_RATELIMIT_BASE_S overrides base
+# for tests). Stall: AG_STALL_S (default 240 opencode, 0 off others). Fallback: agent
+# `fallback` list, after 2 primary hits use first non-cooling entry. Never raises into turns.
+def _rl_key(backend, model):
+    """Cache key backend/model (effective model). Pure."""
+    try: m = (eff_model(backend, model) or (model or "").strip() or "default")
+    except Exception: m = (model or "").strip() or "default"
+    return f"{backend}/{m}"
+def _rl_safe(key): return (re.sub(r"[^A-Za-z0-9_.-]", "_", key or "unknown")[:120] or "unknown")
+def _rl_base(): return ag_cache_home()/"ratelimit"
+def _rl_slots_dir(key): return _rl_base()/"slots"/_rl_safe(key)
+def _rl_cooldown_path(key): return _rl_base()/"cooldown"/(_rl_safe(key)+".json")
+def _rl_is_free(backend, model):
+    """Default-limited set: opencode free ids (ends -free, big-pickle) + catalog free. Pure-ish."""
+    if backend != "opencode": return False
+    try: m = (eff_model(backend, model) or (model or "")).strip()
+    except Exception: m = (model or "").strip()
+    ml = m.lower()
+    if ml.endswith("-free") or "big-pickle" in ml: return True
+    try:
+        f = globals().get("catalog_info")
+        if callable(f):
+            info = f(backend, model)
+            if isinstance(info, dict) and info.get("free"): return True
+    except Exception: pass
+    return False
+def _rl_limit(backend, model):
+    """Max concurrent slots; 0 = unlimited. Config globs, env, then default 2 for free. Pure-ish."""
+    try: m = (eff_model(backend, model) or (model or "")).strip()
+    except Exception: m = (model or "").strip()
+    key = f"{backend}/{m}"
+    try:
+        cfg = (_ag_conf().get("ratelimit") or {}).get("max_concurrent") or {}
+        if isinstance(cfg, dict):
+            for pat, n in cfg.items():
+                try:
+                    if fnmatch.fnmatch(key, str(pat)) or fnmatch.fnmatch(m, str(pat)):
+                        return max(0, int(n))
+                except Exception: continue
+    except Exception: pass
+    try:
+        ev = (os.environ.get("AG_MAX_CONCURRENT") or "").strip()
+        if ev:
+            n = int(ev)
+            if n > 0 and _rl_is_free(backend, model): return n
+    except Exception: pass
+    return 2 if _rl_is_free(backend, model) else 0
+def _rl_backoff(hits):
+    try: base = float((os.environ.get("AG_RATELIMIT_BASE_S") or "30").strip() or 30)
+    except Exception: base = 30.0
+    if not (base > 0): base = 30.0
+    try: h = int(hits)
+    except Exception: h = 1
+    if h < 1: h = 1
+    return min(base * (2 ** (h - 1)), 600.0)
+def _rl_read_cooldown(key):
+    try:
+        d = json.loads(_rl_cooldown_path(key).read_text())
+        until = float(d.get("until") or 0); hits = int(d.get("hits") or 0)
+        rem = until - time.time()
+        return {"until": until, "hits": hits, "remaining": rem if rem > 0 else 0}
+    except Exception: return {"until": 0, "hits": 0, "remaining": 0}
+def _rl_write_cooldown(key, hits):
+    try:
+        h = max(1, int(hits)); until = time.time() + _rl_backoff(h)
+        p = _rl_cooldown_path(key); p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"until": until, "hits": h}))
+        return until
+    except Exception: return 0
+def _rl_clear_cooldown(key):
+    try: _rl_cooldown_path(key).unlink()
+    except Exception: pass
+def _rl_tool_note(sdir, name, note, on_event, ev="ratelimit_wait", **kw):
+    try: append_chat(sdir, name, "tool", note)
+    except Exception: pass
+    try: _event(sdir, ev, name, **kw)
+    except Exception: pass
+    if on_event:
+        try: on_event(name, "tool", note)
+        except Exception: pass
+def _rl_wait_cooldown(backend, model, sdir, name, on_event):
+    """Sleep out shared cooldown; emits one tool row. Returns seconds waited. Never raises."""
+    try: key = _rl_key(backend, model)
+    except Exception: return 0.0
+    start = time.monotonic(); first = True
+    while True:
+        try: rem = _rl_read_cooldown(key).get("remaining") or 0
+        except Exception: return max(0.0, time.monotonic() - start) if not first else 0.0
+        if rem <= 0: break
+        if first:
+            first = False
+            try: m = eff_model(backend, model) or model
+            except Exception: m = model
+            _rl_tool_note(sdir, name, f"[ratelimit] cooling down {m} {int(rem + 0.999)}s", on_event, ev="ratelimit_cooldown", model=str(m), wait=int(rem + 0.999))
+        try: time.sleep(min(rem, 0.2))
+        except Exception: break
+    return 0.0 if first else max(0.0, time.monotonic() - start)
+def _rl_acquire_slot(backend, model, sdir, name, on_event):
+    """Hold one flock slot; waits with one tool row. Returns ((f,path), waited). Never raises."""
+    try: lim = _rl_limit(backend, model)
+    except Exception: return (None, 0.0)
+    if not lim: return (None, 0.0)
+    try: key = _rl_key(backend, model)
+    except Exception: return (None, 0.0)
+    import fcntl
+    try: d = _rl_slots_dir(key); d.mkdir(parents=True, exist_ok=True)
+    except Exception: return (None, 0.0)
+    start = time.monotonic(); emitted = False
+    while True:
+        for i in range(lim):
+            p = d/f"{i}.lock"
+            try: p.touch(exist_ok=True)
+            except Exception: continue
+            try: f = open(p, "r+b")
+            except Exception:
+                try: f = open(p, "w+b")
+                except Exception: continue
+            try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                try: f.close()
+                except Exception: pass
+                continue
+            try:
+                f.seek(0); f.truncate()
+                f.write(json.dumps({"pid": os.getpid(), "agent": name, "ts": now_iso()}).encode()[:500]); f.flush()
+            except Exception: pass
+            return ((f, p), max(0.0, time.monotonic() - start))
+        if not emitted:
+            emitted = True
+            try: m = eff_model(backend, model) or model
+            except Exception: m = model
+            _rl_tool_note(sdir, name, f"[ratelimit] waiting for a slot on {m} ({lim} busy)", on_event, ev="ratelimit_wait", model=str(m), limit=lim)
+        try: time.sleep(0.2)
+        except Exception: return (None, max(0.0, time.monotonic() - start))
+def _rl_release_slot(h):
+    if not h: return
+    try:
+        f, p = h
+        try:
+            import fcntl; fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception: pass
+        try: f.close()
+        except Exception: pass
+        try:
+            import fcntl; f2 = open(p, "r+b")
+            try:
+                fcntl.flock(f2.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try: f2.seek(0); f2.truncate(); f2.flush()
+                except Exception: pass
+                try: fcntl.flock(f2.fileno(), fcntl.LOCK_UN)
+                except Exception: pass
+            except OSError: pass
+            finally:
+                try: f2.close()
+                except Exception: pass
+        except Exception: pass
+    except Exception: pass
+def _rl_stall_s(backend):
+    v = (os.environ.get("AG_STALL_S") or "").strip()
+    if v != "":
+        try: f = float(v); return f if f > 0 else 0
+        except Exception: return 0
+    return 240.0 if backend == "opencode" else 0
+def _rl_pick_fallback(agent, backend, primary):
+    """First fallback not cooling down, same backend, privacy-respecting. Returns model or ''. Never raises."""
+    try:
+        fbs = agent.get("fallback") or []
+        if isinstance(fbs, str): fbs = [fbs]
+        out = []
+        for x in fbs:
+            s = (x or "").strip()
+            if s and s not in out: out.append(s)
+        for fb in out:
+            if fb == primary: continue
+            try:
+                pf = globals().get("model_privacy")
+                if callable(pf) and (agent.get("data") or "work") != "public":
+                    order = {"zdr": 0, "retain": 1, "train": 2, "unknown": 2}
+                    pp = pf(backend, primary); fp = pf(backend, fb)
+                    if order.get(fp, 2) > order.get(pp, 2): continue
+            except Exception: pass
+            try:
+                if _rl_read_cooldown(_rl_key(backend, fb)).get("remaining") or 0: continue
+            except Exception: pass
+            return fb
+    except Exception: pass
+    return ""
+def _rl_slot_holders(key):
+    """[(idx, pid, agent)] for locked slots. Never raises."""
+    out = []
+    try:
+        import fcntl
+        d = _rl_slots_dir(key)
+        for p in sorted(d.glob("*.lock")):
+            try: f = open(p, "rb")
+            except Exception: continue
+            try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                try:
+                    holder = json.loads(p.read_text() or "{}")
+                    out.append((p.stem, holder.get("pid"), holder.get("agent")))
+                except Exception: out.append((p.stem, None, None))
+                try: f.close()
+                except Exception: pass
+                continue
+            try:
+                import fcntl as _f; _f.flock(f.fileno(), _f.LOCK_UN)
+            except Exception: pass
+            try: f.close()
+            except Exception: pass
+    except Exception: pass
+    return out
+def do_ratelimit(a):
+    """`ag ratelimit [--json]` status; `ag ratelimit clear [KEY]` drops cooldowns."""
+    op = (getattr(a, "op", None) or "").strip()
+    key = (getattr(a, "key", None) or "").strip()
+    base = _rl_base()
+    if op == "clear":
+        if key:
+            _rl_clear_cooldown(key)
+            return emit(a, "ratelimit", {"_text": f"cleared {key}", "cleared": [key]})
+        n = 0
+        try:
+            for p in (base/"cooldown").glob("*.json"):
+                try: p.unlink(); n += 1
+                except Exception: pass
+        except Exception: pass
+        return emit(a, "ratelimit", {"_text": f"cleared {n} cooldown(s)", "cleared": n})
+    slots = {}; cooldowns = {}
+    try:
+        for d in (base/"slots").iterdir() if (base/"slots").is_dir() else []:
+            try: k = d.name
+            except Exception: continue
+            holders = []
+            for idx, pid, ag in _rl_slot_holders(k):
+                holders.append({"slot": idx, "pid": pid, "agent": ag})
+            if holders: slots[k] = holders
+    except Exception: pass
+    try:
+        for p in (base/"cooldown").glob("*.json") if (base/"cooldown").is_dir() else []:
+            try:
+                d = json.loads(p.read_text())
+                rem = float(d.get("until") or 0) - time.time()
+                if rem < 0: rem = 0
+                cooldowns[p.stem] = {"remaining": int(rem + 0.999), "hits": int(d.get("hits") or 0)}
+            except Exception: continue
+    except Exception: pass
+    data = {"slots": slots, "cooldowns": cooldowns}
+    if getattr(a, "json", False): return emit(a, "ratelimit", data)
+    lines = []
+    if slots:
+        for k, hs in sorted(slots.items()):
+            for h in hs: lines.append(f"slot {k}/{h['slot']}: pid {h['pid']} agent {h['agent']}")
+    else: lines.append("slots: idle")
+    if cooldowns:
+        for k, c in sorted(cooldowns.items()):
+            lines.append(f"cooldown {k}: {c['remaining']}s remaining (hits {c['hits']})")
+    else: lines.append("cooldowns: none")
+    return emit(a, "ratelimit", {**data, "_text": "\n".join(lines)})
 
 def do_handoff(a):
     """Native interactive handoff reachable from CLI.
@@ -11321,6 +11682,31 @@ def do_selfcheck(a):
         append_chat(td,"t1","user","hello")
         assert "user: hello" in recent_history(td,"t1")
         assert do_status(mk())==0
+        assert classify_turn_failure("opencode",1,"Rate limit exceeded",False)=="ratelimit"
+        assert classify_turn_failure("opencode",1,"Endpoint is unavailable",False)=="ratelimit"
+        assert classify_turn_failure("opencode",1,"stalled: no output for 1s (backend killed)",False)=="ratelimit"
+        assert classify_turn_failure("claude",1,"503 service unavailable",False)=="transient"
+        assert classify_turn_failure("opencode",1,"429 too many requests",True) is None
+        assert _rl_key("opencode","default")=="opencode/"+OPENCODE_MODEL_DEFAULT
+        assert _rl_is_free("opencode","default") and not _rl_is_free("claude","opus")
+        assert _rl_is_free("opencode","opencode/big-pickle") and _rl_limit("claude","opus")==0
+        assert _rl_limit("opencode","default")==2
+        os.environ["AG_MAX_CONCURRENT"]="5"; assert _rl_limit("opencode","default")==5
+        del os.environ["AG_MAX_CONCURRENT"]
+        os.environ["AG_RATELIMIT_BASE_S"]="0.2"; assert abs(_rl_backoff(1)-0.2)<1e-9 and abs(_rl_backoff(2)-0.4)<1e-9
+        del os.environ["AG_RATELIMIT_BASE_S"]
+        assert abs(_rl_backoff(1)-30)<1e-9 and _rl_backoff(99)==600
+        assert _rl_stall_s("opencode")==240.0
+        os.environ["AG_STALL_S"]="1"; assert _rl_stall_s("opencode")==1 and _rl_stall_s("claude")==1
+        del os.environ["AG_STALL_S"]
+        assert _rl_stall_s("claude")==0
+        assert _rl_pick_fallback({"fallback":["b"],"model":"a"},"opencode","a") in ("b","")
+        assert do_agents(mk(sub="add",name="rlfb",backend="echo",model="default",adir=".",role="sub",fallback=["m1","m2"]))==0
+        assert [x for x in load_agents(td) if x["name"]=="rlfb"][0]["fallback"]==["m1","m2"]
+        assert do_agents(mk(sub="set",name="rlfb",fallback=[""]))==0
+        assert [x for x in load_agents(td) if x["name"]=="rlfb"][0]["fallback"]==[]
+        assert do_agents(mk(sub="rm",name="rlfb",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
+        assert do_ratelimit(mk(op="",key=""))==0
         # tui regressions: theme var never shadowed, responsive breaks, wrap, labels
         import pathlib as _pl
         _src = [l for l in _pl.Path(__file__).read_text().splitlines() if "theme dict clobbered" not in l]
@@ -11654,9 +12040,11 @@ def do_selfcheck(a):
             ("codex","Error: thread/resume: thread/resume failed: no rollout found for thread id 0000 (code -32600)")):
         assert classify_turn_failure(_b,1,_e,False)=="resume_missing", _b
         assert classify_turn_failure(_b,1,_e,True) is None and classify_turn_failure(_b,0,_e,False) is None
-    for _e in ("API Error: 429 rate_limit_error","Overloaded","HTTP 529","503 Service Unavailable","read ECONNRESET","stream closed unexpectedly",
+    for _e in ("Overloaded","HTTP 529","503 Service Unavailable","read ECONNRESET","stream closed unexpectedly",
             "{'name': 'APIError', 'data': {'message': \"OpenCode's free tier can only be used from within OpenCode\", 'statusCode': 403"):
         assert classify_turn_failure("claude",1,_e,False)=="transient", _e
+    for _e in ("API Error: 429 rate_limit_error","Rate limit exceeded","Endpoint is unavailable"):
+        assert classify_turn_failure("claude",1,_e,False)=="ratelimit", _e
     assert classify_turn_failure("claude",1,"Authentication required",False) is None
     # turn queue: steer prio first, FIFO by seq within prio; dead-pid tickets reaped
     assert sorted([_ticket_name(5,10,"b"),_ticket_name(0,11,"c"),_ticket_name(5,9,"a")])==[_ticket_name(0,11,"c"),_ticket_name(5,9,"a"),_ticket_name(5,10,"b")]
@@ -13613,9 +14001,9 @@ def build():
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort: claude --effort, opencode --variant (e.g. max), codex model_reasoning_effort ("" clears)')
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort: claude --effort, opencode --variant (e.g. max), codex model_reasoning_effort ("" clears)'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)')
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort: claude --effort, opencode --variant (e.g. max), codex model_reasoning_effort ("" clears)')
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort: claude --effort, opencode --variant (e.g. max), codex model_reasoning_effort ("" clears)'); ags2.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)')
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)
@@ -13683,6 +14071,7 @@ def build():
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
     mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by Artificial Analysis intelligence/coding/agentic score, speed, tier (openrouter.ai/rankings + models.dev)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only"); mo.add_argument("--sort",choices=("intel","coding","speed","popular"),default=None,help="rank order (implies --rank)"); mo.add_argument("--auto",choices=("on","off"),default=None,help="toggle background catalog refresh (config.json catalog_auto)"); mo.add_argument("--status",action="store_true",help="last fetch per catalog source + auto state"); mo.add_argument("--bg",action="store_true",help=argparse.SUPPRESS)
     rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS); rt.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile to show (default: detected harness)"); rt.add_argument("--json",action="store_true",default=argparse.SUPPRESS); rt.add_argument("--check",action="store_true",help="per-project setup check: configured? + questions to ask the user")
+    rl=sub.add_parser("ratelimit",help="rate-limit slots + cooldowns (opencode free-tier)"); rl.add_argument("op",nargs="?",default=None,help="clear"); rl.add_argument("key",nargs="?",default=None,help="cooldown key backend/model (clear one)")
     st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] | backend.B.(enabled|model|mode|plan|effort)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
     return p
 
@@ -14199,7 +14588,7 @@ def main(argv=None):
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
         "delegate":do_delegate,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
-        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"queue":do_queue,"stop":do_stop}[a.subcmd]
+        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)
 

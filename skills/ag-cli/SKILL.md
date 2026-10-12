@@ -106,6 +106,11 @@ Scheduled wakes live in `ag-agents`. One global launchd job drives all state dir
 
 Registry `$AG_CONFIG_HOME/schedule-dirs.json`. Concurrent ticks are lock-safe; corrupt `schedules.json` refuses the tick.
 
+```sh
+{{AG}} --dir <state> ratelimit [--json]          # slots in use (pid, agent) + cooldowns
+{{AG}} --dir <state> ratelimit clear [KEY]       # drop one/all cooldowns
+```
+
 ## Sanity
 
 `{{AG}} selfcheck` (regression checks, own temp dir) · `{{AG}} keys` (TUI cheat-sheet) · `{{AG}} agents doctor` (backends + rtk).

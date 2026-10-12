@@ -10,8 +10,8 @@ import unittest
 from importlib.machinery import SourceFileLoader
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-KEY_FLAG_CMDS = [["setup"], ["models"], ["schedule", "add"], ["agents", "add"], ["wake"],
-                 ["chat", "send"], ["queue"], ["stop"], ["harness", "use"]]
+KEY_FLAG_CMDS = [["setup"], ["models"], ["schedule", "add"], ["agents", "add"], ["agents", "set"], ["wake"],
+                 ["chat", "send"], ["queue"], ["stop"], ["harness", "use"], ["ratelimit"]]
 SKIP_FLAGS = {"--help", "--json"}
 
 

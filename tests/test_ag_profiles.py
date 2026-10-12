@@ -74,7 +74,7 @@ class Profiles(unittest.TestCase):
         self.agj("setup", "--yes", "--harness", "none", env={"AG_HARNESS": "opencode"})
         doc = self.rt()
         self.assertEqual(doc["version"], 2); self.assertNotIn("jobs", doc)
-        self.assertEqual(set(doc["profiles"]), {"default", "claude", "opencode"})
+        self.assertEqual(set(doc["profiles"]), {"default", "claude"})  # sparse: opencode inherits the built-in table, not frozen
         self.assertEqual(doc["profiles"]["claude"]["jobs"]["plan"]["claude"], "haiku")
 
     def test_agents_add_job_uses_active_profile(self):
@@ -152,7 +152,10 @@ class Profiles(unittest.TestCase):
         self.assertEqual(pr["claude"]["jobs"]["plan"]["ag"], {"backend": "claude", "model": "haiku"})
         self.assertEqual(pr["codex"]["jobs"]["plan"]["ag"]["backend"], "codex")
         self.agj("setup", "--answers", json.dumps({"use": "strong"}), env={"AG_HARNESS": "claude"})
-        self.assertEqual(self.rt("project")["profiles"]["claude"]["jobs"]["hardest"]["ag"]["model"], "fable")
+        pj = self.rt("project")["profiles"]["claude"]["jobs"]
+        self.assertEqual(pj["implement"]["ag"], {"backend": "claude", "model": "opus"})  # sparse: only jobs differing from the preset are frozen
+        self.assertNotIn("hardest", pj)  # fable == preset default: inherited, not frozen
+        self.assertEqual(self.agj("route", "hardest", env={"AG_HARNESS": "claude"})["data"]["jobs"]["hardest"]["ag"]["model"], "fable")
         self.assertEqual(self.agj("route", "plan", env={"AG_HARNESS": "claude"})["data"]["jobs"]["plan"]["ag"]["model"], "opus")
         self.agj("setup", "--answers", json.dumps({"use": "custom", "jobs": {"review": "codex/gpt-x", "debug": "sonnet"}}), env={"AG_HARNESS": "claude"})
         j = self.agj("route", env={"AG_HARNESS": "claude"})["data"]["jobs"]

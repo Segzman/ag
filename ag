@@ -8817,7 +8817,9 @@ def _rl_slots_dir(key): return _rl_base()/"slots"/_rl_safe(key)
 def _rl_cooldown_path(key): return _rl_base()/"cooldown"/(_rl_safe(key)+".json")
 def _rl_is_free(backend, model):
     """Default-limited set: opencode free ids (ends -free, big-pickle) + catalog free. Pure-ish."""
-    if backend != "opencode": return False
+    if backend != "opencode":
+        try: return or_slot_limit(backend, model) is not None  # openrouter :free
+        except Exception: return False
     try: m = (eff_model(backend, model) or (model or "")).strip()
     except Exception: m = (model or "").strip()
     ml = m.lower()
@@ -8855,6 +8857,10 @@ def _rl_limit(backend, model):
             _lv = _pl(backend, model)
             if isinstance(_lv, int) and _lv >= 0: return _lv
         except Exception: pass
+    try:  # openrouter :free default 2 (openrouter-catalog; account rpd 50/1000 feeds `ag usage`)
+        _osl = or_slot_limit(backend, model)
+        if isinstance(_osl, int) and _osl >= 0: return _osl
+    except Exception: pass
     return 4 if _rl_is_free(backend, model) else 0  # probe 2026-10-12: every live free model took 8 short calls at once; long agent turns trip a volume limit sooner
 def _rl_backoff(hits):
     try: base = float((os.environ.get("AG_RATELIMIT_BASE_S") or "30").strip() or 30)
@@ -9186,11 +9192,13 @@ def api_validate(backend, model):
         if not isinstance(ps, dict) or pid not in ps: return f"no such provider: {pid} (ag providers list)"
     except Exception: pass
     return None
-def _api_http_once(base_url, key, model_id, messages, timeout_s, stream=True):
+def _api_http_once(base_url, key, model_id, messages, timeout_s, stream=True, _extra=None):
     """One POST /chat/completions. Returns (text, usage, ratelimit_s|None, err). Key never logged."""
     import urllib.request, urllib.error
     url = (base_url or "").strip().rstrip("/") + "/chat/completions"
     body = {"model": model_id, "messages": messages, "max_tokens": api_max_tokens(), "stream": bool(stream)}
+    if isinstance(_extra, dict):  # e.g. openrouter work routing {"provider": {"data_collection": "deny", "zdr": True}}
+        for k, v in _extra.items(): body[k] = {**body[k], **v} if isinstance(v, dict) and isinstance(body.get(k), dict) else v
     if stream: body["stream_options"] = {"include_usage": True}
     try: data = json.dumps(body).encode()
     except Exception as e: return "", {}, None, f"api: cannot encode request: {e}"
@@ -9403,7 +9411,8 @@ def _api_turn(sdir, name, text, on_event=None, command=None, on_start=None, time
                         except Exception: pass
                         return {"error": _e, "exit": 2, "sid": "", "reply": _e}
                     ckey = str(ckey)
-                    txt, us, rls, err = _api_http_once(cbase, ckey, cmid or mid, msgs, 0, stream=True)
+                    txt, us, rls, err = _api_http_once(cbase, ckey, cmid or mid, msgs, 0, stream=True,
+                        _extra=or_work_body(backend, cur, agent_data(a)))
                     if err == "429":
                         rl_hits += 1
                         try: kh = _rl_key(backend, cur)
@@ -13296,6 +13305,7 @@ def do_selfcheck(a):
     secret_selfcheck()
     keys_selfcheck()
     api_selfcheck()
+    orcat_selfcheck()
     _setup_selfcheck()
     _acp_selfcheck(str(td))
     assert compat_verdict("claude","2.1.10")=="graceful" and compat_verdict("claude","2.1.289")=="ok" and auth_parse("codex","Not logged in")=="no"
@@ -13312,7 +13322,7 @@ def do_selfcheck(a):
 # AG_CONFIG_HOME (default $AG_HOME/.config/ag) holds routing.json; AG_CACHE_HOME
 # (default $AG_HOME/.cache/ag) holds models.json; AG_SKILLS_DIR overrides the
 # skill template dir (default <ag dir>/skills). Tests point all of them at a tmp dir.
-MODEL_BACKENDS = ("claude", "opencode", "codex", "cursor", "gemini")
+MODEL_BACKENDS = ("claude", "opencode", "codex", "cursor", "gemini", "openrouter")
 MODELS_TTL_S = 24 * 3600
 MODELS_STATIC = {
     "claude": (["default", "fable", "opus", "sonnet", "haiku"], "static (claude CLI has no list command)"),
@@ -13393,6 +13403,15 @@ def parse_model_lines(out):
 
 def _models_fetch(b):
     """(ids, source, error) for one backend; error == '' on success."""
+    if b == "openrouter":  # public list; rich docs land in openrouter-models.json as a side effect
+        url = or_models_url()
+        try:
+            docs = _or_trim_models(_http_json(url, {"User-Agent": OR_UA, "Accept": "application/json"}, 15))
+            if not docs: return [], url, "empty model list"
+            try: _put_file(or_models_path(), json.dumps({"fetched_at": now_iso(), "attempted_at": now_iso(), "error": "", "data": docs}) + "\n")
+            except OSError: pass
+            return [d["id"] for d in docs], url, ""
+        except Exception as e: return [], url, str(e)[:200]
     if b in MODELS_STATIC:
         ids, src = MODELS_STATIC[b]
         return list(ids), src, ""
@@ -13600,9 +13619,16 @@ def do_models(a):
             f'  openrouter rankings  {fa(o["fetched_at"])}' + "".join(f'; {k} {_ago(v)}' for k, v in o["parts"].items()) + (f'; error: {o["error"]}' if o["error"] else ""),
             f'  models.dev           {fa(src["models.dev"]["fetched_at"])}',
             f'  artificial analysis  {"api key set, " + fa(src["artificial_analysis_api"]["fetched_at"]) if src["artificial_analysis_api"]["enabled"] else "no AG_AA_KEY (optional)"}',
-            f'  zen privacy          {fa(src["zen_privacy"]["fetched_at"])}' + (f'; error: {src["zen_privacy"]["error"]}' if src["zen_privacy"]["error"] else "")]
+            f'  zen privacy          {fa(src["zen_privacy"]["fetched_at"])}' + (f'; error: {src["zen_privacy"]["error"]}' if src["zen_privacy"]["error"] else ""),
+            f'  openrouter models    {fa(src["openrouter"]["openrouter_models"]["fetched_at"])}' + (f'; error: {src["openrouter"]["openrouter_models"]["error"]}' if src["openrouter"]["openrouter_models"]["error"] else ""),
+            f'  openrouter policies  {fa(src["openrouter"]["openrouter_policies"]["fetched_at"])} ({src["openrouter"]["openrouter_policies"]["models"]} models)']
         t += [f"  {b} model list".ljust(23) + fa(v) for b, v in src["model_lists"].items()]
         return emit(a, "models", {"status": True, "sources": src, "_text": "\n".join(t)})
+    if getattr(a, "backend", None) == "openrouter":  # tools-support rows + endpoint dataPolicy class
+        rows = or_catalog_rows(free=bool(a.free), zdr=bool(getattr(a, "zdr", False)), tier=a.tier, sort=a.sort or "intel", refresh=bool(a.refresh))
+        src = catalog_sources()
+        return emit(a, "models", {"rank": True, "sort": a.sort or "intel", "models": rows, "sources": src,
+            "_text": or_rank_text(rows, src) if rows else "no models match"})
     cache = models_load(bs := [a.backend] if a.backend else list(MODEL_BACKENDS), refresh=a.refresh)
     if a.rank or a.tier or a.free or a.sort or getattr(a, "zdr", False):
         rows = [r for r in catalog_rows(a.backend, refresh=a.refresh, sort=a.sort or "intel") if (not a.tier or r["tier"] == a.tier) and (not a.free or r["free"]) and (not getattr(a, "zdr", False) or r.get("data") == "zdr")]
@@ -13854,6 +13880,7 @@ def catalog_sources():
         "artificial_analysis_api": {"enabled": bool(aa_key()), "fetched_at": aa.get("fetched_at")},
         "zen_privacy": {"url": os.environ.get("AG_ZEN_URL") or OPENCODE_ZEN_URL, "fetched_at": zp.get("fetched_at"), "error": zp.get("error") or None,
             "what": "opencode.ai/docs/zen Privacy (zero-retention vs train/log)"},
+        "openrouter": or_sources(),
         "model_lists": {b: (e or {}).get("checked_at") for b, e in (ml.get("backends") or {}).items()}, "auto": catalog_auto_on()}
 
 def catalog_attribution(src):
@@ -13930,6 +13957,11 @@ def _zen_lists():
     return ([str(x).lower() for x in (d.get("zdr") or [])], [str(x).lower() for x in (d.get("retain") or [])], [str(x).lower() for x in (d.get("train") or [])])
 def model_privacy(backend, model):
     """'zdr'|'retain'|'train'|'unknown' for a backend/model id. Built-in table + live Zen cache; unknown free opencode = train. Pure of roster."""
+    try:  # per-endpoint OpenRouter dataPolicy beats the registry default (openrouter-catalog)
+        _odc = or_data_class(backend, model)
+        if _odc in ("zdr", "retain", "train"): return _odc
+        if _odc == "unknown": return "train"
+    except Exception: pass
     _pf = globals().get("provider_privacy")
     if callable(_pf):
         try:
@@ -13977,6 +14009,10 @@ def agent_data(a, default=None):
 def privacy_error(backend, model, data="work"):
     """Error string when a work agent may not use the model, else None. Pure."""
     if privacy_off() or (data or "work").strip().lower() != "work": return None
+    try:  # openrouter via opencode cannot enforce ZDR (no provider-routing passthrough)
+        _ooe = or_opencode_refusal(backend, model, data)
+        if _ooe: return _ooe
+    except Exception: pass
     eff = eff_model(backend, model)
     p = model_privacy(backend, eff or model)
     if p in ("train", "unknown"):
@@ -14203,6 +14239,10 @@ def _usage_rpd():
                     r = int((pv.get("rpd") if isinstance(pv, dict) else pv) or 0)
                     if r > 0 and pk not in ("version",): out[str(pk)] = r
                 except Exception: continue
+    except Exception: pass
+    try:  # openrouter account tier (50/day free, 1000 after $10); explicit budget wins
+        _orpd = or_account_rpd()
+        if isinstance(_orpd, int) and _orpd > 0: out.setdefault("openrouter", _orpd)
     except Exception: pass
     try:
         for pk, r in (budget_load().get("providers") or {}).items(): out[str(pk)] = r
@@ -14507,6 +14547,247 @@ def catalog_rank_text(rows, sources=None):
                 f'{n(r["agentic"]).rjust(7)}  {n(r["speed"], "{:.0f}").rjust(5)}  {lat.rjust(7)}  {_fmt_ctx(r["context"]).rjust(4)}  {_fmt_cost(r).ljust(10)}  '
                 f'{(r["released"] or "-").ljust(10)}  ' + ("|".join(r["variants"]) if r.get("variants") else "-") + "  " + " ".join(x for x, f in (("new", r["new"]), ("fast", r["fast"])) if f))
     return "\n".join(x.rstrip() for x in out)
+
+# ---- OpenRouter catalog: rank + privacy-classify openrouter.ai models (spec: openrouter-catalog) ----
+# FACTS (verified 2026-10-12): GET https://openrouter.ai/api/v1/models lists models (ids like
+# poolside/laguna-s-2.1:free, context_length, pricing, supported_parameters);
+# /api/v1/models/<id>/endpoints has provider/uptime but NO data policy; /api/v1/providers has
+# only policy URLs. The page https://openrouter.ai/<id>/providers embeds one
+# "dataPolicy":{"training":bool,"trainingOpenRouter":bool,"retainsPrompts":bool,...} per
+# endpoint in the escaped Next.js payload (unescape \\"). Work-request fields per
+# https://openrouter.ai/docs/features/provider-routing (provider.data_collection: deny)
+# and https://openrouter.ai/docs/features/zdr (provider.zdr): work turns send
+# {"provider": {"data_collection": "deny", "zdr": true}}. Opencode provider config
+# (https://opencode.ai/docs/providers/ custom provider + https://opencode.ai/docs/config/
+# provider options) only carries npm/options {baseURL, apiKey, timeouts...} — no per-request
+# provider-routing passthrough, so work agents on openrouter models via opencode are refused.
+# ponytail: 24h caches, failure keeps last; policies fetched only for shown models
+# (free + top 60 by intel), at most OR_POLICY_PAR parallel.
+OR_MODELS_URL = "https://openrouter.ai/api/v1/models"
+OR_SITE_URL = "https://openrouter.ai"
+OR_KEY_URL = "https://openrouter.ai/api/v1/key"
+OR_POLICY_PAR = 4
+OR_POLICY_TOP = 60
+_OR_POLICY_RE = re.compile(r'"dataPolicy"\s*:\s*\{([^}]*)\}')
+def or_models_url(): return (os.environ.get("AG_OR_MODELS_URL") or OR_MODELS_URL).strip()
+def or_site_url(): return (os.environ.get("AG_OR_SITE_URL") or OR_SITE_URL).strip().rstrip("/")
+def or_key_url(): return (os.environ.get("AG_OR_KEY_URL") or OR_KEY_URL).strip()
+def or_models_path(): return ag_cache_home()/"openrouter-models.json"
+def or_policies_path(): return ag_cache_home()/"openrouter-policies.json"
+def or_key_path(): return ag_cache_home()/"openrouter-key.json"
+def _or_float(v):
+    try: f = float(v)
+    except (TypeError, ValueError): return None
+    return f if f >= 0 else None
+def _or_trim_models(raw):
+    """[{id, ctx, cost_in, cost_out, tools, free}] from /api/v1/models. Pure; free = :free or $0/$0."""
+    out = []
+    for m in ((raw or {}).get("data") or []):
+        if not isinstance(m, dict) or not m.get("id"): continue
+        ci, co = _or_float((m.get("pricing") or {}).get("prompt")), _or_float((m.get("pricing") or {}).get("completion"))
+        out.append({"id": m["id"], "ctx": m.get("context_length") if isinstance(m.get("context_length"), int) else None,
+            "cost_in": ci, "cost_out": co, "tools": "tools" in (m.get("supported_parameters") or []),
+            "free": m["id"].endswith(":free") or (ci == 0 and co == 0)})
+    return out
+def or_models_refresh():
+    """Fetch + cache the trimmed model list. Returns (docs, err); failure keeps last cache. Never raises."""
+    url = or_models_url()
+    try:
+        docs = _or_trim_models(_http_json(url, {"User-Agent": OR_UA, "Accept": "application/json"}, 15))
+        if not docs: return or_models_load(), "empty model list (kept last good)"
+        try: _put_file(or_models_path(), json.dumps({"fetched_at": now_iso(), "attempted_at": now_iso(), "error": "", "data": docs}) + "\n")
+        except OSError: pass
+        return docs, ""
+    except Exception as e:
+        try: cached = _json_or_empty(or_models_path()).get("data") or []
+        except Exception: cached = []
+        return cached if isinstance(cached, list) else [], str(e)[:200]
+def or_models_load(refresh=False):
+    """Trimmed OpenRouter models (cache 24h at openrouter-models.json, last good kept).
+    Stale cache returns at once + detached refresh; no cache blocks once (<=15s). Never raises."""
+    p = or_models_path(); d = _json_or_empty(p); docs = d.get("data") if isinstance(d.get("data"), list) else []
+    if not refresh and docs and _age_s(d.get("fetched_at")) <= MODELS_TTL_S: return docs
+    if not refresh and docs: catalog_bg_refresh(); return docs
+    if not refresh and not docs and _age_s(d.get("attempted_at")) < BG_STAMP_S and d.get("error"): return []
+    docs, err = or_models_refresh()
+    if err and docs: return docs
+    if err: d = {**d, "attempted_at": now_iso(), "error": err}
+    return docs
+def or_parse_policies(html):
+    """[{training, trainingOpenRouter, retainsPrompts}] from a providers page (escaped or raw JSON). Missing keys fail safe (True). Pure."""
+    try: un = (html or "").replace('\\"','"')
+    except Exception: return []
+    out = []
+    for m in _OR_POLICY_RE.finditer(un):
+        g = lambda k: (re.search(r'"%s"\s*:\s*(true|false)' % k, m.group(1)) or [None, "true"])[1] == "true"
+        try: out.append({"training": g("training"), "trainingOpenRouter": g("trainingOpenRouter"), "retainsPrompts": g("retainsPrompts")})
+        except Exception: continue
+    return out
+def or_policy_class(pols):
+    """zdr (some endpoint training=false and retainsPrompts=false) | retain (training=false, retains) |
+    train (every endpoint trains or trainingOpenRouter) | unknown. Pure."""
+    if not pols: return "unknown"
+    trains = lambda p: p.get("training") or p.get("trainingOpenRouter")
+    if any(not trains(p) and not p.get("retainsPrompts") for p in pols): return "zdr"
+    if any(not trains(p) for p in pols): return "retain"
+    return "train"
+def _or_policy_fetch(mid):
+    """(class, endpoints|None) for one model id: providers page + endpoints count. Raises on page failure."""
+    html = _http_text(f"{or_site_url()}/{mid}/providers", {"User-Agent": OR_UA, "Accept": "text/html,*/*"})
+    cls = or_policy_class(or_parse_policies(html))
+    try:
+        ep = _http_json(f"{or_models_url()}/{mid}/endpoints", {"User-Agent": OR_UA, "Accept": "application/json"}, 15)
+        ends = ((ep or {}).get("data") or {}).get("endpoints")
+        n = len(ends) if isinstance(ends, list) else None
+    except Exception: n = None
+    return cls, n
+def or_policies_load(ids, refresh=False):
+    """{id: {class, endpoints, fetched_at}} for the ids (cache 24h, failure keeps last/unknown).
+    Missing (or refresh=stale) fetched now, at most OR_POLICY_PAR parallel. Never raises."""
+    p = or_policies_path(); d = _json_or_empty(p)
+    if not isinstance(d.get("models"), dict): d["models"] = {}
+    want = []
+    for mid in dict.fromkeys(ids):
+        e = d["models"].get(mid) or {}
+        if refresh or not e.get("fetched_at") or _age_s(e.get("fetched_at")) > MODELS_TTL_S:
+            if e.get("fetched_at") and not refresh: catalog_bg_refresh()
+            else: want.append(mid)
+    if want:
+        sem = threading.Semaphore(OR_POLICY_PAR)
+        def run(mid):
+            with sem:
+                try: cls, n = _or_policy_fetch(mid)
+                except Exception: return
+                d["models"][mid] = {"class": cls, "endpoints": n, "fetched_at": now_iso()}
+        ts = [threading.Thread(target=run, args=(mid,), daemon=True) for mid in want]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        try: _put_file(p, json.dumps(d) + "\n")
+        except OSError: pass
+    return {mid: (d["models"].get(mid) or {"class": "unknown", "endpoints": None}) for mid in dict.fromkeys(ids)}
+def or_data_class(backend, model):
+    """Raw OpenRouter data class for backend/model, or None when not an openrouter model.
+    Cache-only (never fetches); unknown when no policy cached. Never raises."""
+    try:
+        b, m = (backend or "").strip(), (model or "").strip()
+        if b != "openrouter" and "openrouter/" not in m: return None
+        if m.startswith("opencode/openrouter/"): m = m[len("opencode/"):]
+        if m.startswith("openrouter/"): m = m[len("openrouter/"):]
+        if not m or m == "default": return "unknown"
+        c = ((_json_or_empty(or_policies_path()).get("models") or {}).get(m) or {}).get("class")
+        return c if c in ("zdr", "retain", "train", "unknown") else "unknown"
+    except Exception: return "unknown"
+def or_work_body(backend, model, data="work"):
+    """Extra chat-completions body for work agents on openrouter via the api backend
+    (deny training providers, ZDR-only routing); {} otherwise. Pure."""
+    if (data or "work").strip().lower() != "work": return {}
+    try: pid, _ = api_split_model((model or "").strip())
+    except Exception: pid = None
+    if (pid or "").strip() != "openrouter" and "openrouter/" not in (model or ""): return {}
+    return {"provider": {"data_collection": "deny", "zdr": True}}
+def or_opencode_refusal(backend, model, data="work"):
+    """Error when a work agent would run an openrouter model via opencode (no per-request
+    provider-routing passthrough, so ZDR is unenforceable); else None. Pure."""
+    if (data or "work").strip().lower() != "work" or (backend or "").strip() != "opencode": return None
+    m = (model or "").strip()
+    if m.startswith("openrouter/") or m.startswith("opencode/openrouter/") or "/openrouter/" in m:
+        return ("openrouter models cannot enforce zero-retention via the opencode backend "
+            "(no provider-routing passthrough); use --backend api (ag providers add openrouter --key-ref keychain:NAME)")
+    return None
+def or_slot_limit(backend, model):
+    """2 for openrouter :free models, else None (caller falls through). Pure."""
+    m = (model or "").strip()
+    if ((backend or "").strip() == "openrouter" or "openrouter/" in m) and m.endswith(":free"): return 2
+    return None
+def or_key_load(refresh=False):
+    """{fetched_at, is_free_tier, rpd, error}: 50/day free tier, 1000 after $10 credit.
+    Needs the registry openrouter key; without one returns the last cache. Never raises."""
+    p = or_key_path()
+    try:
+        d = _json_or_empty(p)
+        if not refresh and isinstance(d.get("rpd"), int) and _age_s(d.get("fetched_at")) <= MODELS_TTL_S: return d
+        key = None
+        try: key = api_resolve_key((providers_load() or {}).get("openrouter") or {})
+        except Exception: key = None
+        if not key: return d
+        try:
+            raw = _http_json(or_key_url(), {"User-Agent": OR_UA, "Accept": "application/json", "Authorization": "Bearer " + str(key)}, 15)
+            data = (raw or {}).get("data") if isinstance(raw, dict) else None
+            ift = (data or {}).get("is_free_tier") if isinstance(data, dict) else (raw or {}).get("is_free_tier")
+            d = {"fetched_at": now_iso(), "attempted_at": now_iso(), "error": "", "is_free_tier": bool(ift), "rpd": 50 if ift is True else 1000}
+            try: _put_file(p, json.dumps(d) + "\n")
+            except OSError: pass
+        except Exception as e: d = {**d, "attempted_at": now_iso(), "error": str(e)[:200]}
+        return d
+    except Exception: return {}
+def or_account_rpd():
+    """Known openrouter requests/day or None. Cache-only, never raises."""
+    try:
+        r = _json_or_empty(or_key_path()).get("rpd")
+        return r if isinstance(r, int) and r > 0 else None
+    except Exception: return None
+def or_sources():
+    om, op, ok = _json_or_empty(or_models_path()), _json_or_empty(or_policies_path()), _json_or_empty(or_key_path())
+    return {"openrouter_models": {"url": or_models_url(), "fetched_at": om.get("fetched_at"), "error": om.get("error") or None,
+            "what": "model list + price/tools (openrouter.ai/api/v1/models)"},
+        "openrouter_policies": {"url": or_site_url() + "/<id>/providers", "fetched_at": op.get("fetched_at") or (next(iter((op.get("models") or {}).values()), {}) or {}).get("fetched_at"),
+            "models": len(op.get("models") or {}), "what": "per-endpoint dataPolicy (model page HTML, 24h)"},
+        "openrouter_key": {"url": or_key_url(), "fetched_at": ok.get("fetched_at"), "rpd": ok.get("rpd"),
+            "what": "account tier (is_free_tier: 50/day free, 1000 after $10)"}}
+def or_catalog_rows(free=False, zdr=False, tier=None, sort="intel", refresh=False):
+    """[{backend openrouter, id openrouter/<id>, **scores, data, endpoints}] for tools-support models,
+    best first. Policies fetched only for free + top OR_POLICY_TOP by intel. Never raises."""
+    try:
+        docs = or_models_load(refresh=refresh); rk = rankings_load(refresh=refresh)
+        tools = [d for d in docs if d.get("tools")]
+        scored = [(d, rankings_match(rk, "openrouter", "openrouter/" + d["id"])) for d in tools]
+        cands = [d["id"] for d, _ in scored if d.get("free")]
+        cands += [d["id"] for d, m in sorted(scored, key=lambda t: (-(t[1].get("score") or -1), t[0]["id"])) if m.get("score") is not None][:OR_POLICY_TOP]
+        pols = or_policies_load(dict.fromkeys(cands), refresh=refresh)
+        rows = []
+        for d, m in scored:
+            sc = m.get("score")
+            rows.append({"backend": "openrouter", "id": "openrouter/" + d["id"], "or_id": d["id"],
+                "tier": _tier_of(d["id"], None, sc), "tier_source": "score" if sc is not None else "guess",
+                "reasoning": None, "tools": True, "context": d.get("ctx"), "cost_in": d.get("cost_in"), "cost_out": d.get("cost_out"),
+                "free": bool(d.get("free")), "released": None, "new": False, "score": sc, "coding": m.get("coding"), "agentic": m.get("agentic"),
+                "speed": m.get("speed"), "latency_ms": m.get("latency_ms"), "fast": bool(m.get("fast")), "popularity": m.get("popularity"),
+                "variant": m.get("variant"), "or_slug": m.get("slug"), "rank_match": m.get("how"),
+                "data": (pols.get(d["id"]) or {}).get("class") or "unknown", "endpoints": (pols.get(d["id"]) or {}).get("endpoints"), "source": "openrouter"})
+        rows = [r for r in rows if (not tier or r["tier"] == tier) and (not free or r["free"]) and (not zdr or r["data"] == "zdr")]
+        at = _SORT_ATTR.get(sort, "score")
+        rows.sort(key=lambda r: (r[at] is None, -(r[at] or 0), TIER_ORDER.index(r["tier"]), -(r["score"] or 0), -(r["speed"] or 0), r["id"]))
+        return rows
+    except Exception: return []
+def or_rank_text(rows, sources=None):
+    n = lambda v, f="{:g}": "-" if v is None else f.format(v)
+    out = [catalog_attribution(sources if sources is not None else catalog_sources())] if sources is not False else []
+    w = max([len(r["id"]) for r in rows] + [2])
+    out += ["openrouter (%d; tools-support only; data = endpoint dataPolicy)" % len(rows),
+        f'  {"id".ljust(w)}  tier      data     eps  intel  coding  agentic  tok/s  latency  ctx   $in/$out']
+    for r in rows:
+        lat = "-" if r["latency_ms"] is None else f'{r["latency_ms"]/1000:.1f}s'
+        eps = "-" if r.get("endpoints") is None else str(r["endpoints"])
+        out.append(f'  {r["id"].ljust(w)}  {(r["tier"] + ("~" if r["tier_source"] == "guess" else "")).ljust(8)}  {(r.get("data") or "?").ljust(7)}  {eps.rjust(3)}  {n(r["score"]).rjust(5)}  {n(r["coding"]).rjust(6)}  '
+            f'{n(r["agentic"]).rjust(7)}  {n(r["speed"], "{:.0f}").rjust(5)}  {lat.rjust(7)}  {_fmt_ctx(r["context"]).rjust(4)}  {_fmt_cost(r).ljust(10)}')
+    return "\n".join(x.rstrip() for x in out)
+def orcat_selfcheck():
+    assert _or_trim_models({"data": [{"id": "a/b:free", "context_length": 100, "pricing": {"prompt": "0", "completion": "0"}, "supported_parameters": ["tools"]}]}) == [{"id": "a/b:free", "ctx": 100, "cost_in": 0.0, "cost_out": 0.0, "tools": True, "free": True}]
+    assert _or_trim_models({"data": [{"id": "a/c", "pricing": {"prompt": "-1", "completion": "x"}, "supported_parameters": []}]})[0]["free"] is False
+    assert or_parse_policies('\\"dataPolicy\\":{\\"training\\":false,\\"trainingOpenRouter\\":false,\\"retainsPrompts\\":false}') == [{"training": False, "trainingOpenRouter": False, "retainsPrompts": False}]
+    assert or_parse_policies('"dataPolicy": {"training": true}') == [{"training": True, "trainingOpenRouter": True, "retainsPrompts": True}]
+    assert or_policy_class([{"training": False, "trainingOpenRouter": False, "retainsPrompts": False}, {"training": False, "trainingOpenRouter": False, "retainsPrompts": True}]) == "zdr"
+    assert or_policy_class([{"training": False, "trainingOpenRouter": False, "retainsPrompts": True}]) == "retain"
+    assert or_policy_class([{"training": True, "trainingOpenRouter": False, "retainsPrompts": True}]) == "train"
+    assert or_policy_class([{"training": False, "trainingOpenRouter": True, "retainsPrompts": False}]) == "train"
+    assert or_policy_class([]) == "unknown"
+    assert or_work_body("api", "openrouter/a/b", "work") == {"provider": {"data_collection": "deny", "zdr": True}}
+    assert or_work_body("api", "openrouter/a/b", "public") == {} and or_work_body("api", "groq/m", "work") == {}
+    assert "--backend api" in (or_opencode_refusal("opencode", "openrouter/a/b", "work") or "")
+    assert or_opencode_refusal("opencode", "openrouter/a/b", "public") is None and or_opencode_refusal("opencode", "opencode/m", "work") is None
+    assert or_slot_limit("api", "openrouter/a:free") == 2 and or_slot_limit("api", "groq/m") is None
+    assert or_data_class("api", "groq/m") is None and model_privacy("api", "openrouter/zzz-no-such-model") == "train"
+    assert privacy_error("opencode", "openrouter/a/b", "work") is not None and "--backend api" in privacy_error("opencode", "openrouter/a/b", "work")
 
 def catalog_stats(backend):
     md = modelsdev_load(); ix = _md_index(md); rk = rankings_load()

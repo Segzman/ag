@@ -10992,6 +10992,151 @@ def do_delegate(a):
         return 124
     return emit(a,"delegate",{"_text":f'delegated to {a.agent} (exit={r["exit"]})'})
 
+# ---- crosscheck: same task to 2+ agents in parallel, compare answers ----
+# ponytail: threads + run_turn (per-agent queue = own session), difflib only.
+# Ceilings: verdict = first-line OK|BUG:|PASS|FAIL|yes|no or JSON verdict;
+# else normalized unified diff + ratio. Privacy via globals().get so the
+# parallel privacy agent is optional (missing helper = no guard).
+_CROSSCHECK_PASS = {"ok", "pass", "yes", "true", "approve", "approved"}
+_CROSSCHECK_FAIL = {"fail", "no", "bug", "false", "reject", "rejected"}
+_CROSSCHECK_HEAD_RE = re.compile(r"^\s*(ok|pass|fail|yes|no)\b\s*:?\s*(.*)$|^\s*(bug)\s*:\s*(.*)$", re.I)
+def _crosscheck_canon(v):
+    w = (v or "").strip().lower().rstrip(":")
+    if w in _CROSSCHECK_PASS: return "pass"
+    if w in _CROSSCHECK_FAIL: return "fail"
+    return w or "fail"
+def crosscheck_verdict(text):
+    """Pure. Canon verdict ("pass"/"fail"/other) or None when not verdict-like."""
+    t = (text or "").strip()
+    if not t: return None
+    if t.startswith("{"):
+        try:
+            o = json.loads(t)
+            if isinstance(o, dict) and "verdict" in o: return _crosscheck_canon(str(o["verdict"]))
+        except Exception: pass
+        try:
+            m = re.search(r'"verdict"\s*:\s*"([^"]+)"', t)
+            if m: return _crosscheck_canon(m.group(1))
+        except Exception: pass
+    for line in t.splitlines():
+        if not line.strip(): continue
+        m = _CROSSCHECK_HEAD_RE.match(line)
+        if m: return _crosscheck_canon(m.group(1) or m.group(3))
+        return None
+    return None
+def crosscheck_normalize(text):
+    """Pure. Strip trailing ws per line, drop leading/trailing blanks. For diff."""
+    lines = [(l or "").rstrip() for l in (text or "").splitlines()]
+    while lines and not lines[0].strip(): lines.pop(0)
+    while lines and not lines[-1].strip(): lines.pop()
+    return "\n".join(lines)
+def crosscheck_compare(replies):
+    """Pure. {name: reply} -> verdicts/verdict_mode/agree/diff/similarity."""
+    names = list(replies)
+    verdicts = {n: crosscheck_verdict(replies[n]) for n in names}
+    if verdicts and all(v is not None for v in verdicts.values()):
+        agree = len(set(verdicts.values())) == 1
+        return {"verdicts": verdicts, "verdict_mode": True, "agree": agree,
+            "diff": "", "similarity": 1.0 if agree else 0.0}
+    norms = {n: crosscheck_normalize(replies[n]) for n in names}
+    agree = len(set(norms.values())) == 1
+    if len(names) == 2:
+        a0, b0 = norms[names[0]].splitlines(), norms[names[1]].splitlines()
+        diff = "\n".join(difflib.unified_diff(a0, b0, fromfile=names[0], tofile=names[1], lineterm=""))
+        sim = difflib.SequenceMatcher(None, norms[names[0]], norms[names[1]]).ratio()
+    else:
+        parts, sims = [], []
+        for n in names[1:]:
+            parts += list(difflib.unified_diff(norms[names[0]].splitlines(), norms[n].splitlines(),
+                fromfile=names[0], tofile=n, lineterm="")) + [""]
+            sims.append(difflib.SequenceMatcher(None, norms[names[0]], norms[n]).ratio())
+        diff = "\n".join(parts).strip()
+        sim = min(sims) if sims else 1.0
+    return {"verdicts": None, "verdict_mode": False, "agree": agree, "diff": diff, "similarity": round(sim, 4)}
+def crosscheck_privacy_check(sdir, row):
+    """Refuse work agents on train/unknown models. None = ok. No privacy helper yet = ok."""
+    try:
+        if (os.environ.get("AG_PRIVACY") or "1").strip().lower() == "off": return None
+    except Exception: return None
+    mp = globals().get("model_privacy")
+    if not callable(mp): return None
+    data = (row.get("data") or "").strip()
+    if not data:
+        try:
+            doc = (globals().get("routing_load") or (lambda **k: {}))(scope="effective", sdir=sdir) or {}
+            data = ((doc.get("privacy") or {}).get("default") or "work").strip()
+        except Exception: data = "work"
+    if (data or "work") != "work": return None
+    try: priv = mp(row.get("backend", ""), row.get("model", ""))
+    except Exception: return None
+    if priv in ("train", "unknown"):
+        return (f'model {row.get("model","")} may train on your data (opencode docs); '
+            "use --data public or a zero-retention model (space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)")
+    return None
+def do_crosscheck(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    names = [(getattr(a, "aname", "") or "").strip(), (getattr(a, "bname", "") or "").strip()]
+    for m in (getattr(a, "more", None) or []):
+        names += m if isinstance(m, list) else [m]
+    names = [n for n in (n.strip() if isinstance(n, str) else "" for n in names) if n]
+    task = " ".join(getattr(a, "task", None) or []).strip()
+    judge = (getattr(a, "judge", None) or "").strip() or None
+    if len(names) < 2: return emit(a, "crosscheck", error="need 2+ agents", hint="ag crosscheck A B \"task\" [--more C ...]")
+    if len(set(names)) != len(names): return emit(a, "crosscheck", error="duplicate agents", hint="each agent answers once")
+    if not task: return emit(a, "crosscheck", error="empty task", hint='ag crosscheck A B "what to do"')
+    timeout_s = _valid_runtime(getattr(a, "timeout", 1800))
+    if timeout_s is None: return emit(a, "crosscheck", error="invalid --timeout: need finite seconds >= 0 (0 = unlimited)", hint="ag crosscheck A B --timeout 300 \"task\"")
+    rows = {r["name"]: r for r in load_agents(sdir)}
+    for n in names + ([judge] if judge else []):
+        if n not in rows:
+            close = difflib.get_close_matches(n, list(rows), n=3, cutoff=0.6)
+            return emit(a, "crosscheck", error=f"no such agent: {n}",
+                hint=("did you mean: " + ", ".join(close) + "? " if close else "") + "ag agents list")
+    for n in names + ([judge] if judge else []):
+        if (err := crosscheck_privacy_check(sdir, rows[n])):
+            return emit(a, "crosscheck", error=f"privacy: agent {n}: {err}", hint="AG_PRIVACY=off disables (unsafe)")
+    out, th_err = {}, {}
+    def _one(n):
+        try: out[n] = run_turn(sdir, n, task, timeout_s=timeout_s)
+        except Exception as e: th_err[n] = f"{type(e).__name__}: {e}"[:300]
+    ths = [threading.Thread(target=_one, args=(n,), daemon=True) for n in names]
+    [t.start() for t in ths]; [t.join() for t in ths]
+    if th_err:
+        n = next(iter(th_err))
+        return emit(a, "crosscheck", error=f"agent {n}: {th_err[n]}", hint=f"ag chat log {n}")
+    for n in names:
+        r = out.get(n) or {}
+        if r.get("timed_out") or ("error" in r and not r.get("reply")):
+            return emit(a, "crosscheck", error=f"agent {n}: {r.get('error') or 'turn failed'}",
+                hint=f"ag chat log {n}", data={"agents": names, "task": task})
+        if "error" in r and r.get("reply") is None:
+            return emit(a, "crosscheck", error=f"agent {n}: {r['error']}", hint=f"ag chat log {n}")
+    replies = {n: (out[n].get("reply") or "") for n in names}
+    cmp_ = crosscheck_compare(replies)
+    judge_reply = None
+    if judge:
+        jp = ("Two agents answered the same task. Task: " + task + "\n\n"
+            + "\n\n".join(f"[{n}]:\n{replies[n]}" for n in names)
+            + "\n\nWhich answer is right and why? Be terse; start with a verdict line (OK or BUG: ...) when judging correctness.")
+        jr = run_turn(sdir, judge, jp, timeout_s=timeout_s)
+        if jr.get("timed_out") or ("error" in jr and not jr.get("reply")):
+            return emit(a, "crosscheck", error=f"judge {judge}: {jr.get('error') or 'turn failed'}", hint=f"ag chat log {judge}")
+        judge_reply = jr.get("reply") or ""
+    verdict_txt = ("verdicts " + " ".join(f"{n}={cmp_['verdicts'][n]}" for n in names) if cmp_["verdict_mode"]
+        else (f"similarity {cmp_['similarity']:.2f}" + ("\n" + cmp_["diff"] if cmp_["diff"] else "\n(no diff: identical)")))
+    body = "".join(f"=== {n} ===\n{replies[n].strip() or '(empty)'}\n\n" for n in names)
+    body += verdict_txt + "\n" + ("AGREE" if cmp_["agree"] else "DISAGREE") + "\n"
+    if judge: body += f"\n=== {judge} (judge) ===\n{(judge_reply or '').strip() or '(empty)'}\n"
+    try: _event(sdir, "crosscheck", ",".join(names), agents=names, task=task[:120],
+        agree=cmp_["agree"], verdict=(cmp_["verdicts"] if cmp_["verdict_mode"] else ("AGREE" if cmp_["agree"] else "DISAGREE")),
+        **({"judge": judge} if judge else {}))
+    except Exception: pass
+    data = {"agents": names, "task": task, "replies": replies, "verdicts": cmp_["verdicts"],
+        "verdict_mode": cmp_["verdict_mode"], "agree": cmp_["agree"], "diff": cmp_["diff"],
+        "similarity": cmp_["similarity"], "judge": judge, "judge_reply": judge_reply, "_text": body.rstrip()}
+    emit(a, "crosscheck", data)
+    return 0 if cmp_["agree"] else 3
+
 def do_selfcheck(a):
     import tempfile
     td = Path(tempfile.mkdtemp(prefix="agent-check-"))
@@ -11091,6 +11236,18 @@ def do_selfcheck(a):
         assert do_agents(mk(sub="add",name="dl",backend="echo",model="default",adir=str(td),role="sub"))==0
         assert do_delegate(mk(agent="dl",text=["say","hi"]))==0
         assert any(r.get("role")=="delegate" for r in load_chat_log(td,"claude"))
+        assert crosscheck_verdict("OK all good")=="pass" and crosscheck_verdict("BUG: broken x")=="fail"
+        assert crosscheck_verdict("PASS")=="pass" and crosscheck_verdict("no")=="fail"
+        assert crosscheck_verdict('{"verdict":"yes","why":"x"}')=="pass" and crosscheck_verdict("plain prose") is None
+        assert crosscheck_normalize("  a  \n\nb \n")=="  a\n\nb"
+        _cc = crosscheck_compare({"x":"OK done","y":"PASS done"}); assert _cc["agree"] and _cc["verdict_mode"]
+        _cc = crosscheck_compare({"x":"OK done","y":"FAIL nope"}); assert not _cc["agree"] and _cc["verdict_mode"]
+        _cc = crosscheck_compare({"x":"same text","y":"same text"}); assert _cc["agree"] and not _cc["verdict_mode"] and _cc["similarity"]==1.0
+        _cc = crosscheck_compare({"x":"alpha","y":"beta"}); assert not _cc["agree"] and 0 <= _cc["similarity"] < 1.0 and "alpha" in _cc["diff"]
+        assert do_agents(mk(sub="add",name="cc1",backend="echo",model="default",adir=str(td),role="sub"))==0
+        assert do_agents(mk(sub="add",name="cc2",backend="echo",model="default",adir=str(td),role="sub"))==0
+        assert do_crosscheck(mk(aname="cc1",bname="cc2",task=["same","task"],more=[],judge=None,timeout=30))==0
+        assert any((json.loads(l).get("type")=="crosscheck") for l in (td/"events.jsonl").read_text().splitlines())
         ev=_parse_claude('{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"file data"}]}]}}')
         assert ev==[("toolout","file data")]
         ev=_parse_opencode('{"type":"tool_use","sessionID":"s","part":{"type":"tool","tool":"read","state":{"title":"f","output":"hello out"}}}')
@@ -13374,6 +13531,7 @@ def build():
     fgt=sub.add_parser("forget",help="wipe a session's logs (auth traces)"); fgt.add_argument("sess")
     sub.add_parser("keys",help="control cheat-sheet")
     dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); dg.add_argument("--parent",default=None,help="run as background wake; auto-wake PARENT when its cohort finishes"); dg.add_argument("--group",default=None); dg.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); dg.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result")
+    cc=sub.add_parser("crosscheck",help="same task to 2+ agents in parallel, compare answers"); cc.add_argument("aname",help="first agent"); cc.add_argument("bname",help="second agent"); cc.add_argument("task",nargs="*",help="self-contained task both agents answer"); cc.add_argument("--more",action="append",nargs="+",default=[],metavar="AGENT",help="extra agent (repeatable or space-separated)"); cc.add_argument("--judge",default=None,metavar="AGENT",help="third agent asked which answer is right and why (one turn)"); cc.add_argument("--timeout",type=float,default=1800,help="per-agent backend budget in seconds (0=unlimited, default 1800)")
     cx=sub.add_parser("context",help="scoped guidance + persistent memory"); cxs=cx.add_subparsers(dest="ctxsub",required=False)
     cxs.add_parser("init",help="non-destructive scaffold of context state")
     cxa=cxs.add_parser("assign",help="assign agent to project scope + brief"); cxa.add_argument("cname"); cxa.add_argument("--scope",default=""); cxa.add_argument("--project-root",default=None); cxa.add_argument("--task",default=None); cxa.add_argument("--acceptance",default=None); cxa.add_argument("--file",dest="cfile",action="append",default=[]); cxa.add_argument("--brief",default=None); cxa.add_argument("--brief-file",default=None)
@@ -13926,7 +14084,7 @@ def main(argv=None):
         "harness":do_harness,"agents":do_agents,"roles":do_roles,"chat":do_chat,"status":do_status,
         "handoff":do_handoff,"hosts":do_hosts,"sync":do_sync,
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
-        "delegate":do_delegate,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
+        "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"queue":do_queue,"stop":do_stop}[a.subcmd]
     maybe_auto_update(a.subcmd)

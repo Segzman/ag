@@ -67,6 +67,7 @@ Pre-prompt failure -> `[acp] fallback to cli: <reason>` and one CLI rerun. Permi
 |---|---|
 | One headless turn | `chat send <agent> "<task>"` then `chat log <agent>` |
 | Orchestrator assigns, logged in its chat | `delegate <agent> "<task>"` |
+| Second opinion: same task to 2+ agents, compared | `crosscheck <a> <b> "<task>" [--more <c>] [--judge <j>] [--timeout S]` |
 | Background, returns now | `wake <agent> "<task>"` then `wakes`, `events --limit 20`, `chat log` |
 | Follow-up when a session ends | `spawn --wake <agent> --wake-message "<task>" -- <cmd>` (once) |
 | opencode native command | `chat send oc --command review "path"` (opencode only) |
@@ -81,6 +82,20 @@ Pre-prompt failure -> `[acp] fallback to cli: <reason>` and one CLI rerun. Permi
 ```
 
 Tasks must be self-contained: what to do, what done looks like. Fan-out = different agents; two chunks to one agent serialize. `chat send`/`delegate --timeout` (default 1800, 0 = none) is a hard backend budget starting after guard acquired (lock wait unbounded); expiry exits 124. Prefer `wake` for slow work. `wake --max-runtime` same budget; `wake --timeout` only marks `stalled`; `--notify`/`--on-done` run after. `wake` is at-most-once *launch*: verify via `events` + `wakes`; relaunch lost ones with `wakes --reap`. `kill <worker-sid>` stops a worker. Use `--request-id` on retried calls to avoid double work. Slash text (`/model`, `/profile use docs`, `/help`) runs locally, never reaches the model.
+
+### Second opinions via crosscheck
+
+```sh
+{{AG}} --dir <state> crosscheck cheap zdr "is this a real bug? <evidence>" [--judge orch]
+```
+
+Pair a cheap Claude (haiku, mechanical/review job) with a zero-retention free model for an independent second read; verdict-like replies (`OK`/`BUG:`/`PASS`/`FAIL`/`yes`/`no`, JSON `verdict`) report `AGREE`/`DISAGREE` (exit 0/3), prose reports a unified diff + similarity ratio. `--judge <third>` asks one more agent which answer is right and why (one turn). Tasks must be self-contained (both agents see only the task + their own history). Suggested pairs:
+
+| Cheap Claude | ZDR free second | Use for |
+|---|---|---|
+| TODO(bench) | TODO(bench) | TODO(bench) — fill after benchmarks |
+
+Per-agent privacy guard applies: `work` agents refuse train/unknown models.
 
 ## Cohorts (fan-out, one summary)
 

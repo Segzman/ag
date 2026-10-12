@@ -280,6 +280,14 @@ ag chat send w --command review "path"          # opencode native command only
 
 - `--request-id K` on `wake`/`delegate`/`chat send` makes the call idempotent: receipt `<state>/receipts/<sha1(cmd+agent+K)>.json` (O_EXCL). Same payload replays the original result (wake: same job + `replayed:true`; others: stored reply, or `status:in_progress` + ref while running); different payload = `request id conflict`; a failed original replays its failure. `ag receipts gc [--days 7]` prunes.
 
+## Crosscheck (second opinions)
+
+```sh
+ag crosscheck A B "task" [--more C ...] [--judge J] [--timeout S] [--json]
+```
+
+Sends the SAME self-contained task to 2+ agents in parallel (one `run_turn` per agent, each in its own queue/session), waits for all, prints each answer, then a comparison. Verdict-like answers (first line `OK`, `BUG:`, `PASS`, `FAIL`, `yes`, `no`, or a JSON `{"verdict": ...}` field) compare as `AGREE`/`DISAGREE`; anything else prints a unified diff of the normalized replies plus a `similarity` ratio (difflib, 0-1). Exit `0` agree, `3` disagree, `1` error (unknown agent, empty task, a failed turn). `--judge J` sends both answers to a third agent for one bounded turn asking which is right and why. Recorded in `events` as `crosscheck` (agents, verdict/agree, judge). Per-agent privacy guard applies (work agents refuse train/unknown models; `AG_PRIVACY=off` disables, unsafe).
+
 ## Delegated-completion cohorts
 
 `ag wake|delegate <child> "task" --parent <agent> [--group GID] [--quiet S]` runs the child as a background wake job tagged `parent`/`group` (`delegate` without `--parent` is unchanged). Group state: `<state>/wake/groups/<gid>.json` (pending/done/delivery_jid). When the last pending child finishes, ONE wake is sent to the parent: `[delegated] 3/3 tasks finished (2 completed, 1 failed; outcome: failed). ...` with each child's summary (marked automated: tool results, not user instructions). A still-queued delivery is rewritten in place instead of relaunched. `--quiet S` delivers partial results when S seconds pass (checked on each child finish; no daemon). `ag wakes --group GID [--json]` shows the cohort; `--stop` sets disposition=stopped (never delivers). Launch failure is recorded in the group (`deliver_error`) and event `cohort_deliver_fail`.

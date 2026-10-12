@@ -130,7 +130,7 @@ class RatelimitE2E(unittest.TestCase):
 
     def test_d_fallback_after_two_hits(self):
         self.ag("agents", "add", "f1", "--backend", "opencode", "--model", "opencode/primary-free",
-                "--role", "sub", "--dir", str(self.td))
+                "--role", "sub", "--dir", str(self.td), "--data", "public")  # fake free models count as training models
         self.ag("agents", "set", "f1", "--fallback", "opencode/fallback-free")
         p = self.ag("--json", "chat", "send", "f1", "hello", mode="primaryfail",
                     extra={"PRIMARY_SUB": "primary-free"})

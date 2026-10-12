@@ -39,7 +39,7 @@ class Variants(unittest.TestCase):
         (r/"fake"/"oc.verbose").write_text(VERBOSE)
         (r/"home/.codex/models_cache.json").write_text(json.dumps(CODEX_CACHE))
         self.env = dict(os.environ, AG_HOME=str(r/"home"), AG_CONFIG_HOME=str(r/"cfg"), AG_CACHE_HOME=str(r/"cache"),
-            AGENT_CLI_DIR=str(r/"state"), AG_PROBE="0", AG_AUTO_UPDATE="0", AG_CATALOG_AUTO="0", HOME=str(r/"home"),
+            AGENT_CLI_DIR=str(r/"state"), AG_PROBE="0", AG_AUTO_UPDATE="0", AG_CATALOG_AUTO="0", AG_PRIVACY="off", HOME=str(r/"home"),
             FAKE_DIR=str(r/"fake"), PATH=f"{r/'fake'}:/usr/bin:/bin",
             AG_MODELSDEV_URL="http://127.0.0.1:1/api.json", AG_OPENROUTER_RANKINGS_URL="http://127.0.0.1:1/or")
         for k in ("AG_AA_KEY", "OPENCODE_CONFIG", "CODEX_HOME"): self.env.pop(k, None)

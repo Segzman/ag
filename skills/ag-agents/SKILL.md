@@ -28,7 +28,7 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 {{AG}} --dir <state> models --backend opencode   # valid model ids
 ```
 
-`agents add` without `--model/--mode/--plan` takes backend defaults from routing (set via `ag setup`). `--job JOB` fills backend+model from routing when `--backend` absent. `delegate`/`wake`/`chat send --job` only record the job; never switch an agent. Switches refuse while busy. `default` model = no `-m`. `echo` = keyless test backend. `doctor` probe: logged-out backend fails turns fast (`not logged in to <backend>`), unknown proceeds; cache 60s; `AG_PROBE=0` disables.
+`agents add` without `--model/--mode/--plan/--effort` takes backend defaults from routing (set via `ag setup`). `--job JOB` fills backend+model+effort from routing when `--backend` absent (`ag route` shows `backend/model@effort`). `delegate`/`wake`/`chat send --job` only record the job; never switch an agent. Switches refuse while busy. `default` model = no `-m`. `echo` = keyless test backend. `doctor` probe: logged-out backend fails turns fast (`not logged in to <backend>`), unknown proceeds; cache 60s; `AG_PROBE=0` disables.
 
 ### Caps and permission modes
 
@@ -36,7 +36,7 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 {{AG}} --dir <state> agents caps [BACKEND]       # per-backend capability table (modes, plan, resume, interrupt)
 {{AG}} --dir <state> agents add w --backend codex --mode edits [--plan]
 {{AG}} --dir <state> agents set w --mode ro|edits|auto|full | --mode "" | --plan | --no-plan
-{{AG}} --dir <state> agents set w --effort max            # reasoning effort: opencode --variant, claude --effort, codex model_reasoning_effort; "" clears
+{{AG}} --dir <state> agents set w --effort max            # reasoning effort: opencode --variant, claude --effort, codex model_reasoning_effort; "" clears, unset = routing/backend default
 ```
 
 Modes: `ro` read-only, `edits` workspace writes, `auto`, `full` unrestricted. Unset = backend default. Check `agents caps` first: a mode the backend can't enforce (echo, gemini `auto`) prints a `[mode]` warning and runs default. Prefer `ro` for review/plan jobs. Never `full` unless asked.

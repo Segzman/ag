@@ -21,7 +21,7 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 {{AG}} --dir <state> agents doctor [--refresh]   # installed, version, compat, auth probe (+ rtk)
 {{AG}} --dir <state> agents list
 {{AG}} --dir <state> agents ps [--tree]          # live turns/wakes: pids, CPU, RSS, elapsed
-{{AG}} --dir <state> agents add w --backend opencode --role sub [--model ID] [--job mechanical]
+{{AG}} --dir <state> agents add w --backend opencode --role sub [--model ID] [--data work|public] [--job mechanical]
 {{AG}} --dir <state> agents set w --model ID | --backend B | --persona planner | --worktree
 {{AG}} --dir <state> agents rm w [--force]
 {{AG}} --dir <state> harness use w codex         # switch backend; harness current w shows it
@@ -60,6 +60,16 @@ Secret-looking keys (`*KEY*|*TOKEN*|*SECRET*|*PASSWORD*`) must be refs: `--env O
 ```
 
 Pre-prompt failure -> `[acp] fallback to cli: <reason>` and one CLI rerun. Permissions answered from agent mode. `AG_ACP=0` disables. Verified: opencode; cursor/gemini need login.
+
+## Data privacy
+
+Work code only to zdr models. Source: opencode.ai/docs/zen Privacy (2026-10-12); `{{AG}} models --rank` shows `data` (zdr/retain/train), `--zdr` filters. `{{AG}} route --check` asks the project data class; `setup --scope project --answers '{"data":"work"}'` stores `routing.json` `privacy.default`.
+
+| data | models |
+|---|---|
+| zdr | `opencode/space-bunny-free`, `opencode/longcat-2.5-preview-free`, `opencode/step-5-preview-free`; paid Mistral/Jev |
+| retain | paid OpenAI/Anthropic (30d); direct `claude`/`codex` (own subscription); `gemini`/`cursor` |
+| train | `opencode/muse-spark-1.3-contributor-free`, `big-pickle`, `exo-free`, `mimo-v2.6-flash-free`, `ling-3.1-flash-free`, `ling-3.0-flash-fin-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free` |
 
 ## Delegate
 
@@ -176,4 +186,4 @@ Outbound SSH only, explicit handoff, no auto failover. Details: `docs/MULTI_HOST
 
 ## Guardrails
 
-Don't switch backends/models unless asked. Never request secrets via chat. Unknown `/word` errors; don't retry as prose. Persistent bots = `schedule add` (or `spawn --wake`). Cost: route mechanical work to cheap backends; never use `full` mode casually.
+Data privacy: work code only to zdr models (`space-bunny-free`, `longcat-2.5-preview-free`, `step-5-preview-free`); `agents add|set --data work|public` (default `work` from `routing.json` `privacy.default`); `work` refuses train/unknown models (exit 2); `AG_PRIVACY=off` disables (unsafe). Pair a cheap Claude (haiku) with a zdr free model for second opinions when the task is work. Don't switch backends/models unless asked. Never request secrets via chat. Unknown `/word` errors; don't retry as prose. Persistent bots = `schedule add` (or `spawn --wake`). Cost: route mechanical work to cheap backends; never use `full` mode casually.

@@ -542,6 +542,12 @@ def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
     if agent not in [r.get("name") for r in rows]:
         _event(sdir, "wake_fail", trigger, agent=agent, exit=exit_code, reason="no such agent")
         return {"error": f"no such agent: {agent}"}
+    try:
+        _ar = next(r for r in rows if r.get("name") == agent)
+        if (_pve := privacy_error(_ar.get("backend", "claude"), _ar.get("model", "default") or "default", agent_data(_ar))):
+            _event(sdir, "wake_fail", trigger, agent=agent, exit=exit_code, reason="privacy")
+            return {"error": _pve, "exit": 2}
+    except Exception: pass
     if not (message or "").strip():
         _event(sdir, "wake_fail", trigger, agent=agent, exit=exit_code, reason="empty message")
         return {"error": "empty message"}
@@ -990,7 +996,7 @@ def do__wake_run(a):
             exit_code=124, fields={"timed_out": True})
         return 1
     if "error" in r:
-        _mark_failed(r["error"], 1)
+        _mark_failed(r["error"], r.get("exit", 1) if isinstance(r.get("exit"), int) else 1)
         return 1
     if r.get("interrupted"):
         _wake_finish(sdir, jid, "failed", error="interrupted", exit_code=130, fields={"interrupted": True}); return 1
@@ -2701,7 +2707,8 @@ def do_harness_profile(a):
 # ag-level default model for OpenCode: "default"/missing resolves to this ID
 # everywhere OpenCode runs through ag (headless argv, handoff, new agents,
 # switches, pickers). Explicit custom models always win; other backends untouched.
-OPENCODE_MODEL_DEFAULT = "opencode/muse-spark-1.3-contributor-free"
+# ponytail: zero-retention default so work agents are safe (privacy guard).
+OPENCODE_MODEL_DEFAULT = "opencode/space-bunny-free"
 MODELS = {
     "claude": ["default","sonnet","opus","haiku"],
     "opencode": [OPENCODE_MODEL_DEFAULT],
@@ -2712,7 +2719,7 @@ MODELS = {
 }
 def eff_model(backend, model):
     """Effective model string for argv/display. Pure.
-    OpenCode default/missing resolves to the ag-level default (Muse Spark);
+    OpenCode default/missing resolves to the ag-level default (space-bunny-free, zdr);
     other backends keep '' (= backend default, no -m flag). Explicit custom
     strings pass through untouched on every backend."""
     m = (model or "").strip()
@@ -2986,6 +2993,12 @@ def update_agent_settings(sdir, name, updates):
         if model is None:
             model = models.get(new, "default")
         model = eff_model(new, model) or "default"
+        if "data" in updates:
+            dv = (updates.get("data") or "").strip().lower()
+            if dv not in ("work", "public", ""): return (False, f"bad --data {updates.get('data')!r}: work|public")
+        try: _pd = agent_data({**a, **updates})
+        except Exception: _pd = "work"
+        if (_pe := privacy_error(new, model, _pd)): return (False, _pe)
         sids = dict(meta.get("sids") or {})
         if meta.get("sid"):
             # A stale meta backend may differ from the roster: the SID still
@@ -6631,6 +6644,9 @@ def do_agents(a):
         if eerr: return emit(a,"agents",error=eerr)
         if (_ae := acp_check(be, getattr(a,"transport",None) or "", getattr(a,"acp_cmd",None))): return emit(a,"agents",error=_ae)
         if be=="opencode" and mod in ("","default"): mod = OPENCODE_MODEL_DEFAULT
+        data = (getattr(a, "data", None) or "").strip().lower() or privacy_default()
+        if data not in ("work", "public"): return emit(a,"agents",error=f"bad --data {getattr(a,'data',None)!r}: work|public")
+        if (_pe := privacy_error(be, mod, data)): return emit(a,"agents",error=_pe)
         wt, adir = None, a.adir or "."
         if getattr(a,"worktree",False):
             wt, err, hint = wt_create(a.name, adir, getattr(a,"base",None))
@@ -6640,6 +6656,7 @@ def do_agents(a):
             "dir":adir,"role":a.role,"persona":pers,"system":getattr(a,"system",None) or "",
             "instructions":[s for s in (getattr(a,"instructions",None) or []) if (s or "").strip()],
             **({"mode":a.mode} if getattr(a,"mode",None) else {}),**({"plan":True} if getattr(a,"plan",None) else {}),
+            "data":data,
             **({"worktree":wt} if wt else {}),**{k:getattr(a,k) for k in ("transport","acp_cmd","effort") if getattr(a,k,None)}})
         rows[-1].update(eup)
         save_agents(sdir,rows)
@@ -6680,6 +6697,10 @@ def do_agents(a):
             if a.mode not in MODES + ("",): return emit(a, "agents", error=f"bad mode: {a.mode}", hint='|'.join(MODES)+' ("" clears)')
             updates["mode"] = a.mode
         if getattr(a, "plan", None) is not None: updates["plan"] = a.plan
+        if getattr(a, "data", None) is not None:
+            dv = (a.data or "").strip().lower()
+            if dv not in ("work", "public", ""): return emit(a, "agents", error=f"bad --data {a.data!r}: work|public (\"\" clears)")
+            updates["data"] = dv
         _cur = next((r for r in rows if r["name"] == a.name), None)
         if _cur is not None:
             eup, eerr, cfg_changed = agent_env_updates(a, _cur)
@@ -8016,6 +8037,15 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
     workdir = os.path.abspath(a.get("dir",".") or ".")
     if command and backend != "opencode":
         return {"error":f"--command is opencode-only (agent {name} runs {backend})"}
+    if (_pve := privacy_error(backend, model, agent_data(a))):
+        try: append_chat(sdir,name,"error",_pve); _event(sdir,"privacy",name,backend=backend,model=eff_model(backend,model) or model)
+        except Exception: pass
+        if on_event:
+            try: on_event(name,"tool",_pve)
+            except Exception: pass
+        try: _ms = load_chat_meta(sdir,name,agent=a).get("sid","")
+        except Exception: _ms = ""
+        return {"error":_pve,"exit":2,"sid":_ms,"reply":_pve}
     # Single shared guard: block here while another process runs this agent,
     # then re-read the roster under lock so a concurrent mutation cannot slip
     # between our snapshot and the backend launch.
@@ -8037,6 +8067,16 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if command and backend != "opencode":
             _release_agent_turn(_turn_lock); _turn_lock = None
             return {"error":f"--command is opencode-only (agent {name} runs {backend})"}
+        if (_pve := privacy_error(backend, model, agent_data(a))):
+            _release_agent_turn(_turn_lock); _turn_lock = None
+            try: append_chat(sdir,name,"error",_pve); _event(sdir,"privacy",name,backend=backend,model=eff_model(backend,model) or model)
+            except Exception: pass
+            if on_event:
+                try: on_event(name,"tool",_pve)
+                except Exception: pass
+            try: _ms = load_chat_meta(sdir,name,agent=a).get("sid","")
+            except Exception: _ms = ""
+            return {"error":_pve,"exit":2,"sid":_ms,"reply":_pve}
         if not _rs and (_pe := preflight_auth(backend)): _release_agent_turn(_turn_lock); _turn_lock = None; return {"error":_pe}
         meta = load_chat_meta(sdir,name,agent=a)
         sids = meta.get("sids") or {}
@@ -8401,6 +8441,7 @@ def do_chat(a):
         r = (agent_steer if a.sub=="steer" else run_turn)(sdir,a.name,text,command=cmd,timeout_s=timeout_s,
             on_event=(lambda n,k,t: print(t) if live and k=="text" and t else print(t,file=sys.stderr) if live and k=="tool" and (t or "").startswith("[mode]") else None)); _rcpt_done(_h, r)
         if "error" in r and not r.get("timed_out"):
+            if r.get("exit") == 2: emit(a,"chat",error=r["error"]); return 2
             return emit(a,"chat",error=r["error"])
         if r.get("slash") and r.get("exit") and getattr(a,"json",False):
             return emit(a,"chat",error=f'/{r["slash"]} failed (exit {r["exit"]})',
@@ -8471,7 +8512,9 @@ def do_wake(a):
     if _rc is not None: return _rc
     r = launch_wake_chat(sdir,agent,text,notify=notify,on_done=on_done,timeout_s=timeout_s,
         max_runtime_s=max_runtime_s,job_type=getattr(a,"job",None),**ck); _rcpt_done(_h, r)
-    if "error" in r: return emit(a,"wake",error=r["error"],hint="ag agents list")
+    if "error" in r:
+        if r.get("exit") == 2: emit(a,"wake",error=r["error"]); return 2
+        return emit(a,"wake",error=r["error"],hint="ag agents list")
     grp = ck.get("cohort",{}).get("group")
     if getattr(a,"json",False):
         return emit(a,"wake",{"agent":agent,"launched":True,
@@ -10970,12 +11013,15 @@ def do_delegate(a):
         ck, cerr = _cohort_kw(sdir, a)
         r = {"error": cerr} if cerr else launch_wake_chat(sdir,a.agent,task,max_runtime_s=timeout_s,job_type=getattr(a,"job",None),**ck)
         _rcpt_done(_h, r)
-        if "error" in r: return emit(a,"delegate",error=r["error"])
+        if "error" in r:
+            if isinstance(r, dict) and r.get("exit") == 2: emit(a,"delegate",error=r["error"]); return 2
+            return emit(a,"delegate",error=r["error"])
         return emit(a,"delegate",{"_text":f'delegated to {a.agent} (background job {r["job"]}, group {ck["cohort"]["group"]})',"job":r["job"],"group":ck["cohort"]["group"],"agent":a.agent})
     live = not getattr(a,"json",False)
     r = delegate_task(sdir,a.agent,task,timeout_s=timeout_s,job=getattr(a,"job",None),
         on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None)); _rcpt_done(_h, r)
     if "error" in r and not r.get("timed_out"):
+        if r.get("exit") == 2: emit(a,"delegate",error=r["error"]); return 2
         return emit(a,"delegate",error=r["error"])
     if getattr(a,"json",False):
         data = {"reply":r["reply"],"exit":r["exit"],"agent":a.agent}
@@ -11657,12 +11703,13 @@ def do_models(a):
         t = [f'catalog auto-refresh {"on" if src["auto"] else "off"} (`ag models --auto on|off`, env AG_CATALOG_AUTO=0)',
             f'  openrouter rankings  {fa(o["fetched_at"])}' + "".join(f'; {k} {_ago(v)}' for k, v in o["parts"].items()) + (f'; error: {o["error"]}' if o["error"] else ""),
             f'  models.dev           {fa(src["models.dev"]["fetched_at"])}',
-            f'  artificial analysis  {"api key set, " + fa(src["artificial_analysis_api"]["fetched_at"]) if src["artificial_analysis_api"]["enabled"] else "no AG_AA_KEY (optional)"}']
+            f'  artificial analysis  {"api key set, " + fa(src["artificial_analysis_api"]["fetched_at"]) if src["artificial_analysis_api"]["enabled"] else "no AG_AA_KEY (optional)"}',
+            f'  zen privacy          {fa(src["zen_privacy"]["fetched_at"])}' + (f'; error: {src["zen_privacy"]["error"]}' if src["zen_privacy"]["error"] else "")]
         t += [f"  {b} model list".ljust(23) + fa(v) for b, v in src["model_lists"].items()]
         return emit(a, "models", {"status": True, "sources": src, "_text": "\n".join(t)})
     cache = models_load(bs := [a.backend] if a.backend else list(MODEL_BACKENDS), refresh=a.refresh)
-    if a.rank or a.tier or a.free or a.sort:
-        rows = [r for r in catalog_rows(a.backend, refresh=a.refresh, sort=a.sort or "intel") if (not a.tier or r["tier"] == a.tier) and (not a.free or r["free"])]
+    if a.rank or a.tier or a.free or a.sort or getattr(a, "zdr", False):
+        rows = [r for r in catalog_rows(a.backend, refresh=a.refresh, sort=a.sort or "intel") if (not a.tier or r["tier"] == a.tier) and (not a.free or r["free"]) and (not getattr(a, "zdr", False) or r.get("data") == "zdr")]
         src = catalog_sources()
         return emit(a, "models", {"rank": True, "sort": a.sort or "intel", "models": rows, "sources": src,
             "_text": catalog_rank_text(rows, src) if rows else "no models match"})
@@ -11886,10 +11933,12 @@ def rankings_match(rk, backend, model):
         "fast": bool(sp and fast and sp >= fast), "popularity": (rk.get("pop") or {}).get(pp) if pp else None}
 
 def catalog_refresh():
-    """Re-fetch the remote catalog sources (models.dev, OpenRouter rankings, AA API if keyed); each failure keeps its last cache, never raises."""
+    """Re-fetch the remote catalog sources (models.dev, OpenRouter rankings, AA API if keyed, Zen privacy); each failure keeps its last cache, never raises."""
     for f in (modelsdev_load, rankings_load, aa_load):
         try: f(True)
         except Exception: pass
+    try: zen_privacy_load(True)
+    except Exception: pass
 
 def catalog_refresh_all():
     """catalog_refresh + the live per-backend model lists. Used by `ag models --bg` and the daily `ag update --quiet`."""
@@ -11899,16 +11948,134 @@ def catalog_refresh_all():
 
 def catalog_sources():
     rk, md, aa, ml = (_json_or_empty(f()) for f in (or_rankings_path, modelsdev_path, aa_cache_path, models_cache_path))
+    try: zp = _json_or_empty(zen_privacy_path())
+    except Exception: zp = {}
     return {"openrouter_rankings": {"url": os.environ.get("AG_OPENROUTER_RANKINGS_URL") or OR_RANK_URL, "fetched_at": rk.get("fetched_at"), "parts": rk.get("fetched") or {},
             "error": rk.get("error") or None, "what": "Artificial Analysis indices + speed + usage via openrouter.ai/rankings"},
         "models.dev": {"url": os.environ.get("AG_MODELSDEV_URL") or MODELSDEV_URL, "fetched_at": md.get("fetched_at")},
         "artificial_analysis_api": {"enabled": bool(aa_key()), "fetched_at": aa.get("fetched_at")},
+        "zen_privacy": {"url": os.environ.get("AG_ZEN_URL") or OPENCODE_ZEN_URL, "fetched_at": zp.get("fetched_at"), "error": zp.get("error") or None,
+            "what": "opencode.ai/docs/zen Privacy (zero-retention vs train/log)"},
         "model_lists": {b: (e or {}).get("checked_at") for b, e in (ml.get("backends") or {}).items()}, "auto": catalog_auto_on()}
 
 def catalog_attribution(src):
     o = src["openrouter_rankings"]
     return (f'scores: Artificial Analysis via openrouter.ai/rankings (fetched {_ago(o["fetched_at"])})' if o["fetched_at"]
         else "scores: unavailable (openrouter.ai/rankings not fetched); tiers guessed from names, marked ~")
+
+# ---- data privacy: zero-retention guard for model choice (spec: privacy) ----
+# FACTS (verbatim, opencode.ai/docs/zen "Privacy", 2026-10-12): zdr = space-bunny-free,
+# longcat-2.5-preview-free, step-5-preview-free; train = muse-spark-1.3-contributor-free,
+# big-pickle, exo-free, mimo-v2.6-flash-free, ling-3.1-flash-free, ling-3.0-flash-fin-free,
+# nemotron-3-ultra-free, nemotron-3.5-lightning-free; paid Zen: OpenAI/Anthropic retain
+# 30 days, Mistral/Jev no training; direct claude/codex = own subscription (retain).
+# ponytail: one block, built-in table + live zen refresh in the catalog cache path.
+OPENCODE_ZEN_URL = "https://opencode.ai/docs/zen"
+PRIVACY_ZDR = ("opencode/space-bunny-free", "opencode/longcat-2.5-preview-free", "opencode/step-5-preview-free")
+PRIVACY_TRAIN = ("opencode/muse-spark-1.3-contributor-free", "opencode/big-pickle", "opencode/exo-free",
+    "opencode/mimo-v2.6-flash-free", "opencode/ling-3.1-flash-free", "opencode/ling-3.0-flash-fin-free",
+    "opencode/nemotron-3-ultra-free", "opencode/nemotron-3.5-lightning-free")
+PRIVACY_ZDR_HINT = "space-bunny-free, longcat-2.5-preview-free, step-5-preview-free"
+def zen_privacy_path(): return ag_cache_home()/"opencode-zen-privacy.json"
+def _http_text(url, headers=None, timeout=15):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "ag-cli", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r: return r.read().decode("utf-8", "replace")
+def _zen_parse(text):
+    """{zdr,retain,train} model lists from the Zen Privacy section. JSON passes through; markdown = line heuristics. Pure."""
+    try:
+        o = json.loads(text or "")
+        if isinstance(o, dict) and any(isinstance(o.get(k), list) for k in ("zdr", "retain", "train")):
+            return {k: [str(x) for x in (o.get(k) or []) if isinstance(x, str)][:200] for k in ("zdr", "retain", "train")}
+    except Exception: pass
+    t = text or ""
+    m = re.search(r"(?i)privacy", t)
+    sec = t[m.start():] if m else t
+    sec = re.split(r"\n#{1,3} ", sec, maxsplit=1)[0] if m else sec
+    zdr, ret, tr = [], [], []
+    for ln in sec.splitlines():
+        l = ln.lower()
+        ids = re.findall(r"opencode/[a-z0-9][a-z0-9_.\-]*", l) + re.findall(r"(?:space-bunny|longcat[\w.\-]*|step-5[\w.\-]*|muse-spark[\w.\-]*|big-pickle|exo[\w.\-]*|mimo[\w.\-]*|ling[\w.\-]*|nemotron[\w.\-]*)(?:-free)?", l)
+        if not ids: continue
+        if "zero-retention" in l or "zero retention" in l or "no training" in l: zdr += ids
+        elif "retain" in l: ret += ids
+        elif "train" in l or "logg" in l or "improve" in l or "confidential" in l: tr += ids
+    uniq = lambda xs: list(dict.fromkeys(xs))[:200]
+    return {"zdr": uniq(zdr), "retain": uniq(ret), "train": uniq(tr)}
+def zen_privacy_load(refresh=False):
+    """{zdr,retain,train,fetched_at,error} from the Zen docs Privacy section (cache 24h, failure keeps last). Never raises."""
+    p = zen_privacy_path()
+    try:
+        url = (os.environ.get("AG_ZEN_URL") or OPENCODE_ZEN_URL).strip()
+        if url.lower() in ("0", "off", "none"): return _json_or_empty(p)
+        d = _json_or_empty(p)
+        have = bool(d.get("fetched_at"))
+        if not refresh and have and _age_s(d.get("fetched_at")) <= MODELS_TTL_S: return d
+        if not refresh and have: catalog_bg_refresh(); return d
+        if not refresh and not have and _age_s(d.get("attempted_at")) < BG_STAMP_S and d.get("error"): return d
+        try:
+            raw = _http_text(url, {"Accept": "text/markdown,text/html,application/json,*/*"})
+            par = _zen_parse(raw)
+            if not any(par.values()) and any(d.get(k) for k in ("zdr", "retain", "train")):
+                d = {**d, "attempted_at": now_iso(), "error": "empty privacy section (kept last good)"}
+            else:
+                d = {"fetched_at": now_iso(), "attempted_at": now_iso(), "error": "", **par}
+            try: _put_file(p, json.dumps(d) + "\n")
+            except OSError: pass
+        except Exception as e: d = {**d, "attempted_at": now_iso(), "error": str(e)[:200]}
+        return d
+    except Exception: return {}
+def _zen_lists():
+    """Cache-only live lists (no fetch, selfcheck-safe); refresh happens via zen_privacy_load in the catalog read path."""
+    try: d = _json_or_empty(zen_privacy_path())
+    except Exception: d = {}
+    return ([str(x).lower() for x in (d.get("zdr") or [])], [str(x).lower() for x in (d.get("retain") or [])], [str(x).lower() for x in (d.get("train") or [])])
+def model_privacy(backend, model):
+    """'zdr'|'retain'|'train'|'unknown' for a backend/model id. Built-in table + live Zen cache; unknown free opencode = train. Pure of roster."""
+    m = (model or "").strip()
+    if m in ("", "default"):
+        if backend == "opencode": return model_privacy(backend, OPENCODE_MODEL_DEFAULT)
+        return "zdr" if backend == "echo" else "retain" if backend in ("claude", "codex", "gemini", "cursor") else "unknown"
+    if backend in ("claude", "codex"): return "retain"
+    if backend == "echo": return "zdr"
+    if backend in ("gemini", "cursor"): return "retain"
+    low = m.lower(); short = low.split("/", 1)[-1]
+    zl, rl, tl = _zen_lists()
+    norm = lambda s: re.sub(r"[^a-z0-9]+", "", s)
+    hit = lambda pool: low in pool or short in pool or any(norm(low) == norm(x) or norm(short) == norm(x) for x in pool)
+    if low in [x.lower() for x in PRIVACY_ZDR] or hit(zl): return "zdr"
+    if low in [x.lower() for x in PRIVACY_TRAIN] or hit(tl): return "train"
+    if hit(rl): return "retain"
+    if "mistral" in low or re.search(r"(?<![a-z])jev(?![a-z])", low): return "zdr"
+    if low.startswith(("openai/", "anthropic/")) or "/openai" in low or "/anthropic" in low: return "retain"
+    if "claude" in low or short in ("haiku", "sonnet", "opus", "fable") or "gpt" in low or "openai" in low: return "retain"
+    if backend == "opencode" and "free" in low: return "train"
+    return "unknown"
+def privacy_off(): return os.environ.get("AG_PRIVACY", "1").strip().lower() in ("0", "off", "false", "no")
+def privacy_default(cwd=None):
+    """Effective routing.json privacy.default (global < project), else 'work'. Pure of roster."""
+    try: gp, pp = routing_paths(project_root(cwd))
+    except Exception: return "work"
+    d = "work"
+    for doc in (_json_or_empty(gp), _json_or_empty(pp)):
+        try: v = (doc.get("privacy") or {}).get("default")
+        except Exception: v = None
+        if isinstance(v, str) and v.strip().lower() in ("work", "public"): d = v.strip().lower()
+    return d
+def agent_data(a, default=None):
+    """Effective data class for an agent row ('work'|'public'). Unset/'' = privacy.default (default work). Pure."""
+    v = (a.get("data") or "").strip().lower() if isinstance(a, dict) else ""
+    if v in ("work", "public"): return v
+    d = (default or "").strip().lower() if isinstance(default, str) else ""
+    return d if d in ("work", "public") else privacy_default()
+def privacy_error(backend, model, data="work"):
+    """Error string when a work agent may not use the model, else None. Pure."""
+    if privacy_off() or (data or "work").strip().lower() != "work": return None
+    eff = eff_model(backend, model)
+    p = model_privacy(backend, eff or model)
+    if p in ("train", "unknown"):
+        return f"model {eff or model} may train on your data (opencode docs); use --data public or a zero-retention model ({PRIVACY_ZDR_HINT})"
+    return None
 
 
 def _md_norm(s):
@@ -11984,11 +12151,13 @@ def catalog_info(backend, model, _md=None, _ix=None, _aa=None, _rk=None):
     try: new = (datetime.now(timezone.utc) - datetime.fromisoformat(rel).replace(tzinfo=timezone.utc)).days <= 30
     except ValueError: new = False
     fast = r.get("fast", False) if sp == r.get("speed") else bool(sp and rk and rk.get("fast_tps") and sp >= rk["fast_tps"])
+    try: data = model_privacy(backend, model)
+    except Exception: data = "unknown"
     return {"tier": _tier_of(model, e or None, sc), "tier_source": ts, "reasoning": e.get("reasoning"), "tools": e.get("tool_call"),
         "context": e.get("context"), "cost_in": ci, "cost_out": co, "free": bool(free), "released": rel or None, "new": new,
         "score": sc, "coding": r.get("coding"), "agentic": r.get("agentic"), "speed": sp, "latency_ms": r.get("latency_ms"), "fast": fast,
         "popularity": r.get("popularity"), "variant": r.get("variant"), "or_slug": r.get("slug"), "rank_match": r.get("how"),
-        "source": ("models.dev:" + how) if e else "heuristic"}
+        "data": data, "source": ("models.dev:" + how) if e else "heuristic"}
 
 def _neg_str(s): return tuple(-ord(c) for c in s)
 _SORT_ATTR = {"intel": "score", "coding": "coding", "speed": "speed", "popular": "popularity"}
@@ -11997,6 +12166,8 @@ def catalog_rows(backend=None, refresh=False, sort="intel"):
     """[{backend, id, **catalog_info}] per backend, best first by `sort` (intel|coding|speed|popular; unscored last, then tier, intel, speed, newest)."""
     bs = [backend] if backend else list(MODEL_BACKENDS); at = _SORT_ATTR.get(sort, "score")
     cache = models_load(bs); md = modelsdev_load(refresh); ix = _md_index(md); aa = aa_load(refresh); rk = rankings_load(refresh)
+    try: zen_privacy_load(refresh)
+    except Exception: pass
     rows = []
     for b in bs:
         for m in (cache["backends"].get(b) or {}).get("models") or []:
@@ -12007,10 +12178,15 @@ def catalog_rows(backend=None, refresh=False, sort="intel"):
     return rows
 
 def catalog_pick(backend, tier, free_only=False, job=None):
-    """Best model id of the tier for a backend: highest intelligence (coding score for job implement/debug), then speed; unscored last; None if none."""
+    """Best model id of the tier for a backend: highest intelligence (coding score for job implement/debug), then speed; unscored last; None if none.
+    free_only ranks zdr first so work defaults stay zero-retention (Muse stays pickable via --data public)."""
     k = "coding" if job in ("implement", "debug") else "score"
     c = [r for r in catalog_rows(backend) if r["tier"] == tier and (r["free"] or not free_only)]
-    c.sort(key=lambda r: (r[k] is None, -(r[k] or 0), r["score"] is None, -(r["score"] or 0), -(r["speed"] or 0)))
+    if free_only:
+        try: zdr = lambda r: (r.get("data") or model_privacy(r["backend"], r["id"])) != "zdr"
+        except Exception: zdr = lambda r: False
+        c.sort(key=lambda r: (zdr(r), r[k] is None, -(r[k] or 0), r["score"] is None, -(r["score"] or 0), -(r["speed"] or 0)))
+    else: c.sort(key=lambda r: (r[k] is None, -(r[k] or 0), r["score"] is None, -(r["score"] or 0), -(r["speed"] or 0)))
     return c[0]["id"] if c else None
 
 def _fmt_ctx(n): return "-" if not n else f"{n/1000000:.3g}M" if n >= 1000000 else f"{round(n/1000)}k"
@@ -12021,10 +12197,10 @@ def catalog_rank_text(rows, sources=None):
     out = [catalog_attribution(sources if sources is not None else catalog_sources())] if sources is not False else []
     for b in dict.fromkeys(r["backend"] for r in rows):
         rs = [r for r in rows if r["backend"] == b]; w = max(len(r["id"]) for r in rs)
-        out += [f"{b} ({len(rs)})", f'  {"id".ljust(w)}  tier      intel  coding  agentic  tok/s  latency  ctx   $in/$out    released    flags']
+        out += [f"{b} ({len(rs)})", f'  {"id".ljust(w)}  tier      data     intel  coding  agentic  tok/s  latency  ctx   $in/$out    released    flags']
         for r in rs:
             lat = "-" if r["latency_ms"] is None else f'{r["latency_ms"]/1000:.1f}s'
-            out.append(f'  {r["id"].ljust(w)}  {(r["tier"] + ("~" if r["tier_source"] == "guess" else "")).ljust(8)}  {n(r["score"]).rjust(5)}  {n(r["coding"]).rjust(6)}  '
+            out.append(f'  {r["id"].ljust(w)}  {(r["tier"] + ("~" if r["tier_source"] == "guess" else "")).ljust(8)}  {(r.get("data") or "?").ljust(7)}  {n(r["score"]).rjust(5)}  {n(r["coding"]).rjust(6)}  '
                 f'{n(r["agentic"]).rjust(7)}  {n(r["speed"], "{:.0f}").rjust(5)}  {lat.rjust(7)}  {_fmt_ctx(r["context"]).rjust(4)}  {_fmt_cost(r).ljust(10)}  '
                 f'{(r["released"] or "-").ljust(10)}  ' + " ".join(x for x, f in (("new", r["new"]), ("fast", r["fast"])) if f))
     return "\n".join(x.rstrip() for x in out)
@@ -12159,6 +12335,9 @@ def routing_save(scope, data, sdir=None):
     """Write a v2 doc to the global|project routing.json; returns the Path. Raises ValueError on a bad shape."""
     if scope not in ("global", "project"): raise ValueError(f"bad scope {scope!r}")
     d = _rt_v2(data)
+    if "privacy" in d:
+        pv = (d.get("privacy") or {}).get("default")
+        if pv not in ("work", "public"): raise ValueError(f"bad privacy.default {pv!r}: work|public")
     for n, pr in d["profiles"].items():
         if n not in ROUTE_PROFILES: raise ValueError(f"unknown profile {n!r} ({','.join(ROUTE_PROFILES)})")
         for j, je in (pr.get("jobs") or {}).items():
@@ -12323,13 +12502,15 @@ def route_check(harness, profile, proj=None):
                 {"value": "custom", "label": "Customize per job"}]},
             {"id": "other_harnesses", "multi": True, "question": "Also set up ag for other harnesses in this project?",
                 "options": [{"value": h, "label": h} for h in others]}]
+        qs.append({"id": "data", "multi": False, "question": "Data class for this project? (work = code stays on zero-retention models only)",
+            "options": [{"value": "work", "label": "Work (only zero-retention models: space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)"}, {"value": "public", "label": "Public (any model, may train on your data)"}]})
         be = harness if harness in SETUP_HARNESSES else "claude"
         cands = list(dict.fromkeys(m for m in (_pick(be, t, be == "opencode") for t in ("small", "balanced", "big")) if m)) or \
             ({"claude": ["haiku", "sonnet", "opus"], "opencode": [OPENCODE_MODEL_DEFAULT], "codex": ["default"]}[be])
         qs += [{"id": f"job.{j}", "when": {"use": "custom"}, "multi": False, "question": f"Model for {j} ({JOB_DESC[j]})?",
             "options": [{"value": f"{be}/{m}", "label": m} for m in cands]} for j in JOB_KEYS]
     return {"configured": done, "project": str(proj), "harness": harness, "profile": profile, "questions": qs,
-        "answers_format": '{"use": "inherit|cheap|strong|custom", "other_harnesses": ["codex"], "jobs": {"review": "claude/opus"}}  (jobs only for use=custom)'}
+        "answers_format": '{"use": "inherit|cheap|strong|custom", "other_harnesses": ["codex"], "jobs": {"review": "claude/opus"}, "data": "work|public"}  (jobs only for use=custom; data sets routing.json privacy.default, default work)'}
 
 def do_route(a):
     hn, via = detect_harness()
@@ -12395,7 +12576,7 @@ def setup_state_from(scope="global", preset=None, sets=None, harn=None, claude_m
         "preset": preset or (existing.get(scope) or {}).get("preset") or "cost-first", "forced": bool(preset),
         "jobs": {}, "claude_md": claude_md, "proj": str(proj), "existing": existing, "sets": dict(sets or {}), "edits": {},
         "backends": {}, "bsets": {b: dict(v) for b, v in (bsets or {}).items()}, "bedits": {},
-        "profile": profile or (os.environ.get("AG_PROFILE") or "").strip() or profile_for(detect_harness()[0]), "pedits": {}, "pjobs": {}, "no_jobs": False, "meta": None})
+        "profile": profile or (os.environ.get("AG_PROFILE") or "").strip() or profile_for(detect_harness()[0]), "pedits": {}, "pjobs": {}, "no_jobs": False, "meta": None, "privacy": None})
 
 def setup_set_scope(st, scope): st["scope"] = scope; return _setup_rebase(st)
 def setup_set_profile(st, profile):
@@ -12461,7 +12642,8 @@ def setup_targets(st):
     for p, j in pj.items():
         if st.get("sparse") and not j: profs.pop(p, None)
     doc = {**keep, "version": 2, **({"preset": ex["preset"]} if st["no_jobs"] and ex.get("preset") else {} if st["no_jobs"] else {"preset": st["preset"]}), "profiles": profs,
-        **({"backends": bks} if bks else {}), **({"project": st["meta"]} if st["meta"] else {})}
+        **({"backends": bks} if bks else {}), **({"project": st["meta"]} if st["meta"] else {}),
+        **({"privacy": {"default": st["privacy"]}} if st.get("privacy") in ("work", "public") else {})}
     if scope == "project" and not st["meta"] and ex.get("project"): doc["project"] = ex["project"]
     ef = lambda h: routing_effective(doc, None, profile_for(h)) if scope == "global" else routing_effective(gl, doc, profile_for(h))
     eff = ef("claude")
@@ -12628,10 +12810,10 @@ function modelsPanel(){const body=h('tbody');const draw=()=>{body.textContent=''
  const rf=h('button',{type:'button',onclick:async()=>{rf.disabled=true;msg.textContent='refreshing…';try{const r=await post('refresh',{});if(r.rows){D.rows=r.rows;for(const k in ROW)delete ROW[k];for(const k in byB)delete byB[k];D.rows.forEach(x=>{ROW[x.backend+'::'+x.id]=x;(byB[x.backend]=byB[x.backend]||[]).push(x)});D.status=r.status||D.status;msg.textContent='refreshed '+D.rows.length+' models';draw();document.querySelectorAll('select[data-ag]').forEach(s=>fill(s,s._cur))}else msg.textContent=(r.errors||['failed']).join('; ')}catch(e){msg.textContent=String(e)}rf.disabled=false}},'Refresh');
  draw();return h('div',null,h('div',{class:'card'},h('div',{class:'row'},bs,ts,h('label',null,h('input',{type:'checkbox',onchange:e=>{F.free=e.target.checked;draw()}}),'free only'),h('label',null,h('input',{type:'checkbox',onchange:e=>{F.fresh=e.target.checked;draw()}}),'new (30 days)'),h('input',{type:'text',placeholder:'search','aria-label':'Search models',oninput:e=>{F.q=e.target.value.toLowerCase();draw()}}),rf,cnt,msg),
  h('div',{class:'mt'},h('table',null,h('thead',null,h('tr',null,['backend','model','tier','ctx','reasoning','tools','cost','released','score / tok/s'].map(x=>h('th',null,x)))),body))))}
-function skillsPanel(){const s=S();return h('div',{class:'card'},h('p',{style:'margin-top:0'},'Install the ag skills (ag-cli, ag-agents, with the routing table) into:'),
+function skillsPanel(){const s=S();if(!s.privacy)s.privacy={default:'work'};const pv=h('select',{'aria-label':'Data class for this scope',onchange:e=>{s.privacy.default=e.target.value}},['work','public'].map(v=>h('option',{value:v,selected:s.privacy.default===v},v==='work'?'Work (zero-retention only)':'Public (any model)')));return h('div',{class:'card'},h('p',{style:'margin-top:0'},'Install the ag skills (ag-cli, ag-agents, with the routing table) into:'),
  h('div',{class:'row'},D.harness_opts.map(x=>h('label',null,h('input',{type:'checkbox',checked:D.harnesses.includes(x),onchange:e=>{D.harnesses=D.harnesses.filter(y=>y!==x);if(e.target.checked)D.harnesses.push(x)}}),x))),
  h('div',{class:'row'},h('label',null,h('input',{type:'checkbox',checked:s.claude_md,disabled:scope!=='global',onchange:e=>{s.claude_md=e.target.checked}}),'Write the routing block into ~/.claude/CLAUDE.md'),scope!=='global'?h('span',{class:'mut'},'global scope only'):null),
- h('p',{class:'mut'},'Routing is saved to '+s.path+'.'))}
+ h('div',{class:'row'},h('label',null,'Data class for this '+(scope==='global'?'global':'project')+' scope: ',pv),h('span',{class:'mut'},'work = code only to zero-retention models')),h('p',{class:'mut'},'Routing is saved to '+s.path+'.'))}
 function render(){$('#hb').textContent='harness: '+D.harness;$('#paths').textContent=S().path;$('#dry').hidden=!D.dry_run;
  const tabs=$('#tabs');tabs.textContent='';const names=D.profile_names.map(p=>[p,({claude:'Claude Code',opencode:'opencode',codex:'codex','default':'Default'})[p]||p]).concat([['backends','Backends'],['models','Models'],['skills','Skills']]);
  if(!names.some(n=>n[0]===tab))tab=names[0][0];
@@ -12643,7 +12825,7 @@ async function post(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-
 function showErr(list){const b=$('#errs')||$('#main');const old=$('#errs');if(old)old.textContent='';const d=h('div',{class:'err',role:'alert'},list.map(x=>h('div',null,x)));(old||b).append(d);d.scrollIntoView({block:'nearest'})}
 let busy=false;
 async function save(){if(busy)return;busy=true;const s=S(),profiles={};for(const p of D.profile_names)profiles[p]={jobs:s.profiles[p].jobs};
- try{const r=await post('save',{scope,profiles,backends:s.backends,harnesses:D.harnesses,claude_md:!!s.claude_md});
+ try{const r=await post('save',{scope,profiles,backends:s.backends,harnesses:D.harnesses,claude_md:!!s.claude_md,privacy:s.privacy||{default:'work'}});
   if(r.ok){done(r)}else showErr(r.errors||['save failed'])}catch(e){showErr([String(e)])}busy=false}
 function done(r){document.querySelector('header').querySelectorAll('button').forEach(b=>b.disabled=true);$('#tabs').hidden=true;const m=$('#main');m.textContent='';
  m.append(h('div',{class:'card'},h('h2',{class:'ok',style:'margin-top:0'},r.dry_run?'Dry run: nothing written':'Saved'),h('table',null,r.files.map(f=>h('tr',null,h('td',null,f.status),h('td',null,f.path)))),(r.notes||[]).map(n=>h('p',{class:'mut'},n)),r.files.filter(f=>f.diff).map(f=>h('pre',null,f.diff)),h('p',{class:'mut'},'You can close this tab; ag setup has exited.')))}
@@ -12685,8 +12867,12 @@ def setup_web_payload(st, status=None, dry=False):
     gp, pp = routing_paths(st["proj"]); scopes = {}
     for sc in ("global", "project"):
         s = st if st["scope"] == sc else setup_state_from(sc, None, None, st["harnesses"], st["claude_md"], proj=st["proj"], existing=st["existing"])
+        try: _pv = ((st["existing"].get(sc) or {}).get("privacy") or {}).get("default")
+        except Exception: _pv = None
+        if _pv not in ("work", "public"): _pv = "work"
         scopes[sc] = {"path": _setup_short(gp if sc == "global" else pp), "profiles": _web_profiles(s, sc),
-            "backends": {b: dict(s["backends"][b]) for b in BACKEND_TABS}, "claude_md": bool(setup_claude_md_on(s)) and sc == "global"}
+            "backends": {b: dict(s["backends"][b]) for b in BACKEND_TABS}, "claude_md": bool(setup_claude_md_on(s)) and sc == "global",
+            "privacy": {"default": _pv}}
     hf = globals().get("detect_harness")
     try: harness = hf()[0] if callable(hf) else "none"
     except Exception: harness = "none"
@@ -12727,8 +12913,14 @@ def setup_web_apply(st0, body, v2=None):
             if e.get("mode") not in (None, "") and e["mode"] not in CAPS[b]["modes"]: errs.append(f"{b}: mode {e['mode']!r} not in {'|'.join(CAPS[b]['modes'])}"); continue
             if e.get("plan") is True and not CAPS[b]["plan"]: errs.append(f"{b}: no plan mode"); continue
             bk[b] = _bk_clean(e)
+    pv = None
+    if "privacy" in body:
+        pv = body.get("privacy")
+        if isinstance(pv, str): pv = {"default": pv}
+        if not isinstance(pv, dict) or pv.get("default") not in ("work", "public"): errs.append("privacy.default must be work|public")
     if errs: return errs, None, None
     st = setup_state_from(scope, None, None, [h for h in SETUP_HARNESSES if h in hs], body.get("claude_md") if scope == "global" else None, proj=st0["proj"], existing=st0["existing"], profile=prim)
+    if pv is not None: st["privacy"] = pv["default"]
     st["edits"] = {j: dict(v) for j, v in profs[prim].items()}
     st["pedits"] = {p: {j: dict(v) for j, v in jobs.items()} for p, jobs in profs.items() if p != prim and v2}; st["sparse"] = v2
     st["bedits"] = bk; _setup_rebase(st)
@@ -13118,6 +13310,10 @@ def setup_apply_answers(st, ans, harness):
     if not isinstance(oth, list) or [h for h in oth if h not in SETUP_HARNESSES]: return f"bad answers.other_harnesses: list of {','.join(SETUP_HARNESSES)}"
     harn = list(dict.fromkeys(([harness] if harness in SETUP_HARNESSES else []) + oth))
     st.update(harnesses=harn, no_jobs=True, meta={"answered": datetime.now(timezone.utc).isoformat(timespec="seconds"), "harnesses": harn})
+    if "data" in ans or "privacy" in ans:
+        dc = str(ans.get("data", ans.get("privacy", "work")) or "work").strip().lower()
+        if dc not in ("work", "public"): return f"bad answers.data {dc!r}: work|public"
+        st["privacy"] = dc
     if use in ("cheap", "strong"):
         for h in harn:
             tier = "small" if use == "cheap" else "big"
@@ -13282,6 +13478,22 @@ def _setup_selfcheck():
     e, s1, _ = setup_web_apply(s0, pj(), v2=False); assert not e and s1["jobs"]["plan"]["ag"] == {"backend": "codex", "model": "m"}
     assert setup_web_apply(s0, pj(scope="x"), v2=False)[0] and setup_web_apply(s0, pj(backends={"codex": {"mode": "zzz"}}), v2=False)[0]
     assert setup_web_apply(s0, pj(backends={"codex": {"enabled": False}}), v2=False)[0] and setup_web_apply(s0, pj(profiles={"x": {}}), v2=False)[0]
+    # data privacy: built-in table, fail-safe, guards (pure, no network: AG_ZEN_URL=off in tests still uses built-ins)
+    assert OPENCODE_MODEL_DEFAULT == "opencode/space-bunny-free"
+    assert model_privacy("opencode", "opencode/space-bunny-free") == "zdr" and model_privacy("opencode", "opencode/longcat-2.5-preview-free") == "zdr"
+    assert model_privacy("opencode", "opencode/muse-spark-1.3-contributor-free") == "train" and model_privacy("opencode", "opencode/big-pickle") == "train"
+    assert model_privacy("opencode", "opencode/mystery-zzz-free") == "train" and model_privacy("claude", "opus") == "retain" and model_privacy("codex", "default") == "retain"
+    assert model_privacy("echo", "default") == "zdr" and model_privacy("opencode", "default") == "zdr"
+    assert _zen_parse(json.dumps({"zdr": ["opencode/a-free"]})) == {"zdr": ["opencode/a-free"], "retain": [], "train": []}
+    assert privacy_default() == "work" and agent_data({}) == "work" and agent_data({"data": "public"}) == "public"
+    _pe = privacy_error("opencode", "opencode/muse-spark-1.3-contributor-free", "work")
+    assert _pe and "may train on your data" in _pe and "space-bunny-free" in _pe
+    assert privacy_error("opencode", "opencode/space-bunny-free", "work") is None and privacy_error("opencode", "opencode/muse-spark-1.3-contributor-free", "public") is None
+    _sa = setup_state_from("project", None, None, [], None, proj="/x", existing={"global": {}, "project": {}})
+    assert setup_apply_answers(_sa, {"use": "inherit", "other_harnesses": [], "data": "public"}, "claude") is None and _sa["privacy"] == "public"
+    assert setup_apply_answers(_sa, {"use": "inherit", "data": "nope"}, "claude")
+    _rc = route_check("claude", "claude", proj="/x")
+    assert any(q["id"] == "data" for q in _rc["questions"]) and '"data": "work|public"' in _rc["answers_format"]
 
 def build():
     p = argparse.ArgumentParser(prog="ag", description="CLI helper for autonomous agents")
@@ -13342,9 +13554,9 @@ def build():
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort: claude --effort, opencode --variant (e.g. max), codex model_reasoning_effort ("" clears)')
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort: claude --effort, opencode --variant (e.g. max), codex model_reasoning_effort ("" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort: claude --effort, opencode --variant (e.g. max), codex model_reasoning_effort ("" clears)')
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort: claude --effort, opencode --variant (e.g. max), codex model_reasoning_effort ("" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)')
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)
@@ -13410,7 +13622,7 @@ def build():
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
-    mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by Artificial Analysis intelligence/coding/agentic score, speed, tier (openrouter.ai/rankings + models.dev)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only"); mo.add_argument("--sort",choices=("intel","coding","speed","popular"),default=None,help="rank order (implies --rank)"); mo.add_argument("--auto",choices=("on","off"),default=None,help="toggle background catalog refresh (config.json catalog_auto)"); mo.add_argument("--status",action="store_true",help="last fetch per catalog source + auto state"); mo.add_argument("--bg",action="store_true",help=argparse.SUPPRESS)
+    mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by Artificial Analysis intelligence/coding/agentic score, speed, tier (openrouter.ai/rankings + models.dev)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only"); mo.add_argument("--sort",choices=("intel","coding","speed","popular"),default=None,help="rank order (implies --rank)"); mo.add_argument("--auto",choices=("on","off"),default=None,help="toggle background catalog refresh (config.json catalog_auto)"); mo.add_argument("--status",action="store_true",help="last fetch per catalog source + auto state"); mo.add_argument("--zdr",action="store_true",help="zero-retention models only (data privacy)"); mo.add_argument("--bg",action="store_true",help=argparse.SUPPRESS)
     rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS); rt.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile to show (default: detected harness)"); rt.add_argument("--json",action="store_true",default=argparse.SUPPRESS); rt.add_argument("--check",action="store_true",help="per-project setup check: configured? + questions to ask the user")
     st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL | backend.B.(enabled|model|mode|plan)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
     return p

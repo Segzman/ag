@@ -80,10 +80,20 @@ ag auto-checks GitHub once a day in a detached process; applies on next run. Git
 ## Models
 
 ```sh
-{{AG}} models [--backend B] [--refresh] [--rank] [--sort intel|coding|speed|popular] [--tier small|balanced|big] [--free] [--auto on|off] [--status] [--json]
+{{AG}} models [--backend B] [--refresh] [--rank] [--sort intel|coding|speed|popular] [--tier small|balanced|big] [--free] [--zdr] [--auto on|off] [--status] [--json]
 ```
 
-Live list per backend (opencode, codex, cursor discovered; claude/gemini static aliases). Cache `~/.cache/ag/models.json`, TTL 24h, auto-refresh when stale; `--refresh` forces. A failing source keeps its last good list and records `error`. Use it to pick valid model ids before `agents add --model`. `--rank` shows Artificial Analysis scores (intelligence/coding/agentic) + tok/s + latency from openrouter.ai/rankings, plus ctx, price/`free`, release date, `new`/`fast` badges. Tier is derived from the intelligence score (big >= 40, balanced 20-40, small < 20); `tier~` = no score, guessed from the name. Sorted by intelligence per backend; `--sort intel|coding|speed|popular`; `--tier T`/`--free` filter; `--json` has every field + `sources` fetch times. Source: "scores: Artificial Analysis via openrouter.ai/rankings". `AG_AA_KEY` adds the official AA API as an override. Stale caches refresh in a detached background run (never blocks); `{{AG}} models --auto on|off` toggles it (also the daily update's catalog refresh), `--status` shows last fetch per source. Small-fast vs big-smart: `models --backend opencode --free --tier big`, `--sort speed`. `{{AG}} route [JOB] [--profile P] [--check] [--json]` shows the detected harness + effective job routing for its profile; `--check` = per-project setup questions (see `ag-agents`).
+Live list per backend (opencode, codex, cursor discovered; claude/gemini static aliases). Cache `~/.cache/ag/models.json`, TTL 24h, auto-refresh when stale; `--refresh` forces. A failing source keeps its last good list and records `error`. Use it to pick valid model ids before `agents add --model`. `--rank` shows Artificial Analysis scores (intelligence/coding/agentic) + tok/s + latency from openrouter.ai/rankings, plus ctx, price/`free`, release date, `new`/`fast` badges. Tier is derived from the intelligence score (big >= 40, balanced 20-40, small < 20); `tier~` = no score, guessed from the name. Sorted by intelligence per backend; `--sort intel|coding|speed|popular`; `--tier T`/`--free` filter; `--json` has every field + `sources` fetch times. Source: "scores: Artificial Analysis via openrouter.ai/rankings". `AG_AA_KEY` adds the official AA API as an override. Stale caches refresh in a detached background run (never blocks); `{{AG}} models --auto on|off` toggles it (also the daily update's catalog refresh), `--status` shows last fetch per source. Small-fast vs big-smart: `models --backend opencode --free --tier big`, `--sort speed`. `--rank` shows a `data` column (zdr/retain/train); `--zdr` filters zero-retention only. `{{AG}} route [JOB] [--profile P] [--check] [--json]` shows the detected harness + effective job routing for its profile; `--check` = per-project setup questions (see `ag-agents`).
+
+## Data privacy
+
+Rule: work code only to zdr models. `agents add|set --data work|public` (default from `routing.json` `privacy.default`, default `work`); project setup asks it (`route --check` data question, `setup --answers '{"data":"work"}'`, web form selector). `work` refuses `train`/`unknown` at add/set and at turn time (exit 2, never sent). `AG_PRIVACY=off` disables (unsafe). Opencode `default` = `opencode/space-bunny-free` (zdr); free catalog picks rank zdr first. Live table: opencode.ai/docs/zen Privacy (`AG_ZEN_URL`, 24h cache); unknown free opencode = `train`.
+
+| data | models |
+|---|---|
+| zdr | `opencode/space-bunny-free`, `opencode/longcat-2.5-preview-free`, `opencode/step-5-preview-free`; paid Mistral/Jev |
+| retain | paid OpenAI/Anthropic (30d); direct `claude`/`codex` (own subscription); `gemini`/`cursor` |
+| train | `opencode/muse-spark-1.3-contributor-free`, `big-pickle`, `exo-free`, `mimo-v2.6-flash-free`, `ling-3.1-flash-free`, `ling-3.0-flash-fin-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free` |
 
 ## Setup
 

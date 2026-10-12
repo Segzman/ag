@@ -2977,6 +2977,10 @@ def update_agent_settings(sdir, name, updates):
         rows = load_agents(sdir)
         a = next((r for r in rows if r["name"] == name), None)
         if a is None: return (False, f"no such agent: {name} (ag agents list)")
+        if "mode" in updates or "plan" in updates:  # dispatch mode ceiling: explicit escalation refused
+            if (_mce := _mode_ceiling_err(updates.get("mode", a.get("mode") or ""),
+                    updates.get("plan", bool(a.get("plan"))))):
+                return (False, f"{_mce} (parent {_mode_ceiling()[0]}; AG_MODE_CEILING=off disables, unsafe)")
         old = a.get("backend", "claude")
         new = new or old
         meta = load_chat_meta(sdir, name, agent=a)
@@ -4416,6 +4420,33 @@ def mode_env(sdir, agent, env):
 def caps_rows(backend=None):
     names = [backend] if backend else list(CAPS)
     return [{"backend": b, **CAPS[b], "advisory": [m for m in MODES if m not in CAPS[b]["modes"]]} for b in names]
+
+# --- dispatch mode ceiling: a turn's children may not exceed the parent's mode ---
+# Order: plan/ro < edits < auto < full; unset (= backend default) counts as edits.
+def _mode_rank(mode="", plan=False):
+    """Pure: privilege rank of (mode, plan). plan and ro share the floor."""
+    if plan or (mode or "") in ("plan", "ro"): return 0
+    return {"": 1, "edits": 1, "auto": 2, "full": 3}.get(mode or "", 1)
+def _mode_ceiling():
+    """(parent, ceiling) when running inside an ag-launched turn, else None.
+    Marker is set by _turn_env; AG_MODE_CEILING=off disables (unsafe)."""
+    if (os.environ.get("AG_MODE_CEILING") or "").strip().lower() == "off": return None
+    p = (os.environ.get("AG_PARENT_AGENT") or "").strip()
+    if not p: return None
+    pm = (os.environ.get("AG_PARENT_MODE") or "").strip()
+    return (p, pm if pm in ("plan",) + MODES else "edits")
+def _mode_ceiling_err(mode, plan=False):
+    """Pure: 'mode X exceeds parent ceiling Y' or ''. Clearing ("") and plan never exceed."""
+    mc = _mode_ceiling()
+    if not mc or not (mode or ""): return ""
+    if _mode_rank(mode, plan) > _mode_rank(mc[1]): return f"mode {mode} exceeds parent ceiling {mc[1]}"
+    return ""
+def _mode_clamp(a):
+    """Ceiling string to clamp this agent's turn to, or ''."""
+    mc = _mode_ceiling()
+    if not mc: return ""
+    if _mode_rank(a.get("mode") or "", bool(a.get("plan"))) > _mode_rank(mc[1]): return mc[1]
+    return ""
 
 def do_caps(a):
     be = getattr(a, "backend", None)
@@ -6613,6 +6644,8 @@ def do_agents(a):
         if any(r["name"]==a.name for r in rows):
             return emit(a,"agents",error=f"exists: {a.name}")
         if getattr(a,"mode",None) and a.mode not in MODES: return emit(a,"agents",error=f"bad mode: {a.mode}",hint="|".join(MODES))
+        if (_mce := _mode_ceiling_err(getattr(a, "mode", None) or "", bool(getattr(a, "plan", None)))):
+            return emit(a,"agents",error=_mce,hint=f"parent {_mode_ceiling()[0]} (AG_MODE_CEILING=off disables, unsafe)")
         pers = getattr(a,"persona",None) or ""
         if pers and pers not in [r["name"] for r in load_roles(sdir)]:
             return emit(a,"agents",error=f"no such role: {pers}",hint="ag roles list")
@@ -6702,7 +6735,7 @@ def do_agents(a):
             updates.update({"dir": wt["path"], "worktree": wt})
         ok, message = update_agent_settings(sdir, a.name, updates)
         if not ok: return emit(a, "agents", error=message,
-            hint="ag roles list" if "no such role" in message else None)
+            hint="ag roles list" if "no such role" in message else ("AG_MODE_CEILING=off disables (unsafe)" if "parent ceiling" in message else None))
         if updates.get("worktree"): return emit(a, "agents", {"_text": f"updated {a.name}  branch {updates['worktree']['branch']}  worktree {updates['dir']}", "worktree": updates["worktree"]})
         return emit(a, "agents", {"_text": f"updated {a.name}"})
 
@@ -7982,6 +8015,8 @@ def _turn_env(sdir, a, backend, prof, notes=None):
     overlay + secret askpass wiring. `notes` collects unresolved-ref notes."""
     env = dict(os.environ, **(backend_env_for_profile(sdir, a, prof) if prof else {}))
     merge_agent_env(sdir, a, prof, env, notes)
+    env["AG_PARENT_AGENT"] = a.get("name", "") or ""  # dispatch mode ceiling: children inherit this turn's agent+mode
+    env["AG_PARENT_MODE"] = "plan" if a.get("plan") else (a.get("mode") or "")
     return secret_env(sdir, mode_env(sdir, a, env))
 
 def _turn_source(p):
@@ -8037,6 +8072,11 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if command and backend != "opencode":
             _release_agent_turn(_turn_lock); _turn_lock = None
             return {"error":f"--command is opencode-only (agent {name} runs {backend})"}
+        _ceil = "" if _rs else _mode_clamp(a)  # dispatch mode ceiling: over-privileged child runs clamped
+        _mc_parent = (os.environ.get("AG_PARENT_AGENT") or "").strip() if _ceil else ""
+        a_eff = dict(a)
+        if _ceil == "plan": a_eff["plan"] = True
+        elif _ceil: a_eff["mode"] = _ceil
         if not _rs and (_pe := preflight_auth(backend)): _release_agent_turn(_turn_lock); _turn_lock = None; return {"error":_pe}
         meta = load_chat_meta(sdir,name,agent=a)
         sids = meta.get("sids") or {}
@@ -8071,10 +8111,10 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             sid = sids.get(backend, "")
             if not sid and meta.get("backend", backend) == backend:
                 sid = meta.get("sid","")
-        prompt, sys_txt, prof_name = _turn_prompt(sdir, a, backend, sid, text, command, _rs)
+        prompt, sys_txt, prof_name = _turn_prompt(sdir, a_eff, backend, sid, text, command, _rs)
         try:
-            argv = _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, prof_name)
-            _mw = mode_warning(backend, a.get("mode") or "", bool(a.get("plan")))
+            argv = _turn_argv(sdir, a_eff, backend, model, workdir, sid, prompt, sys_txt, command, prof_name)
+            _mw = mode_warning(backend, a_eff.get("mode") or "", bool(a_eff.get("plan")))
             if _mw and not _rs:
                 _event(sdir, "mode_warn", name, warning=_mw)
                 if on_event: on_event(name, "tool", _mw)
@@ -8085,6 +8125,15 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             if not _rs: append_chat(sdir,name,"user",text,event_id=user_eid)
         except Exception:
             user_persist_ok = False
+        if _ceil and not _rs:
+            _note = f"[mode] clamped to {_ceil} by parent {_mc_parent}"
+            try: append_chat(sdir,name,"tool",_note)
+            except Exception: pass
+            try: _event(sdir,"mode_clamp",name,ceiling=_ceil,parent=_mc_parent)
+            except Exception: pass
+            if on_event:
+                try: on_event(name,"tool",_note)
+                except Exception: pass
         buf = TimelineBuffer(sdir,name,on_event)
         if not user_persist_ok:
             buf.persist_failed = True
@@ -8095,7 +8144,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         _usage, _fresh = {}, not sid
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
         _en = []
-        env = _turn_env(sdir, a, backend, prof_name, _en)
+        env = _turn_env(sdir, a_eff, backend, prof_name, _en)
         for _n in _en:
             if on_event: on_event(name, "tool", _n)
         _timed_out = {"hit": False}
@@ -11140,6 +11189,20 @@ def do_selfcheck(a):
         assert "--command" not in backend_argv("opencode",model="",workdir=".",sid="",prompt="hi")
         assert backend_argv("opencode",model="x",workdir=".",prompt="hi",effort="max")[-6:-1]==["x","--variant","max","--dir","."] and "--variant" not in backend_argv("opencode",prompt="hi")
         assert "--effort" in backend_argv("claude",prompt="hi",effort="high") and backend_argv("codex",prompt="hi",effort="low")[3:5]==["-c",'model_reasoning_effort="low"']
+        assert [_mode_rank(m) for m in MODES]==[0,1,2,3] and _mode_rank("",True)==0 and _mode_rank("plan")==0 and _mode_rank("")==1
+        _mpa, _mpm, _mmc = os.environ.get("AG_PARENT_AGENT"), os.environ.get("AG_PARENT_MODE"), os.environ.get("AG_MODE_CEILING")
+        try:
+            os.environ.pop("AG_PARENT_AGENT",None); assert _mode_ceiling() is None and _mode_ceiling_err("full")==""
+            os.environ.update(AG_PARENT_AGENT="p",AG_PARENT_MODE="ro")
+            assert _mode_ceiling()==("p","ro") and _mode_ceiling_err("full")=="mode full exceeds parent ceiling ro" and _mode_ceiling_err("ro")=="" and _mode_clamp({"mode":"full"})=="ro" and _mode_clamp({"mode":"ro"})==""
+            os.environ.pop("AG_PARENT_MODE",None); assert _mode_ceiling()==("p","edits")
+            os.environ["AG_MODE_CEILING"]="off"; assert _mode_ceiling() is None
+            _me = _turn_env(td,{"name":"par","backend":"echo","mode":"full"},"",None)
+            assert _me.get("AG_PARENT_AGENT")=="par" and _me.get("AG_PARENT_MODE")=="full"
+        finally:
+            for _k,_v in (("AG_PARENT_AGENT",_mpa),("AG_PARENT_MODE",_mpm),("AG_MODE_CEILING",_mmc)):
+                if _v is None: os.environ.pop(_k,None)
+                else: os.environ[_k]=_v
         _r = run_turn(td,"sl","hi",command="x")
         assert "error" in _r and "opencode-only" in _r["error"], _r
         assert set(TUI_MODE_TITLE) >= {"input","normal","setmodel","newname","newbackend","dagent","dtext","backendpick","profilepick"}

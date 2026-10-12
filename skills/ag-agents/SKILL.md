@@ -39,7 +39,7 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 {{AG}} --dir <state> agents set w --effort max            # reasoning effort: opencode --variant, claude --effort, codex model_reasoning_effort; "" clears
 ```
 
-Modes: `ro` read-only, `edits` workspace writes, `auto`, `full` unrestricted. Unset = backend default. Check `agents caps` first: a mode the backend can't enforce (echo, gemini `auto`) prints a `[mode]` warning and runs default. Prefer `ro` for review/plan jobs. Never `full` unless asked.
+Modes: `ro` read-only, `edits` workspace writes, `auto`, `full` unrestricted. Unset = backend default. Check `agents caps` first: a mode the backend can't enforce (echo, gemini `auto`) prints a `[mode]` warning and runs default. Prefer `ro` for review/plan jobs. Never `full` unless asked. Dispatch ceiling: inside a turn, `agents add/set --mode` above the parent's mode fails (`mode X exceeds parent ceiling Y`; plan/ro < edits < auto < full; unset parent = `edits`); over-privileged children run clamped with a `[mode] clamped to Y by parent <name>` tool row. `AG_MODE_CEILING=off` disables (unsafe).
 
 ### Per-agent env and keys
 

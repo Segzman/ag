@@ -2974,6 +2974,7 @@ def handoff_history(sdir, name, budget, old):
     sel, used = [], 0
     for r in reversed(rows):
         line = f'{r.get("role", "")}: {r.get("text", "")}'
+        if not sel and len(line) > cap: line = "…" + line[-cap:]  # newest row alone over budget: keep its tail
         if sel and used + len(line) > cap: break
         sel.append(line); used += len(line)
     sel.reverse()
@@ -11045,6 +11046,7 @@ def do_delegate(a):
 
 def do_selfcheck(a):
     import tempfile
+    os.environ["AG_HARNESS"] = "claude"  # asserts assume the claude profile; detection would follow the calling harness (opencode/codex)
     td = Path(tempfile.mkdtemp(prefix="agent-check-"))
     class A: pass
     def mk(**k):
@@ -11195,7 +11197,7 @@ def do_selfcheck(a):
         assert _hh.startswith("[handoff from echo]") and "user: q1" in _hh and "agent: a1" in _hh, _hh
         append_chat(td,"ho","user","x"*400)
         _hh2 = handoff_history(td,"ho",10,"echo")
-        assert "q1" not in _hh2 and "x"*10 in _hh2, _hh2  # oldest-dropped under budget
+        assert "q1" not in _hh2 and "x"*10 in _hh2 and len(_hh2) < 80, _hh2  # oldest-dropped; newest truncated to budget
         assert handoff_history(td,"ho",0,"echo").startswith("[handoff from echo]")  # bad budget -> default
         assert handoff_default_budget()==4000
         os.environ["AG_HANDOFF_BUDGET"]="7"; assert handoff_default_budget()==7

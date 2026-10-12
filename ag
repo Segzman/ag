@@ -6563,6 +6563,70 @@ def do_receipts(a):
         except OSError: pass
     return emit(a,"receipts",{"_text":f"removed {n} receipts","removed":n})
 
+# ---- agents fork: clone config + history, fresh session, lineage ----
+def resume_replay_hist(sdir, name, limit=4000, drop_trailing_user=True):
+    """History replay for a fresh session (stale-session recovery shape).
+    Last 10 user/agent rows, tail-cut to limit chars. drop_trailing_user:
+    True when the current in-flight user row is already appended (retry
+    path); False for a forked agent's first turn, where the trailing SRC
+    user row is genuine history. Pure of backend I/O beyond the log read."""
+    try: rows = load_chat_log(sdir, name)
+    except Exception: return ""
+    if drop_trailing_user and rows and rows[-1].get("role") == "user": rows = rows[:-1]  # current msg is sent separately
+    rows = [r for r in rows if r.get("role") in ("user", "agent")][-10:]
+    return "\n".join(f'{r["role"]}: {r.get("text", "")}' for r in rows)[-limit:]
+
+def do_agents_fork(a, sdir):
+    src = getattr(a, "src", None) or getattr(a, "name", "") or ""
+    new = getattr(a, "new", None) or ""
+    if not src or not new: return emit(a, "agents", error="usage: ag agents fork SRC NEW [--backend B] [--model M] [--effort E] [--worktree]",
+        hint="ag agents list")
+    rows = load_agents(sdir)
+    scol = next((r for r in rows if r["name"] == src), None)
+    if scol is None: return emit(a, "agents", error=f"no such agent: {src}", hint="ag agents list")
+    if any(r["name"] == new for r in rows): return emit(a, "agents", error=f"exists: {new}")
+    if agent_busy(sdir, src): return emit(a, "agents", error=f"{src} is busy (turn or handoff running); retry when idle.")
+    be = getattr(a, "backend", None) or scol.get("backend", "claude")
+    if be not in ("claude", "opencode", "gemini", "codex", "cursor", "echo", "acp"):
+        return emit(a, "agents", error=f"unknown backend: {be} ({'/'.join(NATIVE_ORDER)}/acp)")
+    mod = getattr(a, "model", None) if getattr(a, "model", None) is not None else scol.get("model", "default") or "default"
+    eff = getattr(a, "effort", None) if getattr(a, "effort", None) is not None else scol.get("effort", "")
+    if (_ae := acp_check(be, scol.get("transport", "") if getattr(a, "backend", None) is None else "", getattr(a, "acp_cmd", None) if getattr(a, "acp_cmd", None) is not None else scol.get("acp_cmd"))): return emit(a, "agents", error=_ae)
+    pers = scol.get("persona", "") or ""
+    if pers and pers not in [r["name"] for r in load_roles(sdir)]:
+        return emit(a, "agents", error=f"no such role: {pers}", hint="ag roles list")
+    try: srows = load_chat_log(sdir, src)
+    except Exception: srows = []
+    fork_turn = sum(1 for r in srows if r.get("role") == "user")
+    adir = scol.get("dir", ".") or "."
+    wt = None
+    if getattr(a, "worktree", False):
+        wt, err, hint = wt_create(new, adir, getattr(a, "base", None))
+        if err: return emit(a, "agents", error=err, hint=hint)
+        adir = wt["path"]
+    row = {"name": new, "backend": be, "model": mod or "default", "dir": adir, "role": scol.get("role", "sub") or "sub",
+        "persona": pers, "system": scol.get("system", "") or "",
+        "instructions": list(scol.get("instructions") or []),
+        "forked_from": src, "forked_at": now_iso(), "fork_turn": fork_turn}
+    for k in ("mode", "plan", "effort", "transport", "acp_cmd", "profile", "env", "env_unset", "subscription_only"):
+        if k == "effort":
+            if eff not in (None, ""): row["effort"] = eff
+            continue
+        v = scol.get(k)
+        if v not in (None, "", [], {}): row[k] = (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
+    if wt: row["worktree"] = wt
+    if be == "opencode" and row["model"] in ("", "default"): row["model"] = OPENCODE_MODEL_DEFAULT
+    rows.append(row); save_agents(sdir, rows)
+    try:
+        sp, np = chat_log_path(sdir, src), chat_log_path(sdir, new)
+        if sp.is_file(): np.write_bytes(sp.read_bytes())
+        save_chat_meta(sdir, new, {"backend": be, "model": row["model"], "dir": adir, "role": row["role"], "sid": "", "sids": {}})
+    except Exception as e: return emit(a, "agents", error=f"forked {src} -> {new} but history copy failed: {e}")
+    try: _event(sdir, "fork", new, src=src, fork_turn=fork_turn)
+    except Exception: pass
+    if wt: return emit(a, "agents", {"_text": f"forked {src} -> {new}  branch {wt['branch']}  worktree {wt['path']}  <- {src}", "worktree": wt})
+    return emit(a, "agents", {"_text": f"forked {src} -> {new}  <- {src}"})
+
 # ---- agents ps: live process trees per agent (turn / wake / handoff) ----
 def _etime_s(e):
     try:
@@ -6615,7 +6679,8 @@ def _ps_tree(table, root, pgid=None):
 
 def agents_ps(sdir, table=None):
     table = table if table is not None else _ps_table()
-    be = {r.get("name"): r.get("backend", "") for r in load_agents(sdir)}
+    agm = {r.get("name"): r for r in load_agents(sdir)}
+    be = {n: r.get("backend", "") for n, r in agm.items()}
     roots = []  # (agent, state, pid, pgid, ts)
     for a in be:
         r = None
@@ -6643,7 +6708,8 @@ def agents_ps(sdir, table=None):
         pids = _ps_tree(table, pid, pgid)
         rows.append({"agent": a, "state": state, "pids": pids, "root": pid, "procs": len(pids),
             "cpu": round(sum(table[x]["cpu"] for x in pids), 1), "rss_mb": round(sum(table[x]["rss_mb"] for x in pids), 1),
-            "elapsed_s": proc["etime_s"], "backend": be.get(a, ""), "comm": proc["comm"]})
+            "elapsed_s": proc["etime_s"], "backend": be.get(a, ""), "comm": proc["comm"],
+            **({"forked_from": agm[a]["forked_from"], "forked_at": agm[a].get("forked_at", ""), "fork_turn": agm[a].get("fork_turn", 0)} if agm.get(a, {}).get("forked_from") else {})})
     return rows
 
 def do_agents_ps(a, sdir):
@@ -6653,7 +6719,7 @@ def do_agents_ps(a, sdir):
     L = [f'{"AGENT":12} {"STATE":8} {"PIDS":18} {"PROCS":>5} {"%CPU":>6} {"RSS_MB":>8} {"ELAPSED":>8} BACKEND']
     for r in rows:
         pd = ",".join(map(str, r["pids"][:3])) + ("+" if len(r["pids"]) > 3 else "")
-        L.append(f'{r["agent"][:12]:12} {r["state"]:8} {pd:18} {r["procs"]:>5} {r["cpu"]:>6.1f} {r["rss_mb"]:>8.1f} {r["elapsed_s"]:>7}s {r["backend"]}')
+        L.append(f'{r["agent"][:12]:12} {r["state"]:8} {pd:18} {r["procs"]:>5} {r["cpu"]:>6.1f} {r["rss_mb"]:>8.1f} {r["elapsed_s"]:>7}s {r["backend"]}' + (f'  <- {r["forked_from"]}' if r.get("forked_from") else ""))
         if getattr(a, "tree", False):
             tb = _ps_table()
             for x in r["pids"]: L.append(f'  {x:>7} ppid={tb[x]["ppid"]} {tb[x]["comm"]}' if x in tb else f'  {x:>7} (gone)')
@@ -6688,8 +6754,9 @@ def do_agents(a):
     rows = load_agents(sdir)
     if a.sub=="list":
         if getattr(a,"json",False): return emit(a,"agents",{"agents":[{**r,"queue":len(queue_list(sdir,r["name"])),"queue_held":queue_held(sdir,r["name"])} for r in rows]})
-        txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("persona","") or "-":12} {r.get("profile","") or "-":12} {(r.get("mode") or "-")+("+plan" if r.get("plan") else ""):9} {r.get("dir",".")}{"  ["+r["worktree"]["branch"]+"]" if r.get("worktree") else ""}' for r in rows) or "(none)"
+        txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("persona","") or "-":12} {r.get("profile","") or "-":12} {(r.get("mode") or "-")+("+plan" if r.get("plan") else ""):9} {r.get("dir",".")}{"  ["+r["worktree"]["branch"]+"]" if r.get("worktree") else ""}{"  <- "+r["forked_from"] if r.get("forked_from") else ""}' for r in rows) or "(none)"
         return emit(a,"agents",{"_text":txt})
+    if a.sub=="fork": return do_agents_fork(a, sdir)
     if a.sub=="caps": return do_caps(a)
     if a.sub=="env":
         cur = next((r for r in rows if r["name"]==a.name), None)
@@ -8058,7 +8125,7 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
         hist = handoff_history(sdir, name, ph.get("budget"), ph.get("from", "?"))
         prompt = (hist+"\n\n---\n"+text) if hist else text
     else:
-        hist = "" if (sid and (backend in ("claude","opencode","cursor","codex") or acp_on(a, backend, command))) else recent_history(sdir,name)
+        hist = "" if (sid and (backend in ("claude","opencode","cursor","codex") or acp_on(a, backend, command))) else (resume_replay_hist(sdir, name, drop_trailing_user=False) if a.get("forked_from") else recent_history(sdir,name))
         prompt = (hist+"\n\n---\n"+text) if hist else text
     sys_txt = eff_system(sdir, a)
     # harness profile: instructions/memory/skills context must reach backend
@@ -8528,10 +8595,7 @@ def _retry_plan(sdir,name,backend,sid,rc,err,timed_out,got_output,rs,lock,t0,tim
             (meta.get("sids") or {}).pop(backend, None)
             if meta.get("backend", backend) == backend: meta["sid"] = ""
             save_chat_meta(sdir,name,meta)
-            rows = load_chat_log(sdir,name)
-            if rows and rows[-1].get("role") == "user": rows = rows[:-1]  # current msg is sent separately
-            rows = [r for r in rows if r.get("role") in ("user","agent")][-10:]
-            nx["hist"] = "\n".join(f'{r["role"]}: {r.get("text","")}' for r in rows)[-4000:]
+            nx["hist"] = resume_replay_hist(sdir, name)
             nx["resumed"] = True
             note = f"[resume] session {sid} not found; started fresh with history replay"
             append_chat(sdir,name,"tool",note)
@@ -11902,6 +11966,16 @@ def do_selfcheck(a):
         assert do_agents(mk(sub="set",name="t1",backend=None,model="opus",adir=None,role=None,persona="reviewer",system=None))==0
         assert [x for x in load_agents(td) if x["name"]=="t1"][0]["persona"]=="reviewer"
         assert do_agents(mk(sub="set",name="t1",backend=None,model=None,adir=None,role=None,persona="",system=None))==0
+        assert do_agents(mk(sub="add",name="fsrc",backend="echo",model="default",adir=".",role="sub"))==0
+        append_chat(td,"fsrc","user","q1"); append_chat(td,"fsrc","agent","a1")
+        save_chat_meta(td,"fsrc",{"backend":"echo","sid":"oldsid","sids":{"echo":"oldsid"}})
+        assert do_agents(mk(sub="fork",src="fsrc",new="fdst",backend=None,model=None,effort=None,worktree=False,base=None,acp_cmd=None))==0
+        _ff=[x for x in load_agents(td) if x["name"]=="fdst"][0]
+        assert _ff["forked_from"]=="fsrc" and _ff["fork_turn"]==1 and load_chat_meta(td,"fdst")["sid"]==""
+        append_chat(td,"fsrc","user","q2")
+        assert "user: q2" in resume_replay_hist(td,"fsrc",drop_trailing_user=False) and "user: q2" not in resume_replay_hist(td,"fsrc")
+        assert do_agents(mk(sub="rm",name="fdst",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
+        assert do_agents(mk(sub="rm",name="fsrc",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
         assert do_roles(mk(sub="add",name="rev",system="Be terse."))==0
         assert do_roles(mk(sub="list"))==0
         assert do_roles(mk(sub="show",name="rev"))==0
@@ -14558,6 +14632,7 @@ def build():
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
     aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
+    agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
     ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)')
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")

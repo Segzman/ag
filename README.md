@@ -196,10 +196,10 @@ ag agents doctor | list
 ag agents add w --backend opencode --role sub [--model ID] [--dir D] [--persona P|--system TEXT|@file] [--job JOB]
 ag agents set w --backend B --model ID --persona P --worktree      # refused while busy
 ag agents rm w [--force]
-ag harness use w codex ; ag harness current w     # switch backend; remembers one model + one session id per backend
+ag harness use w codex [--model ID] [--budget N] ; ag harness current w     # switch backend; remembers one model + one session id per backend
 ```
 
-Switches preserve name/workdir/role/persona, never resume a foreign session id, and refuse while a turn runs (one cross-process flock guard per agent, also covering live native handoffs).
+Switches preserve name/workdir/role/persona, never resume a foreign session id, and refuse while a turn runs (one cross-process flock guard per agent, also covering live native handoffs). A switch stores a pending handoff: the next turn replays the old backend's newest-first user/agent rows until `--budget` tokens (~ chars/4, default 4000, `AG_HANDOFF_BUDGET` overrides), oldest-dropped, prefixed `[handoff from <old>]`; consumed after the first successful turn (`agents set --backend` uses the default budget).
 
 ### Per-agent env and keys
 

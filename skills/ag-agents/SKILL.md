@@ -24,7 +24,7 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 {{AG}} --dir <state> agents add w --backend opencode --role sub [--model ID] [--job mechanical]
 {{AG}} --dir <state> agents set w --model ID | --backend B | --persona planner | --worktree
 {{AG}} --dir <state> agents rm w [--force]
-{{AG}} --dir <state> harness use w codex         # switch backend; harness current w shows it
+{{AG}} --dir <state> harness use w codex [--budget N]   # switch backend; next turn replays old history bounded by N tokens (default 4000, AG_HANDOFF_BUDGET); harness current w shows it
 {{AG}} --dir <state> models --backend opencode   # valid model ids
 ```
 

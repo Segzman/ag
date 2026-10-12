@@ -1988,7 +1988,10 @@ def do_harness(a):
         sdir = state_dir(a.dir); ensure_state(sdir)
         message = ""
         if a.sub == "use":
-            ok, message = switch_backend(sdir, a.agent, a.backend, a.model)
+            try: _b = None if getattr(a, "budget", None) in (None, "") else int(getattr(a, "budget"))
+            except (TypeError, ValueError): return emit(a, "harness", error=f"bad --budget: {getattr(a, 'budget')}")
+            if _b is not None and _b <= 0: return emit(a, "harness", error=f"bad --budget: {_b} (positive tokens)")
+            ok, message = switch_backend(sdir, a.agent, a.backend, a.model, _b)
             if not ok: return emit(a, "harness", error=message)
         data = harness_current(sdir, a.agent)
         if "error" in data: return emit(a, "harness", error=data["error"])
@@ -2952,6 +2955,31 @@ def harness_current(sdir, name):
         "persona": a.get("persona", ""), "profile": a.get("profile", ""),
         "sid": _slash_sid(sdir, name, a, backend)}
 
+HANDOFF_BUDGET_DEFAULT = 4000  # tokens; tokens ~ chars/4
+
+def handoff_default_budget():
+    """Default handoff replay budget (tokens). AG_HANDOFF_BUDGET overrides. Pure."""
+    try: v = int((os.environ.get("AG_HANDOFF_BUDGET") or "").strip() or 0)
+    except Exception: v = 0
+    return v if v > 0 else HANDOFF_BUDGET_DEFAULT
+
+def handoff_history(sdir, name, budget, old):
+    """Bounded replay for a backend switch: newest-first user/agent rows until
+    budget (tokens ~ chars/4), oldest-dropped, chronological, prefixed. Pure of backend I/O."""
+    try: b = int(budget)
+    except Exception: b = 0
+    if b <= 0: b = handoff_default_budget()
+    cap = b * 4  # char budget (tokens ~ chars/4)
+    rows = [r for r in load_chat_log(sdir, name) if r.get("role") in ("user", "agent")]
+    sel, used = [], 0
+    for r in reversed(rows):
+        line = f'{r.get("role", "")}: {r.get("text", "")}'
+        if sel and used + len(line) > cap: break
+        sel.append(line); used += len(line)
+    sel.reverse()
+    body = "\n".join(sel)
+    return f"[handoff from {old}]\n{body}" if body else f"[handoff from {old}]"
+
 def update_agent_settings(sdir, name, updates):
     """Apply settings under the same guard as turns, refusing rather than waiting.
     Models and native SIDs belong to their backend, including custom model IDs.
@@ -2994,10 +3022,14 @@ def update_agent_settings(sdir, name, updates):
         if updates.pop("_clear_claude_sid", False):
             sids.pop("claude", None)
             if (meta.get("backend") or old) == "claude": meta["sid"] = ""
+        try: _hb = int(updates.pop("_handoff_budget", None) or 0)
+        except (TypeError, ValueError): _hb = 0
         a.update(updates)
         a.update({"backend": new, "model": model})
         models[new] = model
         a["models"] = models
+        if new != old:
+            a["pending_handoff"] = {"from": old, "budget": _hb if _hb > 0 else handoff_default_budget()}
         save_agents(sdir, rows)
         meta.update({"backend": new, "model": model,
             "sid": sids.get(new, ""), "sids": sids})
@@ -3005,15 +3037,17 @@ def update_agent_settings(sdir, name, updates):
         if new != old:
             _event(sdir, "harness", name, backend=new, model=model)
             sid_note = f"resumes {sids[new]}" if sids.get(new) else "fresh session"
-            return (True, f"backend {old} -> {new} ({model}, {sid_note}).")
+            _ph = a.get("pending_handoff") or {}
+            return (True, f"backend {old} -> {new} ({model}, {sid_note}; handoff replay {_ph.get('budget', handoff_default_budget())} tokens next turn).")
         return (True, f"updated {name} [{new}] ({model}).")
     finally:
         _release_agent_turn(guard)
 
-def switch_backend(sdir, name, new_backend, model=None):
+def switch_backend(sdir, name, new_backend, model=None, budget=None):
     """Shared CLI/slash/TUI switch: preserve identity, backend models and SIDs."""
     updates = {"backend": (new_backend or "").strip().lower()}
     if model is not None: updates["model"] = model
+    if budget is not None: updates["_handoff_budget"] = budget
     return update_agent_settings(sdir, name, updates)
 
 def slash_help_text(sdir, name):
@@ -7932,8 +7966,16 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
     if command:
         # native custom command: message text is command args, sent bare.
         prompt = text
+    elif _rs and "hist" in _rs:
+        hist = _rs["hist"]
+        prompt = (hist+"\n\n---\n"+text) if hist else text
+    elif (ph := a.get("pending_handoff")) and isinstance(ph, dict):
+        # cross-backend handoff: bounded replay of the old backend's turns,
+        # even when the new backend already has a session id.
+        hist = handoff_history(sdir, name, ph.get("budget"), ph.get("from", "?"))
+        prompt = (hist+"\n\n---\n"+text) if hist else text
     else:
-        hist = _rs["hist"] if _rs and "hist" in _rs else "" if (sid and (backend in ("claude","opencode","cursor","codex") or acp_on(a, backend, command))) else recent_history(sdir,name)
+        hist = "" if (sid and (backend in ("claude","opencode","cursor","codex") or acp_on(a, backend, command))) else recent_history(sdir,name)
         prompt = (hist+"\n\n---\n"+text) if hist else text
     sys_txt = eff_system(sdir, a)
     # harness profile: instructions/memory/skills context must reach backend
@@ -8256,6 +8298,15 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             out["error"] = f"max-runtime {timeout_s:g}s exceeded (backend killed)"
         if buf.persist_failed or not agent_persist_ok:
             out["persist_error"] = True
+        if rc == 0 and not _intr and not _timed_out["hit"]:
+            # cross-backend handoff replay is one-shot: consume after the first
+            # successful turn (failures keep it for the next attempt). Never raises.
+            try:
+                _rows = load_agents(sdir)
+                _a = next((r for r in _rows if r["name"] == name), None)
+                if _a is not None and _a.pop("pending_handoff", None) is not None:
+                    save_agents(sdir, _rows)
+            except Exception: pass
         return out
     finally:
         if not _rs: _release_agent_turn(_turn_lock)
@@ -11135,6 +11186,22 @@ def do_selfcheck(a):
         assert _r["exit"]==0 and OPENCODE_MODEL_DEFAULT in _r["reply"], _r
         ok,_m = switch_backend(td,"sl","echo")
         assert ok and [x for x in load_agents(td) if x["name"]=="sl"][0]["backend"]=="echo"
+        assert [x for x in load_agents(td) if x["name"]=="sl"][0]["pending_handoff"]=={"from":"opencode","budget":4000}, "switch stores pending handoff"
+        assert do_agents(mk(sub="add",name="ho",backend="echo",model="default",adir=".",role="sub",persona=None,system=None))==0
+        ok,_m = switch_backend(td,"ho","opencode",None,50)
+        assert ok and [x for x in load_agents(td) if x["name"]=="ho"][0]["pending_handoff"]=={"from":"echo","budget":50}
+        append_chat(td,"ho","user","q1"); append_chat(td,"ho","agent","a1")
+        _hh = handoff_history(td,"ho",50,"echo")
+        assert _hh.startswith("[handoff from echo]") and "user: q1" in _hh and "agent: a1" in _hh, _hh
+        append_chat(td,"ho","user","x"*400)
+        _hh2 = handoff_history(td,"ho",10,"echo")
+        assert "q1" not in _hh2 and "x"*10 in _hh2, _hh2  # oldest-dropped under budget
+        assert handoff_history(td,"ho",0,"echo").startswith("[handoff from echo]")  # bad budget -> default
+        assert handoff_default_budget()==4000
+        os.environ["AG_HANDOFF_BUDGET"]="7"; assert handoff_default_budget()==7
+        os.environ["AG_HANDOFF_BUDGET"]="junk"; assert handoff_default_budget()==4000
+        del os.environ["AG_HANDOFF_BUDGET"]
+        assert do_agents(mk(sub="rm",name="ho",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
         oc_argv = backend_argv("opencode",model="",workdir=".",sid="",prompt="hi",command="rev")
         assert oc_argv[1:] == ["run","--format","json","--thinking","--command","rev","-m",OPENCODE_MODEL_DEFAULT,"--dir",".","hi"] and (oc_argv[0]=="opencode" or oc_argv[0].endswith("/opencode"))
         assert "--command" not in backend_argv("opencode",model="",workdir=".",sid="",prompt="hi")
@@ -13325,7 +13392,7 @@ def build():
     ev = sub.add_parser("events",help="pings: spawn/send/exit feed"); ev.add_argument("--limit",type=int,default=20); ev.add_argument("--session",default=None)
     dm = sub.add_parser("_daemon",help=argparse.SUPPRESS); dm.add_argument("sp")
     h = sub.add_parser("harness",help="select agent backends and share harness configuration"); hs=h.add_subparsers(dest="sub",required=True)
-    huse=hs.add_parser("use",help="switch an agent backend, remembering its model"); huse.add_argument("agent"); huse.add_argument("backend"); huse.add_argument("--model",default=None)
+    huse=hs.add_parser("use",help="switch an agent backend, remembering its model"); huse.add_argument("agent"); huse.add_argument("backend"); huse.add_argument("--model",default=None); huse.add_argument("--budget",default=None,help="handoff replay budget in tokens for the next turn (default 4000, AG_HANDOFF_BUDGET overrides)")
     hcur=hs.add_parser("current",help="show an agent's backend, model and persona"); hcur.add_argument("agent")
     hshow=hs.add_parser("show"); hshow.add_argument("--home",default=None)
     hexp=hs.add_parser("export"); hexp.add_argument("file",nargs="?",default=None); hexp.add_argument("--home",default=None)

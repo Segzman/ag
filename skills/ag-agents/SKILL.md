@@ -51,7 +51,17 @@ Modes: `ro` read-only, `edits` workspace writes, `auto`, `full` unrestricted. Un
 {{AG}} --dir <state> harness profile add P --instructions F --env K=V --env-unset K   # shared by profile users
 ```
 
-Secret-looking keys (`*KEY*|*TOKEN*|*SECRET*|*PASSWORD*`) must be refs: `--env OPENAI_API_KEY='${MY_KEY}'`; literals rejected. `HOME`/`PATH` refused (use `--env PATH+=dir`).
+Secret-looking keys (`*KEY*|*TOKEN*|*SECRET*|*PASSWORD*`) must be refs: `--env OPENAI_API_KEY='${MY_KEY}'`; literals rejected. `HOME`/`PATH` refused (use `--env PATH+=dir`). Keychain refs work too: `--env MY_TOKEN='${keychain:MYKEY}'` (Keychain service `ag`; resolved at spawn, REDACTED in `agents env`).
+
+Route to an added provider (opencode backend, model `<provider>/<model>`; privacy + slots come from the registry):
+
+```sh
+{{AG}} --dir <state> providers add groq --key-ref keychain:MYKEY   # presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova
+{{AG}} --dir <state> providers list | show groq | rm groq
+{{AG}} --dir <state> keys set MYKEY --from-env GROQ_API_KEY
+{{AG}} --dir <state> keys test MYKEY --provider groq
+{{AG}} --dir <state> agents add w --backend opencode --model groq/gpt-oss-120b --data work
+```
 
 ### ACP transport (opt-in)
 

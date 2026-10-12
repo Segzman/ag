@@ -109,6 +109,22 @@ ag spawn --no-secret-popup -- ... # opt out per session; AG_SECRET_POPUP=0 globa
 - **Guarantee:** never written to disk in plaintext; lives in memory and pipes only (osascript -> ag -> PTY fd, or askpass stdout -> sudo/ssh/git). `input.log` has `[secret input redacted]`.
 - **Limits:** the receiving program gets plaintext; Python can't zero strings; a program that echoes its own input can leak to `output.log`; keyword detection is heuristic (Cancel sends nothing); the parent-name check can be spoofed, so every dialog names the requesting command in `[brackets]`. macOS only (`osascript`); elsewhere injection/detection are off.
 
+## Keys and providers
+
+API keys live in the macOS Keychain (service `ag`), never in argv, logs, chat, status files, or git. Refs `${keychain:NAME}` work wherever `${VAR}` refs work (agent/profile env, provider config); resolved only at child-spawn into the child env, redacted in `agents env`.
+
+```sh
+ag keys set NAME [--from-env VAR]          # value from secure dialog (getpass on TTY) or env var; stored via `security -i` on STDIN (never `-w VALUE` in argv); macOS only
+ag keys list                               # names + created/updated, never values
+ag keys rm NAME                            # delete from Keychain
+ag keys test NAME --provider P             # cheap GET to the provider /models (prints ok/401, never the key)
+ag providers add ID --base-url URL --key-ref keychain:NAME [--npm @ai-sdk/openai-compatible] [--privacy zdr|retain|train] [--max-concurrent N] [--rpd N] [--model ID ...]
+ag providers list | show ID | rm ID        # stored in $AG_CONFIG_HOME/providers.json (refs only, never secrets)
+ag providers add groq --key-ref keychain:NAME        # presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova
+```
+
+Presets (base URLs + privacy + max_concurrent/rpd from `free-providers.md`; `(*)` unverified): groq `https://api.groq.com/openai/v1` zdr max2; cerebras `https://api.cerebras.ai/v1` zdr max2; openrouter `https://openrouter.ai/api/v1` train max1 rpd50; cloudflare `https://api.cloudflare.com/client/v4/accounts/{env:CF_ACCOUNT_ID}/ai/v1` retain max2 (AI Gateway `(*)`); gemini `https://generativelanguage.googleapis.com/v1beta/openai/` train max1; mistral `https://api.mistral.ai/v1` train max1; sambanova `https://api.sambanova.ai/v1` retain max1 rpd20. ag writes an opencode config fragment (`"apiKey": "{env:AG_KEY_<ID>}"`) merged into the scoped `OPENCODE_CONFIG` it already builds (never your global `~/.config/opencode/opencode.json`) and injects `AG_KEY_<ID>` into the child env only. Provider privacy feeds `models --rank` data + the work-guard; provider max_concurrent feeds ratelimit slots for `<provider>/*` models.
+
 ## Notes and todos
 
 `ag note "..."` / `ag notes` · `ag todo add|list|done|clear` · `ag history` · `ag events`.

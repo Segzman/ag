@@ -2904,6 +2904,14 @@ def native_launch(sdir, name, backend=""):
         env = backend_env_for_profile(sdir, fake_agent, prof)
         extra = backend_argv_extra(b, sdir, prof)
     env, env_unset = agent_env_overrides(sdir, a, prof, env)
+    _pa = globals().get("providers_apply")
+    if callable(_pa) and b == "opencode":
+        try:
+            _full = _pa(sdir, dict(a, backend=b), dict(os.environ, **env), None)
+            for _k, _v in _full.items():
+                if _k.startswith("AG_KEY_") and _k not in env: env[_k] = _v
+            if _full.get("OPENCODE_CONFIG") and _full.get("OPENCODE_CONFIG") != env.get("OPENCODE_CONFIG"): env["OPENCODE_CONFIG"] = _full["OPENCODE_CONFIG"]
+        except Exception: pass
     argv = list(argv) + list(extra)
     return {"ok": True, "backend": b, "argv": argv, "cwd": cwd,
         "env": env, "env_unset": env_unset, "profile": prof, "sid": sid}
@@ -7712,7 +7720,7 @@ def env_check(env, unset):
         base = k[:-1] if k.endswith("+") else k
         if k.endswith("+") and base != "PATH": return f"env {k}: only PATH+=dir is supported"
         if base in ENV_DENY and k != "PATH+": return f"env {base} is not settable (PATH only via --env PATH+=dir)"
-        if ENV_SECRET_RE.search(base) and _codex_env_ref(v) is None:
+        if ENV_SECRET_RE.search(base) and _codex_env_ref(v) is None and (lambda f: not callable(f) or f(v) is None)(globals().get("_keychain_ref")):
             return f"env {k}: secret-looking key needs a reference, not a literal (use --env {k}='${{VAR}}')"
     for k in unset or []:
         if not _ENV_KEY_RE.match(str(k)) or str(k).endswith("+"): return f"bad env-unset key: {k!r}"
@@ -7721,10 +7729,21 @@ def env_check(env, unset):
 
 def env_apply(env, setd, unset, notes=None):
     """Apply one env layer to the full child env dict in place: unset, then set
-    (refs resolved from os.environ; unresolved -> var dropped + note, never the
+    (refs resolved from os.environ or Keychain ${keychain:NAME}; unresolved -> var dropped + note, never the
     literal ${...}; ~ expanded for CLAUDE_CONFIG_DIR/CODEX_HOME; PATH+ prepends)."""
     for k in unset or []: env.pop(k, None)
     for k, v in (setd or {}).items():
+        _kf = globals().get("_keychain_ref"); _kn = _kf(v) if callable(_kf) else None
+        if _kn:
+            _kr = globals().get("keychain_get"); _vv, _ = _kr(_kn) if callable(_kr) else (None, "no keychain")
+            if not _vv:
+                if notes is not None: notes.append(f"[env] {k}: keychain:{_kn} not found; variable dropped")
+                continue
+            v = _vv; _vv = None
+            if k in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"): v = os.path.expanduser(v)
+            if k == "PATH+": env["PATH"] = os.path.expanduser(v) + os.pathsep + env.get("PATH", os.defpath)
+            else: env[k] = v
+            continue
         ref = _codex_env_ref(v)
         if ref:
             if ref not in os.environ:
@@ -7766,8 +7785,13 @@ def agent_env_report(sdir, a, redact=True):
     full = merge_agent_env(sdir, a, prof, dict(os.environ, **pe), notes)
     st = {k: v for k, v in full.items() if os.environ.get(k) != v}
     if redact:
+        _kf = globals().get("_keychain_ref")
+        _cfg = {}
+        try: _cfg = dict((a.get("env") or {})); _pr = (load_profiles(sdir).get(prof) or {}) if prof else {}; _cfg.update(_pr.get("env") or {})
+        except Exception: pass
         for k in st:
             if REDACT_KEYS.search(k) or ENV_SECRET_RE.search(k): st[k] = "REDACTED"
+            elif callable(_kf) and _kf(_cfg.get(k) or "") is not None: st[k] = "REDACTED"
     return {"set": st, "unset": sorted(k for k in os.environ if k not in full), "notes": notes}
 
 def agent_env_updates(a, cur):
@@ -8186,6 +8210,10 @@ def _turn_env(sdir, a, backend, prof, notes=None):
     merge_agent_env(sdir, a, prof, env, notes)
     env["AG_PARENT_AGENT"] = a.get("name", "") or ""  # dispatch mode ceiling: children inherit this turn's agent+mode
     env["AG_PARENT_MODE"] = "plan" if a.get("plan") else (a.get("mode") or "")
+    _pa = globals().get("providers_apply")
+    if callable(_pa):
+        try: env = _pa(sdir, a, env, notes)
+        except Exception: pass
     return secret_env(sdir, mode_env(sdir, a, env))
 
 def _turn_source(p):
@@ -8709,6 +8737,12 @@ def _rl_limit(backend, model):
             n = int(ev)
             if n > 0 and _rl_is_free(backend, model): return n
     except Exception: pass
+    _pl = globals().get("provider_limit")
+    if callable(_pl):
+        try:
+            _lv = _pl(backend, model)
+            if isinstance(_lv, int) and _lv >= 0: return _lv
+        except Exception: pass
     return 2 if _rl_is_free(backend, model) else 0
 def _rl_backoff(hits):
     try: base = float((os.environ.get("AG_RATELIMIT_BASE_S") or "30").strip() or 30)
@@ -11469,6 +11503,286 @@ def _tui_main(stdscr, sdir):
         elif isinstance(ch, int) and 32 <= ch <= 126:
             mode = "input"; inp += chr(ch); slash_sync()
 
+# ---- keys + providers: keychain secrets, ${keychain:NAME} refs, opencode provider registry (one block, spec: keys) ----
+# Sources for presets: /Users/sekun/swarm-research/free-providers.md (2026-10-12, official docs; `(*)` = unverified).
+# Table 1 base URLs + 3c max_concurrent/privacy: groq https://api.groq.com/openai/v1 max2 zdr-capable;
+# cerebras https://api.cerebras.ai/v1 max2 zdr-ish(no retain); openrouter https://openrouter.ai/api/v1 max1 rpd50 train;
+# cloudflare OpenAI-compat via AI Gateway (*) max2 retain-no-train; gemini https://generativelanguage.googleapis.com/v1beta/openai/ max1 train;
+# mistral https://api.mistral.ai/v1 max1 train; sambanova https://api.sambanova.ai/v1 max1 rpd20 retain-unverified.
+# rpd only where the doc publishes RPD (sambanova 20, openrouter 50); other limits are RPM/TPM/tokens (`(*)` unverified, left None).
+# npm: doc 3b pattern is native SDK where one exists else @ai-sdk/openai-compatible; presets use openai-compatible (unverified per provider).
+# ponytail: no secret ever in argv/logs/chat/status/git; refs resolved only at child-spawn into child env.
+KEYCHAIN_SERVICE = "ag"
+KEYCHAIN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_KEYCHAIN_ENV_RES = (re.compile(r"^\$\{keychain:([A-Za-z0-9][A-Za-z0-9_.-]{0,63})\}$"), re.compile(r"^\{env:keychain:([A-Za-z0-9][A-Za-z0-9_.-]{0,63})\}$"))
+def _keychain_ref(v):
+    """NAME when `v` is exactly ${keychain:NAME} or {env:keychain:NAME}, else None. Pure."""
+    if not isinstance(v, str): return None
+    for rx in _KEYCHAIN_ENV_RES:
+        m = rx.match(v.strip())
+        if m: return m.group(1)
+    return None
+def _normalize_key_ref(v):
+    """keychain:NAME from bare/` ${}`/`{env:}` forms, else None. Pure."""
+    if not isinstance(v, str): return None
+    s = v.strip()
+    m = re.match(r"^\$\{keychain:([A-Za-z0-9][A-Za-z0-9_.-]{0,63})\}$", s) or re.match(r"^\{env:keychain:([A-Za-z0-9][A-Za-z0-9_.-]{0,63})\}$", s)
+    if m: return "keychain:" + m.group(1)
+    m = re.match(r"^keychain:([A-Za-z0-9][A-Za-z0-9_.-]{0,63})$", s)
+    if m: return "keychain:" + m.group(1)
+    return None
+def _keys_security_bin(): return os.environ.get("AG_SECURITY_BIN") or shutil.which("security") or "security"
+def _keys_need_mac():
+    """None when keychain usable, else refuse string. AG_KEYS_ALLOW_NONMAC=1 is a test hook (still keychain, never plaintext)."""
+    if sys.platform == "darwin" or os.environ.get("AG_KEYS_ALLOW_NONMAC") == "1": return None
+    return "keychain needs macOS `security` (no plaintext fallback; tests: AG_KEYS_ALLOW_NONMAC=1 with a fake `security` on PATH)"
+def _keys_meta_path(): return ag_config_home()/"keys.json"
+def _keys_meta_load():
+    try: d = json.loads(_keys_meta_path().read_text())
+    except Exception: return {}
+    return d if isinstance(d, dict) else {}
+def _keys_meta_save(d):
+    p = _keys_meta_path(); p.parent.mkdir(parents=True, exist_ok=True); _atomic_write(p, json.dumps(d, indent=2) + "\n")
+def keychain_set(name, value):
+    """Store via `security -i` (command on STDIN, never -w VALUE in argv). Returns err or ''."""
+    if not KEYCHAIN_NAME_RE.match(name or ""): return f"bad key name {name!r} (1-64 letters/digits/._-)"
+    if not isinstance(value, str) or not value: return "empty value (refused)"
+    if (_m := _keys_need_mac()): return _m
+    sec = _keys_security_bin()
+    cmd = "add-generic-password -s %s -a %s -U -w %s\n" % (shlex.quote(KEYCHAIN_SERVICE), shlex.quote(name), shlex.quote(value))
+    try: p = subprocess.run([sec, "-i"], input=cmd, capture_output=True, text=True, timeout=15)
+    except FileNotFoundError: return f"no `security` on PATH ({sec})"
+    except Exception as e: return str(e)[:160]
+    return "" if p.returncode == 0 else (ANSI.sub("", (p.stderr or p.stdout or "")).strip()[-160:] or f"security -i exit {p.returncode}")
+def keychain_get(name):
+    """(value|None, err). argv carries only service/account; secret only on stdout, never logged."""
+    if not KEYCHAIN_NAME_RE.match(name or ""): return None, f"bad key name {name!r}"
+    if (_m := _keys_need_mac()): return None, _m
+    sec = _keys_security_bin()
+    try: p = subprocess.run([sec, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name, "-w"], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except FileNotFoundError: return None, f"no `security` on PATH ({sec})"
+    except Exception as e: return None, str(e)[:160]
+    if p.returncode != 0: return None, (ANSI.sub("", (p.stderr or "")).strip()[-160:] or "not found")
+    v = p.stdout[:-1] if p.stdout.endswith("\n") else p.stdout
+    return (v, "") if v else (None, "empty")
+def keychain_delete(name):
+    """Delete one key. Returns err or ''."""
+    if not KEYCHAIN_NAME_RE.match(name or ""): return f"bad key name {name!r}"
+    if (_m := _keys_need_mac()): return _m
+    sec = _keys_security_bin()
+    try: p = subprocess.run([sec, "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", name], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except FileNotFoundError: return f"no `security` on PATH ({sec})"
+    except Exception as e: return str(e)[:160]
+    return "" if p.returncode == 0 else (ANSI.sub("", (p.stderr or p.stdout or "")).strip()[-160:] or f"exit {p.returncode}")
+def _keychain_resolve(ref, notes=None, label=""):
+    """Resolve keychain:NAME or ${keychain:NAME} to the secret (never logged). Returns value or None."""
+    n = _normalize_key_ref(ref) if isinstance(ref, str) and ref.strip().startswith("keychain:") else None
+    if n is None and isinstance(ref, str): n = ("keychain:" + _keychain_ref(ref)) if _keychain_ref(ref) else None
+    if n is None: return None
+    v, _ = keychain_get(n.split(":", 1)[1])
+    if not v and notes is not None: notes.append(f"[keys] {label or n}: keychain ref unresolved; variable dropped")
+    return v or None
+# Provider registry: $AG_CONFIG_HOME/providers.json {id: {base_url,key_ref,npm,privacy,max_concurrent,rpd,models}} (refs only, never secrets).
+PROVIDER_PRESETS = {
+    "groq": {"base_url": "https://api.groq.com/openai/v1", "privacy": "zdr", "max_concurrent": 2, "rpd": None, "npm": "@ai-sdk/openai-compatible"},
+    "cerebras": {"base_url": "https://api.cerebras.ai/v1", "privacy": "zdr", "max_concurrent": 2, "rpd": None, "npm": "@ai-sdk/openai-compatible"},
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1", "privacy": "train", "max_concurrent": 1, "rpd": 50, "npm": "@ai-sdk/openai-compatible"},
+    "cloudflare": {"base_url": "https://api.cloudflare.com/client/v4/accounts/{env:CF_ACCOUNT_ID}/ai/v1", "privacy": "retain", "max_concurrent": 2, "rpd": None, "npm": "@ai-sdk/openai-compatible"},
+    "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "privacy": "train", "max_concurrent": 1, "rpd": None, "npm": "@ai-sdk/openai-compatible"},
+    "mistral": {"base_url": "https://api.mistral.ai/v1", "privacy": "train", "max_concurrent": 1, "rpd": None, "npm": "@ai-sdk/openai-compatible"},
+    "sambanova": {"base_url": "https://api.sambanova.ai/v1", "privacy": "retain", "max_concurrent": 1, "rpd": 20, "npm": "@ai-sdk/openai-compatible"},
+}
+def custom_providers_path(): return ag_config_home()/"providers.json"
+def providers_load():
+    """{id: entry} from $AG_CONFIG_HOME/providers.json ({} when missing). Never contains secrets."""
+    try: d = json.loads(custom_providers_path().read_text())
+    except Exception: return {}
+    return d if isinstance(d, dict) else {}
+def providers_save(d):
+    p = custom_providers_path(); p.parent.mkdir(parents=True, exist_ok=True); _atomic_write(p, json.dumps(d, indent=2) + "\n")
+def provider_env_key(pid): return "AG_KEY_" + re.sub(r"[^A-Za-z0-9_]", "_", pid or "x").upper()
+def provider_privacy(backend, model):
+    """Privacy class for <provider>/* models from the registry, else None. Called via globals from model_privacy."""
+    try:
+        ps = providers_load()
+        if not ps: return None
+        m = (model or "").strip()
+        cand = []
+        if backend and backend in ps: cand.append(ps[backend])
+        for pid, e in ps.items():
+            if not isinstance(e, dict): continue
+            if m == pid or m.startswith(pid + "/") or m.startswith("opencode/" + pid + "/") or m == "opencode/" + pid: cand.append(e)
+        for e in cand:
+            p = (e.get("privacy") or "").strip().lower()
+            if p in ("zdr", "retain", "train"): return p
+    except Exception: pass
+    return None
+def provider_limit(backend, model):
+    """max_concurrent for <provider>/* models from the registry, else None. Called via globals from _rl_limit."""
+    try:
+        ps = providers_load()
+        if not ps: return None
+        m = (model or "").strip()
+        for pid, e in ([(backend, ps.get(backend))] if backend in ps else []) + [(k, v) for k, v in ps.items()]:
+            if not isinstance(e, dict): continue
+            hit = (pid == backend) or m == pid or m.startswith(pid + "/") or m.startswith("opencode/" + pid + "/") or m == "opencode/" + pid
+            if hit and isinstance(e.get("max_concurrent"), int) and e["max_concurrent"] >= 0: return e["max_concurrent"]
+    except Exception: pass
+    return None
+def providers_opencode_fragment():
+    """{"provider": {id: {"npm","options":{"baseURL","apiKey":"{env:AG_KEY_ID}"}}}} (placeholders only, never secrets)."""
+    prov = {}
+    for pid, e in providers_load().items():
+        if not isinstance(e, dict) or not (e.get("base_url") or "").strip(): continue
+        b = {"options": {"baseURL": e["base_url"].strip(), "apiKey": "{env:%s}" % provider_env_key(pid)}}
+        if (e.get("npm") or "").strip(): b["npm"] = e["npm"].strip()
+        prov[pid] = b
+    return {"provider": prov} if prov else {}
+def providers_apply(sdir, agent, env, notes=None):
+    """Merge provider fragment into scoped OPENCODE_CONFIG + inject AG_KEY_<ID> into child env only. Never persists secrets."""
+    try: ps = providers_load()
+    except Exception: return env
+    if not ps or (agent or {}).get("backend") != "opencode": return env
+    frag = providers_opencode_fragment()
+    if frag:
+        base = {}
+        if env.get("OPENCODE_CONFIG"):
+            try: base = json.loads(Path(env["OPENCODE_CONFIG"]).read_text())
+            except Exception: base = {}
+        cur = base.get("provider")
+        base["provider"] = {**(cur if isinstance(cur, dict) else {}), **frag["provider"]}
+        base.setdefault("$schema", "https://opencode.ai/config.json")
+        p = sdir/"modes"/re.sub(r"[^\w.-]", "_", (agent or {}).get("name") or "agent")/"opencode.json"
+        try: p.parent.mkdir(parents=True, exist_ok=True); _atomic_write(p, json.dumps(base, indent=2)); env = {**env, "OPENCODE_CONFIG": str(p)}
+        except Exception: pass
+    for pid, e in ps.items():
+        if not isinstance(e, dict): continue
+        kr = (e.get("key_ref") or "").strip()
+        if not kr: continue
+        v = None
+        if _normalize_key_ref(kr): v = _keychain_resolve(kr, None, "")
+        else:
+            r = _codex_env_ref(kr)
+            if r and r in os.environ: v = os.environ[r]
+        if v: env[provider_env_key(pid)] = v; v = None
+        elif notes is not None: notes.append(f"[keys] provider {pid}: key ref unresolved; provider skipped")
+    return env
+def keys_selfcheck():
+    assert _keychain_ref("${keychain:abc-1}") == "abc-1" and _keychain_ref("{env:keychain:a.b}") == "a.b" and _keychain_ref("${VAR}") is None and _keychain_ref("keychain:a") is None
+    assert _normalize_key_ref("keychain:a") == "keychain:a" and _normalize_key_ref("${keychain:a}") == "keychain:a" and _normalize_key_ref("${VAR}") is None
+    assert provider_env_key("groq") == "AG_KEY_GROQ" and provider_env_key("a-b") == "AG_KEY_A_B"
+    assert set(PROVIDER_PRESETS) >= {"groq", "cerebras", "openrouter", "cloudflare", "gemini", "mistral", "sambanova"}
+    assert PROVIDER_PRESETS["openrouter"]["rpd"] == 50 and PROVIDER_PRESETS["sambanova"]["rpd"] == 20 and PROVIDER_PRESETS["groq"]["max_concurrent"] == 2
+    assert all(v["privacy"] in ("zdr", "retain", "train") for v in PROVIDER_PRESETS.values())
+def do_keys_new(a, sdir):
+    """`ag keys set|list|rm|test` (secrets via Keychain only)."""
+    op = getattr(a, "ksub", None) or ""
+    if op == "set":
+        name = (getattr(a, "key_name", None) or "").strip()
+        if not KEYCHAIN_NAME_RE.match(name or ""): return emit(a, "keys", error=f"bad key name {name!r}", hint="1-64 letters/digits/._- (e.g. GROQ_API_KEY)")
+        fv = getattr(a, "from_env", None)
+        if fv:
+            v = os.environ.get(fv)
+            if not v: return emit(a, "keys", error=f"env {fv} is not set", hint=f"export {fv}=... first")
+        else:
+            st, v = secret_read(f"API key for {name}: ")
+            if st != "ok": return emit(a, "keys", error=f"secret input {st}", hint="needs macOS dialog or a TTY (or --from-env VAR)")
+        err = keychain_set(name, v); v = None
+        if err: return emit(a, "keys", error=err, hint="macOS only (no plaintext fallback)")
+        try:
+            m = _keys_meta_load(); now = now_iso()
+            m[name] = {"created": m.get(name, {}).get("created", now), "updated": now}; _keys_meta_save(m)
+        except Exception: pass
+        return emit(a, "keys", {"_text": f"stored {name} in Keychain (service {KEYCHAIN_SERVICE})", "name": name})
+    if op == "list":
+        m = _keys_meta_load()
+        rows = [{"name": k, "created": (v or {}).get("created", ""), "updated": (v or {}).get("updated", "")} for k, v in sorted(m.items())]
+        if getattr(a, "json", False): return emit(a, "keys", {"keys": rows})
+        return emit(a, "keys", {"_text": "\n".join(f'{r["name"]:24} created {r["created"] or "-"} updated {r["updated"] or "-"}' for r in rows) or "(no keys)", "keys": rows})
+    if op == "rm":
+        name = (getattr(a, "key_name", None) or "").strip()
+        err = keychain_delete(name)
+        if err and "not found" not in err.lower() and "could not be found" not in err.lower(): return emit(a, "keys", error=err)
+        try: m = _keys_meta_load(); m.pop(name, None); _keys_meta_save(m)
+        except Exception: pass
+        return emit(a, "keys", {"_text": f"removed {name}", "name": name})
+    if op == "test":
+        name = (getattr(a, "key_name", None) or "").strip()
+        pid = (getattr(a, "provider", None) or "").strip()
+        if not pid: return emit(a, "keys", error="need --provider ID", hint="ag providers list")
+        ps = providers_load()
+        e = ps.get(pid)
+        if not isinstance(e, dict): return emit(a, "keys", error=f"no such provider: {pid}", hint="ag providers list")
+        v, err = keychain_get(name)
+        if err or not v: return emit(a, "keys", error=f"key {name}: {err or 'empty'}", hint=f"ag keys set {name} --from-env VAR")
+        base = (e.get("base_url") or "").strip().rstrip("/")
+        if not base: return emit(a, "keys", error=f"provider {pid} has no base-url")
+        import urllib.request, urllib.error
+        url = base + "/models"
+        try: req = urllib.request.Request(url, headers={"Authorization": "Bearer " + v, "User-Agent": "ag-cli"}); v = None
+        except Exception as ex: return emit(a, "keys", error=str(ex)[:160])
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r: return emit(a, "keys", {"_text": f"ok: {pid} accepted key {name} (HTTP {r.status})", "ok": True, "http": r.status})
+        except urllib.error.HTTPError as h: return emit(a, "keys", {"_text": f"{h.code} unauthorized: {pid} rejected key {name}" if h.code in (401, 403) else f"HTTP {h.code} from {pid}", "ok": False, "http": h.code})
+        except Exception as ex: return emit(a, "keys", error=f"{pid} /models: {str(ex)[:160]}")
+    return None
+def do_providers(a):
+    """`ag providers add|list|rm|show` ($AG_CONFIG_HOME/providers.json, refs only)."""
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    op = getattr(a, "psub", None) or ""
+    if op == "add":
+        pid = (getattr(a, "pid", None) or "").strip()
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$", pid or ""): return emit(a, "providers", error=f"bad provider id {pid!r}", hint="e.g. groq (preset) or my-gateway")
+        pre = PROVIDER_PRESETS.get(pid) or {}
+        base = (getattr(a, "base_url", None) or "").strip() or pre.get("base_url") or ""
+        if not base: return emit(a, "providers", error=f"need --base-url URL (no preset for {pid!r})", hint="ag providers add ID --base-url URL --key-ref keychain:NAME")
+        kr = (getattr(a, "key_ref", None) or "").strip()
+        if not kr: return emit(a, "providers", error="need --key-ref keychain:NAME", hint=f"ag keys set NAME --from-env VAR; ag providers add {pid} --key-ref keychain:NAME")
+        nkr = _normalize_key_ref(kr) or (_codex_env_ref(kr) and kr.strip())
+        if _normalize_key_ref(kr): kr = _normalize_key_ref(kr)
+        elif _codex_env_ref(kr): pass
+        else: return emit(a, "providers", error=f"bad --key-ref {kr!r} (want keychain:NAME or ${{VAR}})", hint="never a literal secret")
+        if len(kr) > 200: return emit(a, "providers", error="key-ref too long")
+        npm = (getattr(a, "npm", None) or "").strip() or pre.get("npm") or "@ai-sdk/openai-compatible"
+        priv = ((getattr(a, "privacy", None) or "").strip().lower() or pre.get("privacy") or "retain").lower()
+        if priv not in ("zdr", "retain", "train"): return emit(a, "providers", error=f"bad --privacy {priv!r}: zdr|retain|train")
+        try: mc = pre.get("max_concurrent") if getattr(a, "max_concurrent", None) is None else getattr(a, "max_concurrent", None)
+        except Exception: mc = None
+        try: rpd = pre.get("rpd") if getattr(a, "rpd", None) is None else getattr(a, "rpd", None)
+        except Exception: rpd = None
+        if mc is not None and (not isinstance(mc, int) or mc < 0): return emit(a, "providers", error="--max-concurrent must be an int >= 0")
+        if rpd is not None and (not isinstance(rpd, int) or rpd < 0): return emit(a, "providers", error="--rpd must be an int >= 0")
+        ms = [s.strip() for s in (getattr(a, "models", None) or []) if (s or "").strip()]
+        ps = providers_load()
+        ps[pid] = {"base_url": base, "key_ref": kr, "npm": npm, "privacy": priv}
+        if mc is not None: ps[pid]["max_concurrent"] = mc
+        elif "max_concurrent" in ps[pid]: ps[pid].pop("max_concurrent", None)
+        if rpd is not None: ps[pid]["rpd"] = rpd
+        elif "rpd" in ps[pid]: ps[pid].pop("rpd", None)
+        if ms: ps[pid]["models"] = sorted(set(ms))
+        elif "models" in ps[pid]: pass
+        providers_save(ps)
+        return emit(a, "providers", {"_text": f"provider {pid}: {base} ({priv}, key {kr})", "id": pid, **ps[pid]})
+    if op == "list":
+        ps = providers_load()
+        rows = [{"id": k, "base_url": (v or {}).get("base_url", ""), "privacy": (v or {}).get("privacy", ""), "models": (v or {}).get("models", []), "rpd": (v or {}).get("rpd"), "max_concurrent": (v or {}).get("max_concurrent")} for k, v in sorted(ps.items())]
+        if getattr(a, "json", False): return emit(a, "providers", {"providers": rows})
+        return emit(a, "providers", {"_text": "\n".join(f'{r["id"]:12} {r["base_url"]:48} {r["privacy"] or "-":6} models={len(r["models"])}' for r in rows) or "(no providers)", "providers": rows})
+    if op == "show":
+        pid = (getattr(a, "pid", None) or "").strip()
+        e = providers_load().get(pid)
+        if not isinstance(e, dict): return emit(a, "providers", error=f"no such provider: {pid}", hint="ag providers list")
+        if getattr(a, "json", False): return emit(a, "providers", {"id": pid, **e})
+        L = [f'id: {pid}'] + [f"{k}: {e.get(k)}" for k in ("base_url", "key_ref", "npm", "privacy", "max_concurrent", "rpd")] + [f'models: {", ".join(e.get("models") or []) or "-"}']
+        return emit(a, "providers", {"_text": "\n".join(L), "id": pid, **e})
+    if op == "rm":
+        pid = (getattr(a, "pid", None) or "").strip()
+        ps = providers_load()
+        if pid not in ps: return emit(a, "providers", error=f"no such provider: {pid}", hint="ag providers list")
+        ps.pop(pid, None); providers_save(ps)
+        return emit(a, "providers", {"_text": f"removed {pid}", "id": pid})
+    return emit(a, "providers", error="usage: ag providers add|list|rm|show", hint="ag providers add groq --key-ref keychain:NAME")
+
 KEYS_HELP = """ag keys
   sessions: spawn -- <cmd> | send <id> text | send --key ctrl-c|esc|up|enter | snap [--since OFF] [--clean] | sessions | wait | kill [--force]
   attach <id>: jump into live terminal (auth etc). Ctrl-] detaches, session keeps running. resize follows your terminal.
@@ -11553,6 +11867,10 @@ def do_forget(a):
     return emit(a,"forget",{"_text":f'wiped {n}B of logs for {st["id"]}',"id":st["id"],"bytes":n})
 
 def do_keys(a):
+    _fn = globals().get("do_keys_new")
+    if callable(_fn) and getattr(a, "ksub", None):
+        try: return _fn(a, state_dir(a.dir))
+        except TypeError: return _fn(a)
     if getattr(a,"json",False): return emit(a,"keys",{"keys":KEYS_HELP.splitlines()})
     return emit(a,"keys",{"_text":KEYS_HELP})
 
@@ -12398,6 +12716,7 @@ def do_selfcheck(a):
     _qd = _qdir(td,"qa",mk=True); (_qd/_ticket_name(5,1,"dead")).write_text(json.dumps({"id":"dead","pid":2**22+7}))
     assert queue_list(td,"qa")==[] and not list(_qd.glob("[0-9]-*")) and not queue_held(td,"qa")
     secret_selfcheck()
+    keys_selfcheck()
     _setup_selfcheck()
     _acp_selfcheck(str(td))
     assert compat_verdict("claude","2.1.10")=="graceful" and compat_verdict("claude","2.1.289")=="ok" and auth_parse("codex","Not logged in")=="no"
@@ -13032,6 +13351,12 @@ def _zen_lists():
     return ([str(x).lower() for x in (d.get("zdr") or [])], [str(x).lower() for x in (d.get("retain") or [])], [str(x).lower() for x in (d.get("train") or [])])
 def model_privacy(backend, model):
     """'zdr'|'retain'|'train'|'unknown' for a backend/model id. Built-in table + live Zen cache; unknown free opencode = train. Pure of roster."""
+    _pf = globals().get("provider_privacy")
+    if callable(_pf):
+        try:
+            _pv = _pf(backend, model)
+            if _pv in ("zdr", "retain", "train", "unknown"): return _pv
+        except Exception: pass
     m = (model or "").strip()
     if m in ("", "default"):
         if backend == "opencode": return model_privacy(backend, OPENCODE_MODEL_DEFAULT)
@@ -14693,7 +15018,16 @@ def build():
     tut=sub.add_parser("tui",help="interactive orchestration console"); tut.add_argument("--theme",default=None)
     ata=sub.add_parser("attach",help="jump into a live session terminal (Ctrl-] detaches)"); ata.add_argument("sess")
     fgt=sub.add_parser("forget",help="wipe a session's logs (auth traces)"); fgt.add_argument("sess")
-    sub.add_parser("keys",help="control cheat-sheet")
+    kx=sub.add_parser("keys",help="Keychain keys (set/list/rm/test); bare `ag keys` = control cheat-sheet"); kxs=kx.add_subparsers(dest="ksub",required=False)
+    kxs.add_parser("list",help="list key names + created/updated (never values)")
+    _kset=kxs.add_parser("set",help="store a key in the macOS Keychain (service ag)"); _kset.add_argument("key_name",help="account name"); _kset.add_argument("--from-env",dest="from_env",default=None,metavar="VAR",help="read value from env var instead of a secure dialog")
+    _krm=kxs.add_parser("rm",help="delete a key"); _krm.add_argument("key_name",help="account name")
+    _kt=kxs.add_parser("test",help="cheap authenticated GET to the provider /models (never prints the key)"); _kt.add_argument("key_name",help="account name"); _kt.add_argument("--provider",dest="provider",default=None,help="provider id from providers registry")
+    pv=sub.add_parser("providers",help="opencode-compatible provider registry (refs only, no secrets)"); pvs=pv.add_subparsers(dest="psub",required=True)
+    pvs.add_parser("list",help="list providers")
+    _padd=pvs.add_parser("add",help="add/update a provider (presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova)"); _padd.add_argument("pid",help="provider id"); _padd.add_argument("--base-url",dest="base_url",default=None,help="OpenAI-compat base URL"); _padd.add_argument("--key-ref",dest="key_ref",default=None,help="keychain:NAME or ${VAR} (never a literal secret)"); _padd.add_argument("--npm",default=None,help="AI-SDK package (default @ai-sdk/openai-compatible)"); _padd.add_argument("--privacy",default=None,choices=["zdr","retain","train"],help="data class"); _padd.add_argument("--max-concurrent",dest="max_concurrent",type=int,default=None,help="ratelimit slots for <provider>/*"); _padd.add_argument("--rpd",type=int,default=None,help="known free-tier requests/day"); _padd.add_argument("--model",dest="models",action="append",default=None,help="model id (repeatable)")
+    _prm=pvs.add_parser("rm",help="remove a provider"); _prm.add_argument("pid",help="provider id")
+    _psh=pvs.add_parser("show",help="show one provider"); _psh.add_argument("pid",help="provider id")
     dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); dg.add_argument("--parent",default=None,help="run as background wake; auto-wake PARENT when its cohort finishes"); dg.add_argument("--group",default=None); dg.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); dg.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result")
     cc=sub.add_parser("crosscheck",help="same task to 2+ agents in parallel, compare answers"); cc.add_argument("aname",help="first agent"); cc.add_argument("bname",help="second agent"); cc.add_argument("task",nargs="*",help="self-contained task both agents answer"); cc.add_argument("--more",action="append",nargs="+",default=[],metavar="AGENT",help="extra agent (repeatable or space-separated)"); cc.add_argument("--judge",default=None,metavar="AGENT",help="third agent asked which answer is right and why (one turn)"); cc.add_argument("--timeout",type=float,default=1800,help="per-agent backend budget in seconds (0=unlimited, default 1800)")
     cx=sub.add_parser("context",help="scoped guidance + persistent memory"); cxs=cx.add_subparsers(dest="ctxsub",required=False)
@@ -15248,7 +15582,7 @@ def main(argv=None):
         "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon,
         "harness":do_harness,"agents":do_agents,"roles":do_roles,"chat":do_chat,"status":do_status,
         "handoff":do_handoff,"hosts":do_hosts,"sync":do_sync,
-        "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,
+        "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,"providers":do_providers,
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit}[a.subcmd]

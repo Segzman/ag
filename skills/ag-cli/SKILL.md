@@ -61,6 +61,20 @@ ag pops a native macOS dialog (masked) and hands the value to the program; the m
 
 Backend turns and spawned sessions get `SUDO_ASKPASS`/`SSH_ASKPASS`/`GIT_ASKPASS` -> `<state>/bin/ag-askpass` (+ a `sudo` shim adding `-A`). `ag askpass` only answers when its parent is sudo/ssh/git; never call it yourself. Secret never hits disk: `input.log` records `[secret input redacted]`, events log outcome only. Never request secrets in chat or put them in argv. Cancel in dialog = nothing sent. macOS only; elsewhere detection is off. A program that echoes its own input can still leak to `output.log`.
 
+## Keys and providers
+
+```sh
+{{AG}} --dir <state> keys set NAME [--from-env VAR]     # Keychain (service ag) via `security -i` on STDIN; macOS only
+{{AG}} --dir <state> keys list                          # names + created/updated, never values
+{{AG}} --dir <state> keys rm NAME
+{{AG}} --dir <state> keys test NAME --provider P        # GET provider /models, prints ok/401, never the key
+{{AG}} --dir <state> providers add ID --base-url URL --key-ref keychain:NAME [--npm @ai-sdk/openai-compatible] [--privacy zdr|retain|train] [--max-concurrent N] [--rpd N] [--model ID ...]
+{{AG}} --dir <state> providers list | show ID | rm ID
+{{AG}} --dir <state> providers add groq --key-ref keychain:NAME   # presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova
+```
+
+`${keychain:NAME}` works wherever `${VAR}` refs work (agent/profile env); resolved at spawn into child env only, redacted in `agents env`. Providers live in `$AG_CONFIG_HOME/providers.json` (refs only); ag merges an opencode fragment (`"apiKey": "{env:AG_KEY_<ID>}"`) into the scoped `OPENCODE_CONFIG` and injects `AG_KEY_<ID>` into the child env only (never global `~/.config/opencode/opencode.json`). Privacy feeds the work-guard; max_concurrent feeds ratelimit slots for `<provider>/*`.
+
 ## Notes / todos
 
 `ag note "..."` / `ag notes` · `ag todo add|list|done|clear` · `ag history` · `ag events`.

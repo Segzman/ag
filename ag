@@ -11547,6 +11547,7 @@ def keychain_set(name, value):
     """Store via `security -i` (command on STDIN, never -w VALUE in argv). Returns err or ''."""
     if not KEYCHAIN_NAME_RE.match(name or ""): return f"bad key name {name!r} (1-64 letters/digits/._-)"
     if not isinstance(value, str) or not value: return "empty value (refused)"
+    if "'" in value or any(ord(c) < 32 for c in value): return "unsupported character in secret (single quote/control chars break `security -i` parsing); refused"
     if (_m := _keys_need_mac()): return _m
     sec = _keys_security_bin()
     cmd = "add-generic-password -s %s -a %s -U -w %s\n" % (shlex.quote(KEYCHAIN_SERVICE), shlex.quote(name), shlex.quote(value))
@@ -11670,6 +11671,7 @@ def providers_apply(sdir, agent, env, notes=None):
 def keys_selfcheck():
     assert _keychain_ref("${keychain:abc-1}") == "abc-1" and _keychain_ref("{env:keychain:a.b}") == "a.b" and _keychain_ref("${VAR}") is None and _keychain_ref("keychain:a") is None
     assert _normalize_key_ref("keychain:a") == "keychain:a" and _normalize_key_ref("${keychain:a}") == "keychain:a" and _normalize_key_ref("${VAR}") is None
+    assert "unsupported character" in keychain_set("X", "a'b") and "unsupported character" in keychain_set("X", "a\nb")
     assert provider_env_key("groq") == "AG_KEY_GROQ" and provider_env_key("a-b") == "AG_KEY_A_B"
     assert set(PROVIDER_PRESETS) >= {"groq", "cerebras", "openrouter", "cloudflare", "gemini", "mistral", "sambanova"}
     assert PROVIDER_PRESETS["openrouter"]["rpd"] == 50 and PROVIDER_PRESETS["sambanova"]["rpd"] == 20 and PROVIDER_PRESETS["groq"]["max_concurrent"] == 2

@@ -12260,7 +12260,7 @@ def do_keys_new(a, sdir):
         base = (e.get("base_url") or "").strip().rstrip("/")
         if not base: return emit(a, "keys", error=f"provider {pid} has no base-url")
         import urllib.request, urllib.error
-        url = base + "/models"
+        url = base + ("/key" if "openrouter.ai" in base else "/models")  # openrouter /models is public: /key needs a valid key
         try: req = urllib.request.Request(url, headers={"Authorization": "Bearer " + v, "User-Agent": "ag-cli"}); v = None
         except Exception as ex: return emit(a, "keys", error=str(ex)[:160])
         try:

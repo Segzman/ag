@@ -38,13 +38,13 @@ class Modes(unittest.TestCase):
         a = {"name":"oc","backend":"opencode","mode":"edits"}
         env = ag.mode_env(sd, a, {})
         cfg = json.loads(Path(env["OPENCODE_CONFIG"]).read_text())
-        self.assertEqual(cfg["permission"], {"edit":"allow","bash":"ask"})
+        self.assertEqual(cfg["permission"]["edit"], "allow"); self.assertEqual(cfg["permission"]["bash"]["*"], "deny"); self.assertEqual(cfg["permission"]["bash"]["bun test*"], "allow"); self.assertEqual(cfg["permission"]["*"], "deny"); self.assertEqual(cfg["permission"]["read"], "allow")  # plugin/MCP tools denied in edits
         base = Path(self.td)/"prof.json"; base.write_text(json.dumps({"mcp":{"x":{}},"permission":{"webfetch":"deny","edit":"ask"}}))
         env2 = ag.mode_env(sd, {**a,"mode":"full"}, {"OPENCODE_CONFIG":str(base),"OTHER":"1"})
         cfg2 = json.loads(Path(env2["OPENCODE_CONFIG"]).read_text())
         self.assertEqual(cfg2["permission"], {"webfetch":"deny","edit":"ask","*":"allow"}); self.assertIn("mcp", cfg2); self.assertEqual(env2["OTHER"], "1")
         self.assertEqual(json.loads(base.read_text())["permission"]["edit"], "ask")  # profile file untouched
-        self.assertEqual(json.loads(Path(ag.mode_env(sd, {**a,"mode":"","plan":True}, {})["OPENCODE_CONFIG"]).read_text())["permission"], {"edit":"ask","bash":"ask"})
+        _ro = json.loads(Path(ag.mode_env(sd, {**a,"mode":"","plan":True}, {})["OPENCODE_CONFIG"]).read_text())["permission"]; self.assertEqual((_ro["*"], _ro["edit"], _ro["bash"], _ro["read"]), ("deny", "ask", "ask", "allow"))
         self.assertEqual(ag.mode_env(sd, {"name":"oc","backend":"opencode"}, {"K":"v"}), {"K":"v"})
         self.assertEqual(ag.mode_env(sd, {"name":"c","backend":"claude","mode":"ro"}, {}), {})
 

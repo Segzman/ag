@@ -76,7 +76,7 @@ class Seams(unittest.TestCase):
     def test_opencode_mode_env_overlay(self):
         L = self.turn("opencode", "--mode", "edits")
         p = Path(L["env"]["OPENCODE_CONFIG"]); self.assertEqual(p.parent.parent.name, "modes")
-        self.assertEqual(json.loads(p.read_text())["permission"], {"edit": "allow", "bash": "ask"})
+        _pm = json.loads(p.read_text())["permission"]; self.assertEqual(_pm["edit"], "allow"); self.assertEqual(_pm["bash"]["*"], "deny")
         L = self.turn("opencode")
         self.assertNotIn("OPENCODE_CONFIG", L["env"])
 

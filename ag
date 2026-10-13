@@ -4492,13 +4492,43 @@ def mode_flags(backend, mode="", plan=False):
         return ["--mode", "plan"] if plan else list(_CURSOR_MODE.get(ok, []))
     return []
 
+# edits-mode shell allowlist for opencode (accident guard, NOT a sandbox: verified 2026-10-13 that opencode
+# matches the whole command string by prefix, so `git status && touch x` / `;` / `$(...)` ride an allowed prefix).
+OPENCODE_EDITS_BASH_ALLOW = ["cd *", "ls", "ls *", "pwd", "cat *", "head *", "tail *", "wc *", "grep *", "rg *", "which *",
+    "git status*", "git diff*", "git log*", "git show*", "git branch*", "git rev-parse*", "git ls-files*", "git blame*",
+    "git add *", "git commit *", "git stash*", "git restore *", "git switch *", "git checkout *", "git mv *", "git rm *",
+    "tsc*", "npx tsc*", "bunx tsc*", "bun test*", "bun run test*", "bun run lint*", "bun run typecheck*", "bun run build*",
+    "npm test*", "npm run test*", "npm run lint*", "npm run typecheck*", "npm run build*", "pnpm test*", "pnpm run *",
+    "yarn test*", "yarn run *", "pytest*", "python -m pytest*", "python3 -m pytest*", "python -m unittest*", "python3 -m unittest*",
+    "go test*", "go vet*", "go build*", "cargo test*", "cargo check*", "cargo clippy*", "cargo build*",
+    "ruff *", "eslint *", "npx eslint*", "prettier --check*", "make test*", "make check*", "make lint*", "mkdir *"]
+
+OPENCODE_CORE_TOOLS = ("bash", "edit", "write", "read", "grep", "glob", "list", "patch", "todowrite", "todoread", "webfetch", "task", "skill")
+
+def opencode_bash_allow(mode):
+    """edits allowlist: config.json opencode_bash_allow.<mode> (list) replaces the default."""
+    try:
+        v = (_ag_conf().get("opencode_bash_allow") or {}).get(mode)
+        if isinstance(v, list): return [str(x) for x in v if str(x).strip()]
+    except Exception: pass
+    return list(OPENCODE_EDITS_BASH_ALLOW) if mode == "edits" else []
+
 def opencode_permission(mode="", plan=False):
-    """Pure: opencode `permission` config block for the mode ({} = leave backend default)."""
+    """Pure-ish: opencode `permission` config block for the mode ({} = leave backend default).
+    Verified on opencode 1.18 (2026-10-13): a bare "deny" drops the tool and Zen free models 403;
+    "*":"ask" overrides every allow rule (whatever the order) and headless runs reject asks;
+    "*":"deny" + allow patterns works and keeps the tool. So: ro = ask everything (truly no shell);
+    edits = deny-by-default shell with an allowlist (git/tests/typecheck/lint/read-only)."""
     m = "ro" if plan else mode
-    # "ask", not "deny": deny drops the tool from the request and opencode Zen's free tier then
-    # 403s ("can only be used from within OpenCode"). Headless `opencode run` auto-rejects asks.
-    return {"ro": {"edit": "ask", "bash": "ask"}, "edits": {"edit": "allow", "bash": "ask"},
-            "auto": {"edit": "allow", "bash": "allow"}, "full": {"*": "allow"}}.get(m, {})
+    # ro/edits: deny every tool by default ("*": "deny"), then allow built-ins. Plugin/MCP tools (e.g. a
+    # context-mode ctx_execute that runs shell) are otherwise unaffected by bash/edit rules; the `tools` switch
+    # does not hide plugin tools. Verified 2026-10-13: ctx_execute unavailable, Zen free still 200, no 403.
+    base = {"*": "deny", **{t: "allow" for t in OPENCODE_CORE_TOOLS if t not in ("bash", "edit", "write", "patch")}}
+    if m == "ro": return {**base, "edit": "ask", "bash": "ask"}
+    if m == "edits":
+        allow = opencode_bash_allow("edits")
+        return {**base, "edit": "allow", "bash": ({"*": "deny", **{p: "allow" for p in allow}} if allow else "ask")}
+    return {"auto": {"edit": "allow", "bash": "allow"}, "full": {"*": "allow"}}.get(m, {})
 
 def mode_env(sdir, agent, env):
     """Overlay OPENCODE_CONFIG with a generated config carrying the `permission` block,
@@ -4511,6 +4541,7 @@ def mode_env(sdir, agent, env):
         except Exception: base = {}
     cur = base.get("permission")
     base["permission"] = {**(cur if isinstance(cur, dict) else {}), **perm}
+
     base.setdefault("$schema", "https://opencode.ai/config.json")
     p = sdir/"modes"/re.sub(r"[^\w.-]", "_", agent.get("name") or "agent")/"opencode.json"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -13306,7 +13337,7 @@ def do_selfcheck(a):
         assert env_check({"HOME":"/x"},[]) and env_check({"A_TOKEN":"lit"},[]) and env_check({"PATH":"/x"},[]) and not env_check({"A_TOKEN":"${X}","PATH+":"/d"},["Y"])
         _e = env_apply({"PATH":"/b","Z":"1"}, {"PATH+":"/d","K":"${NOPE_AG_SC}"}, ["Z"], _n:=[]); assert _e=={"PATH":"/d"+os.pathsep+"/b"} and len(_n)==1, (_e,_n)
         assert backend_argv("claude",prompt="hi",mode="ro")[-3:]==["--permission-mode","dontAsk","hi"] and mode_flags("gemini")==["--approval-mode","default"]
-        assert mode_flags("codex","full")==["-s","danger-full-access"] and opencode_permission("full")=={"*":"allow"} and mode_warning("echo","ro") and not mode_warning("claude","ro")
+        assert mode_flags("codex","full")==["-s","danger-full-access"] and opencode_permission("full")=={"*":"allow"} and opencode_permission("ro")["*"]=="deny" and opencode_permission("ro")["bash"]=="ask" and opencode_permission("ro")["read"]=="allow" and opencode_permission("edits")["bash"]["*"]=="deny" and opencode_permission("edits")["bash"]["git status*"]=="allow" and "git push*" not in opencode_permission("edits")["bash"] and mode_warning("echo","ro") and not mode_warning("claude","ro")
         # unknown /word: explicit real route, never model prose
         _r = run_turn(td,"pa","/frobnicate")
         assert _r["exit"]==1 and "NOT sent to the model" in _r["reply"] and "/handoff" in _r["reply"], _r

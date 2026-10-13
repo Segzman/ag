@@ -121,7 +121,7 @@ Pair a cheap Claude (haiku, mechanical/review job) with a zero-retention free mo
 
 Benchmarked 2026-10-12 (12 auto-graded tasks x3; probe: every live free model took 8 short concurrent calls; ~10 long agent turns at once did trip an account limit). Avoid: `exo-free` (deprecated, 410), `ling-3.0-flash-fin-free` (unavailable), `ling-3.1-flash-free` (frequent empty replies). Don't trust nemotron/longcat alone on arithmetic or dates.
 
-Per-agent privacy guard applies: `work` agents refuse train/unknown models.
+Per-agent privacy guard applies: `work` agents refuse train/unknown models. OpenRouter second opinions: `models --backend openrouter` (tools-support + endpoint `data` class), work agents via `--backend api --model openrouter/<id>` (sends `{"provider": {"data_collection": "deny", "zdr": true}}`); opencode backend refuses openrouter work models.
 
 ## Cohorts (fan-out, one summary)
 

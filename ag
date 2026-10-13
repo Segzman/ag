@@ -183,7 +183,7 @@ def do_ls(a):
     root = Path(a.root or ".")
     pat = a.pattern or "*"
     hits = [str(p) for p in root.rglob("*") if fnmatch.fnmatch(p.name,pat) or fnmatch.fnmatch(str(p),pat)]
-    hits = sorted(h for h in hits if ".agent" not in h)[:500]
+    hits = sorted(h for h in hits if ".agent" not in Path(h).parts)[:500]  # path component, not substring
     if getattr(a,"json",False): return emit(a,"ls",{"root":str(root),"pattern":pat,"files":hits})
     return emit(a,"ls",{"_text":"\n".join(hits) or "(none)"})
 
@@ -193,7 +193,7 @@ def do_grep(a):
     inc = a.include or "*"
     out, scanned = [], 0
     for p in root.rglob("*"):
-        if not p.is_file() or ".agent" in str(p) or ".git/" in str(p): continue
+        if not p.is_file() or ".agent" in p.parts or ".git" in p.parts: continue
         if not fnmatch.fnmatch(p.name,inc): continue
         try:
             if p.stat().st_size>1_000_000: continue
@@ -4962,7 +4962,7 @@ def parse_timeline_claude(line, scope=None):
             if not isinstance(b, dict) or b.get("type") != "tool_result": continue
             c = b.get("content")
             if isinstance(c, list):
-                txt = " ".join(x.get("text", "") for x in c
+                txt = " ".join(str(x.get("text", "")) for x in c
                     if isinstance(x, dict) and x.get("type") == "text")
             else:
                 txt = str(c or "")
@@ -7975,7 +7975,11 @@ def acp_turn_lines(argv, env, workdir, sid, prompt, mode="edits", model="", ctl=
         except Exception: pass
         q.put(None)
     threading.Thread(target=_rd, daemon=True).start()
-    threading.Thread(target=lambda: [err.append(x) for x in iter(p.stderr.readline, b"")], daemon=True).start()
+    def _drain_err():  # keep only the tail: a chatty agent must not grow memory without bound
+        for x in iter(p.stderr.readline, b""):
+            err.append(x)
+            if len(err) > 400: del err[:200]
+    threading.Thread(target=_drain_err, daemon=True).start()
     def send(o):
         try: p.stdin.write((json.dumps(o) + "\n").encode()); p.stdin.flush(); return True
         except Exception: return False
@@ -14112,7 +14116,7 @@ def access_error(backend, model, data="work", cwd=None, sdir=None):
                     if fnmatch.fnmatch(c.lower(), (pat or "").lower()): return f"model {disp} blocked by access policy (deny {pat!r}); see ag access show"
                 except Exception: continue
         return f"model {disp} not allowed by access policy; see ag access show"
-    except Exception: return None
+    except Exception as _e: return f"access check failed ({type(_e).__name__}): refusing (fail closed); check routing.json access policy (ag access show)"
 def usage_ledger_path(): return ag_cache_home() / "usage.jsonl"
 def usage_provider(backend, model):
     """Provider id for ledger grouping: globals provider_for when present, else first path segment. Pure."""
@@ -14267,7 +14271,7 @@ def budget_check(backend, model):
         elif b.get("daily") and dc >= 0.8 * float(b["daily"]): w = f"[budget] daily ${dc:.2f}/${float(b['daily']):.2f} ({dc / float(b['daily']) * 100:.0f}%)"
         elif b.get("monthly") and mc >= 0.8 * float(b["monthly"]): w = f"[budget] monthly ${mc:.2f}/${float(b['monthly']):.2f} ({mc / float(b['monthly']) * 100:.0f}%)"
         return None, w
-    except Exception: return None, None
+    except Exception as _e: return f"budget check failed ({type(_e).__name__}): refusing (fail closed); check ag budget show", None
 def do_access(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     sub = getattr(a, "sub", None) or "show"

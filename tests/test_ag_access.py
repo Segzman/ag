@@ -168,5 +168,15 @@ class Access(unittest.TestCase):
         self.assertTrue(json.loads(p.stdout)["ok"])
 
 
+
+class FailClosed(unittest.TestCase):  # swarm finding 2026-10-12: guards swallowed exceptions (fail open)
+    def test_access_and_budget_fail_closed(self):
+        import importlib.machinery
+        m = importlib.machinery.SourceFileLoader("ag_fc", str(Path(__file__).resolve().parent.parent / "ag")).load_module()
+        def boom(*a, **k): raise RuntimeError("x")
+        m.access_effective = boom; m.budget_load = boom
+        self.assertIn("fail closed", m.access_error("opencode", "opencode/x", "work") or "")
+        self.assertIn("fail closed", m.budget_check("opencode", "opencode/x")[0] or "")
+
 if __name__ == "__main__":
     unittest.main()

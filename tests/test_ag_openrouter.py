@@ -221,7 +221,7 @@ class Orcat(unittest.TestCase):
     def test_slots_and_rpd(self):
         ag = self.lib()
         self.assertEqual(ag._rl_limit("api", "openrouter/apodex/apodex-1.1-mini:free"), 2)
-        self.assertEqual(ag._rl_limit("api", "groq/some-model"), 0)
+        self.assertEqual(ag._rl_limit("api", "groq/some-model"), 2)  # measured: groq free 8K TPM
         self.assertTrue(ag._rl_is_free("api", "openrouter/x:free"))
         self.assertFalse(ag._rl_is_free("api", "groq/x"))
         self.assertEqual(self.ag("providers", "add", "openrouter", "--base-url", f"http://127.0.0.1:{self.port}",

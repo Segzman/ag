@@ -19,7 +19,7 @@ def fresh():
     AG.ensure_state(sdir)
     AG.save_agents(sdir, [{"name": "src", "backend": "echo", "model": "default", "dir": ".", "role": "sub",
         "persona": "reviewer", "system": "sys", "instructions": ["m.md"], "mode": "edits", "plan": True,
-        "effort": "max", "env": {"K": "v"}, "env_unset": ["U"]}])
+        "effort": "max", "env": {"K": "v"}, "env_unset": ["U"], "data": "work", "fallback": ["opencode/space-bunny-free"]}])
     (sdir / "chats").mkdir(parents=True, exist_ok=True)
     (sdir / "chats" / "src.jsonl").write_text(
         json.dumps({"role": "user", "text": "q1"}) + "\n" + json.dumps({"role": "agent", "text": "a1"}) + "\n" +
@@ -54,6 +54,12 @@ class ForkTest(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("AG_PROBE", None)
         for td in self.tds: shutil.rmtree(td, ignore_errors=True)
+
+    def test_keeps_privacy_class_and_fallback(self):  # swarm finding 2026-10-12: fork dropped `data`
+        td, sdir = fresh(); self.tds.append(td)
+        rc, _ = fork(sdir); self.assertEqual(rc, 0)
+        n = {x["name"]: x for x in AG.load_agents(sdir)}["new1"]
+        self.assertEqual(n.get("data"), "work"); self.assertEqual(n.get("fallback"), ["opencode/space-bunny-free"])
 
     def test_copies_config_history_not_sids(self):
         td, sdir = fresh(); self.tds.append(td)

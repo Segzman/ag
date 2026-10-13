@@ -2630,8 +2630,9 @@ def do_harness_profile(a):
             return emit(a, "harness", error=f"no such profile: {name}")
         v = validate_profile(name, profs[name])
         eff = ensure_effective_profile(sdir, name)
-        # redact env values: counts/names only
+        # redact secret-looking env values (stored as ${VAR} refs, but never echo them)
         red = dict(profs[name])
+        if isinstance(red.get("env"), dict): red["env"] = {k: ("<redacted>" if ENV_SECRET_RE.search(k) else v) for k, v in red["env"].items()}
         data = {"profile": name, "sources": red, "valid": v,
             "effective": {k: v2 for k, v2 in eff.items() if k != "error"}}
         if getattr(a, "json", False): return emit(a, "harness", data)
@@ -2972,7 +2973,7 @@ def native_handoff_text(sdir, name, backend=""):
     if launch.get("ok") and launch.get("profile"):
         eff = ensure_effective_profile(sdir, launch["profile"])
         files = (eff.get("files") or {}) if "error" not in eff else {}
-        env_show = " ".join(f"{k}={v}" for k, v in sorted(penv.items())) or "(no extra env)"
+        env_show = " ".join(f"{k}=<redacted>" if (k.startswith("AG_KEY_") or ENV_SECRET_RE.search(k)) else f"{k}={v}" for k, v in sorted(penv.items())) or "(no extra env)"  # resolved secrets live in penv
         argv_show = " ".join(backend_argv_extra(b, sdir, launch["profile"])) or "(no extra argv)"
         unsup = (eff.get("unsupported") or [])[:3]
         prof_line = (f"\n  profile {launch['profile']}: env {env_show}"
@@ -4643,7 +4644,7 @@ def _parse_claude(line):
                 out.append(("toolout",tl_bound(txt,600)[0] if txt else ("(error)" if b.get("is_error") else "(ok)")))
         return out
     if t=="result":
-        return [("done",f'{o.get("subtype","")} cost=${o.get("total_cost_usd",0):.3f}')]
+        return [("done",f'{o.get("subtype","")} cost=${o.get("total_cost_usd") or 0:.3f}')]
     return []
 
 def _parse_opencode(line):
@@ -6649,7 +6650,7 @@ def do_agents_fork(a, sdir):
         "persona": pers, "system": scol.get("system", "") or "",
         "instructions": list(scol.get("instructions") or []),
         "forked_from": src, "forked_at": now_iso(), "fork_turn": fork_turn}
-    for k in ("mode", "plan", "effort", "transport", "acp_cmd", "profile", "env", "env_unset", "subscription_only"):
+    for k in ("mode", "plan", "effort", "transport", "acp_cmd", "profile", "env", "env_unset", "subscription_only", "data", "fallback", "claude_config_dir"):  # data: a fork must not silently change privacy class
         if k == "effort":
             if eff not in (None, ""): row["effort"] = eff
             continue
@@ -12825,6 +12826,7 @@ def do_selfcheck(a):
         oc_argv = backend_argv("opencode",model="",workdir=".",sid="",prompt="hi",command="rev")
         assert oc_argv[1:] == ["run","--format","json","--thinking","--command","rev","-m",OPENCODE_MODEL_DEFAULT,"--dir",".","hi"] and (oc_argv[0]=="opencode" or oc_argv[0].endswith("/opencode"))
         assert "--command" not in backend_argv("opencode",model="",workdir=".",sid="",prompt="hi")
+        assert _parse_claude('{"type":"result","subtype":"s","total_cost_usd":null}')==[("done","s cost=$0.000")]  # null cost must not crash
         assert backend_argv("opencode",model="x",workdir=".",prompt="hi",effort="max")[-6:-1]==["x","--variant","max","--dir","."] and "--variant" not in backend_argv("opencode",prompt="hi")
         assert "--effort" in backend_argv("claude",prompt="hi",effort="high") and backend_argv("codex",prompt="hi",effort="low")[3:5]==["-c",'model_reasoning_effort="low"']
         # per-model variants: claude static, unknown passes through, opencode/codex from the model-list cache

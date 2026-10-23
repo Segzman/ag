@@ -151,3 +151,16 @@ becomes a chat message/notification to the user, then is archived. Write atomica
 - Tests offline: dir mailbox two-node round trip for every op, unknown op rejected, admin_ops [] disables, ls-remote
   sha compare (fake git on PATH), pinned-sha download URL, dev interval, tick runs the check in dev mode only.
   README + skills docs.
+
+### Part 5 revision (user, 2026-10-23) — supersedes the dev-mode polling above
+- NO 60 s polling. Auto-update stays daily (`UPDATE_EVERY_S` 86400) for everyone; drop `--dev`, `AG_UPDATE_EVERY_S`
+  and the tick-driven check. Keep: cheap ls-remote sha check + pinned-sha download + `update-commit` + heartbeat commit
+  + `update --status` showing the installed commit.
+- Push-driven updates: `ag push [GIT_PUSH_ARGS…]` (only inside a git checkout of ag): runs `git push` (args passed
+  through), and on success (a) publishes relay admin `update` to every peer in `nodes/` except self, (b) `ag notify
+  "ag pushed" "<branch> <old>..<new> → updating <peers>"` locally. Peers run the admin op on their next sync/tick,
+  update, and `ag notify "ag updated" "<node>: <old> → <new>"` (Muse on the VM turns that into a message).
+- Notify channels: `notify.json` `{"dir": PATH, "macos": bool}`; `ag notify --set-dir D` and `--macos on|off`.
+  macOS channel = `osascript -e 'display notification BODY with title TITLE'` (escape quotes; no-op off macOS).
+  Default on macOS when no dir is set: macos channel on. Both channels may be on.
+- Relay admin ops unchanged (update | notify-dir PATH | status; drop dev-on/dev-off).

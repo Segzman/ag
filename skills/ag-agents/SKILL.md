@@ -95,7 +95,9 @@ Work code only to zdr models. Source: opencode.ai/docs/zen Privacy (2026-10-12);
 
 ```sh
 {{AG}} --dir <state> chat send oc "implement X per <spec>; report files changed" --job implement
-{{AG}} --dir <state> chat log oc
+{{AG}} --dir <state> chat log oc                        # last rows (role: text); use --json for rows
+{{AG}} --dir <state> chat log oc --last                 # final agent reply of the last turn, raw text (no role prefix)
+{{AG}} --dir <state> chat log oc --tail 50 --no-tools   # --tail N (overrides --limit); --no-tools hides tool/toolout/diff/reasoning
 {{AG}} --dir <state> wake oc "summarize failures" --max-runtime 900 --job debug
 {{AG}} --dir <state> wakes [--agent oc] [--wait <job> --timeout 60] [--cancel <job>]
 {{AG}} --dir <state> chat send oc "..." --request-id K     # idempotent (also wake/delegate); same payload replays result

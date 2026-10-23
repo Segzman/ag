@@ -93,3 +93,13 @@ and a bare git repo; publish → sync on target materialises row + agent (echo b
   credentials for it, `max_mode`, data note: prompts and replies are stored in that repo) + skill templates.
 - Tests: `tests/test_ag_relay_sched.py` with stub `relay_*` functions monkeypatched where part 1 isn't merged yet, plus
   doc coverage. Keep part 1's function signatures exactly.
+
+## Part 3 — one-shot cloud runs + stale-session fix (2026-10-23, owner `codex-ag`)
+- Bug: `agents rm NAME` leaves `chats/NAME.meta.json` (opencode `sid`/`sids`); re-adding NAME resumes the old session.
+  Fix: `agents rm` removes the session ids from the meta (keep the chat log file unless `--purge`), and `agents add`
+  never inherits a stale sid. Add `agents reset NAME` = drop session ids (fresh session next turn), keep config/log.
+- `wake AGENT "msg" --on NODE`: one-shot remote run via the relay: publish a schedule file with `"once": true` and
+  `"at_epoch": now`; the target materialises it, fires it on its next tick, reports the result, and removes the row
+  after reporting; the origin removes the mailbox file after ingest. `wakes` shows it as `remote@NODE` until the result
+  arrives; `relay results --id` shows the reply. Tests with the dir mailbox (two fake nodes) as in test_ag_relay.py.
+- Docs: README + skills (ag-agents: "run an agent in the cloud: `wake A \"…\" --on muse`").

@@ -8,6 +8,7 @@ import os
 import re
 import unittest
 from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY_FLAG_CMDS = [["setup"], ["models"], ["schedule", "add"], ["agents", "add"], ["agents", "set"], ["agents", "fork"], ["wake"],
@@ -37,7 +38,10 @@ def _walk(parser, path, out):
 
 
 def _commands():
-    ag = SourceFileLoader("ag_doc_cov", os.path.join(ROOT, "ag")).load_module()
+    # source file has no .py extension: explicit loader spec (load_module is 3.12-removed)
+    loader = SourceFileLoader("ag_doc_cov", os.path.join(ROOT, "ag"))
+    ag = module_from_spec(spec_from_loader("ag_doc_cov", loader))
+    loader.exec_module(ag)
     out = {}
     _walk(ag.build(), [], out)
     return out

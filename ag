@@ -10236,6 +10236,472 @@ def do_schedule(a):
         return emit(a, cmd, {"_text": msg, "schedule": r, **({"job": r["last_job"]} if sub == "run" else {})})
     finally: ll.close()
 
+# ---- relay: schedule handoff between machines through a shared mailbox ----
+# docs/RELAY.md: a private git repo (cloned at cfg.checkout) or a user-synced
+# folder (dir transport) both nodes reach. Each node only ever writes its own
+# files -- nodes/<node>.json (heartbeat), schedules/<target>/<node>--<id>.json
+# (published by origin = this node), results/<origin>/<target>--<id>--<due>.json
+# (written by the target) -- so concurrent rebases never conflict. Part 2 wires
+# `schedule add AGENT ... --on NODE` (local row stores on/sdir/agent_spec).
+
+def _relay_cmd(args, timeout=120):
+    """[exit, stderr+stdout tail]. Never raises."""
+    try: p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e: return 1, f"{type(e).__name__}: {e}"[:200]
+    return p.returncode, ((p.stderr or "") + (p.stdout or "")).strip()
+def _relay_git(args, timeout=180):
+    """None on exit 0, else the git error tail. Never raises."""
+    rc, out = _relay_cmd(args, timeout)
+    return None if rc == 0 else (out.splitlines() or [f"exit {rc}"])[0][:200]
+def _relay_node_name():
+    try: import socket
+    except Exception: return "node"
+    return re.sub(r"[^a-z0-9-]", "", (socket.gethostname() or "").split(".")[0].lower())[:24] or "node"
+def relay_cfg():
+    """$AG_CONFIG_HOME/relay.json with ~-expanded paths, or None (missing/corrupt/incomplete)."""
+    cfg = _json_or_empty(ag_config_home() / "relay.json")
+    if not isinstance(cfg, dict): return None
+    for k in ("node", "transport", "url", "state", "workdir", "max_mode"):
+        if not isinstance(cfg.get(k), str) or not cfg[k]: return None
+        cfg[k] = os.path.expanduser(cfg[k])
+    if cfg["transport"] not in ("git", "dir"): return None
+    cfg["checkout"] = os.path.expanduser(cfg.get("checkout") or "")
+    return cfg
+def relay_root(cfg):
+    """Path of the mailbox: the git checkout, or the dir-transport folder."""
+    return Path(os.path.expanduser(str(cfg["checkout"] if cfg["transport"] == "git" else cfg["url"])))
+def relay_publish_schedule(cfg, row, agent_spec):
+    """Write schedules/<row['on']>/<node>--<row['id']>.json from a local schedule row. No git ops."""
+    sp = dict(agent_spec or {})
+    mail = {"origin": cfg["node"], "target": row["on"], "id": row["id"], "agent": row["agent"], "message": row["message"],
+        "catch_up": bool(row.get("catch_up")), "overlap": row.get("overlap", "skip"),
+        "max_runtime_s": row.get("max_runtime_s") or 0, "job": row.get("job"), "enabled": row.get("enabled", True),
+        "updated": time.time(),
+        "agent_spec": {k: sp[k] for k in ("backend", "model", "effort", "mode", "data", "stall_s") if sp.get(k) not in (None, "")}}
+    if row.get("every_s"): mail["every_s"] = row["every_s"]
+    elif row.get("at"): mail["at"], mail["days"] = row["at"], row.get("days")
+    f = relay_root(cfg) / "schedules" / row["on"] / f'{cfg["node"]}--{row["id"]}.json'
+    f.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(f, json.dumps(mail, indent=1))
+    return f
+def relay_unpublish_schedule(cfg, target, sid):
+    """Delete our published schedule file for target. True if something was removed. No git ops."""
+    f = relay_root(cfg) / "schedules" / target / f'{cfg["node"]}--{sid}.json'
+    try: f.unlink()
+    except OSError: return False
+    return True
+def _relay_state(cfg): return Path(os.path.expanduser(str(cfg["state"])))
+def _relay_jload(p):
+    try: return json.loads(p.read_text())
+    except Exception: return None
+def _relay_epoch(iso):
+    try: return int(datetime.fromisoformat(str(iso)).timestamp())
+    except Exception: return None
+def _relay_errs_join(errs):
+    uniq = []
+    for e in errs:
+        s = str(e)[:180]
+        if s and s not in uniq: uniq.append(s)
+    return "; ".join(uniq)[:500] or None
+
+def _relay_who(cfg):
+    """git -c identity args: every commit in the mailbox is authored by ag-relay <node>@ag-relay."""
+    return ("-c", "user.name=ag-relay", "-c", f"user.email={cfg['node']}@ag-relay")
+
+def _relay_pull(cfg, out, errs):
+    """Clone (first git round) or pull --rebase; dir transport = the folder itself.
+    Pending local mail writes (e.g. a just-unpublished file) are committed first: rebase refuses a dirty tree."""
+    if cfg["transport"] == "dir":
+        r = relay_root(cfg)
+        for d in ("nodes", "schedules", "results"): (r / d).mkdir(parents=True, exist_ok=True)
+        out["pulled"] = True
+        return True
+    co = Path(cfg["checkout"])
+    if (co / ".git").exists():
+        rc, st = _relay_cmd(["git", "-C", str(co), "status", "--porcelain"])
+        if rc == 0 and st.strip():
+            who = _relay_who(cfg)
+            e = _relay_git(["git", "-C", str(co), *who, "add", "-A"])
+            if e: errs.append(f"pre-add: {e}"); return False
+            e = _relay_git(["git", "-C", str(co), *who, "commit", "--quiet", "--allow-empty",
+                f"--author=ag-relay <{cfg['node']}@ag-relay>", "-m", f"relay: {cfg['node']} sync"])
+            if e: errs.append(f"pre-commit: {e}"); return False
+        e = _relay_git(["git", "-C", str(co), "pull", "--rebase", "--quiet"])
+        op = "pull"
+    else:
+        co.parent.mkdir(parents=True, exist_ok=True)
+        e = _relay_git(["git", "clone", "--quiet", cfg["url"], str(co)])
+        op = "clone"
+    if e:
+        errs.append(f"{op}: {e}")
+        return False
+    for d in ("nodes", "schedules", "results"): (co / d).mkdir(parents=True, exist_ok=True)
+    out["pulled"] = True
+    return True
+
+def _relay_agent_add(sdir, name, spec, cfg, origin):
+    """Create the relay agent exactly like agents add does (incl. the privacy guard). -> None | error text."""
+    try:
+        adir = Path(os.path.expanduser(str(cfg.get("workdir") or "~/ag-relay-work"))) / str(origin).replace("/", "_")
+        adir.mkdir(parents=True, exist_ok=True)
+        args = [sys.executable, ag_script_path(), "--dir", str(sdir), "agents", "add", name]
+        for flag, k in (("--backend", "backend"), ("--model", "model"), ("--effort", "effort"), ("--data", "data")):
+            if spec.get(k): args += [flag, str(spec[k])]
+        if spec.get("mode"): args += ["--mode", str(spec["mode"])]
+        if spec.get("stall_s") is not None: args += ["--stall-s", str(spec["stall_s"])]
+        args += ["--dir", str(adir)]
+        rc, t = _relay_cmd(args, 60)
+        if rc == 0: return None
+        line = (t.splitlines() or ["agents add failed"])[0]
+        return line[7:] if line.startswith("error: ") else line
+    except Exception as e: return f"{type(e).__name__}: {str(e)[:150]}"[:200]
+
+def _relay_mail(root, node, errs):
+    """Parsed inbox schedules; bad files skipped with a note."""
+    inbox = root / "schedules" / node
+    out = []
+    if not inbox.is_dir(): return out
+    for f in sorted(inbox.glob("*.json")):
+        try: m = json.loads(f.read_text())
+        except ValueError: errs.append(f"{f.name}: bad json"); continue
+        if not (isinstance(m, dict) and m.get("origin") and m.get("id") and ("every_s" in m or "at" in m)):
+            errs.append(f"{f.name}: bad schedule"); continue
+        out.append(m)
+    return out
+
+def _relay_materialize(cfg, root, now, out, errs):
+    """Target side: upsert inbox schedules into cfg.state (row id <origin>--<id>, agent relay-<origin>-<agent>),
+    create missing agents via agents add, prune rows whose mail file is gone. next_due recomputed only on
+    timing change / new row; runs/last_* counters kept. Registers cfg.state for the global tick."""
+    node, sdir = cfg["node"], _relay_state(cfg)
+    mails = _relay_mail(root, node, errs)
+    ensure_state(sdir)
+    inbox = root / "schedules" / node
+    ll = _sched_flock(sdir, "schedules.lock")
+    try:
+        try: rows = _sched_load(sdir)
+        except ValueError as e: errs.append(f"{sdir}/schedules.json: {e}"); rows = None
+        if rows is not None:
+            names = {r.get("name") for r in load_agents(sdir)}
+            for m in mails:
+                mid = f'{m["origin"]}--{m["id"]}'
+                row = next((r for r in rows if r.get("id") == mid), None)
+                timing = {k: m[k] for k in ("every_s", "at", "days") if k in m}
+                if row is None:
+                    row = {"id": mid, "created": now, "next_due": None, "last_due": None, "last_job": None,
+                        "last_status": None, "runs": 0, "missed": 0, "skipped": 0, "notify": None, "on_done": ""}
+                    rows.append(row)
+                    out["materialized"].append(mid)
+                if row["next_due"] is None or any(row.get(k) != v for k, v in timing.items()):
+                    row.update(timing)
+                    row["next_due"] = _sched_next(row, now)
+                row.update(message=m.get("message", ""), catch_up=bool(m.get("catch_up")), overlap=m.get("overlap", "skip"),
+                    max_runtime_s=m.get("max_runtime_s") or 0, job=m.get("job"), enabled=m.get("enabled", True),
+                    relay_origin=m["origin"], relay_id=m["id"], agent=f'relay-{m["origin"]}-{m["agent"]}')
+                if row["agent"] not in names:
+                    spec = dict(m.get("agent_spec") or {})
+                    if spec.get("mode") and _mode_rank(spec["mode"]) > _mode_rank(cfg["max_mode"]): spec["mode"] = cfg["max_mode"]  # target ceiling
+                    e = _relay_agent_add(sdir, row["agent"], spec, cfg, m["origin"])
+                    if e:
+                        row["last_status"] = f"error: {e}"[:200]; row["next_due"] = None  # parked until the agent materialises
+                    else:
+                        if row["next_due"] is None: row["next_due"] = _sched_next(row, now)
+                        names.add(row["agent"])
+            drop = [r for r in rows if r.get("relay_origin") and not (inbox / f'{r["relay_origin"]}--{r["relay_id"]}.json').exists()]
+            if drop:
+                rows = [r for r in rows if r not in drop]
+                out["removed"].extend(r["id"] for r in drop)
+            _sched_save(sdir, rows)
+            _sched_reg_set(sdir, bool(rows))  # register only dirs with rows; an emptied target leaves the registry
+    finally: ll.close()
+
+def _relay_reply(sdir, r, j):
+    """Latest full agent reply since the job started, else the short one saved on the job."""
+    since, until = str(j.get("ts") or ""), str(j.get("ended_at") or "")
+    try: log = [x for x in load_chat_log(sdir, r["agent"])
+        if x.get("role") == "agent" and since <= str(x.get("ts") or "") and (not until or str(x.get("ts") or "") <= until)]
+    except Exception: log = []
+    if log: return str(log[-1].get("text") or "")
+    return str(j.get("reply") or j.get("error") or "")
+
+def _relay_report(cfg, root, now, out, errs):
+    """Target side: one result file per finished wake job not reported yet (relay_reported marker)."""
+    node, sdir = cfg["node"], _relay_state(cfg)
+    ll = _sched_flock(sdir, "schedules.lock")
+    try:
+        try: rows = _sched_load(sdir)
+        except ValueError as e: errs.append(str(e)); return
+        dirty = False
+        for r in rows:
+            if not (r.get("relay_origin") and r.get("last_job")) or r.get("relay_reported") == r["last_job"]: continue
+            j = _wake_read_job(sdir, r["last_job"])
+            try: j = _wake_reconcile(sdir, j)
+            except Exception: pass
+            st = (j or {}).get("status") or ""
+            if not j or st in ("queued", "running"): continue
+            due = int(r.get("last_due") or 0)
+            f = root / "results" / r["relay_origin"] / f'{node}--{r["relay_id"]}--{due}.json'
+            res = {"origin": r["relay_origin"], "target": node, "id": r["relay_id"], "due": due, "job": r["last_job"],
+                "status": st, "exit": j.get("backend_exit", j.get("exit")), "reply": _relay_reply(sdir, r, j)[:20000],
+                "error": (j.get("error") or "")[:200], "started": due, "reported": int(now)}
+            fin = _relay_epoch(j.get("ended_at"))
+            if fin is not None: res["finished"] = fin
+            if j.get("verify"): res["verify"] = j["verify"]
+            try:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write(f, json.dumps(res, indent=1))
+            except OSError as e: errs.append(f"{f.name}: {e}"); continue
+            r["relay_reported"] = r["last_job"]
+            out["reported"].append(str(f))
+            dirty = True
+        if dirty: _sched_save(sdir, rows)
+    finally: ll.close()
+
+def _relay_ing_cache():
+    p = ag_cache_home() / "relay-ingested.json"
+    try: d = json.loads(p.read_text())
+    except Exception: d = {}
+    return (d if isinstance(d, dict) else {}), p
+
+def _relay_local_rows(cfg):
+    """[(sdir, rows)] for every registered schedule dir (+ cfg.state); corrupt/unreadable dirs skipped."""
+    seen, out = set(), []
+    for x in _sched_reg_get() + [str(_relay_state(cfg))]:
+        try: d = Path(x).expanduser().resolve()
+        except Exception: continue
+        if d in seen: continue
+        try:
+            if not (d / "schedules.json").exists(): continue
+            rows = _sched_load(d)
+        except (OSError, ValueError): continue
+        seen.add(d)
+        out.append((d, rows))
+    return out
+
+def _relay_ingest(cfg, root, now, out, errs):
+    """Origin side: copy each fresh result under results/<node>/ into the local row's state dir
+    (<row.sdir or dir>/relay/results/), bump the row (runs, last_due, last_status 'remote <st>'),
+    emit relay_result, record the file as ingested, and prune mailbox files older than 7 days."""
+    node = cfg["node"]
+    rdir = root / "results" / node
+    files = sorted(rdir.glob("*.json")) if rdir.is_dir() else []
+    if not files: return
+    cache, cpath = _relay_ing_cache()
+    local = _relay_local_rows(cfg)
+    for f in files:
+        if f.name in cache: continue
+        try: res = json.loads(f.read_text())
+        except ValueError: errs.append(f"{f.name}: bad json"); continue
+        if not (isinstance(res, dict) and res.get("id") and res.get("target")):
+            errs.append(f"{f.name}: bad result"); continue
+        hit = None
+        for d, rws in local:
+            r0 = next((r for r in rws if r.get("id") == res["id"] and r.get("on") == res["target"]), None)
+            if r0: hit = (r0.get("sdir"), d); break
+        dest = Path(os.path.expanduser(str((hit[0] if hit and hit[0] else hit[1]) if hit else (ag_config_home() / "relay-results"))))
+        cp = dest / "relay" / "results" / f.name
+        try:
+            cp.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(cp, f.read_text())
+        except OSError as e: errs.append(f"{f.name}: {e}"); continue
+        cache[f.name] = {"ts": int(now), "path": str(cp), "target": res["target"], "id": res["id"],
+            "due": res.get("due"), "status": res.get("status")}
+        out["ingested"].append(f.name)
+        if hit:
+            try:
+                ll = _sched_flock(hit[1], "schedules.lock")
+                try:
+                    rws = _sched_load(hit[1])
+                    r2 = next((r for r in rws if r.get("id") == res["id"] and r.get("on") == res["target"]), None)
+                    if r2:
+                        r2["runs"] = r2.get("runs", 0) + 1
+                        if res.get("due") is not None: r2["last_due"] = res["due"]
+                        r2["last_status"] = f'remote {res.get("status") or "unknown"}'
+                        _sched_save(hit[1], rws)
+                        _event(hit[1], "relay_result", None, id=res["id"], target=res["target"], status=res.get("status"), job=res.get("job"))
+                finally: ll.close()
+            except ValueError as e: errs.append(str(e))
+            except OSError as e: errs.append(str(e))
+    for n, m in cache.items():
+        if now - m.get("ts", 0) > 604800:
+            try: (rdir / n).unlink()
+            except OSError: pass
+    dirty = bool(out["ingested"])
+    items = list(cache.items())
+    drop = {n for n, m in items if now - m.get("ts", 0) > 30 * 86400}
+    items = [kv for kv in items if kv[0] not in drop]
+    if len(items) > 2000: drop.update(kv[0] for kv in sorted(items, key=lambda kv: (kv[1].get("ts", 0), kv[0]))[:-2000])
+    if drop: cache = {n: m for n, m in cache.items() if n not in drop}; dirty = True
+    if dirty:
+        try:
+            cpath.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(cpath, json.dumps(cache, indent=1))
+        except Exception: pass
+
+def _relay_commit():
+    """Short HEAD sha of the ag checkout itself, else None."""
+    try:
+        g = subprocess.run(["git", "-C", str(Path(ag_script_path()).parent), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    return (g.stdout.strip()[:12] or None) if g.returncode == 0 else None
+def _relay_backends():
+    """Usable backend names from the cached provider probe ($AG_CACHE_HOME/providers.json)."""
+    d = _relay_jload(ag_cache_home() / "providers.json")
+    return sorted(b for b, v in d.items() if isinstance(v, dict) and v.get("ok")) if isinstance(d, dict) else []
+def _relay_heartbeat(cfg, root, now, cache):
+    """nodes/<node>.json: who we are, what we can run, what is waiting for us."""
+    nd = root / "schedules" / cfg["node"]
+    rdir = root / "results" / cfg["node"]
+    hb = {"node": cfg["node"], "ag_version": VERSION, "ag_commit": _relay_commit(), "backends": _relay_backends(),
+        "last_seen": int(now), "schedules_in": len(list(nd.glob("*.json"))) if nd.is_dir() else 0,
+        "results_pending": len([f for f in (list(rdir.glob("*.json")) if rdir.is_dir() else []) if f.name not in cache])}
+    f = root / "nodes" / f'{cfg["node"]}.json'
+    f.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(f, json.dumps(hb, indent=1))
+    return hb
+def _relay_push(cfg, out, errs):
+    """add -A, commit (only when something changed), push; rejection -> pull --rebase + retry (<=3 tries)."""
+    node, co = cfg["node"], Path(cfg["checkout"])
+    who = _relay_who(cfg)
+    if _relay_git(["git", "-C", str(co), "add", "-A"]) is not None: errs.append("git add failed"); return
+    rc, st = _relay_cmd(["git", "-C", str(co), "status", "--porcelain"])
+    if rc == 0 and st.strip():
+        e = _relay_git(["git", "-C", str(co), *who, "commit", "--quiet", f"--author=ag-relay <{node}@ag-relay>",
+            "-m", f"relay: {node} sync"])
+        if e: errs.append(f"commit: {e}")
+    msg, e = "", None
+    for _ in range(3):
+        rc, msg = _relay_cmd(["git", "-C", str(co), "push", "--quiet", "-u", "origin", "HEAD"])
+        if rc == 0: out["pushed"] = True; return
+        e = _relay_git(["git", "-C", str(co), *who, "pull", "--rebase", "--quiet"])
+        if e: errs.append(f"rebase: {e}"); return
+    errs.append(f"push: {(msg or e or 'rejected')[:150]}")
+
+def relay_sync(cfg, now=None):
+    """One mailbox round: pull, materialize+prune (target), report results (target), ingest (origin),
+    heartbeat, git push. Returns {"pulled", "materialized", "removed", "reported", "ingested", "pushed", "error"}.
+    Never raises."""
+    now = time.time() if now is None else float(now)
+    out = {"pulled": False, "materialized": [], "removed": [], "reported": [], "ingested": [], "pushed": False, "error": None}
+    errs = []
+    try:
+        if _relay_pull(cfg, out, errs):
+            root = relay_root(cfg)
+            _relay_materialize(cfg, root, now, out, errs)
+            _relay_report(cfg, root, now, out, errs)
+            _relay_ingest(cfg, root, now, out, errs)
+            _relay_heartbeat(cfg, root, now, _relay_ing_cache()[0])
+            if cfg["transport"] == "git": _relay_push(cfg, out, errs)
+    except Exception as e: errs.append(f"sync: {type(e).__name__}: {str(e)[:120]}")
+    out["error"] = _relay_errs_join(errs)
+    return out
+
+def _relay_ago(age):
+    return f"{int(age) // 3600}h" if age >= 7200 else f"{max(0, int(age)) // 60}m"
+def _relay_spec(m):
+    return f"every {m['every_s']}s" if m.get("every_s") else f"at {m.get('at')} " + \
+        ("daily" if m.get("days") is None else ",".join(SCHED_DAYS[i] for i in (m.get("days") or []) if 0 <= i < 7))
+def _relay_status(cfg):
+    """{node, peers, sent, received, results, alerts, ...} for `ag relay status`."""
+    root, now = relay_root(cfg), time.time()
+    ours = _relay_commit()
+    hb = _relay_jload(root / "nodes" / f'{cfg["node"]}.json') or {}
+    monitored = {"node": cfg["node"], "peers": [], "sent": [], "received": [], "results": [], "alerts": [],
+        "root": str(root), "backends": _relay_backends(), "commit": ours,
+        "last_seen": hb.get("last_seen"), "ag_version": hb.get("ag_version") or VERSION}
+    for f in sorted((root / "nodes").glob("*.json")):
+        if f.stem == cfg["node"]: continue
+        p = _relay_jload(f) or {}
+        mails = [m for m in (_relay_jload(x) for x in sorted((root / "schedules" / f.stem).glob("*.json")))
+            if isinstance(m, dict)]
+        its = [m["every_s"] for m in mails if isinstance(m.get("every_s"), (int, float)) and m["every_s"] > 0]
+        iv = min(its) if its else 3600
+        alerts = []
+        if not p: alerts.append("no heartbeat seen yet")
+        else:
+            if (m_c := p.get("ag_commit")) and ours and m_c != ours: alerts.append(f"commit differs ({m_c} vs {ours})")
+            if (age := now - p.get("last_seen", 0)) > max(2 * iv, 3600): alerts.append(f"unseen for {_relay_ago(age)}")
+        monitored["peers"].append({"node": p.get("node") or f.stem, "commit": p.get("ag_commit"),
+            "backends": p.get("backends"), "last_seen": p.get("last_seen"), "interval_s": iv,
+            "schedules_in": p.get("schedules_in"), "alerts": alerts})
+        monitored["alerts"] += [f"{p.get('node') or f.stem}: {x}" for x in alerts]
+    for tgt in sorted(d for d in (root / "schedules").iterdir() if d.is_dir()) if (root / "schedules").is_dir() else []:
+        for f in sorted(tgt.glob(f'{cfg["node"]}--*.json')):
+            m = _relay_jload(f) or {}
+            monitored["sent"].append({"target": tgt.name, "id": m.get("id"), "enabled": m.get("enabled", True),
+                "spec": _relay_spec(m), "agent": m.get("agent")})
+    for f in sorted((root / "schedules" / cfg["node"]).glob("*.json")) if (root / "schedules" / cfg["node"]).is_dir() else []:
+        m = _relay_jload(f) or {}
+        monitored["received"].append({"origin": m.get("origin"), "id": m.get("id"), "agent": m.get("agent"),
+            "enabled": m.get("enabled", True), "spec": _relay_spec(m)})
+    cache = _relay_ing_cache()[0]
+    rws = sorted(cache.items(), key=lambda kv: (kv[1].get("ts", 0), kv[0]), reverse=True)[:5]
+    for n, m in rws:
+        monitored["results"].append({"file": n, "ts": m.get("ts"), "id": m.get("id"), "target": m.get("target"),
+            "status": m.get("status"), "due": m.get("due")})
+    return monitored
+
+def do_relay(a):
+    cmd = "relay"
+    def err(m, h=None): return emit(a, cmd, error=m, hint=h) or 1
+    if a.rsub == "init":
+        if bool(getattr(a, "git_url", None)) == bool(getattr(a, "relay_dir", None)):
+            return err("give exactly one of --git URL / --dir PATH", "ag relay init --git URL | --dir PATH [--node NAME] [--state DIR]")
+        if a.node and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,23}", a.node):
+            return err(f"bad --node {a.node!r}: lowercase letters, digits and dashes")
+        cfg = {"node": a.node or _relay_node_name(), "transport": "git" if a.git_url else "dir",
+            "url": a.git_url or str(Path(os.path.expanduser(str(a.relay_dir))).absolute()),
+            "state": a.state or "~/.agent-relay", "workdir": a.workdir or "~/ag-relay-work",
+            "max_mode": a.max_mode or "edits", "checkout": ""}
+        if cfg["transport"] == "git":
+            nm = (a.git_url.rstrip("/").rsplit("/", 1)[-1] or "relay")
+            if nm.endswith(".git"): nm = nm[:-4]
+            cfg["checkout"] = str(ag_cache_home() / "relay" / (re.sub(r'[^A-Za-z0-9._-]+', '-', nm) or 'relay'))
+        if cfg["max_mode"] not in MODES: return err(f"bad --max-mode {cfg['max_mode']!r}", "ro|edits|auto|full")
+        p = ag_config_home() / "relay.json"; p.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(p, json.dumps(cfg, indent=1))
+        cfg = relay_cfg() or cfg
+        out = relay_sync(cfg)
+        txt = f"relay {cfg['node']} -> {cfg['transport']} {cfg['url']}" + (f" (checkout {cfg['checkout']})" if cfg["checkout"] else "") + \
+            f"; state {cfg['state']}; workdir {cfg['workdir']}; max_mode {cfg['max_mode']}"
+        return emit(a, cmd, {"_text": txt, "cfg": cfg, **out}, error=out["error"])
+    cfg = relay_cfg()
+    if not cfg: return err("relay not set up", "ag relay init --git URL | --dir PATH")
+    if a.rsub == "sync":
+        out = relay_sync(cfg)
+        txt = f"relay {cfg['node']}: pulled={int(out['pulled'])} materialized={len(out['materialized'])} removed={len(out['removed'])}" \
+            f" reported={len(out['reported'])} ingested={len(out['ingested'])} pushed={int(out['pushed'])}"
+        return emit(a, cmd, {**out, "_text": txt}, error=out["error"])
+    if a.rsub == "status":
+        st = _relay_status(cfg)
+        L = [f"relay {cfg['node']} -> {cfg['transport']} {cfg['url']}" + (f" (checkout {cfg['checkout']})" if cfg["checkout"] else "") +
+            f"  max_mode {cfg['max_mode']}",
+            f"self: commit {st['commit'] or '-'}  backends {','.join(st['backends']) or '-'}  state {cfg['state']}"
+            + (f"  last sync {_relay_ago(time.time() - st['last_seen'])} ago" if st.get("last_seen") else "  last sync never")]
+        for p in st["peers"]:
+            L.append(f'  {p["node"]:14} commit {p["commit"] or "-":12} seen {(_relay_ago(time.time() - p["last_seen"]) if p.get("last_seen") else "never"):8} schedules {p.get("schedules_in", 0)}' + (f"  ALERT: {'; '.join(p['alerts'])}" if p["alerts"] else ""))
+        L.append("sent: " + (", ".join(f'{x["id"]} -> {x["target"]} ({x["spec"]})' + ("" if x["enabled"] else " [disabled]") + f', agent {x["agent"]}' for x in st["sent"]) or "none"))
+        L.append("received: " + (", ".join(f'{x["origin"]}--{x["id"]} ({x["spec"]})' + ("" if x["enabled"] else " [disabled]") + f', agent {x["agent"]}' for x in st["received"]) or "none"))
+        L.append("recent results: " + (", ".join(f'{x["id"]} via {x["target"]} {x["status"] or "-"} {_sched_ts(x["ts"])}' for x in st["results"]) or "none"))
+        return emit(a, cmd, {**st, "_text": "\n".join(L)})
+    if a.rsub == "results":
+        cache = _relay_ing_cache()[0]
+        rws = sorted(cache.items(), key=lambda kv: (kv[1].get("ts", 0), kv[0]), reverse=True)
+        if getattr(a, "id", None): rws = [kv for kv in rws if kv[1].get("id") == a.id]
+        rws = rws[:max(0, int(getattr(a, "limit", 20) or 20))]
+        recs = []
+        for n, m in rws:
+            r = dict(m, file=n, reply=(_relay_jload(Path(m.get("path") or "")) or {}).get("reply", ""))
+            recs.append(r)
+        if getattr(a, "last", False):
+            top = recs[0] if recs else None
+            return emit(a, cmd, {"_text": (top and top.get("reply")) or "(no results)", "last": top})
+        return emit(a, cmd, {"_text": "\n".join(f'{_sched_ts(x["ts"])}  {x["id"]:14} {x.get("target") or "-":10} {x.get("status") or "-"}' for x in recs) or "(no results)",
+            "results": recs})
+    return err("relay: init | sync | status | results")
+
 def orch_snapshot(sdir):
     ensure_state(sdir)
     sess = []
@@ -16599,6 +17065,11 @@ def build():
     for v_ in ("rm","pause","resume","run"): scs.add_parser(v_).add_argument("id")
     sct=scs.add_parser("tick"); sct.add_argument("--all",action="store_true"); sct.add_argument("--now",default=None,help="ISO time (tests)"); sct.add_argument("--reap",action="store_true"); sct.add_argument("--dry-run",dest="dry_run",action="store_true")
     sci=scs.add_parser("install"); sci.add_argument("--write",action="store_true"); sci.add_argument("--cron",action="store_true"); sci.add_argument("--interval",type=int,default=60)
+    ry_=sub.add_parser("relay",help="run schedules made here on another machine (mailbox: git repo | synced folder)"); rys=ry_.add_subparsers(dest="rsub",required=True)
+    ryi=rys.add_parser("init",help="write relay.json; clone for --git; first heartbeat"); ryi.add_argument("--git",dest="git_url",default=None,help="private repo URL (a bare/local git path works too)"); ryi.add_argument("--dir",dest="relay_dir",default=None,help="folder used directly as the mailbox (sync it yourself)"); ryi.add_argument("--node",default=None,help="this machine's name (default: short hostname, [a-z0-9-])"); ryi.add_argument("--state",default=None,help="ag state dir where inbound schedules materialise (default ~/.agent-relay)"); ryi.add_argument("--workdir",default=None,help="parent of per-origin agent workdirs (default ~/ag-relay-work)"); ryi.add_argument("--max-mode",dest="max_mode",default=None,choices=MODES,help="highest --mode a target accepts from the mailbox (default edits)")
+    rys.add_parser("sync",help="pull mailbox, materialise/report inbound schedules, ingest results, heartbeat, push")
+    rys.add_parser("status",help="this node + peers, schedules in flight, recent results")
+    ryr=rys.add_parser("results",help="ingested remote results, newest first"); ryr.add_argument("--id",default=None,help="filter by schedule id"); ryr.add_argument("--limit",type=int,default=20); ryr.add_argument("--last",action="store_true",help="print only the newest result's reply text")
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50);     ws.add_argument("--wait",default=None,nargs="+",help="block until one or more wake jobs finish (exit 0 ok, 1 failed, 124 timeout)"); ws.add_argument("--wait-group",dest="wait_group",default=None,help="block until all jobs of cohort GROUP finish (same exit codes)"); ws.add_argument("--timeout",type=int,default=30);  ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3)
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
@@ -17028,7 +17499,7 @@ def do_sync(a):
 # or AG_AUTO_UPDATE=0. Takes effect on the next invocation, never mid-command.
 UPDATE_RAW_URL = "https://raw.githubusercontent.com/Segzman/ag/master/ag"
 UPDATE_EVERY_S = 86400
-UPDATE_SKIP = {"schedule", "_daemon", "_wake_run", "_acp", "_sudo", "askpass", "selfcheck", "update", "tui", "attach", "shell"}
+UPDATE_SKIP = {"schedule", "relay", "_daemon", "_wake_run", "_acp", "_sudo", "askpass", "selfcheck", "update", "tui", "attach", "shell"}
 
 def _ag_conf_path():
     return Path(os.environ.get("AG_CONFIG_HOME") or Path.home()/".config/ag")/"config.json"
@@ -17129,6 +17600,7 @@ def _lift_trailing_dir(argv, subs):
     si = next((i for i, t in enumerate(head) if t in subs), -1)
     if si < 0: return argv, None
     if head[si] == "agents" and len(head) > si+1 and head[si+1] in ("add", "set"): return argv, None
+    if head[si] == "relay" and len(head) > si+1 and head[si+1] == "init": return argv, None  # relay init --dir = mailbox, not state
     out, j, d = head[:si+1], si+1, None
     while j < len(head):
         t = head[j]
@@ -17171,7 +17643,7 @@ def main(argv=None):
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,"providers":do_providers,
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
-        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
+        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"relay":do_relay,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
         "access":do_access,"usage":do_usage,"budget":do_budget}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)

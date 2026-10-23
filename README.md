@@ -458,6 +458,21 @@ ag sync list
 ag sync resume SNAPSHOT --name N --project P [--source-stopped] [--run] [--backend B] [--model M] [--timeout S] [--max-runtime S]
 ```
 
+## Relay: run schedules on another machine
+
+Schedules created on one machine can run on another — even a VM that accepts no inbound connections. Both sides point one `ag relay init` at the same mailbox (a **private** git repo, or a folder you sync yourself) and each `relay sync` pulls, processes and pushes:
+
+```sh
+ag --dir <state> relay init --git URL | --dir MAILBOX [--node NAME] [--state DIR] [--workdir DIR] [--max-mode ro|edits|auto|full]
+ag --dir <state> relay sync                  # pull, process inbound schedules, ingest results, heartbeat, push (dir transport: no git ops)
+ag --dir <state> relay status                # this node + every peer: last seen, ag commit, backends; sync-state alerts
+ag --dir <state> relay results [--id ID] [--limit N] [--last]   # ingested replies, newest first; --last = newest reply text
+```
+
+- Mailbox layout: `nodes/<node>.json` (heartbeat: version, ag commit, usable backends, last seen, `schedules_in`, `results_pending`), `schedules/<target>/<origin>--<id>.json` (written by the origin), `results/<origin>/<target>--<id>--<due>.json` (written by the target). Each node only ever writes its own files, so git rebases never conflict. Data note: prompts and replies are stored in that repo — use a private one; the VM needs git credentials for it.
+- On a target, inbound schedules materialise into `--state DIR` (`schedules.json` row ids `<origin>--<id>`, agents `relay-<origin>-<agent>`, workdirs `<workdir>/<origin>`); the normal `agents add` guards apply (a refused model parks the row `last_status: error`, no crash) and the target clamps a published mode to its `--max-mode` (default `edits`). Rows materialise exactly as published: disabled mail rows stay disabled, all counters are preserved, and rows whose mail disappears are removed on the next sync.
+- On the origin, finished runs land in the row's state dir as `relay/results/` (reply kept up to 20000 chars) and `relay results` lists them; the mailbox result files are cleaned after 7 days by the origin itself. `relay status` flags a peer whose `ag_commit` differs from ours or unseen for > 2x its shortest schedule interval (or 1h).
+
 ## Harness profiles
 
 Opt-in named sources (instructions, memory, skills, MCP) shared by N agents. Files live in `<state>/profiles_effective/<name>/`; no home/global config is written.

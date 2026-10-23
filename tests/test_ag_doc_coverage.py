@@ -4,10 +4,10 @@ Command rule: top-level `ag X` needs word X; `ag X Y` needs a line that mentions
 both X and Y as words. Flag rule: key commands' long flags must appear in README.
 """
 import argparse
+import importlib.util
 import os
 import re
 import unittest
-from importlib.machinery import SourceFileLoader
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY_FLAG_CMDS = [["setup"], ["models"], ["schedule", "add"], ["agents", "add"], ["agents", "set"], ["agents", "fork"], ["wake"],
@@ -37,7 +37,13 @@ def _walk(parser, path, out):
 
 
 def _commands():
-    ag = SourceFileLoader("ag_doc_cov", os.path.join(ROOT, "ag")).load_module()
+    # SourceFileLoader.load_module() is gone (3.12+); exec the single file like
+    # tests/test_ag_context.py does.
+    spec = importlib.util.spec_from_loader("ag_doc_cov", loader=None)
+    ag = importlib.util.module_from_spec(spec)
+    ag.__file__ = os.path.join(ROOT, "ag")
+    with open(os.path.join(ROOT, "ag"), encoding="utf-8") as f:
+        exec(f.read(), ag.__dict__)
     out = {}
     _walk(ag.build(), [], out)
     return out

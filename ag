@@ -9970,6 +9970,13 @@ def do_wake(a):
 
 # ---- schedule: recurring wakes. ONE global launchd/cron tick (`schedule tick --all --reap`) walks the
 # registry $AG_CONFIG_HOME/schedule-dirs.json; rows live in <sdir>/schedules.json. See README "Scheduled tasks".
+# relay core (part 1) stand-ins — replaced on merge
+def relay_cfg(): return None
+def relay_root(cfg): return Path(cfg.get("checkout") if cfg.get("transport") == "git" else cfg["url"])
+def relay_publish_schedule(cfg, row, agent_spec): return None
+def relay_unpublish_schedule(cfg, target, sid): return None
+def relay_sync(cfg, now=None): return {"pulled": False, "materialized": [], "removed": [], "reported": [], "ingested": [], "pushed": False, "error": None}
+
 SCHED_LABEL = "org.ag.schedule"
 SCHED_LATE_S = 600  # fixed-time row later than this is "missed" unless --catch-up
 SCHED_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -10113,7 +10120,7 @@ def _sched_tick_dir(sdir, now, dry, reap):
             except ValueError as e:
                 _event(sdir, "schedule_fail", None, reason=str(e)); out["error"] = str(e); return out
             for r in rows:
-                if r.get("enabled", True) and r.get("next_due") is not None and r["next_due"] <= now:
+                if not r.get("on") and r.get("enabled", True) and r.get("next_due") is not None and r["next_due"] <= now:
                     out["actions"].append({"id": r["id"], "action": _sched_step(sdir, r, now, dry), "due": r["next_due"]})
             if not dry:
                 if out["actions"]: _sched_save(sdir, rows)
@@ -10127,7 +10134,9 @@ def _sched_tick_dir(sdir, now, dry, reap):
     return out
 
 def _sched_ts(t): return datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M") if t else "-"
-def _sched_spec(r): return f"every {r['every_s']}s" if r.get("every_s") else f"at {r['at']} " + ("daily" if r.get("days") is None else ",".join(SCHED_DAYS[i] for i in r["days"]))
+def _sched_spec(r):
+    spec = f"every {r['every_s']}s" if r.get("every_s") else f"at {r['at']} " + ("daily" if r.get("days") is None else ",".join(SCHED_DAYS[i] for i in r["days"]))
+    return f"{spec} @{r['on']}" if r.get("on") else spec
 
 def _sched_plist(interval):
     env = {"PATH": os.environ.get("PATH", "")}
@@ -10164,10 +10173,28 @@ def do_schedule(a):
     if sub == "tick":
         try: now = datetime.fromisoformat(a.now).astimezone().timestamp() if a.now else time.time()
         except ValueError: return err(f"bad --now {a.now!r}: need ISO time")
+        cfg = None; relay_errors = []
+        if a.all:
+            try: cfg = relay_cfg()
+            except Exception as e: relay_errors.append(f"config: {str(e)[:200]}")
+            if cfg is not None:
+                try:
+                    summary = relay_sync(cfg)
+                    if isinstance(summary, dict) and summary.get("error"): relay_errors.append(f"before tick: {summary['error']}")
+                except Exception as e: relay_errors.append(f"before tick: {str(e)[:200]}")
         dirs = [Path(x) for x in _sched_reg_get()] if a.all else [sdir]
         res = [_sched_tick_dir(d, now, a.dry_run, a.reap) for d in dirs]
+        if cfg is not None:
+            try:
+                summary = relay_sync(cfg)
+                if isinstance(summary, dict) and summary.get("error"): relay_errors.append(f"after tick: {summary['error']}")
+            except Exception as e: relay_errors.append(f"after tick: {str(e)[:200]}")
         txt = [f"{r['dir']}: " + (f"error: {r['error']}" if r.get("error") else "busy" if r.get("busy") else ", ".join(f"{x['id']}={x['action']}" for x in r["actions"]) or "nothing due") for r in res]
-        return emit(a, cmd, {"_text": "\n".join(txt) or "no schedule dirs registered", "dirs": res, "dry_run": a.dry_run})
+        data = {"_text": "\n".join(txt) or "no schedule dirs registered", "dirs": res, "dry_run": a.dry_run}
+        if relay_errors:
+            data["relay_error"] = "; ".join(relay_errors)[:500]
+            data["_text"] += "\nrelay error: " + data["relay_error"]
+        return emit(a, cmd, data)
     ensure_state(sdir)
     if sub == "add":
         try:
@@ -10178,6 +10205,13 @@ def do_schedule(a):
         msg = " ".join(a.message).strip()[:WAKE_MSG_MAX]; names = [r.get("name") for r in load_agents(sdir)]
         if not msg: return err("empty message")
         if a.agent not in names: return err(f"no such agent: {a.agent}", "ag agents list")
+        cfg = None
+        if getattr(a, "on", None):
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", a.on): return err(f"bad relay node {a.on!r}")
+            try: cfg = relay_cfg()
+            except Exception as e: return err(f"relay config error: {str(e)[:200]}")
+            if cfg is None: return err("relay not set up: ag relay init --git URL")
+            if a.on == cfg.get("node"): return err("--on must name a different relay node")
         if a.notify and a.notify not in names: return err(f"no such agent: {a.notify}", "ag agents list")
         mr = _valid_runtime(a.max_runtime)
         if mr is None: return err("invalid --max-runtime: need finite seconds >= 0")
@@ -10186,12 +10220,19 @@ def do_schedule(a):
         now = time.time(); row.update(id=rid, agent=a.agent, message=msg, enabled=not a.disabled, overlap=a.overlap, catch_up=a.catch_up,
             max_runtime_s=mr, notify=a.notify, on_done=a.on_done, job=a.job, created=now, next_due=None, last_due=None, last_job=None,
             last_status=None, runs=0, missed=0, skipped=0)
+        if cfg is not None:
+            agent = next(r for r in load_agents(sdir) if r.get("name") == a.agent)
+            agent_spec = {k: agent.get(k) for k in ("backend", "model", "effort", "mode", "data", "stall_s")}
+            row.update(on=a.on, sdir=str(sdir.resolve()), agent_spec=agent_spec)
         row["next_due"] = _sched_next(dict(row, next_due=now), now)
         ll = _sched_flock(sdir, "schedules.lock")
         try:
             try: rows = _sched_load(sdir)
             except ValueError as e: return err(str(e), "fix or remove schedules.json; ag never resets it")
             if any(r.get("id") == rid for r in rows): return err(f"schedule id exists: {rid}")
+            if cfg is not None:
+                try: relay_publish_schedule(cfg, row, agent_spec)
+                except Exception as e: return err(f"relay publish failed: {str(e)[:200]}")
             rows.append(row); _sched_save(sdir, rows); _sched_reg_set(sdir, True)
         finally: ll.close()
         return emit(a, cmd, {"_text": f"scheduled {rid}: {a.agent} {_sched_spec(row)}, next {_sched_ts(row['next_due'])}", "schedule": row})
@@ -10204,14 +10245,18 @@ def do_schedule(a):
             except ValueError as e: out.append({"dir": str(d), "error": str(e)}); continue
             for r in rows:
                 j = _wake_read_job(d, r["last_job"]) if r.get("last_job") else {}
-                out.append({**r, "dir": str(d), "status": j.get("status") or r.get("last_status")})
+                status = j.get("status") or r.get("last_status")
+                if r.get("on") and r.get("last_status"):
+                    status = str(r["last_status"])
+                    if not status.startswith("remote "): status = "remote " + status
+                out.append({**r, "dir": str(d), "status": status})
         try: age = time.time() - float((sdir / "schedule" / "last_tick").read_text())
         except Exception: age = None
         tick = f"tick: last ran {int(age // 60)}m ago" if age is not None else "tick: never ran (ag schedule install)"
-        L = [f"{'id':14} {'agent':10} {'spec':22} {'next_due':16} {'last_due':16} {'status':10} runs miss skip"]
+        L = [f"{'id':14} {'agent':10} {'spec':30} {'next_due':16} {'last_due':16} {'status':20} runs miss skip"]
         for r in out:
             if r.get("error"): L.append(f"{r['dir']}: error: {r['error']}"); continue
-            L.append(f"{r['id'][:14]:14} {r['agent'][:10]:10} {_sched_spec(r)[:22]:22} {('paused' if not r.get('enabled', True) else _sched_ts(r.get('next_due'))):16} {_sched_ts(r.get('last_due')):16} {str(r.get('status') or '-')[:10]:10} {r.get('runs', 0):4} {r.get('missed', 0):4} {r.get('skipped', 0):4}")
+            L.append(f"{r['id'][:14]:14} {r['agent'][:10]:10} {_sched_spec(r):30} {('paused' if not r.get('enabled', True) else _sched_ts(r.get('next_due'))):16} {_sched_ts(r.get('last_due')):16} {str(r.get('status') or '-')[:20]:20} {r.get('runs', 0):4} {r.get('missed', 0):4} {r.get('skipped', 0):4}")
         return emit(a, cmd, {"_text": "\n".join(L + [tick]), "schedules": out, "tick_age_s": age})
     ll = _sched_flock(sdir, "schedules.lock")
     try:
@@ -10220,7 +10265,16 @@ def do_schedule(a):
         r = next((x for x in rows if x.get("id") == a.id), None)
         if not r: return err(f"no such schedule: {a.id}", "ag schedule list")
         now = time.time()
+        if sub == "run" and r.get("on"): return err(f"runs on {r['on']}; use its schedule or wait for the next due")
+        cfg = None
+        if r.get("on"):
+            try: cfg = relay_cfg()
+            except Exception as e: return err(f"relay config error: {str(e)[:200]}")
+            if cfg is None: return err("relay not set up: ag relay init --git URL")
         if sub == "rm":
+            if cfg is not None:
+                try: relay_unpublish_schedule(cfg, r["on"], r["id"])
+                except Exception as e: return err(f"relay unpublish failed: {str(e)[:200]}")
             rows.remove(r); _sched_save(sdir, rows)
             if not rows: _sched_reg_set(sdir, False)
             return emit(a, cmd, {"_text": f"removed {a.id}", "removed": a.id})
@@ -10232,6 +10286,9 @@ def do_schedule(a):
             if e or not jid: r["last_status"] = f"error: {e}"[:200]; _sched_save(sdir, rows); return err(str(e))
             r.update(last_job=jid, runs=r.get("runs", 0) + 1, last_status="fired"); _event(sdir, "schedule_fire", None, id=a.id, job=jid, manual=True)
             msg = f"fired {a.id} (background job {jid})"
+        if cfg is not None and sub in ("pause", "resume"):
+            try: relay_publish_schedule(cfg, r, r.get("agent_spec") or {})
+            except Exception as e: return err(f"relay publish failed: {str(e)[:200]}")
         _sched_save(sdir, rows)
         return emit(a, cmd, {"_text": msg, "schedule": r, **({"job": r["last_job"]} if sub == "run" else {})})
     finally: ll.close()
@@ -16594,7 +16651,7 @@ def build():
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
     wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)")
     sc=sub.add_parser("schedule",help="recurring wakes (one global launchd/cron tick)"); scs=sc.add_subparsers(dest="ssub",required=True)
-    sca=scs.add_parser("add"); sca.add_argument("agent"); sca.add_argument("message",nargs="+"); sca.add_argument("--every",default=None,help="15m | 2h | 1d (>=60s)"); sca.add_argument("--at",default=None,help="HH:MM local"); sca.add_argument("--days",default=None,help="mon-fri | mon,wed,fri | daily | weekends (with --at)"); sca.add_argument("--max-runtime",dest="max_runtime",type=float,default=0); sca.add_argument("--notify",default=""); sca.add_argument("--on-done",dest="on_done",default=""); sca.add_argument("--job",default=None,choices=JOB_KEYS); sca.add_argument("--overlap",choices=["skip","queue"],default="skip"); sca.add_argument("--catch-up",dest="catch_up",action="store_true",help="fixed-time: fire even if >10min late"); sca.add_argument("--disabled",action="store_true"); sca.add_argument("--id",default=None)
+    sca=scs.add_parser("add"); sca.add_argument("agent"); sca.add_argument("message",nargs="+"); sca.add_argument("--every",default=None,help="15m | 2h | 1d (>=60s)"); sca.add_argument("--at",default=None,help="HH:MM local"); sca.add_argument("--days",default=None,help="mon-fri | mon,wed,fri | daily | weekends (with --at)"); sca.add_argument("--max-runtime",dest="max_runtime",type=float,default=0); sca.add_argument("--notify",default=""); sca.add_argument("--on-done",dest="on_done",default=""); sca.add_argument("--job",default=None,choices=JOB_KEYS); sca.add_argument("--overlap",choices=["skip","queue"],default="skip"); sca.add_argument("--catch-up",dest="catch_up",action="store_true",help="fixed-time: fire even if >10min late"); sca.add_argument("--disabled",action="store_true"); sca.add_argument("--id",default=None); sca.add_argument("--on",default=None,metavar="NODE",help="run schedule on another relay node")
     scl=scs.add_parser("list"); scl.add_argument("--all",action="store_true",help="every registered state dir")
     for v_ in ("rm","pause","resume","run"): scs.add_parser(v_).add_argument("id")
     sct=scs.add_parser("tick"); sct.add_argument("--all",action="store_true"); sct.add_argument("--now",default=None,help="ISO time (tests)"); sct.add_argument("--reap",action="store_true"); sct.add_argument("--dry-run",dest="dry_run",action="store_true")

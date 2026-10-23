@@ -121,3 +121,33 @@ becomes a chat message/notification to the user, then is archived. Write atomica
   `ag-tick.service` (Type=oneshot, **KillMode=process** so wake workers outlive the tick, Environment= HOME, PATH and any
   *_PROXY vars present) + `ag-tick.timer` (OnUnitActiveSec=60s, OnBootSec=60s). Document why KillMode=process matters.
 - Tests offline (temp dirs) + README/skills docs + doc coverage.
+
+## Part 5 — dev-mode live updates + relay admin ops (2026-10-23, owner `deepseek-dev`)
+### Dev mode (code: the self-update block, `maybe_auto_update`, `self_update`, `do_update`)
+- `ag update --dev on|off` → config `auto_update: "dev"` (on) / `true` (off = back to daily). `--auto off` still
+  disables everything. Interval: dev 60 s (`AG_UPDATE_EVERY_S` overrides), daily otherwise.
+- Cheap check: git installs `git fetch -q` (as today). Copy installs: `git ls-remote https://github.com/Segzman/ag
+  refs/heads/master` (timeout 15 s; fall back to the GitHub API `repos/Segzman/ag/commits/master` sha if git is
+  missing) and compare with the installed sha stored in `$AG_CACHE_HOME/update-commit`; download only when different,
+  from `https://raw.githubusercontent.com/Segzman/ag/<sha>/ag` (pinned sha, so the CDN can't serve a stale master).
+  Write the sha after a successful install. If update-commit is missing, download once and record it.
+- In dev mode `schedule tick` also runs the check (inline, throttled by the stamp, never raises, never blocks the tick
+  more than 20 s), so the 60 s tick (launchd / systemd) drives updates even when nobody runs ag. Normal invocations keep
+  the detached check with the dev interval.
+- After an update in dev mode: `_event` `ag_updated` with old→new, and `ag notify` (if a notify dir is configured)
+  title `ag updated` body `old → new`.
+- `update --status`: mode (dev/daily/off), interval, installed commit (git HEAD or update-commit), last check, last
+  result line from update.log.
+- Relay heartbeat `ag_commit`: use git HEAD or update-commit (today null on copy installs).
+### Relay admin ops (no shell, fixed allowlist)
+- `ag relay admin NODE OP [ARG]`, OP ∈ `update` | `dev-on` | `dev-off` | `notify-dir PATH` | `status`. Publishes
+  `admin/<target>/<origin>--<id>.json` `{op, arg, origin, id, ts}` (written by origin only) and syncs.
+- Target, in `relay_sync`: for each admin file → run the matching internal function (self_update, set dev mode,
+  write notify.json, collect `update --status` + `relay status` summary) — never a shell, never another op —
+  write `results/<origin>/<target>--<id>--admin.json` `{op, status: ok|error, detail}`; skip ops not in
+  `relay.json` `admin_ops` (default all five; `"admin_ops": []` disables). Remember processed ids so each runs once.
+- Origin ingests like other results; `relay results --id ID` shows it. `relay admin` waits up to `--wait S` (default 0)
+  polling sync every 10 s and prints the result if it arrives.
+- Tests offline: dir mailbox two-node round trip for every op, unknown op rejected, admin_ops [] disables, ls-remote
+  sha compare (fake git on PATH), pinned-sha download URL, dev interval, tick runs the check in dev mode only.
+  README + skills docs.

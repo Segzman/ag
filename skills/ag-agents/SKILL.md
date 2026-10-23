@@ -92,6 +92,7 @@ Work code only to zdr models. Source: opencode.ai/docs/zen Privacy (2026-10-12);
 | Background, returns now | `wake <agent> "<task>"` then `wakes`, `events --limit 20`, `chat log` |
 | Follow-up when a session ends | `spawn --wake <agent> --wake-message "<task>" -- <cmd>` (once) |
 | opencode native command | `chat send oc --command review "path"` (opencode only) |
+| Check the work, not the self-report | `chat send|delegate|wake <agent> "<task>" --verify "<cmd>" [--verify-timeout S]` |
 
 ```sh
 {{AG}} --dir <state> chat send oc "implement X per <spec>; report files changed" --job implement
@@ -103,6 +104,8 @@ Work code only to zdr models. Source: opencode.ai/docs/zen Privacy (2026-10-12);
 ```
 
 Tasks must be self-contained: what to do, what done looks like. Fan-out = different agents; two chunks to one agent serialize. `chat send`/`delegate --timeout` (default 1800, 0 = none) is a hard backend budget starting after guard acquired (lock wait unbounded); expiry exits 124 and the chat error row ends `(raise --max-runtime or split the task)`. Prefer `wake` for slow work. `wake --max-runtime` same budget; `wake --timeout` only marks `stalled`; `--notify`/`--on-done` run after. `wake`/`delegate` to an unknown agent fail at call time (`error: no such agent: X`, hint with close names + `ag agents list`); no job file, no spawn. `wake` is at-most-once *launch*: verify via `events` + `wakes`; relaunch lost ones with `wakes --reap`. `kill <worker-sid>` stops a worker. Use `--request-id` on retried calls to avoid double work. Slash text (`/model`, `/profile use docs`, `/help`) runs locally, never reaches the model.
+
+Agent self-reports lie: `--verify "<cmd>"` (`chat send`/`delegate`/`wake`, `--verify-timeout S` default 600) makes ag run your trusted command via `sh -c` in the agent's workdir after the turn and record `verify: {cmd, exit, tail (last 40 lines)}` in the turn result / wake job (`--json`), a `[verify] exit=N` chat-log row, and `[verify exit=N]` in the cohort summary. The verify exit is separate from the backend exit; timeout = exit 124. The command comes from the orchestrator, never from the agent's reply. Prefer real checks: `--verify "python3 -m unittest tests.test_x"`, `--verify "node --check x.js"`.
 
 ### Second opinions via crosscheck
 

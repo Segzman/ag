@@ -313,6 +313,8 @@ ag spawn --wake w --wake-message "task" -- ./long-job.sh    # follow-up when the
 ag chat send w --command review "path"          # opencode native command only
 ```
 
+- Don't trust the self-report: `--verify "CMD"` (`chat send`/`delegate`/`wake`, plus `--verify-timeout S`, default 600) makes ag run CMD via `sh -c` in the agent's workdir after the turn and record `verify: {cmd, exit, tail (last 40 lines)}` in the turn result (`chat send --json`), the wake job JSON (`wakes --json`), a `[verify] exit=N` row in the chat log, and `[verify exit=N]` in the cohort/parent summary. The verify exit is reported separately — the backend's own exit never changes. Verify-timeout reports exit 124. CMD comes from the orchestrator, never from the agent's reply. `ag chat send w "task" --verify "python3 -m unittest tests.test_x"` is the pattern.
+
 - Same agent serializes (flock + FIFO ticket queue, see below); different agents run in parallel. Fan-out = different agents.
 - `--timeout` (default 1800, `0` = none) is a hard backend budget starting after guard acquisition (lock wait excluded); expiry kills the backend group and exits 124. `wake --max-runtime` is the same for background turns; `wake --timeout` only marks `stalled`. A max-runtime kill leaves a chat error row ending `(raise --max-runtime or split the task)`.
 - `wake`/`delegate` to an unknown agent fail at call time (`error: no such agent: X`, hint with close names + `ag agents list`); no job file, no spawn, no `wake_fail` event.

@@ -155,7 +155,7 @@ Interrupted turns exit 130, keep partial reply, never retried. `stop` leaves HOL
 ## Scheduled wakes
 
 ```sh
-{{AG}} --dir <state> schedule add w --every 15m "msg" [--job J] [--overlap skip|queue] [--max-runtime S] [--id NAME]
+{{AG}} --dir <state> schedule add w --every 15m "msg" [--job J] [--overlap skip|queue] [--max-runtime S] [--id NAME] [--on NODE]
 {{AG}} --dir <state> schedule add w --at 09:00 --days mon-fri "msg" [--catch-up] [--disabled] [--notify X] [--on-done CMD]
 {{AG}} --dir <state> schedule list [--all] | pause ID | resume ID | run ID | rm ID
 ```
@@ -173,6 +173,8 @@ Schedules made here can run on another machine (even one accepting no inbound co
 ```
 
 Mailbox layout: `nodes/<node>.json` heartbeats, `schedules/<target>/<origin>--<id>.json`, `results/<origin>/<target>--<id>--<due>.json` — each node writes only its own files, so rebases never conflict. Target materialises inbound schedules into its `--state` (rows `<origin>--<id>`, agents `relay-<origin>-<name>`, workdirs `<workdir>/<origin>`; `agents add` guards and `--max-mode` clamp apply). Results land back in the origin row's state dir `relay/results/` and `relay results --last` prints the newest reply. Prompts and replies live in the mailbox — use a private repo and give the VM credentials. `status` alerts on a peer's differing `ag_commit` or silence > 2x its shortest schedule interval (or 1h). `--dir` on `init` is the mailbox, not the state dir. Dir transport nodes must be synced by their own means (ag does no copy).
+
+Remote schedule: configure both machines with `ag relay init` pointed at the same private git mailbox, using a different `--node` on each. Run `schedule install --write` on both. Then `schedule add w --every 1h --on muse "msg"` publishes work for `muse`; the origin tick never fires it. Pause/resume publish enabled state, `rm` unpublishes, and `run ID` explains that a remote row runs on its target at the next due time. The target's `--max-mode` defaults to `edits`. Prompts and replies are stored in the mailbox, so keep it private and match its access to the data being relayed.
 
 ## Reliability
 

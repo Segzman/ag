@@ -137,6 +137,10 @@ Scheduled wakes live in `ag-agents`. One global launchd job drives all state dir
 
 Registry `$AG_CONFIG_HOME/schedule-dirs.json`. Concurrent ticks are lock-safe; corrupt `schedules.json` refuses the tick.
 
+### Relay schedule tick
+
+`ag relay init --git URL --node NAME` configures a node against a shared private git mailbox. Run it on both machines with distinct node names; the VM needs credentials to pull and push that repository. Install the global tick on both with `ag schedule install --write`. `schedule tick --all --reap` syncs before ticking (to pull remote schedules) and after (to report results); a relay error is included in `relay_error` and does not abort local schedules. Rows created with `schedule add ... --on NODE` are skipped by the origin's local tick. Prompts and replies are stored in the mailbox, so keep its access limited to people allowed to see that data. The target's `--max-mode` defaults to `edits`.
+
 ```sh
 {{AG}} --dir <state> ratelimit [--json]          # slots in use (pid, agent) + cooldowns
 {{AG}} --dir <state> ratelimit clear [KEY]       # drop one/all cooldowns

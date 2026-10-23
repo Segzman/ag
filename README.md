@@ -360,7 +360,7 @@ ag chat steer w "text" [--json]      # interrupt running turn, run this next on 
 
 ```sh
 ag schedule add w (--every 15m|2h|1d | --at 09:00 [--days mon-fri|mon,wed,fri|daily|weekends]) "msg" \
-   [--max-runtime S] [--notify X] [--on-done CMD] [--job J] [--overlap skip|queue] [--catch-up] [--disabled] [--id NAME]
+   [--max-runtime S] [--notify X] [--on-done CMD] [--job J] [--overlap skip|queue] [--catch-up] [--disabled] [--id NAME] [--on NODE]
 ag schedule list [--all] | rm ID | pause ID | resume ID | run ID
 ag schedule tick [--all] [--now ISO] [--reap] [--dry-run]
 ag schedule install [--write] [--cron] [--interval 60]
@@ -370,6 +370,32 @@ ag schedule install [--write] [--cron] [--interval 60]
 - Local wall clock, min interval 60s. Interval rows run on a fixed grid (missed slots collapse into one catch-up run). Fixed-time rows >10min late are `missed` unless `--catch-up`. DST gap -> forward, overlap -> first occurrence.
 - `--overlap skip` (default) skips a due run while the last job is queued/running (dead workers are reconciled first). Each fire is gated by a `<id>:<due>` request-id receipt, so double ticks or a crash before the state write never double-fire. Concurrent ticks: non-blocking `schedule/tick.lock`.
 - Corrupt `schedules.json` refuses the tick (event `schedule_fail`), never reset. Removed agent -> row `last_status: error`. Events: `schedule_fire|skip|missed|fail`. `list` shows `tick: last ran Xm ago`. `--reap` calls `wakes_reap` when present.
+
+### Remote schedules (`schedule add --on NODE`)
+
+Relay puts schedule requests and results in a mailbox both machines can reach. A private git repository is the usual mailbox; a shared/synced folder can also be used. Configure each machine against the same mailbox with its own node name:
+
+```sh
+ag relay init --git git@github.com:ORG/ag-relay.git --node mac
+ag relay init --git git@github.com:ORG/ag-relay.git --node muse --state ~/.agent-relay --workdir ~/ag-relay-work --max-mode edits
+ag schedule install --write
+```
+
+Run `schedule install --write` on both machines so each global tick can pull new work and report finished jobs. The VM needs git credentials that can read and write the private repository. The target's `--max-mode` sets its safety ceiling for modes requested by the origin (`ro < edits < auto < full`; default `edits`).
+
+Create and manage a remote schedule on the origin:
+
+```sh
+ag schedule add w --every 1h --on muse "review the latest changes"
+ag schedule list
+ag schedule pause ID
+ag schedule resume ID
+ag schedule rm ID
+```
+
+Rows marked `@NODE` never fire in the origin's local tick. Pause and resume publish the changed enabled state; remove deletes the mailbox request. `schedule run ID` is unavailable for remote rows; they run on the target's next due time. `schedule tick --all --reap` syncs before and after ticking, and reports relay failures as `relay_error` without stopping local schedules.
+
+Prompts and replies are stored in the mailbox repository, so use a private repository and only relay data appropriate for everyone with access to it. Configure `--max-mode` on the target to limit how much access a remote schedule can request.
 
 ## Reliability
 

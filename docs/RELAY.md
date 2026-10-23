@@ -103,3 +103,21 @@ and a bare git repo; publish → sync on target materialises row + agent (echo b
   after reporting; the origin removes the mailbox file after ingest. `wakes` shows it as `remote@NODE` until the result
   arrives; `relay results --id` shows the reply. Tests with the dir mailbox (two fake nodes) as in test_ag_relay.py.
 - Docs: README + skills (ag-agents: "run an agent in the cloud: `wake A \"…\" --on muse`").
+
+## Part 4 — notifications + systemd + better results (2026-10-23, owner `codex-notify`)
+Muse (the assistant on the VM) watches `~/.notify-muse/` every 15 s: any valid JSON file `{"title","body"}` there
+becomes a chat message/notification to the user, then is archived. Write atomically (temp file + rename).
+- `ag notify TITLE BODY [--dir D] [--json]`: writes `{"title","body","ts","node","source":"ag"}` atomically into
+  the notify dir. Dir = `--dir` > `$AG_NOTIFY_DIR` > `notify_dir` in `$AG_CONFIG_HOME/notify.json` > error with hint
+  (`ag notify --set-dir ~/.notify-muse`, which writes notify.json). Title ≤ 120 chars, body ≤ 2000 (truncate with …).
+- `wake|chat send|delegate --notify-done` (and schedule add `--notify-done`): when the turn/job ends, call the same
+  writer with title `ag: AGENT done|failed` (+ job id) and body = first 600 chars of the reply or error (+ verify exit).
+  Relay: a published row's `notify_done: true` travels in the schedule file so the **target** writes the
+  notification (that is where Muse is). `wake --on NODE --notify-done` is the "ping me on my phone when the cloud job
+  finishes" path.
+- Relay results: include `error_tail` = last 40 lines of the job's backend stderr / chat-log error rows (today the
+  origin only sees `(exit 1) (failed)`).
+- `ag schedule install --systemd [--write]`: print (or write to `~/.config/systemd/user/` + enable) an
+  `ag-tick.service` (Type=oneshot, **KillMode=process** so wake workers outlive the tick, Environment= HOME, PATH and any
+  *_PROXY vars present) + `ag-tick.timer` (OnUnitActiveSec=60s, OnBootSec=60s). Document why KillMode=process matters.
+- Tests offline (temp dirs) + README/skills docs + doc coverage.

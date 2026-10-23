@@ -310,9 +310,9 @@ ag chat send w "task" --job implement   # delegate / wake / chat send: records `
 ## Delegation and wake
 
 ```sh
-ag chat send w "task" [--timeout S] [--job J]   # one headless turn; read with `ag chat log w`
-ag delegate w "task"                            # orchestrator assigns, logged in its chat
-ag wake w "task" [--max-runtime S] [--timeout S] [--notify X] [--on-done X] [--job J] [--on NODE]
+ag chat send w "task" [--timeout S] [--job J] [--notify-done]   # one headless turn; read with `ag chat log w`
+ag delegate w "task" [--notify-done]            # orchestrator assigns, logged in its chat
+ag wake w "task" [--max-runtime S] [--timeout S] [--notify X] [--notify-done] [--on-done X] [--job J] [--on NODE]
 ag wakes [--agent w] [--limit N] [--wait JOB [JOB…] --timeout S] [--wait-group GID --timeout S] [--cancel JOB]
 ag spawn --wake w --wake-message "task" -- ./long-job.sh    # follow-up when the session ends
 ag chat send w --command review "path"          # opencode native command only
@@ -364,16 +364,22 @@ ag chat steer w "text" [--json]      # interrupt running turn, run this next on 
 
 ```sh
 ag schedule add w (--every 15m|2h|1d | --at 09:00 [--days mon-fri|mon,wed,fri|daily|weekends]) "msg" \
-   [--max-runtime S] [--notify X] [--on-done CMD] [--job J] [--overlap skip|queue] [--catch-up] [--disabled] [--id NAME] [--on NODE]
+   [--max-runtime S] [--notify X] [--notify-done] [--on-done CMD] [--job J] [--overlap skip|queue] [--catch-up] [--disabled] [--id NAME] [--on NODE]
 ag schedule list [--all] | rm ID | pause ID | resume ID | run ID
 ag schedule tick [--all] [--now ISO] [--reap] [--dry-run]
-ag schedule install [--write] [--cron] [--interval 60]
+ag schedule install [--write] [--cron|--systemd] [--interval 60]
 ```
 
-- Rows in `<state>/schedules.json`; each state dir with schedules is listed in `$AG_CONFIG_HOME/schedule-dirs.json` (`add` registers, `rm` of the last row unregisters). ONE global tick (`schedule tick --all --reap`, every 60s) walks the registry. `install` prints the launchd plist (label `org.ag.schedule`); `--write` writes `~/Library/LaunchAgents/` and runs `launchctl bootout` (if loaded) + `bootstrap`; `--cron` prints a crontab line instead. `schedule` never self-updates ag.
+- Rows in `<state>/schedules.json`; each state dir with schedules is listed in `$AG_CONFIG_HOME/schedule-dirs.json` (`add` registers, `rm` of the last row unregisters). ONE global tick (`schedule tick --all --reap`, every 60s) walks the registry. `install` prints the launchd plist (label `org.ag.schedule`); `--write` writes `~/Library/LaunchAgents/` and runs `launchctl bootout` (if loaded) + `bootstrap`; `--cron` prints a crontab line. On Linux, `--systemd` prints `ag-tick.service` + `ag-tick.timer`; `--write` saves them under `~/.config/systemd/user/`, reloads systemd, and enables the timer. The service uses `KillMode=process` so stopping the one-shot tick does not kill wake workers it launched. `schedule` never self-updates ag.
 - Local wall clock, min interval 60s. Interval rows run on a fixed grid (missed slots collapse into one catch-up run). Fixed-time rows >10min late are `missed` unless `--catch-up`. DST gap -> forward, overlap -> first occurrence.
 - `--overlap skip` (default) skips a due run while the last job is queued/running (dead workers are reconciled first). Each fire is gated by a `<id>:<due>` request-id receipt, so double ticks or a crash before the state write never double-fire. Concurrent ticks: non-blocking `schedule/tick.lock`.
 - Corrupt `schedules.json` refuses the tick (event `schedule_fail`), never reset. Removed agent -> row `last_status: error`. Events: `schedule_fire|skip|missed|fail`. `list` shows `tick: last ran Xm ago`. `--reap` calls `wakes_reap` when present.
+
+## Notifications
+
+Muse watches `~/.notify-muse/` every 15 seconds and turns each valid `{"title","body"}` JSON file into a user notification, then archives it. Configure an inbox once with `ag notify --set-dir ~/.notify-muse`, or set `AG_NOTIFY_DIR`; `ag notify TITLE BODY [--dir D]` writes an atomic JSON file. Path priority is `--dir`, `AG_NOTIFY_DIR`, then `$AG_CONFIG_HOME/notify.json`. Titles are capped at 120 characters and bodies at 2,000, with `…` when truncated.
+
+Add `--notify-done` to `wake`, `chat send`, `delegate`, or `schedule add` to write a completion notification with the agent, result or error, job ID when available, and verify exit. For cloud runs, `wake w "task" --on muse --notify-done` carries the option to the target, where Muse can see the inbox. Remote result files include `error_tail` with the last 40 backend stderr or chat-log error lines when available.
 
 ### Remote schedules (`schedule add --on NODE`)
 

@@ -581,7 +581,7 @@ def verify_log_row(sdir, name, v):
     except Exception: pass
 
 def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
-        notify="", on_done="", timeout_s=0, max_runtime_s=0, stall_s=None, job_type=None, cohort=None, extra=None,
+        notify="", notify_done=False, on_done="", timeout_s=0, max_runtime_s=0, stall_s=None, job_type=None, cohort=None, extra=None,
         verify=None, verify_timeout_s=600):
     """Enqueue one wake job + spawn tracked worker. Returns {job,session} or {error}."""
     try: rows = load_agents(sdir)
@@ -635,6 +635,7 @@ def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
         "trigger": trigger, "exit": exit_code, "status": "queued",
         "ts": now_iso(), "session": sid,
         "notify": (notify or "").strip(), "on_done": (on_done or ""),
+        "notify_done": bool(notify_done),
         "timeout_s": timeout_s, "max_runtime_s": max_runtime_s,
         **({"stall_s": stall_s} if stall_s is not None else {}),
         **({"job": job_type} if job_type else {}),
@@ -667,15 +668,18 @@ def _wake_notify(sdir, job, status):
         else:
             detail = str(job.get("error", ""))[:300]
         target = (job.get("notify") or "").strip()
+        names = []
         if target:
             try: names = [r.get("name") for r in load_agents(sdir)]
             except Exception: names = []
             if target in names:
                 try:
                     append_chat(sdir, target, "tool",
-                        f"[wake] job {jid} ({agent}) {status}."
-                        + (f" {detail}" if detail else ""))
+                        f"[wake] job {jid} ({agent}) {status}." + (f" {detail}" if detail else ""))
                 except Exception: pass
+        if job.get("notify_done") and status in ("done", "failed"):
+            _notify_completion(agent, status, reply=job.get("reply"), error=job.get("error"),
+                job=jid, verify=job.get("verify"))
         cmd = (job.get("on_done") or "").strip()
         if cmd:
             try:
@@ -742,7 +746,13 @@ def _wake_finish(sdir, jid, status, reply="", error="", exit_code=0,
             _event(sdir, "wake_fail", cur.get("trigger"), agent=cur.get("agent"),
                 exit=cur.get("exit"), reason=str(error or "")[:120], job=jid)
     except Exception: pass
-    try: _wake_notify(sdir, cur, status)
+    try:
+        notify_job = cur
+        if cur.get("notify_done"):
+            notify_job = dict(cur)
+            if status == "done": notify_job["reply"] = str(reply or "")[:600]
+            else: notify_job["error"] = str(error or "")[:600]
+        _wake_notify(sdir, notify_job, status)
     except Exception: pass
     if cur.get("group"):
         try: _cohort_on_finish(sdir, cur, status)
@@ -1124,7 +1134,7 @@ def wakes_reap(sdir, queued_only=True, include_running=False, agent=None, max_at
         msg = j.get("message", "")
         if j["lost_status"] == "running" and not msg.startswith("[reap]"): msg = REAP_NOTE + "\n" + msg
         r = launch_wake_chat(sdir, j["agent"], msg, trigger=j.get("trigger"), exit_code=j.get("exit"),
-            notify=j.get("notify", ""), on_done=j.get("on_done", ""), timeout_s=j.get("timeout_s", 0),
+            notify=j.get("notify", ""), notify_done=bool(j.get("notify_done")), on_done=j.get("on_done", ""), timeout_s=j.get("timeout_s", 0),
             max_runtime_s=j.get("max_runtime_s", 0), stall_s=j.get("stall_s"), job_type=j.get("job"),
             verify=j.get("verify"), verify_timeout_s=j.get("verify_timeout_s", 600),
             cohort=({"parent": j["parent"], "group": j["group"], "quiet_s": 0} if j.get("group") else None),
@@ -2643,6 +2653,61 @@ def _atomic_write(p, text):
     t = Path(str(p) + ".tmp")
     t.write_text(text)
     t.rename(p)
+
+def _notify_target_dir(explicit=None):
+    """Notification mailbox: explicit path, env override, config, else a setup hint."""
+    value = explicit or os.environ.get("AG_NOTIFY_DIR")
+    if not value:
+        cfg = _json_or_empty(ag_config_home() / "notify.json")
+        if isinstance(cfg, dict): value = cfg.get("notify_dir")
+    if not value:
+        raise ValueError("notify dir not set up; use ag notify --set-dir ~/.notify-muse")
+    return Path(os.path.expanduser(str(value))).absolute()
+
+def _notify_clip(value, limit):
+    value = str(value or "")
+    return value if len(value) <= limit else value[:limit - 1] + "…"
+
+def _notify_write(title, body, directory=None):
+    """Atomically publish one Muse inbox notification. -> (path, record)."""
+    d = _notify_target_dir(directory)
+    ts = time.time()
+    record = {"title": _notify_clip(title, 120), "body": _notify_clip(body, 2000),
+        "ts": ts, "node": _relay_node_name(), "source": "ag"}
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"ag-{int(ts * 1000)}-{os.getpid()}-{os.urandom(4).hex()}.json"
+    _atomic_write(p, json.dumps(record, ensure_ascii=False))
+    return p, record
+
+def _notify_completion(agent, status, reply="", error="", job=None, verify=None):
+    """Best-effort completion ping shared by foreground turns and wake jobs."""
+    title = f"ag: {agent} {status}" + (f" [{job}]" if job else "")
+    body = str(reply or error or "")[:600]
+    if verify:
+        body += ("\n" if body else "") + f"verify exit={verify.get('exit')}"
+    try: _notify_write(title, body)
+    except Exception: pass
+
+def do_notify(a):
+    if getattr(a, "set_dir", None):
+        try:
+            path = Path(os.path.expanduser(a.set_dir)).absolute()
+            cfg = _json_or_empty(ag_config_home() / "notify.json")
+            if not isinstance(cfg, dict): cfg = {}
+            cfg["notify_dir"] = str(path)
+            p = ag_config_home() / "notify.json"; p.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(p, json.dumps(cfg, indent=1))
+            return emit(a, "notify", {"_text": f"notify dir set: {path}", "dir": str(path)})
+        except Exception as e: return emit(a, "notify", error=f"cannot set notify dir: {str(e)[:160]}")
+    title = (getattr(a, "title", None) or "").strip()
+    body = " ".join(getattr(a, "body", None) or []).strip()
+    if not title or not body:
+        return emit(a, "notify", error="need TITLE and BODY",
+            hint="ag notify TITLE BODY [--dir DIR] or ag notify --set-dir DIR")
+    try: p, record = _notify_write(title, body, getattr(a, "notify_dir", None))
+    except Exception as e:
+        return emit(a, "notify", error=str(e)[:200], hint="ag notify --set-dir ~/.notify-muse")
+    return emit(a, "notify", {"_text": f"notification queued: {p}", "path": str(p), "notification": record})
 
 def profile_system_extra(sdir, profile_name):
     """Instructions+memory text that must reach the backend prompt."""
@@ -9876,16 +9941,19 @@ def do_chat(a):
                 hint="ag chat send NAME --timeout 300 TEXT")
         vcmd = (getattr(a,"verify",None) or "").strip()
         vtmo = _valid_runtime(getattr(a,"verify_timeout",600))
+        notify_done = bool(getattr(a, "notify_done", False))
         if vcmd and vtmo is None:
             return emit(a,"chat",error="invalid --verify-timeout: need finite seconds >= 0",
                 hint='ag chat send NAME --verify "CMD" --verify-timeout 900 TEXT')
         live = not getattr(a,"json",False)
         if getattr(a,"job",None): _event(sdir,"chat_job",a.name,job=a.job)
-        _rc, _h = _rcpt(a, sdir, "chat", a.name, json.dumps([text,cmd,a.sub,vcmd,vtmo]))
+        _payload = [text,cmd,a.sub,vcmd,vtmo] + (["notify_done"] if notify_done else [])
+        _rc, _h = _rcpt(a, sdir, "chat", a.name, json.dumps(_payload))
         if _rc is not None: return _rc
         r = (agent_steer if a.sub=="steer" else run_turn)(sdir,a.name,text,command=cmd,timeout_s=timeout_s,force=bool(getattr(a,"force",False)),stall_s=getattr(a,"stall_s",None),
             on_event=(lambda n,k,t: print(t) if live and k=="text" and t else print(t,file=sys.stderr) if live and k=="tool" and (t or "").startswith("[mode]") else None)); _rcpt_done(_h, r)
         if "error" in r and not r.get("timed_out"):
+            if notify_done: _notify_completion(a.name, "failed", error=r.get("error"))
             if r.get("exit") == 2: emit(a,"chat",error=r["error"]); return 2
             return emit(a,"chat",error=r["error"])
         v = None
@@ -9893,6 +9961,9 @@ def do_chat(a):
             try: v = run_verify(sdir,a.name,vcmd,vtmo)
             except Exception as e: v = {"cmd":vcmd,"exit":1,"tail":f"verify error: {e}"}
             verify_log_row(sdir,a.name,v)
+        if notify_done:
+            failed = bool(r.get("error") or r.get("exit") not in (None, 0) or (v and v.get("exit") != 0))
+            _notify_completion(a.name, "failed" if failed else "done", reply=r.get("reply"), error=r.get("error"), verify=v)
         if r.get("slash") and r.get("exit") and getattr(a,"json",False):
             return emit(a,"chat",error=f'/{r["slash"]} failed (exit {r["exit"]})',
                 hint=r["reply"][:300])
@@ -9961,6 +10032,7 @@ def do_wake(a):
     agent = (getattr(a,"agent",None) or "").strip()
     text = " ".join(getattr(a,"message",None) or []).strip()[:WAKE_MSG_MAX]
     notify = (getattr(a,"notify",None) or "").strip()
+    notify_done = bool(getattr(a, "notify_done", False))
     on_done = (getattr(a,"on_done",None) or "").strip()
     try: timeout_s = float(getattr(a,"timeout",0) or 0)
     except Exception: timeout_s = 0
@@ -9990,6 +10062,7 @@ def do_wake(a):
         parent = (getattr(a, "parent", None) or "").strip()
         return emit(a,"wake",error=cerr,hint=_agent_hint(sdir, parent))
     _wake_payload = [text,notify,on_done,timeout_s,max_runtime_s,stall_s,ck.get("cohort"),vcmd,vtmo]
+    if notify_done: _wake_payload.append("notify_done")
     if getattr(a,"on",None): _wake_payload.append(["on",a.on])
     _rc, _h = _rcpt(a, sdir, "wake", agent, json.dumps(_wake_payload,default=str))
     if _rc is not None: return _rc
@@ -10014,7 +10087,7 @@ def do_wake(a):
         rid = "w-" + hashlib.sha1(rid_seed.encode()).hexdigest()[:12]
         row = {"id": rid, "on": target, "agent": agent, "message": text, "once": True,
             "at_epoch": int(time.time()), "enabled": True, "max_runtime_s": max_runtime_s,
-            "job": getattr(a, "job", None)}
+            "job": getattr(a, "job", None), "notify_done": notify_done}
         agent_row = next(r for r in load_agents(sdir) if r.get("name") == agent)
         agent_spec = {k: agent_row.get(k) for k in ("backend", "model", "effort", "mode", "data", "stall_s")}
         try:
@@ -10031,7 +10104,7 @@ def do_wake(a):
         _rcpt_done(_h, r)
         if getattr(a, "json", False): return emit(a, "wake", {"agent": agent, "launched": True, **r})
         return emit(a, "wake", {"_text": f"wake sent -> {agent} ({r['status']}, id {rid})", "agent": agent, **r})
-    r = launch_wake_chat(sdir,agent,text,notify=notify,on_done=on_done,timeout_s=timeout_s,
+    r = launch_wake_chat(sdir,agent,text,notify=notify,notify_done=notify_done,on_done=on_done,timeout_s=timeout_s,
         max_runtime_s=max_runtime_s,stall_s=stall_s,job_type=getattr(a,"job",None),verify=vcmd,verify_timeout_s=vtmo,
         extra=({"force": True} if getattr(a,"force",False) else None),**ck); _rcpt_done(_h, r)
     if "error" in r:
@@ -10147,6 +10220,7 @@ def _sched_fire(sdir, row, rid, trigger_extra=None):
         except Exception: pass
     f.write_text(json.dumps({"cmd": "wake", "agent": agent, "payload_hash": "", "status": "in_progress", "ref": rid, "ts": time.time()}))
     r = launch_wake_chat(sdir, agent, row["message"], trigger=f"schedule:{row['id']}", notify=row.get("notify") or "",
+        notify_done=bool(row.get("notify_done")),
         on_done=row.get("on_done") or "", max_runtime_s=row.get("max_runtime_s") or 0, job_type=row.get("job"),
         extra={"schedule_rid": rid})
     _rcpt_done(f, r)
@@ -10213,12 +10287,47 @@ def _sched_plist(interval):
     return {"Label": SCHED_LABEL, "ProgramArguments": [sys.executable, ag_script_path(), "schedule", "tick", "--all", "--reap"],
         "StartInterval": int(interval), "EnvironmentVariables": env, "StandardOutPath": log, "StandardErrorPath": log}
 
+def _systemd_quote(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+def _sched_systemd_units(interval):
+    env = {"HOME": os.environ.get("HOME", str(_ag_home())), "PATH": os.environ.get("PATH", "")}
+    env.update({k: v for k, v in os.environ.items() if k.upper().endswith("_PROXY")})
+    service = ["[Unit]", "Description=ag scheduled wake tick", "", "[Service]", "Type=oneshot", "KillMode=process"]
+    service += [f"Environment={_systemd_quote(k + '=' + v)}" for k, v in sorted(env.items())]
+    service += ["ExecStart=" + _systemd_quote(sys.executable) + " " + _systemd_quote(ag_script_path()) + " schedule tick --all --reap", ""]
+    timer = ["[Unit]", "Description=Run ag schedule tick periodically", "", "[Timer]",
+        f"OnBootSec={int(interval)}s", f"OnUnitActiveSec={int(interval)}s", "Unit=ag-tick.service", "",
+        "[Install]", "WantedBy=timers.target", ""]
+    return "\n".join(service), "\n".join(timer)
+
 def do_schedule(a):
     sub = a.ssub; sdir = state_dir(a.dir); cmd = "schedule"
     def err(m, h=None): return emit(a, cmd, error=m, hint=h) or 1
     if sub == "install":
         iv = int(a.interval)
         if iv < 10: return err("--interval must be >= 10")
+        if a.cron and a.systemd: return err("choose one of --cron / --systemd")
+        if a.systemd:
+            service, timer = _sched_systemd_units(iv)
+            path = _ag_home() / ".config" / "systemd" / "user"
+            if not a.write:
+                return emit(a, cmd, {"_text": service + "\n" + timer +
+                    f"# write to {path}; then: systemctl --user daemon-reload && systemctl --user enable --now ag-tick.timer\n",
+                    "service": service, "timer": timer, "path": str(path), "enabled": False})
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                _atomic_write(path / "ag-tick.service", service)
+                _atomic_write(path / "ag-tick.timer", timer)
+            except Exception as e: return err(f"systemd unit write failed: {str(e)[:180]}")
+            systemctl = shutil.which("systemctl")
+            if not systemctl:
+                return emit(a, cmd, {"_text": f"wrote units to {path}; systemctl not found", "path": str(path), "enabled": False})
+            p = subprocess.run([systemctl, "--user", "daemon-reload"], capture_output=True, text=True)
+            if p.returncode: return err(f"systemctl daemon-reload failed: {(p.stderr or p.stdout).strip()[:180]}", f"units written to {path}")
+            p = subprocess.run([systemctl, "--user", "enable", "--now", "ag-tick.timer"], capture_output=True, text=True)
+            if p.returncode: return err(f"systemctl enable failed: {(p.stderr or p.stdout).strip()[:180]}", f"units written to {path}")
+            return emit(a, cmd, {"_text": f"installed and enabled {path}/ag-tick.timer", "path": str(path), "enabled": True})
         if a.cron:
             line = f"{'*' if iv <= 60 else '*/' + str(max(1, iv // 60))} * * * * {shlex.quote(sys.executable)} {shlex.quote(ag_script_path())} schedule tick --all --reap >> {shlex.quote(str(ag_cache_home() / 'schedule-tick.log'))} 2>&1"
             return emit(a, cmd, {"_text": line, "cron": line})
@@ -10286,7 +10395,7 @@ def do_schedule(a):
         rid = a.id or f"{a.agent}-{hashlib.sha1(f'{time.time()}{os.getpid()}'.encode()).hexdigest()[:4]}"
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", rid): return err(f"bad id {rid!r}")
         now = time.time(); row.update(id=rid, agent=a.agent, message=msg, enabled=not a.disabled, overlap=a.overlap, catch_up=a.catch_up,
-            max_runtime_s=mr, notify=a.notify, on_done=a.on_done, job=a.job, created=now, next_due=None, last_due=None, last_job=None,
+            max_runtime_s=mr, notify=a.notify, notify_done=bool(a.notify_done), on_done=a.on_done, job=a.job, created=now, next_due=None, last_due=None, last_job=None,
             last_status=None, runs=0, missed=0, skipped=0)
         if cfg is not None:
             agent = next(r for r in load_agents(sdir) if r.get("name") == a.agent)
@@ -10400,7 +10509,8 @@ def relay_publish_schedule(cfg, row, agent_spec):
     sp = dict(agent_spec or {})
     mail = {"origin": cfg["node"], "target": row["on"], "id": row["id"], "agent": row["agent"], "message": row["message"],
         "catch_up": bool(row.get("catch_up")), "overlap": row.get("overlap", "skip"),
-        "max_runtime_s": row.get("max_runtime_s") or 0, "job": row.get("job"), "enabled": row.get("enabled", True),
+        "max_runtime_s": row.get("max_runtime_s") or 0, "job": row.get("job"), "notify_done": bool(row.get("notify_done")),
+        "enabled": row.get("enabled", True),
         "updated": time.time(),
         "agent_spec": {k: sp[k] for k in ("backend", "model", "effort", "mode", "data", "stall_s") if sp.get(k) not in (None, "")}}
     if row.get("once"):
@@ -10537,7 +10647,8 @@ def _relay_materialize(cfg, root, now, out, errs):
                         row.update(timing)
                         row["next_due"] = _sched_next(row, now)
                 row.update(message=m.get("message", ""), catch_up=bool(m.get("catch_up")), overlap=m.get("overlap", "skip"),
-                    max_runtime_s=m.get("max_runtime_s") or 0, job=m.get("job"), enabled=m.get("enabled", True),
+                    max_runtime_s=m.get("max_runtime_s") or 0, job=m.get("job"), notify_done=bool(m.get("notify_done")),
+                    enabled=m.get("enabled", True),
                     relay_origin=m["origin"], relay_id=m["id"], agent=f'relay-{m["origin"]}-{m["agent"]}')
                 if row["agent"] not in names:
                     spec = dict(m.get("agent_spec") or {})
@@ -10565,6 +10676,21 @@ def _relay_reply(sdir, r, j):
     if log: return str(log[-1].get("text") or "")
     return str(j.get("reply") or j.get("error") or "")
 
+def _relay_error_tail(sdir, r, j):
+    """Last 40 lines of saved backend stderr or this job's chat-log error rows."""
+    raw = j.get("backend_stderr") or j.get("stderr") or ""
+    lines = str(raw).splitlines() if raw else []
+    if not lines:
+        since, until = _relay_epoch(j.get("ts")), _relay_epoch(j.get("ended_at"))
+        try:
+            rows = [x for x in load_chat_log(sdir, r.get("agent") or j.get("agent", ""))
+                if x.get("role") == "error" and (since is None or (_relay_epoch(x.get("ts")) or 0) >= since)
+                and (until is None or (_relay_epoch(x.get("ts")) or float("inf")) <= until)]
+        except Exception: rows = []
+        lines = [line for x in rows for line in str(x.get("text") or "").splitlines()]
+    if not lines and j.get("error"): lines = str(j["error"]).splitlines()
+    return "\n".join(line[-500:] for line in lines[-40:])[-20000:]
+
 def _relay_report(cfg, root, now, out, errs):
     """Target side: one result file per finished wake job not reported yet (relay_reported marker)."""
     node, sdir = cfg["node"], _relay_state(cfg)
@@ -10585,6 +10711,7 @@ def _relay_report(cfg, root, now, out, errs):
             res = {"origin": r["relay_origin"], "target": node, "id": r["relay_id"], "due": due, "job": r["last_job"],
                 "status": st, "exit": j.get("backend_exit", j.get("exit")), "reply": _relay_reply(sdir, r, j)[:20000],
                 "error": (j.get("error") or "")[:200], "started": due, "reported": int(now)}
+            if (tail := _relay_error_tail(sdir, r, j)): res["error_tail"] = tail
             if r.get("once"): res["once"] = True
             fin = _relay_epoch(j.get("ended_at"))
             if fin is not None: res["finished"] = fin
@@ -13365,11 +13492,13 @@ def do_delegate(a):
             hint="ag delegate AGENT --timeout 300 TASK")
     vcmd = (getattr(a,"verify",None) or "").strip()
     vtmo = _valid_runtime(getattr(a,"verify_timeout",600))
+    notify_done = bool(getattr(a, "notify_done", False))
     if vcmd and vtmo is None:
         return emit(a,"delegate",error="invalid --verify-timeout: need finite seconds >= 0",
             hint='ag delegate AGENT --verify "CMD" --verify-timeout 900 TASK')
     _rk = [task, getattr(a,"parent",None), getattr(a,"group",None)] if (getattr(a,"parent",None) or getattr(a,"group",None)) else None
     if vcmd: _rk = (_rk or [task]) + [vcmd, vtmo]  # plain delegates keep their old receipt key
+    if notify_done: _rk = (_rk or [task]) + ["notify_done"]
     _rc, _h = _rcpt(a, sdir, "delegate", a.agent, json.dumps(_rk) if _rk else task)
     if _rc is not None: return _rc
     if getattr(a,"parent",None) or getattr(a,"group",None):
@@ -13384,7 +13513,8 @@ def do_delegate(a):
             r = {"error": f"no such agent: {a.agent}"}
             _rcpt_done(_h, r)
             return emit(a,"delegate",error=r["error"],hint=_agent_hint(sdir, a.agent))
-        r = launch_wake_chat(sdir,a.agent,task,max_runtime_s=timeout_s,job_type=getattr(a,"job",None),verify=vcmd,verify_timeout_s=vtmo,extra=({"force": True} if getattr(a,"force",False) else None),**ck)
+        r = launch_wake_chat(sdir,a.agent,task,max_runtime_s=timeout_s,job_type=getattr(a,"job",None),verify=vcmd,verify_timeout_s=vtmo,
+            notify_done=notify_done,extra=({"force": True} if getattr(a,"force",False) else None),**ck)
         _rcpt_done(_h, r)
         if "error" in r:
             if isinstance(r, dict) and r.get("exit") == 2: emit(a,"delegate",error=r["error"]); return 2
@@ -13394,6 +13524,7 @@ def do_delegate(a):
     r = delegate_task(sdir,a.agent,task,timeout_s=timeout_s,job=getattr(a,"job",None),force=bool(getattr(a,"force",False)),
         on_event=(lambda n,k,t: print(t) if live and k=="text" and t else None)); _rcpt_done(_h, r)
     if "error" in r and not r.get("timed_out"):
+        if notify_done: _notify_completion(a.agent, "failed", error=r.get("error"))
         if r.get("exit") == 2: emit(a,"delegate",error=r["error"]); return 2
         return emit(a,"delegate",error=r["error"],hint=_agent_hint(sdir, a.agent))
     v = None
@@ -13401,6 +13532,9 @@ def do_delegate(a):
         try: v = run_verify(sdir,a.agent,vcmd,vtmo)
         except Exception as e: v = {"cmd":vcmd,"exit":1,"tail":f"verify error: {e}"}
         verify_log_row(sdir,a.agent,v)
+    if notify_done:
+        failed = bool(r.get("error") or r.get("exit") not in (None, 0) or (v and v.get("exit") != 0))
+        _notify_completion(a.agent, "failed" if failed else "done", reply=r.get("reply"), error=r.get("error"), verify=v)
     if getattr(a,"json",False):
         data = {"reply":r["reply"],"exit":r["exit"],"agent":a.agent}
         if v: data["verify"] = v
@@ -17629,6 +17763,8 @@ def build():
     g = sub.add_parser("grep",help="regex search"); g.add_argument("pattern"); g.add_argument("--path",default=".")
     g.add_argument("--include",default="*"); g.add_argument("--max",type=int,default=50)
     n = sub.add_parser("note",help="append memory"); n.add_argument("text",nargs="*"); n.add_argument("--tag",default="")
+    no = sub.add_parser("notify",help="write a notification to the configured inbox"); no.add_argument("title",nargs="?"); no.add_argument("body",nargs="*")
+    no.add_argument("--dir",dest="notify_dir",default=None,help="notification inbox directory (overrides AG_NOTIFY_DIR/config)"); no.add_argument("--set-dir",dest="set_dir",default=None,metavar="DIR",help="save the default notification inbox in notify.json")
     ns = sub.add_parser("notes",help="list memory"); ns.add_argument("--limit",type=int,default=20); ns.add_argument("--grep",default=None)
     t = sub.add_parser("todo",help="task list"); ts=t.add_subparsers(dest="sub",required=True)
     ta=ts.add_parser("add"); ta.add_argument("text",nargs="*")
@@ -17686,7 +17822,7 @@ def build():
     ch = sub.add_parser("chat",help="talk to an agent headless"); chs=ch.add_subparsers(dest="sub",required=True)
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
     chs2.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); chs2.add_argument("--command",default=None,help="opencode native custom command (message becomes its args)")
-    chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); chs2.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); chs2.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); chs2.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); chs2.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the turn, ag runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail(40 lines)} in the result + a [verify] row in the chat log (never from the agent's reply)"); chs2.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)")
+    chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); chs2.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); chs2.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); chs2.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); chs2.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the turn finishes"); chs2.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the turn, ag runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail(40 lines)} in the result + a [verify] row in the chat log (never from the agent's reply)"); chs2.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)")
     chst=chs.add_parser("steer",help="interrupt the running turn, run this next (priority 0, same session)"); chst.add_argument("name"); chst.add_argument("text",nargs="*"); chst.add_argument("--timeout",type=float,default=1800); chst.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
     qu=sub.add_parser("queue",help="per-agent turn queue: list/cancel/hold/release"); qu.add_argument("agent"); qu.add_argument("--cancel",default=None,metavar="ID"); qu.add_argument("--hold",action="store_true"); qu.add_argument("--release",action="store_true")
     sp_=sub.add_parser("stop",help="hold queue, cancel waiters + wakes, interrupt running turn"); sp_.add_argument("agent"); sp_.add_argument("--cascade",action="store_true",help="also stop agents whose jobs record parent == agent")
@@ -17713,7 +17849,7 @@ def build():
     _padd=pvs.add_parser("add",help="add/update a provider (presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova)"); _padd.add_argument("pid",help="provider id"); _padd.add_argument("--base-url",dest="base_url",default=None,help="OpenAI-compat base URL"); _padd.add_argument("--key-ref",dest="key_ref",default=None,help="keychain:NAME or ${VAR} (never a literal secret)"); _padd.add_argument("--npm",default=None,help="AI-SDK package (default @ai-sdk/openai-compatible)"); _padd.add_argument("--privacy",default=None,choices=["zdr","retain","train"],help="data class"); _padd.add_argument("--max-concurrent",dest="max_concurrent",type=int,default=None,help="ratelimit slots for <provider>/*"); _padd.add_argument("--rpd",type=int,default=None,help="known free-tier requests/day"); _padd.add_argument("--model",dest="models",action="append",default=None,help="model id (repeatable)")
     _prm=pvs.add_parser("rm",help="remove a provider"); _prm.add_argument("pid",help="provider id")
     _psh=pvs.add_parser("show",help="show one provider"); _psh.add_argument("pid",help="provider id")
-    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); dg.add_argument("--parent",default=None,help="run as background wake; auto-wake PARENT when its cohort finishes"); dg.add_argument("--group",default=None); dg.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); dg.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the turn (or in the background wake job), run trusted CMD via sh -c in the agent workdir and record {cmd,exit,tail} (never from the agent's reply)"); dg.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); dg.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); dg.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
+    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); dg.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the turn finishes"); dg.add_argument("--parent",default=None,help="run as background wake; auto-wake PARENT when its cohort finishes"); dg.add_argument("--group",default=None); dg.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); dg.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the turn (or in the background wake job), run trusted CMD via sh -c in the agent workdir and record {cmd,exit,tail} (never from the agent's reply)"); dg.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); dg.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); dg.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
     cc=sub.add_parser("crosscheck",help="same task to 2+ agents in parallel, compare answers"); cc.add_argument("aname",help="first agent"); cc.add_argument("bname",help="second agent"); cc.add_argument("task",nargs="*",help="self-contained task both agents answer"); cc.add_argument("--more",action="append",nargs="+",default=[],metavar="AGENT",help="extra agent (repeatable or space-separated)"); cc.add_argument("--judge",default=None,metavar="AGENT",help="third agent asked which answer is right and why (one turn)"); cc.add_argument("--timeout",type=float,default=1800,help="per-agent backend budget in seconds (0=unlimited, default 1800)"); cc.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
     cx=sub.add_parser("context",help="scoped guidance + persistent memory"); cxs=cx.add_subparsers(dest="ctxsub",required=False)
     cxs.add_parser("init",help="non-destructive scaffold of context state")
@@ -17724,13 +17860,13 @@ def build():
     cmc=cms.add_parser("config",help="role defaults / per-agent override"); cmc.add_argument("--role",dest="cprole",default=None,choices=["orchestrator","sub"]); cmc.add_argument("--agent",dest="cpagent",default=None); cmc.add_argument("--enable",dest="cpenable",action="store_true",default=None); cmc.add_argument("--disable",dest="cpdisable",action="store_true"); cmc.add_argument("--max-turns",dest="cpmax",type=int,default=None); cmc.add_argument("--tokens",dest="cptokens",type=int,default=None); cmc.add_argument("--keep",dest="cpkeep",type=int,default=None); cmc.add_argument("--timeout",dest="cptimeout",type=int,default=None); cmc.add_argument("--clear",dest="cpclear",action="store_true")
     cmsh=cms.add_parser("show",help="effective settings + stats"); cmsh.add_argument("cpname",nargs="?",default="")
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
-    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); wk.add_argument("--on",default=None,metavar="NODE",help="run once on a relay node")
+    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the wake finishes"); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); wk.add_argument("--on",default=None,metavar="NODE",help="run once on a relay node")
     sc=sub.add_parser("schedule",help="recurring wakes (one global launchd/cron tick)"); scs=sc.add_subparsers(dest="ssub",required=True)
-    sca=scs.add_parser("add"); sca.add_argument("agent"); sca.add_argument("message",nargs="+"); sca.add_argument("--every",default=None,help="15m | 2h | 1d (>=60s)"); sca.add_argument("--at",default=None,help="HH:MM local"); sca.add_argument("--days",default=None,help="mon-fri | mon,wed,fri | daily | weekends (with --at)"); sca.add_argument("--max-runtime",dest="max_runtime",type=float,default=0); sca.add_argument("--notify",default=""); sca.add_argument("--on-done",dest="on_done",default=""); sca.add_argument("--job",default=None,choices=JOB_KEYS); sca.add_argument("--overlap",choices=["skip","queue"],default="skip"); sca.add_argument("--catch-up",dest="catch_up",action="store_true",help="fixed-time: fire even if >10min late"); sca.add_argument("--disabled",action="store_true"); sca.add_argument("--id",default=None); sca.add_argument("--on",default=None,metavar="NODE",help="run schedule on another relay node")
+    sca=scs.add_parser("add"); sca.add_argument("agent"); sca.add_argument("message",nargs="+"); sca.add_argument("--every",default=None,help="15m | 2h | 1d (>=60s)"); sca.add_argument("--at",default=None,help="HH:MM local"); sca.add_argument("--days",default=None,help="mon-fri | mon,wed,fri | daily | weekends (with --at)"); sca.add_argument("--max-runtime",dest="max_runtime",type=float,default=0); sca.add_argument("--notify",default=""); sca.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification after each run"); sca.add_argument("--on-done",dest="on_done",default=""); sca.add_argument("--job",default=None,choices=JOB_KEYS); sca.add_argument("--overlap",choices=["skip","queue"],default="skip"); sca.add_argument("--catch-up",dest="catch_up",action="store_true",help="fixed-time: fire even if >10min late"); sca.add_argument("--disabled",action="store_true"); sca.add_argument("--id",default=None); sca.add_argument("--on",default=None,metavar="NODE",help="run schedule on another relay node")
     scl=scs.add_parser("list"); scl.add_argument("--all",action="store_true",help="every registered state dir")
     for v_ in ("rm","pause","resume","run"): scs.add_parser(v_).add_argument("id")
     sct=scs.add_parser("tick"); sct.add_argument("--all",action="store_true"); sct.add_argument("--now",default=None,help="ISO time (tests)"); sct.add_argument("--reap",action="store_true"); sct.add_argument("--dry-run",dest="dry_run",action="store_true")
-    sci=scs.add_parser("install"); sci.add_argument("--write",action="store_true"); sci.add_argument("--cron",action="store_true"); sci.add_argument("--interval",type=int,default=60)
+    sci=scs.add_parser("install"); sci.add_argument("--write",action="store_true"); sci.add_argument("--cron",action="store_true"); sci.add_argument("--systemd",action="store_true",help="print or install systemd user service + timer"); sci.add_argument("--interval",type=int,default=60)
     ry_=sub.add_parser("relay",help="run schedules made here on another machine (mailbox: git repo | synced folder)"); rys=ry_.add_subparsers(dest="rsub",required=True)
     ryi=rys.add_parser("init",help="write relay.json; clone for --git; first heartbeat"); ryi.add_argument("--git",dest="git_url",default=None,help="private repo URL (a bare/local git path works too)"); ryi.add_argument("--dir",dest="relay_dir",default=None,help="folder used directly as the mailbox (sync it yourself)"); ryi.add_argument("--node",default=None,help="this machine's name (default: short hostname, [a-z0-9-])"); ryi.add_argument("--state",default=None,help="ag state dir where inbound schedules materialise (default ~/.agent-relay)"); ryi.add_argument("--workdir",default=None,help="parent of per-origin agent workdirs (default ~/ag-relay-work)"); ryi.add_argument("--max-mode",dest="max_mode",default=None,choices=MODES,help="highest --mode a target accepts from the mailbox (default edits)")
     rys.add_parser("sync",help="pull mailbox, materialise/report inbound schedules, ingest results, heartbeat, push")
@@ -18273,6 +18409,7 @@ def _lift_trailing_dir(argv, subs):
         head, tail = argv, []
     si = next((i for i, t in enumerate(head) if t in subs), -1)
     if si < 0: return argv, None
+    if head[si] == "notify": return argv, None  # notify --dir selects the notification inbox
     if head[si] == "agents" and len(head) > si+1 and head[si+1] in ("add", "set"): return argv, None
     if head[si] == "relay" and len(head) > si+1 and head[si+1] == "init": return argv, None  # relay init --dir = mailbox, not state
     out, j, d = head[:si+1], si+1, None
@@ -18308,7 +18445,7 @@ def main(argv=None):
     # strip leading -- from run/spawn
     if a.subcmd in ("run","spawn") and getattr(a,"cmd",None) and a.cmd[0]=="--": a.cmd=a.cmd[1:]
     fn = {"run":do_run,"read":do_read,"write":do_write,"edit":do_edit,"ls":do_ls,
-        "grep":do_grep,"note":do_note,"notes":do_notes,"todo":do_todo,"history":do_history,
+        "grep":do_grep,"note":do_note,"notify":do_notify,"notes":do_notes,"todo":do_todo,"history":do_history,
         "approvals":do_approvals,"approve":do_approve,"shell":do_shell,"selfcheck":do_selfcheck,
         "spawn":do_spawn,"send":do_send,"snap":do_snap,"sessions":do_sessions,
         "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon,

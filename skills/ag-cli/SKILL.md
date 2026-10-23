@@ -124,6 +124,15 @@ Rule: work code only to zdr models. `agents add|set --data work|public` (default
 
 Ask the user to run it bare (interactive). Agent context: pass flags + `--yes` (or `--dry-run` first). `--ui` / `AG_SETUP_UI`: `web` (alias `mac`; auto on a local macOS desktop) = local browser form on 127.0.0.1 (random port + one-time token URL; `AG_SETUP_NO_OPEN=1` prints the URL instead of opening; Jobs per profile with grouped model dropdowns + effort select per job (per-model variants when known, else low|medium|high|xhigh|max, plus `default`/`highest`) + capability panel, Backends (with default effort), ranked Models, Skills; Save/Cancel, 15 min idle exits writing nothing), `cli` = curses (jobs table + Backends table, needs 60x24), `plain` = prompts. Writes `routing.json` (jobs + per-backend defaults that feed `agents add`), sparsely: only jobs differing from the inherited profile are stored (explicit `--set JOB=...` always stored), renders `ag-cli`/`ag-agents` skills into harness skill dirs, routing block in `~/.claude/CLAUDE.md` (claude/global). Atomic, never deletes. Job routed to a disabled backend: error, no save.
 
+## Notifications
+
+```sh
+{{AG}} notify TITLE BODY [--dir D] [--json]
+{{AG}} notify --set-dir ~/.notify-muse
+```
+
+Muse polls `~/.notify-muse/` every 15 seconds and archives valid `{"title","body"}` files after showing them. `notify` writes atomically; inbox priority is `--dir` > `$AG_NOTIFY_DIR` > `notify_dir` in `$AG_CONFIG_HOME/notify.json`. Title limit 120 characters, body 2,000; excess ends in `…`. `wake`, `chat send`, `delegate`, and `schedule add` accept `--notify-done`; for a remote wake, that flag travels to the target.
+
 ## Schedule tick (mechanics)
 
 Scheduled wakes live in `ag-agents`. One global launchd job drives all state dirs:
@@ -132,10 +141,12 @@ Scheduled wakes live in `ag-agents`. One global launchd job drives all state dir
 {{AG}} schedule install                 # print launchd plist (label org.ag.schedule)
 {{AG}} schedule install --write         # write ~/Library/LaunchAgents + bootstrap
 {{AG}} schedule install --cron          # print crontab line instead
+{{AG}} schedule install --systemd       # print user service + timer (Linux)
+{{AG}} schedule install --systemd --write  # write units + enable timer
 {{AG}} schedule tick --all --reap       # what the job runs every 60s; --dry-run, --now ISO
 ```
 
-Registry `$AG_CONFIG_HOME/schedule-dirs.json`. Concurrent ticks are lock-safe; corrupt `schedules.json` refuses the tick.
+Registry `$AG_CONFIG_HOME/schedule-dirs.json`. Concurrent ticks are lock-safe; corrupt `schedules.json` refuses the tick. The systemd service is `Type=oneshot` with `KillMode=process`, so a stopped tick does not kill the wake workers it launched; it passes HOME, PATH, and present proxy variables.
 
 ### Relay schedule tick
 

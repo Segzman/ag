@@ -11,7 +11,7 @@ Single-file Python CLI, stdlib only, POSIX. Binary: `{{AG}}`. Delegation to othe
 
 ## State dir — read first
 
-Resolution, no upward search: `--dir` -> `$AGENT_CLI_DIR` -> `$PWD/.agent`. Wrong cwd = fresh empty roster (looks wiped, isn't). **Always pass `--dir`.** Tool calls are fresh shells, so `export` does not persist.
+Resolution, no upward search: `--dir` -> `$AGENT_CLI_DIR` -> `$PWD/.agent`. Wrong cwd = fresh empty roster (looks wiped, isn't). **Always pass `--dir`.** Tool calls are fresh shells, so `export` does not persist. `--dir` (and `--json`) also work after the subcommand (`{{AG}} agents rm w --dir <state>`); after `agents add|set` `--dir` means the agent workdir (state dir not supported there).
 
 ```sh
 {{AG}} --dir <state> agents list

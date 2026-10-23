@@ -64,6 +64,8 @@ Requires Python 3.9+, POSIX, git. `./install.sh [--prefix DIR] [--force]` copies
 
 Resolution, no upward search: `--dir` -> `$AGENT_CLI_DIR` -> `$PWD/.agent`. Wrong cwd silently creates a fresh roster (looks wiped, isn't). **Always pass `--dir`.** Never commit `.agent/`, `approvals.json`, `history.jsonl`, `notes.jsonl`, `todos.json`.
 
+Global `--dir` parses before or after the subcommand (`ag agents rm x --dir D` == `ag --dir D agents rm x`; `--json` likewise, though never past a bare `--`). Exception: for `agents add|set` the `--dir` after that subcommand means the agent workdir, so a state dir there is not supported.
+
 For coding agents driving `ag`: absolute path to the binary, one invocation per shell call (no `;`/`&&` chains), never run TTY commands (`tui`, `attach`, `shell`, `handoff --exec`; use `spawn` + `snap`). The skills `ag-cli` and `ag-agents` encode this; see [Setup](#setup).
 
 ## Sessions (PTY)

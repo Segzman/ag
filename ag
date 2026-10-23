@@ -16965,6 +16965,27 @@ def do_update(a):
     if status == "error": return emit(a, "update", error=detail)
     return emit(a, "update", {"_text": f"{status}: {detail}", "status": status, "detail": detail})
 
+def _lift_trailing_dir(argv, subs):
+    # argparse takes global flags only BEFORE the subcommand; lift a state-dir
+    # `--dir` / `--dir=V` written after it (`agents rm x --dir D`) so argv builds
+    # left-to-right without trickling the value through subparsers. Skipped:
+    # after a bare `--` (child args) and for subs with their own `--dir`
+    # (agents add/set --dir = agent workdir; state dir there is not supported).
+    if "--" in argv:
+        c = argv.index("--"); head, tail = argv[:c], argv[c:]
+    else:
+        head, tail = argv, []
+    si = next((i for i, t in enumerate(head) if t in subs), -1)
+    if si < 0: return argv, None
+    if head[si] == "agents" and len(head) > si+1 and head[si+1] in ("add", "set"): return argv, None
+    out, j, d = head[:si+1], si+1, None
+    while j < len(head):
+        t = head[j]
+        if t == "--dir" and j+1 < len(head): d = head[j+1]; j += 2; continue
+        if t.startswith("--dir="): d = t[6:]; j += 1; continue
+        out.append(t); j += 1
+    return out + tail, d
+
 def main(argv=None):
     if argv is None: argv = sys.argv[1:]
     # Global --json only before explicit `--` boundary. Tokens after the
@@ -16980,7 +17001,10 @@ def main(argv=None):
     head = [x for x in head if x != "--json"]
     argv = head + tail
     p = build()
+    subs = next((s.choices for s in p._actions if isinstance(s, argparse._SubParsersAction)), {})
+    argv, dirlift = _lift_trailing_dir(argv, subs)
     a = p.parse_args(argv)
+    if dirlift is not None: a.dir = dirlift
     if want_json: a.json = True
     if getattr(a, "version", False): print(VERSION); return 0
     if not getattr(a, "subcmd", None): p.print_help(); return 1

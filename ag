@@ -16478,6 +16478,511 @@ def _setup_selfcheck():
     except ValueError: pass
     assert _bk_clean({"effort": "default"}) == {"effort": ""} and _bk_clean({"effort": "max"}) == {"effort": "max"}
 
+# ---- link: VM shows sites + long jobs on the Mac via outbound reverse SSH (docs/LINK.md) ----
+# One ssh -N -T -R supervisor; the Mac needs only its sshd plus the restricted
+# authorized_keys line printed by `link init`/`link mac-key`. Config
+# $AG_CONFIG_HOME/link.json; state $AG_CACHE_HOME/link-{status.json,pid,log}.
+_LINK_DEFS = {"key": "~/.ssh/ag_link", "base": 41000, "watch_port": 7790}
+
+def _link_cfg_path(): return ag_config_home() / "link.json"
+
+def _link_cfg():
+    try: c = json.loads(_link_cfg_path().read_text())
+    except Exception: return {}
+    return c if isinstance(c, dict) else {}
+
+def _link_cfg_write(cfg):
+    ag_config_home().mkdir(parents=True, exist_ok=True)
+    _atomic_write(_link_cfg_path(), json.dumps(cfg, indent=1) + "\n")
+
+def _link_ports_parse(s):
+    """'auto' | '3000,8080' -> "auto" | [3000, 8080]. ValueError on bad."""
+    s = (s or "").strip()
+    if s in ("", "auto"): return "auto"
+    if not re.fullmatch(r"\d+(?:\s*,\s*\d+)*", s): raise ValueError(f"bad --ports {s!r}: use auto | 3000,8080")
+    return [int(x) for x in s.split(",")]
+
+def _link_ss_ports(text):
+    """Listening TCP ports from `ss -Hltn` (4th column = local addr:port)."""
+    out = set()
+    for ln in text.splitlines():
+        f = ln.split()
+        if len(f) > 3 and f[3].rsplit(":", 1)[-1].isdigit(): out.add(int(f[3].rsplit(":", 1)[-1]))
+    return out
+
+def _link_lsof_ports(text):
+    """Listening TCP ports from `lsof -nP -iTCP -sTCP:LISTEN -Fn` (n<addr>:<port> fields)."""
+    out = set()
+    for ln in text.splitlines():
+        m = re.match(r"^n\S+:(\d+)$", ln)
+        if m: out.add(int(m.group(1)))
+    return out
+
+def _link_scan_ports():
+    """Live listening TCP ports on this machine; never raises."""
+    try:
+        if sys.platform == "darwin":
+            p = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fn"], capture_output=True, text=True, timeout=10)
+            return _link_lsof_ports(p.stdout or "")
+        p = subprocess.run(["ss", "-Hltn"], capture_output=True, text=True, timeout=10)
+        return _link_ss_ports(p.stdout or "")
+    except Exception: return set()
+
+def _link_auto_ports(cfg):
+    """`ports: auto` scan minus the ssh port + configured exclude, sorted."""
+    excl = {22}
+    for x in (cfg.get("exclude") or []):
+        try: excl.add(int(x))
+        except Exception: pass
+    return sorted(p for p in _link_scan_ports() if p not in excl)
+
+def _link_ports_map(ports, cfg):
+    """mac port per vm port: map[P] pinned, else base+(P%1000) bumped past collisions. [{vm,mac,title}] sorted by vm."""
+    mmap = {}
+    for k, v in (cfg.get("map") or {}).items():
+        try: mmap[int(k)] = int(v)
+        except Exception: pass
+    try: base = int(cfg.get("base") or _LINK_DEFS["base"])
+    except Exception: base = _LINK_DEFS["base"]
+    used, out, pend = set(), [], []
+    for p in sorted({int(x) for x in ports}):
+        if p in mmap: used.add(mmap[p]); out.append({"vm": p, "mac": mmap[p], "title": f"port {p}"})
+        else: pend.append(p)
+    for p in pend:
+        c = base + p % 1000
+        while c in used: c += 1
+        used.add(c); out.append({"vm": p, "mac": c, "title": f"port {p}"})
+    return sorted(out, key=lambda x: x["vm"])
+
+def _link_watch_port(cfg):
+    try: return int(cfg.get("watch_port") or _LINK_DEFS["watch_port"])
+    except Exception: return _LINK_DEFS["watch_port"]
+
+def _link_forwards(cfg, live=None, watch=True):
+    """[{vm,mac,title}] incl. the watch forward (title "watch") unless watch=False. live = scan override (tests)."""
+    ports = {int(x) for x in (live if live is not None else
+        _link_auto_ports(cfg) if cfg.get("ports") in (None, "auto") else (cfg.get("ports") or []))}
+    wp = _link_watch_port(cfg)
+    if watch: ports.add(wp)
+    out = _link_ports_map(ports, cfg)
+    if watch:
+        for f in out:
+            if f["vm"] == wp: f["title"] = "watch"
+    return out
+
+def _link_ssh_argv(cfg, forwards):
+    argv = ["ssh", "-N", "-T", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=20", "-o", "ServerAliveCountMax=3",
+        "-i", str(Path(cfg.get("key") or _LINK_DEFS["key"]).expanduser())]
+    for f in forwards: argv += ["-R", f"localhost:{f['mac']}:localhost:{f['vm']}"]
+    argv.append(str(cfg["to"]))
+    return argv
+
+_LINK_AK_OPTS = 'restrict,port-forwarding,permitlisten="localhost:*",permitopen="127.0.0.1:1",command="/bin/echo ag-link only"'
+
+def _link_ak(pubtext):
+    """restricted authorized_keys line for the Mac, or None when pubtext is no ssh public key."""
+    t = " ".join((pubtext or "").split()).split()
+    if len(t) not in (2, 3) or not t[0].startswith(("ssh-", "ecdsa-", "sk-")): return None
+    return f"{_LINK_AK_OPTS} {' '.join(t)}"
+
+def _link_keygen(key):
+    """create `key` (ed25519, no passphrase, comment ag-link@<hostname>) when missing. -> error text or None."""
+    k = Path(key).expanduser()
+    if k.exists(): return None
+    k.parent.mkdir(parents=True, exist_ok=True)
+    import socket
+    p = subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", f"ag-link@{socket.gethostname()}", "-f", str(k)],
+        capture_output=True, text=True)
+    return None if p.returncode == 0 else ((p.stderr or p.stdout).strip().splitlines()[-1][:200] if (p.stderr or p.stdout).strip() else "ssh-keygen failed")
+
+_LINK_DIRS = []  # watch-page dir override for tests; empty = schedule registry + ~/.agent
+
+def _link_sdirs():
+    """State dirs the watch page shows: schedule registry + ~/.agent (tests: _LINK_DIRS)."""
+    if _LINK_DIRS: return [Path(x) for x in _LINK_DIRS]
+    seen, out = set(), []
+    for x in [_ag_home() / ".agent"] + [Path(x) for x in _sched_reg_get()]:
+        try: r = str(Path(x).expanduser().resolve())
+        except OSError: r = str(Path(x).expanduser())
+        if r not in seen: seen.add(r); out.append(Path(r))
+    return out
+
+def _link_sessions(dirs=None, now=None):
+    """Read-only rows for /api/sessions: [{dir, id, name, cmd, running, exit, idle_s}]."""
+    now = now or time.time()
+    out = []
+    for d in (dirs or _link_sdirs()):
+        try: subs = sorted((d / "sessions").iterdir())
+        except OSError: continue
+        for sp in subs:
+            st = _sstatus(sp)
+            if not st: continue
+            try: idle = now - (sp / "output.log").stat().st_mtime
+            except OSError:
+                try: idle = now - datetime.fromisoformat(str(st.get("started_at"))).timestamp()
+                except Exception: idle = 0.0
+            if not 0 <= idle <= 1e9: idle = 0.0
+            out.append({"dir": str(d), "id": st.get("id") or sp.name, "name": st.get("name") or "",
+                "cmd": st.get("cmd") or "", "running": bool(st.get("running")), "exit": st.get("exit"), "idle_s": int(idle)})
+    out.sort(key=lambda r: (not r["running"], r["idle_s"], r["id"]))
+    return out
+
+def _link_tail(dirpath, sid, since):
+    """ANSI-stripped chunk like `snap --clean`; -> {"text","next"}; no writes. Only watched dirs + plain session ids."""
+    ok = {str(d.resolve()) for d in _link_sdirs()}
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(sid or "")) or sid in (".", "..") or str(Path(dirpath or "/").resolve()) not in ok:
+        return {"text": "", "next": 0, "error": "unknown session"}
+    try: raw = (Path(dirpath) / "sessions" / sid / "output.log").read_bytes()
+    except OSError: raw = b""
+    try: off = max(0, min(int(since), 2 ** 31 - 1))
+    except Exception: off = 0
+    if off >= len(raw): return {"text": "", "next": off}
+    return {"text": ANSI.sub("", raw[off:].decode(errors="replace")), "next": len(raw)}
+
+def _link_wakes(limit=12):
+    """Running + recent wake jobs per dir for the page (server-rendered; no writes)."""
+    out = []
+    for d in _link_sdirs():
+        jd = d / "wake" / "jobs"
+        try: files = sorted(x.name for x in jd.glob("*.json") if x.is_file())
+        except OSError: continue
+        rows = []
+        for n in files[-200:]:
+            try: rows.append(json.loads((jd / n).read_text()))
+            except Exception: pass
+        rows.sort(key=lambda j: str(j.get("ts") or ""), reverse=True)
+        for j in rows[:limit]:
+            out.append({"dir": str(d), "id": str(j.get("id") or "")[:16], "agent": str(j.get("agent") or "")[:32],
+                "status": str(j.get("status") or "")[:12], "msg": str(j.get("message") or "")[:80]})
+    return out
+
+_LINK_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>ag link</title><style>
+body{font:13px -apple-system,system-ui,sans-serif;margin:0 12px;background:#101418;color:#d7dce2}
+h3{margin:14px 0 4px}a{color:#7fb2ff}code{color:#9ad}
+table{border-collapse:collapse;width:100%}th,td{border:1px solid #2a3038;padding:3px 8px;text-align:left}th{background:#1a2026}
+.up{color:#6ee787}.down{color:#ff7b72}
+#tlog{background:#05070a;border:1px solid #2a3038;padding:8px;white-space:pre-wrap;overflow:auto;max-height:55vh}
+</style></head><body>
+<h3>ag link <span id="up" class="down">?</span></h3>
+<table id="fw"><tr><th>mac</th><th>vm</th></tr></table>
+<h3>sessions</h3><table id="sess"></table>
+<h3>wakes</h3><table>__WAKES__</table>
+<h3>tail</h3><div id="tlog">(select a session)</div>
+<script>
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const sid=location.hash.slice(1);let next=0,dir=null;
+async function tail(){
+ if(!sid)return;
+ try{
+  const t=await(await fetch("/api/tail?dir="+encodeURIComponent(dir||"")+"&id="+encodeURIComponent(sid)+"&since="+next)).json();
+  if(!dir)return;
+  const p=document.getElementById("tlog");
+  if(t.text){p.textContent+=t.text;p.scrollTop=p.scrollHeight;}
+  next=t.next;
+ }catch(e){}
+}
+async function poll(){
+ try{
+  const st=await(await fetch("/api/status")).json();
+  const u=document.getElementById("up");
+  u.className=st.up?"up":"down";
+  u.textContent=st.up?("up pid "+st.pid+" restarts "+(st.restarts||0)):"down";
+  document.getElementById("fw").innerHTML="<tr><th>mac</th><th>vm</th></tr>"+(st.forwards||[]).map(f=>"<tr><td><a href='http://localhost:"+f.mac+"'>"+esc(f.title)+" http://localhost:"+f.mac+"</a></td><td>"+f.vm+"</td></tr>").join("");
+  const ss=await(await fetch("/api/sessions")).json();
+  const me=ss.find(r=>r.id===sid);if(me)dir=me.dir;
+  const rows=ss.map(r=>"<tr><td><a href='#"+esc(r.id)+"'>"+esc(r.id)+"</a></td><td>"+esc(r.name)+"</td><td><code>"+esc(r.cmd)+"</code></td><td class='"+(r.running?"up":"down")+"'>"+(r.running?"run":"exit "+r.exit)+"</td><td>"+r.idle_s+"</td><td>"+esc(r.dir)+"</td></tr>").join("");
+  document.getElementById("sess").innerHTML="<tr><th>id</th><th>name</th><th>cmd</th><th>state</th><th>idle_s</th><th>dir</th></tr>"+(rows||"<tr><td colspan='6'>(none)</td></tr>");
+ }catch(e){}
+ tail();setTimeout(poll,2000);
+}
+poll();
+</script></body></html>"""
+
+def _link_page():
+    import html as _h
+    rows = "".join("<tr><td>" + _h.escape(w["dir"]) + "</td><td>" + _h.escape(w["id"]) + "</td><td>" +
+        _h.escape(w["agent"]) + "</td><td>" + _h.escape(w["status"]) + "</td><td>" + _h.escape(w["msg"]) + "</td></tr>"
+        for w in _link_wakes())
+    wakes = "<tr><th>dir</th><th>wake</th><th>agent</th><th>status</th><th>msg</th></tr>" + (rows or "<tr><td colspan='5'>(none)</td></tr>")
+    return _LINK_PAGE.replace("__WAKES__", wakes)
+
+def _link_watch(port):
+    """Read-only ThreadingHTTPServer on 127.0.0.1:<port>; Host must be localhost/127.0.0.1 (DNS-rebinding guard).
+    GET /, /api/sessions, /api/status, /api/tail?dir&id&since. -> server; caller serve_forever()s it."""
+    import http.server
+    from urllib.parse import parse_qs
+
+    class H(http.server.BaseHTTPRequestHandler):
+        server_version = "ag-link"; protocol_version = "HTTP/1.1"
+        def log_message(self, *a): pass
+        def _send(self, code, body=b"", ctype="text/plain"):
+            self.send_response(code); self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff"); self.close_connection = True; self.end_headers()
+            if body: self.wfile.write(body)
+        def do_GET(self):
+            if (self.headers.get("Host") or "").rsplit(":", 1)[0] not in ("localhost", "127.0.0.1"):
+                return self._send(403, b"forbidden host")
+            path, _, qs = self.path.partition("?")
+            if path == "/": return self._send(200, _link_page().encode(), "text/html")
+            if path == "/api/sessions": return self._send(200, json.dumps(_link_sessions()).encode(), "application/json")
+            if path == "/api/status": return self._send(200, json.dumps(_link_status_read()).encode(), "application/json")
+            if path == "/api/tail":
+                q = parse_qs(qs)
+                d, sid = (q.get("dir") or [""])[0], (q.get("id") or [""])[0]
+                if not d: return self._send(400, b"bad dir")
+                if not re.fullmatch(r"[0-9a-fA-F]{1,16}", sid): return self._send(400, b"bad id")
+                ok = set()
+                for x in _link_sdirs():
+                    try: ok.add(str(Path(x).expanduser().resolve()))
+                    except OSError: pass
+                try: dres = str(Path(d).expanduser().resolve())
+                except OSError: dres = ""
+                if dres not in ok: return self._send(403, b"bad dir")
+                return self._send(200, json.dumps(_link_tail(d, sid, (q.get("since") or ["0"])[0])).encode(), "application/json")
+            return self._send(404, b"not found")
+        def do_POST(self): return self._send(405, b"read-only")
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(port)), H)
+    srv.daemon_threads = True
+    return srv
+
+def _link_status_path(): return ag_cache_home() / "link-status.json"
+def _link_pid_path(): return ag_cache_home() / "link.pid"
+def _link_log_path(): return ag_cache_home() / "link.log"
+
+def _link_status_read():
+    try:
+        d = json.loads(_link_status_path().read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception: return {}
+
+def _link_status_write(st):
+    """Atomic status file; internal keys (proc) are never written."""
+    try:
+        ag_cache_home().mkdir(parents=True, exist_ok=True)
+        _atomic_write(_link_status_path(), json.dumps({k: v for k, v in st.items() if k != "proc"}, indent=1))
+    except Exception: pass
+
+def _link_pid_write(pid):
+    try:
+        ag_cache_home().mkdir(parents=True, exist_ok=True)
+        _link_pid_path().write_text(f"{pid}\n")
+    except Exception: pass
+
+def _link_pid_read():
+    try: return int((_link_pid_path().read_text() or "").strip() or 0)
+    except Exception: return 0
+
+def _link_pid_clear():
+    try: _link_pid_path().unlink()
+    except OSError: pass
+
+def _link_ts(ts):
+    try: return datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S")
+    except Exception: return "-"
+
+_LINK_BACKOFF_CAP = 60.0  # supervisor restart delay cap (tests shrink it)
+_LINK_RESCAN_S = 30
+
+def _link_log(log, msg):
+    try: log.write(f"{time.strftime('%H:%M:%S')} link: {msg}\n"); log.flush()
+    except Exception: pass
+
+def _link_stop_ssh(proc):
+    if proc is None or proc.poll() is not None: return
+    try: proc.terminate()
+    except OSError: return
+    for _ in range(20):
+        if proc.poll() is not None: return
+        time.sleep(0.1)
+    try: proc.kill()
+    except OSError: pass
+
+def _link_supervise(cfg, log, watch=True, foreground=False):
+    """Restart ssh forever (backoff 2,4,8..60s); every 30s re-scan `auto` ports and restart ssh when the set changed.
+    Runs the watch server in-thread unless watch=False/bind fails. SIGTERM/SIGINT: stop ssh + watch, exit."""
+    import signal
+    pid = os.getpid()
+    _link_pid_write(pid)
+    srv = None
+    if watch and _link_watch_port(cfg):
+        try:
+            srv = _link_watch(_link_watch_port(cfg))
+            threading.Thread(target=srv.serve_forever, daemon=True, name="ag-link-watch").start()
+            _link_log(log, f"watch http://127.0.0.1:{_link_watch_port(cfg)}/")
+        except OSError as e:
+            _link_log(log, f"watch bind: {e}"); srv = None
+    st = {"pid": pid, "ssh_pid": None, "up": False, "since": time.time(), "restarts": 0, "last_error": None, "forwards": []}
+    def bye(sig, _frm):
+        _link_stop_ssh(st.get("proc"))
+        if srv:
+            try: srv.shutdown()
+            except Exception: pass
+        st.update(up=False)
+        _link_status_write(st)
+        _link_pid_clear()
+        os._exit(0)
+    signal.signal(signal.SIGTERM, bye)
+    if foreground: signal.signal(signal.SIGINT, bye)
+    _link_status_write(st)
+    prev, restarts = None, 0
+    while True:
+        live = _link_auto_ports(cfg) if cfg.get("ports") in (None, "auto") else None
+        if live is not None and prev is not None and set(live) != prev:
+            _link_log(log, f"listening ports changed {sorted(set(live) ^ prev)}")
+            _link_stop_ssh(st.get("proc"))
+        fws = _link_forwards(cfg, live=live, watch=srv is not None)
+        argv = _link_ssh_argv(cfg, fws)
+        _link_log(log, "start " + " ".join(shlex.quote(x) for x in argv))
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        st.update(proc=proc, ssh_pid=proc.pid, up=True, since=time.time(), forwards=fws)
+        _link_status_write(st)
+        if live is not None: prev = set(live)
+        changed = False
+        last_scan = time.time()
+        while True:
+            if proc.poll() is not None: break
+            if live is not None and time.time() - last_scan >= _LINK_RESCAN_S:
+                cur = set(_link_auto_ports(cfg))
+                if cur != prev:
+                    _link_log(log, f"listening ports changed {sorted(cur ^ prev)}; restarting ssh")
+                    changed = True; _link_stop_ssh(proc); break
+                last_scan = time.time()
+            time.sleep(0.5)
+        rc = proc.wait()
+        st.update(proc=None, ssh_pid=None, up=False, last_error=f"ssh exit {rc}")
+        _link_status_write(st)
+        if changed: continue
+        restarts += 1; st["restarts"] = restarts
+        _link_status_write(st)
+        delay = max(2.0, min(_LINK_BACKOFF_CAP, 2.0 ** min(restarts, 7)))
+        _link_log(log, f"ssh exit {rc}; retry in {delay:.0f}s")
+        time.sleep(delay)
+
+def _link_up(a):
+    cfg = _link_cfg()
+    if not cfg.get("to"): return emit(a, "link", error="no link.json", hint="ag link init --to USER@HOST")
+    pid = _link_pid_read()
+    if pid and _daemon_alive(pid): return emit(a, "link", error=f"link already running (pid {pid})", hint="ag link down first")
+    if a.foreground:
+        _link_supervise(cfg, sys.stderr, watch=not a.no_watch, foreground=True)
+        return 0  # supervise never returns
+    lpid = os.fork()
+    if lpid == 0:
+        try:
+            os.setsid()
+            log = open(_link_log_path(), "a")
+            dn = os.open(os.devnull, os.O_RDWR)
+            os.dup2(dn, 0); os.dup2(log.fileno(), 1); os.dup2(log.fileno(), 2)
+            if os.fork() == 0:
+                try: _link_supervise(cfg, log, watch=not a.no_watch)
+                finally: os._exit(0)
+        except Exception: pass
+        finally: os._exit(0)
+    os.waitpid(lpid, 0)
+    st = {}
+    for _ in range(40):
+        st = _link_status_read()
+        if st.get("pid"): break
+        time.sleep(0.05)
+    wf = [f for f in (st.get("forwards") or []) if f.get("title") == "watch"] or _link_ports_map({_link_watch_port(cfg)}, cfg)
+    url = f"http://localhost:{wf[0]['mac']}/"
+    return emit(a, "link", {"_text": f"link up (pid {st.get('pid') or '?'}); watch {url}", "pid": st.get("pid"), "watch_url": url})
+
+def _link_down(a):
+    st = _link_status_read()
+    pid = _link_pid_read() or int(st.get("pid") or 0)
+    sp = st.get("ssh_pid")
+    live = bool(pid and _daemon_alive(pid))
+    if not live:
+        _link_pid_clear()
+    if not live and not (sp and _daemon_alive(int(sp))):
+        return emit(a, "link", {"_text": "link not running", "running": False})
+    if live:
+        try: os.kill(pid, 15)
+        except OSError: pass
+        for _ in range(50):
+            if not _daemon_alive(pid): break
+            time.sleep(0.1)
+        else:
+            try: os.kill(pid, 9)
+            except OSError: pass
+    if sp and _daemon_alive(int(sp)):
+        try: os.kill(int(sp), 15)
+        except Exception: pass
+    _link_pid_clear()
+    return emit(a, "link", {"_text": f"link stopped (pid {pid})", "stopped": bool(pid)})
+
+def _link_status_cmd(a):
+    st = _link_status_read()
+    pid = _link_pid_read() or int(st.get("pid") or 0)
+    live = bool(pid and _daemon_alive(pid))
+    txt = [f"link {'live' if live else 'not running'} (pid {pid or '-'})"]
+    if st.get("up"): txt.append(f'up since {_link_ts(st.get("since"))}; restarts {st.get("restarts", 0)}')
+    if st.get("last_error"): txt.append(f'last_error {st["last_error"]}')
+    for f in st.get("forwards") or []:
+        txt.append(f"localhost:{f['mac']} -> vm {f['vm']} ({f.get('title') or 'port'})")
+    return emit(a, "link", {"_text": "\n".join(txt), "live": live, "pid": pid, **st})
+
+def _link_serve(a):
+    cfg = _link_cfg()
+    port = int(a.port or _link_watch_port(cfg))
+    try: srv = _link_watch(port)
+    except OSError as e: return emit(a, "link", error=f"bind {port}: {e}", hint="watch port busy; ag link down first")
+    emit(a, "link", {"_text": f"watch http://localhost:{port}/ (Ctrl-C stops)", "port": port})
+    try: srv.serve_forever()
+    except KeyboardInterrupt: pass
+    srv.server_close()
+    return 0
+
+def _link_run(a):
+    cfg = _link_cfg()
+    if not cfg.get("to"): return emit(a, "link", error="no link.json", hint="ag link init --to USER@HOST")
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+    if not cmd: return emit(a, "link", error="no command", hint="ag link run -- bash")
+    ports = cfg.get("ports") if isinstance(cfg.get("ports"), list) else []
+    wp = _link_watch_port(cfg)
+    mac = [f["mac"] for f in _link_ports_map({*ports, wp}, cfg) if f["vm"] == wp][0]
+    sid, _sp = _spawn_tracked(sdir, a.name or "", _shell_cmd(cmd), os.getcwd())
+    url = f"http://localhost:{mac}/#{sid}"
+    return emit(a, "link", {"_text": f"spawned {sid}; watch {url} (needs ag link up)", "id": sid, "url": url})
+
+def _link_mac_key(a):
+    try: pub = Path(a.pubkey).expanduser().read_text()
+    except OSError as e: return emit(a, "link", error=f"read: {e}")
+    ak = _link_ak(pub)
+    if not ak: return emit(a, "link", error="not an ssh public key", hint="ag link mac-key ~/.ssh/ag_link.pub")
+    return emit(a, "link", {"_text": f"add this restricted line to the Mac's ~/.ssh/authorized_keys:\n{ak}", "authorized_keys": ak})
+
+def _link_init(a):
+    to = (a.to or "").strip()
+    if not re.fullmatch(r"\S+@\S+", to): return emit(a, "link", error=f"bad --to {a.to!r}", hint="USER@HOST")
+    try: ports = _link_ports_parse(a.ports)
+    except ValueError as e: return emit(a, "link", error=str(e))
+    if not 0 < int(a.base) < 65536: return emit(a, "link", error="bad --base")
+    if not 0 < int(a.watch_port) < 65536: return emit(a, "link", error="bad --watch-port")
+    cfg = {"to": to, "key": a.key or _LINK_DEFS["key"], "ports": ports, "exclude": [22],
+        "base": int(a.base), "watch_port": int(a.watch_port), "map": {}}
+    _link_cfg_write(cfg)
+    kerr = _link_keygen(cfg["key"])
+    pub = ""
+    try: pub = Path(str(Path(cfg["key"]).expanduser()) + ".pub").read_text()
+    except OSError: pass
+    ak = _link_ak(pub)
+    txt = [f"wrote {_link_cfg_path()} (base {cfg['base']}, watch_port {cfg['watch_port']})"]
+    if pub: txt += [f"public key ({cfg['key']}.pub):", pub.strip()]
+    if ak:
+        txt += ["Mac side, append this restricted line to ~/.ssh/authorized_keys:", ak]
+    elif kerr: txt.append(f"key: {kerr}")
+    else: txt.append("no .pub next to the key; ag link mac-key PUBKEY_FILE prints the line")
+    return emit(a, "link", {"_text": "\n".join(txt), "cfg": cfg, "authorized_keys": ak, "pub": pub, "key_error": kerr})
+
+def do_link(a):
+    return {"init": _link_init, "up": _link_up, "down": _link_down, "status": _link_status_cmd,
+        "serve": _link_serve, "run": _link_run, "mac-key": _link_mac_key}[a.lsub](a)
+
 def build():
     p = argparse.ArgumentParser(prog="ag", description="CLI helper for autonomous agents")
     p.add_argument("--dir", default=None, help="state dir (default ./.agent)")
@@ -16632,6 +17137,14 @@ def build():
     bus.add_parser("show",help="limits + spent/used today")
     bset=bus.add_parser("set",help="set daily/monthly USD + provider rpd"); bset.add_argument("--daily",type=float,default=None,help="USD per UTC day"); bset.add_argument("--monthly",type=float,default=None,help="USD per UTC month"); bset.add_argument("--provider",default=None,help="provider id for --rpd"); bset.add_argument("--rpd",type=int,default=None,help="requests per UTC day for --provider")
     st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] | backend.B.(enabled|model|mode|plan|effort)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
+    lk = sub.add_parser("link", help="VM -> Mac view over outbound reverse SSH (docs/LINK.md)"); lks = lk.add_subparsers(dest="lsub", required=True)
+    lki = lks.add_parser("init", help="write link.json + create the key + print the Mac authorized_keys line"); lki.add_argument("--to", required=True, help="USER@HOST"); lki.add_argument("--key", default=None, help="private key path (default ~/.ssh/ag_link, created when missing)"); lki.add_argument("--ports", default="auto", help="auto | 3000,8080"); lki.add_argument("--base", type=int, default=41000, help="mac port base"); lki.add_argument("--watch-port", dest="watch_port", type=int, default=7790, help="vm watch page port")
+    lku = lks.add_parser("up", help="start the supervisor (ssh -R forwards + watch page; detached unless --foreground)"); lku.add_argument("--foreground", action="store_true"); lku.add_argument("--no-watch", dest="no_watch", action="store_true", help="no watch page / no watch forward")
+    lks.add_parser("down", help="stop supervisor + ssh")
+    lst = lks.add_parser("status", help="supervisor state + pid alive"); lst.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    lsv = lks.add_parser("serve", help="run the watch page server (foreground)"); lsv.add_argument("--port", type=int, default=None)
+    lkr = lks.add_parser("run", help="spawn a command + print the watch url"); lkr.add_argument("--name", default=""); lkr.add_argument("cmd", nargs=argparse.REMAINDER)
+    lkm = lks.add_parser("mac-key", help="print (never write) the restricted authorized_keys line for a pubkey file"); lkm.add_argument("pubkey")
     return p
 
 # ---- portable task snapshots (outbound SSH, no native runtime migration) ----
@@ -17172,7 +17685,7 @@ def main(argv=None):
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
-        "access":do_access,"usage":do_usage,"budget":do_budget}[a.subcmd]
+        "access":do_access,"usage":do_usage,"budget":do_budget,"link":do_link}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)
 

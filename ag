@@ -17388,13 +17388,16 @@ def _link_up(a):
     if lpid == 0:
         try:
             os.setsid()
+            _link_log_path().parent.mkdir(parents=True, exist_ok=True)
             log = open(_link_log_path(), "a")
             dn = os.open(os.devnull, os.O_RDWR)
             os.dup2(dn, 0); os.dup2(log.fileno(), 1); os.dup2(log.fileno(), 2)
             if os.fork() == 0:
                 try: _link_supervise(cfg, log, watch=not a.no_watch)
                 finally: os._exit(0)
-        except Exception: pass
+        except Exception as e:
+            try: _link_status_write({"up": False, "last_error": f"detach failed: {e}"[:200]})
+            except Exception: pass
         finally: os._exit(0)
     os.waitpid(lpid, 0)
     st = {}

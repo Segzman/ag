@@ -74,4 +74,57 @@ class Modes(unittest.TestCase):
         self.ag("agents","add","e2","--backend","echo","--mode","full")
         self.assertIn("[mode] echo", self.ag("chat","send","e2","hello"))
 
+    def test_allow_cmd_defaults_and_merge(self):
+        # item D: venv-python test runners + node syntax check are allowed; bare interpreters are NOT
+        for p in (".venv/bin/python -m unittest*",".venv/bin/python3 -m unittest*",".venv/bin/python -m pytest*","node --check*"):
+            self.assertIn(p, ag.OPENCODE_EDITS_BASH_ALLOW)
+        self.assertNotIn("python *", ag.OPENCODE_EDITS_BASH_ALLOW); self.assertNotIn("node *", ag.OPENCODE_EDITS_BASH_ALLOW)
+        perm = ag.opencode_permission("edits", extra=[".venv/bin/pytest*"])  # per-agent ADDED to the allowlist
+        self.assertEqual(perm["bash"][".venv/bin/pytest*"], "allow"); self.assertEqual(perm["bash"]["git status*"], "allow")
+        self.assertEqual(ag.opencode_permission("edits", extra=["git status*","git status*"])["bash"]["git status*"], "allow")  # dedupe no-op
+        self.assertEqual(ag.opencode_permission("ro", extra=["curl*"])["bash"], "ask")   # extras only touch edits
+        self.assertEqual(ag.opencode_permission("", extra=["curl*"]), {})
+
+    def test_allow_cmd_env_and_prompt(self):
+        sd = Path(self.td)/"sd"; sd.mkdir()
+        conf = Path(self.td)/"conf"; conf.mkdir()
+        (conf/"config.json").write_text(json.dumps({"opencode_bash_allow":{"edits":["git status*"]}}))  # global override replaces defaults
+        a = {"name":"oc","backend":"opencode","mode":"edits","allow_cmd":[".venv/bin/pytest*","node --check*"]}
+        old = os.environ.get("AG_CONFIG_HOME"); os.environ["AG_CONFIG_HOME"] = str(conf)
+        try:
+            env = ag.mode_env(sd, a, {})  # per-agent patterns survive the global override
+            self.assertEqual(json.loads(Path(env["OPENCODE_CONFIG"]).read_text())["permission"]["bash"],
+                {"*":"deny","git status*":"allow",".venv/bin/pytest*":"allow","node --check*":"allow"})
+            hint = ag.edits_shell_hint(a["allow_cmd"])
+            self.assertEqual(hint, "Shell is restricted; allowed command prefixes: git status*, .venv/bin/pytest*, node --check*")
+            prompt, _, _ = ag._turn_prompt(sd, a, "opencode", "", "fix tests", "", None)  # one hint line per edits turn
+            self.assertIn("fix tests", prompt); self.assertTrue(prompt.endswith("\n\n" + hint))  # platform preambles (macOS secrets note) may precede
+            p2, _, _ = ag._turn_prompt(sd, {**a, "allow_cmd": "bogus"}, "opencode", "", "fix tests", "", None)  # non-list ignored
+            self.assertIn("git status*", p2); self.assertNotIn("bogus", p2)
+            p3, _, _ = ag._turn_prompt(sd, {**a, "mode":"ro"}, "opencode", "", "fix tests", "", None)
+            self.assertNotIn("Shell is restricted", p3)
+            p4, _, _ = ag._turn_prompt(sd, {**a, "backend":"echo"}, "echo", "", "fix tests", "", None)
+            self.assertNotIn("Shell is restricted", p4)
+            p5, _, _ = ag._turn_prompt(sd, a, "opencode", "", "fix tests", "review", None)  # native command turn: bare
+            self.assertNotIn("Shell is restricted", p5)
+        finally:
+            if old is None: os.environ.pop("AG_CONFIG_HOME", None)
+            else: os.environ["AG_CONFIG_HOME"] = old
+
+    def test_allow_cmd_cli(self):
+        out = self.ag("agents","add","oc1","--backend","opencode","--mode","edits",
+            "--allow-cmd",".venv/bin/pytest*","--allow-cmd","node --check*")
+        self.assertIn("added", out)
+        r = {x["name"]:x for x in json.loads(self.ag("--json","agents","list"))["data"]["agents"]}["oc1"]
+        self.assertEqual(r["allow_cmd"], [".venv/bin/pytest*","node --check*"])  # visible in agents list --json
+        self.ag("agents","set","oc1","--allow-cmd","")
+        r = {x["name"]:x for x in json.loads(self.ag("--json","agents","list"))["data"]["agents"]}["oc1"]
+        self.assertEqual(r["allow_cmd"], [])  # "" clears
+        self.ag("agents","set","oc1","--allow-cmd",".venv/bin/python3 -m unittest*")
+        r = {x["name"]:x for x in json.loads(self.ag("--json","agents","list"))["data"]["agents"]}["oc1"]
+        self.assertEqual(r["allow_cmd"], [".venv/bin/python3 -m unittest*"])
+        self.ag("agents","fork","oc1","oc2")
+        r2 = {x["name"]:x for x in json.loads(self.ag("--json","agents","list"))["data"]["agents"]}["oc2"]
+        self.assertEqual(r2["allow_cmd"], [".venv/bin/python3 -m unittest*"])  # fork keeps the allowlist
+
 if __name__ == "__main__": unittest.main()

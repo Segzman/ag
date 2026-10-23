@@ -162,6 +162,18 @@ Interrupted turns exit 130, keep partial reply, never retried. `stop` leaves HOL
 
 Needs the global tick installed once (`schedule install --write`, see `ag-cli`); else nothing fires. Local clock, min 60s. Missed fixed-time >10min late skipped unless `--catch-up`. Default `--overlap skip`. Double ticks never double-fire.
 
+## Relay: schedules on another machine
+
+Schedules made here can run on another machine (even one accepting no inbound connections). One `relay init` per machine, all pointing at the same mailbox — a **private** git repo, or a folder you sync yourself — then run `relay sync` on every machine (global tick can drive it):
+
+```sh
+{{AG}} --dir <state> relay init --git URL | --dir MAILBOX [--node NAME] [--state DIR] [--workdir DIR] [--max-mode ro|edits|auto|full]
+{{AG}} --dir <state> relay sync | status        # heartbeat write on init; sync = pull, materialise/report, ingest, push
+{{AG}} --dir <state> relay results [--id ID] [--limit N] [--last]
+```
+
+Mailbox layout: `nodes/<node>.json` heartbeats, `schedules/<target>/<origin>--<id>.json`, `results/<origin>/<target>--<id>--<due>.json` — each node writes only its own files, so rebases never conflict. Target materialises inbound schedules into its `--state` (rows `<origin>--<id>`, agents `relay-<origin>-<name>`, workdirs `<workdir>/<origin>`; `agents add` guards and `--max-mode` clamp apply). Results land back in the origin row's state dir `relay/results/` and `relay results --last` prints the newest reply. Prompts and replies live in the mailbox — use a private repo and give the VM credentials. `status` alerts on a peer's differing `ag_commit` or silence > 2x its shortest schedule interval (or 1h). `--dir` on `init` is the mailbox, not the state dir. Dir transport nodes must be synced by their own means (ag does no copy).
+
 ## Reliability
 
 Stored session id unknown to backend ("Session not found" etc.) -> ag clears it, replays recent history into a fresh session, relaunches once, logs `[resume] ... started fresh`. Overload/503/529/connection reset/opencode free-tier 403 retried 2x (2s, 6s) only if the attempt produced no output (provider error events do not count). `AG_RETRY=0` disables. Rate limits (429 / `Rate limit exceeded` / `Endpoint is unavailable` / stall) use shared cooldown + backoff with per-model slots (measured per-model free limits: muse/space-bunny/mimo/big-pickle 1, nemotron 3, longcat/step-5 2; `AG_MAX_FREE_TOTAL` caps all free turns at 10; default fallback chains reroute free agents on 429/endpoint-unavailable; `AG_MAX_CONCURRENT`, `AG_STALL_S`); `agents add|set --fallback MODEL` (repeatable, `""` clears) keeps work moving after 2 hits. Stall watchdog (default 240 opencode, 0 others) overrides: `agents add|set NAME --stall-s N` (0 = off, "" clears), per turn `wake|chat send --stall-s N`; kill reports `raise it: ag agents set NAME --stall-s 900`. Logged-out backend fails fast (probe). codex headless resumes via `exec --json`. gemini is stateless. Lost wake (worker died): `wakes --reap [--dry-run] [--include-running] [--agent A] [--max-attempts 3]` relaunches; default only jobs lost while queued; `--include-running` redoes mid-turn losses (msg prefixed `[reap]`; verify state first).

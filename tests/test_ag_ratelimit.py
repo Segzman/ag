@@ -11,6 +11,13 @@ Run: python3 tests/test_ag_ratelimit.py
 import json, os, shutil, subprocess, sys, tempfile, threading, time, unittest
 from pathlib import Path
 
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
 AG = str(Path(__file__).resolve().parent.parent / "ag")
 
 FAKE = r'''#!/usr/bin/env python3
@@ -148,7 +155,7 @@ class RatelimitE2E(unittest.TestCase):
 
     def test_e_privacy_refusal_worse_fallback(self):
         from importlib.machinery import SourceFileLoader
-        mod = SourceFileLoader("ag_rl", AG).load_module()
+        mod = _load_src(SourceFileLoader("ag_rl", AG))
         mod.model_privacy = lambda b, m: "zdr" if "good" in m else "train"
         a = {"name": "x", "backend": "opencode", "model": "opencode/good-free", "data": "work",
              "fallback": ["opencode/bad-free"]}

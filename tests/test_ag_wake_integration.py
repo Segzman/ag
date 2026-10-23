@@ -10,10 +10,17 @@ import tempfile
 import threading
 import time
 
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
 AG = Path(__file__).resolve().parents[1] / 'ag'
 
 def module():
-    return importlib.machinery.SourceFileLoader('ag_wake_integration', str(AG)).load_module()
+    return _load_src(importlib.machinery.SourceFileLoader('ag_wake_integration', str(AG)))
 
 def test_exited_parent_descendant_timeout():
     """A successful parent exit must not disable a descendant pipe deadline."""

@@ -3,10 +3,17 @@
 import importlib.machinery, json, os, subprocess, sys, tempfile, time, unittest
 import fcntl
 from pathlib import Path
+
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
 AG = str(Path(__file__).resolve().parent.parent / "ag")
 
 def load():
-    m = importlib.machinery.SourceFileLoader("ag_cohort_t", AG).load_module()
+    m = _load_src(importlib.machinery.SourceFileLoader("ag_cohort_t", AG))
     td = Path(tempfile.mkdtemp(prefix="agco-")); sdir = td / "st"; m.ensure_state(sdir)
     m.save_agents(sdir, [{"name": n, "backend": "echo", "model": "default", "dir": ".", "role": "sub"}
         for n in ("boss", "a", "b", "c")])

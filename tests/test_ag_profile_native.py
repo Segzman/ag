@@ -21,13 +21,20 @@ import sys
 import tempfile
 from pathlib import Path
 
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
 AG = os.environ.get("AG_BIN", str(Path(__file__).resolve().parent.parent / "ag"))
 assert os.path.exists(AG), f"ag missing: {AG}"
 SECRET = "FIXTURE-SECRET-9f8e7d6c5b"
 
 
 def load_mod():
-    return importlib.machinery.SourceFileLoader("agmod2", AG).load_module()
+    return _load_src(importlib.machinery.SourceFileLoader("agmod2", AG))
 
 
 def run_ag(args, state, timeout=30):

@@ -5,8 +5,15 @@ import importlib.machinery, io, json, os, shutil, tempfile, unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
 _AG = str(Path(__file__).resolve().parent.parent / "ag")
-AG = importlib.machinery.SourceFileLoader("ag_fork_t", _AG).load_module()
+AG = _load_src(importlib.machinery.SourceFileLoader("ag_fork_t", _AG))
 
 
 class A:

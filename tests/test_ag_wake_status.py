@@ -29,13 +29,20 @@ import time
 import types
 from pathlib import Path
 
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
 _REPO_AG = str(Path(__file__).resolve().parent.parent / "ag")
 AG = os.environ.get("AG_WAKE_STATUS_BIN", _REPO_AG)
 assert os.path.exists(AG), f"ag missing: {AG}"
 
 
 def load_mod(name="agwakestatus"):
-    return importlib.machinery.SourceFileLoader(name, AG).load_module()
+    return _load_src(importlib.machinery.SourceFileLoader(name, AG))
 
 
 def run(state, *args, timeout=30, env=None):

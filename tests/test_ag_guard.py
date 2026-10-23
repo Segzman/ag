@@ -22,12 +22,19 @@ import tempfile
 import time
 from pathlib import Path
 
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
 AG = os.environ.get("AG_BIN", str(Path(__file__).resolve().parent.parent / "ag"))
 assert os.path.exists(AG), f"ag missing: {AG}"
 
 
 def load_mod(name="agguard"):
-    return importlib.machinery.SourceFileLoader(name, AG).load_module()
+    return _load_src(importlib.machinery.SourceFileLoader(name, AG))
 
 
 def run_ag(args, state, timeout=60, extra_env=None):
@@ -246,7 +253,7 @@ def t_wake_turn_holds_guard():
         [sys.executable, "-c",
          "import importlib.machinery,sys;"
          "from pathlib import Path;"
-         "m=importlib.machinery.SourceFileLoader('x',sys.argv[1]).load_module();"
+         "import importlib.util as u;l=importlib.machinery.SourceFileLoader('x',sys.argv[1]);m=u.module_from_spec(u.spec_from_loader('x',l));l.exec_module(m);"
          "print(m.run_turn(Path(sys.argv[2]),sys.argv[3],'hi'))",
          AG, str(st), "w1"],
         env=dict(os.environ, **env),

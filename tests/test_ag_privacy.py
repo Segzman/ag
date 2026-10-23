@@ -6,6 +6,13 @@ import http.server, json, os, subprocess, sys, tempfile, threading, unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
 HERE = Path(__file__).resolve().parent
 AG = os.environ.get("AG_BIN", str(HERE.parent / "ag"))
 FAKE_OPENCODE = """#!/bin/sh
@@ -64,7 +71,7 @@ class Privacy(unittest.TestCase):
     def lib(self, **env):
         old = {k: os.environ.get(k) for k in self.env}; os.environ.update({**self.env, **env})
         self.addCleanup(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v) for k, v in old.items()])
-        return SourceFileLoader(f"ag_priv_{id(self)}_{len(old)}", AG).load_module()
+        return _load_src(SourceFileLoader(f"ag_priv_{id(self)}_{len(old)}", AG))
 
     # ---- pure table ----
     def test_builtin_table_and_failsafe(self):

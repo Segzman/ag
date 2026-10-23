@@ -6,6 +6,13 @@ import json, os, subprocess, sys, tempfile, unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
 HERE = Path(__file__).resolve().parent
 AG = os.environ.get("AG_BIN", str(HERE.parent / "ag"))
 FAKE_OPENCODE = """#!/bin/sh
@@ -46,7 +53,7 @@ class Access(unittest.TestCase):
     def lib(self, **env):
         old = {k: os.environ.get(k) for k in self.env}; os.environ.update({**self.env, **env})
         self.addCleanup(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v) for k, v in old.items()])
-        return SourceFileLoader(f"ag_acc_{id(self)}", AG).load_module()
+        return _load_src(SourceFileLoader(f"ag_acc_{id(self)}", AG))
 
     def test_pure_match(self):
         ag = self.lib()
@@ -172,7 +179,7 @@ class Access(unittest.TestCase):
 class FailClosed(unittest.TestCase):  # swarm finding 2026-10-12: guards swallowed exceptions (fail open)
     def test_access_and_budget_fail_closed(self):
         import importlib.machinery
-        m = importlib.machinery.SourceFileLoader("ag_fc", str(Path(__file__).resolve().parent.parent / "ag")).load_module()
+        m = _load_src(importlib.machinery.SourceFileLoader("ag_fc", str(Path(__file__).resolve().parent.parent / "ag")))
         def boom(*a, **k): raise RuntimeError("x")
         m.access_effective = boom; m.budget_load = boom
         self.assertIn("fail closed", m.access_error("opencode", "opencode/x", "work") or "")

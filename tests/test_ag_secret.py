@@ -7,6 +7,13 @@ Run: python3 tests/test_ag_secret.py
 import hashlib, importlib.machinery, json, os, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
 AG = os.environ.get("AG_BIN", str(Path(__file__).resolve().parent.parent / "ag"))
 SECRET = "s3cret"
 # compare against a hash so the plaintext never appears in the logged command
@@ -127,7 +134,7 @@ class SecretTest(unittest.TestCase):
     def test_backend_toolout_note_once(self):
         os.environ["AG_ASKPASS_CMD"] = "true"
         try:
-            m = importlib.machinery.SourceFileLoader("ag_secret_mod", AG).load_module()
+            m = _load_src(importlib.machinery.SourceFileLoader("ag_secret_mod", AG))
             self.state.mkdir(parents=True)
             class Buf: pass
             buf, seen = Buf(), []

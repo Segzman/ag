@@ -9,6 +9,13 @@ import re
 import unittest
 from importlib.machinery import SourceFileLoader
 
+def _load_src(loader):  # SourceFileLoader.load_module was removed in Python 3.15
+    import importlib.util, sys
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY_FLAG_CMDS = [["setup"], ["models"], ["schedule", "add"], ["agents", "add"], ["agents", "set"], ["agents", "fork"], ["wake"],
                  ["chat", "send"], ["queue"], ["stop"], ["harness", "use"], ["ratelimit"], ["crosscheck"],
@@ -37,7 +44,7 @@ def _walk(parser, path, out):
 
 
 def _commands():
-    ag = SourceFileLoader("ag_doc_cov", os.path.join(ROOT, "ag")).load_module()
+    ag = _load_src(SourceFileLoader("ag_doc_cov", os.path.join(ROOT, "ag")))
     out = {}
     _walk(ag.build(), [], out)
     return out

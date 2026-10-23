@@ -543,8 +543,46 @@ def _agent_hint(sdir, name):
     if close: return f"did you mean: {', '.join(close)}? {base}"
     return base
 
+def verify_workdir(sdir, name):
+    """cwd for --verify: agent workdir when set, else process cwd."""
+    try:
+        ag_ = next((r for r in load_agents(sdir) if r.get("name") == name), None)
+        w = (ag_ or {}).get("dir") or ""
+        if w: return str(Path(w).expanduser())
+    except Exception: pass
+    return os.getcwd()
+
+def run_verify(sdir, name, cmd, timeout_s=600):
+    """Run one trusted verify command (sh -c) in the agent workdir. Never raises.
+
+    Returns {cmd, exit, tail}: tail = last 40 lines of combined output, 200
+    chars/line; exit 124 on timeout. The command comes from the orchestrator
+    (--verify), never from the agent's reply (self-reports are untrusted)."""
+    v = {"cmd": (cmd or "").strip(), "exit": 1, "tail": ""}
+    if not v["cmd"]: return {**v, "tail": "verify error: empty command"}
+    try: timeout_s = float(timeout_s or 600)
+    except Exception: timeout_s = 600.0
+    cwd = verify_workdir(sdir, name)
+    try:
+        p = subprocess.run(["sh", "-c", v["cmd"]], cwd=cwd, capture_output=True,
+            text=True, timeout=timeout_s)
+        out = "\n".join(l for l in ((p.stdout or "") + "\n" + (p.stderr or "")).splitlines() if l.strip())
+        v["exit"] = p.returncode
+        v["tail"] = "\n".join(l[:200] for l in out.splitlines()[-40:])
+    except subprocess.TimeoutExpired:
+        v["exit"] = 124; v["tail"] = f"verify timed out after {timeout_s:g}s in {cwd}"
+    except Exception as e:
+        v["tail"] = f"verify error: {type(e).__name__}: {str(e)[:120]}"
+    return v
+
+def verify_log_row(sdir, name, v):
+    """Best-effort one-line [verify] record in the agent's chat log."""
+    try: append_chat(sdir, name, "tool", f'[verify] exit={v.get("exit")}')
+    except Exception: pass
+
 def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
-        notify="", on_done="", timeout_s=0, max_runtime_s=0, stall_s=None, job_type=None, cohort=None, extra=None):
+        notify="", on_done="", timeout_s=0, max_runtime_s=0, stall_s=None, job_type=None, cohort=None, extra=None,
+        verify=None, verify_timeout_s=600):
     """Enqueue one wake job + spawn tracked worker. Returns {job,session} or {error}."""
     try: rows = load_agents(sdir)
     except Exception: rows = []
@@ -581,6 +619,11 @@ def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
     if max_runtime_s is None:
         _event(sdir, "wake_fail", trigger, agent=agent, exit=exit_code, reason="invalid max-runtime")
         return {"error": "invalid --max-runtime: need finite seconds >= 0"}
+    verify = (verify or "").strip()
+    vtmo = _valid_runtime(verify_timeout_s)
+    if verify and vtmo is None:
+        _event(sdir, "wake_fail", trigger, agent=agent, exit=exit_code, reason="invalid verify-timeout")
+        return {"error": "invalid --verify-timeout: need finite seconds >= 0"}
     jid = hashlib.sha256(f"{time.time()}{agent}{message}{os.getpid()}{trigger}".encode()).hexdigest()[:8]
     sid = hashlib.sha256(f"{time.time()}{agent}{jid}{os.getpid()}".encode()).hexdigest()[:6]
     try:
@@ -595,6 +638,7 @@ def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
         "timeout_s": timeout_s, "max_runtime_s": max_runtime_s,
         **({"stall_s": stall_s} if stall_s is not None else {}),
         **({"job": job_type} if job_type else {}),
+        **({"verify": verify, "verify_timeout_s": vtmo if vtmo is not None else 600} if verify else {}),
         **({"parent": cohort["parent"], "group": cohort["group"]} if cohort else {}), **(extra or {})}
     def _publish(wsid, sp):
         if cohort: _cohort_add(sdir, cohort, jid)
@@ -773,9 +817,10 @@ def _cohort_on_finish(sdir, job, status):
         if not g or jid not in g.get("pending", []): return
         g["pending"].remove(jid)
         txt = job.get("reply") if status == "done" else job.get("error")
+        _ve = job.get("verify", {}).get("exit") if isinstance(job.get("verify"), dict) else None
         g["done"].append({"jid": jid, "agent": job.get("agent"), "status": status,
             "cancelled": bool(job.get("cancelled")) or str(job.get("error", "")).startswith("cancelled"),
-            "summary": " ".join(str(txt or "").split())[:500]})
+            "summary": " ".join(str(txt or "").split())[:500] + (f' [verify exit={_ve}]' if _ve is not None else "")})
         if g.get("disposition") == "stopped": return _cohort_write(sdir, g)
         due = not g["pending"] or (g.get("quiet_s") and time.time() - g.get("last_ts", 0) >= g["quiet_s"])
         djid = g.get("delivery_jid"); dj = _wake_read_job(sdir, djid) if djid else {}
@@ -1020,26 +1065,34 @@ def do__wake_run(a):
         finally:
             _release_wake_job(lock)
     max_runtime_s = _valid_runtime(job.get("max_runtime_s")) or 0
+    vcmd = str(job.get("verify") or "")
     try:
         r = run_turn(sdir, agent, message, on_start=_on_start, timeout_s=max_runtime_s, stall_s=job.get("stall_s"), force=bool(job.get("force")))
     except Exception as e:
         _mark_failed(f"turn error: {e}", 1)
         return 1
+    _wvf = {}
+    if vcmd and ("error" not in r or r.get("timed_out")):  # verify only after a turn that ran; backend exit stays untouched
+        try: r["verify"] = run_verify(sdir, agent, vcmd, job.get("verify_timeout_s") or 600)
+        except Exception as e: r["verify"] = {"cmd": vcmd, "exit": 1, "tail": f"verify error: {e}"}
+        verify_log_row(sdir, agent, r["verify"])
+        _wvf = {"verify": r["verify"]}
     if r.get("timed_out"):
         _wake_finish(sdir, jid, "failed", error=r.get("error", "max-runtime exceeded"),
-            exit_code=124, fields={"timed_out": True})
+            exit_code=124, fields={"timed_out": True, **_wvf})
         return 1
     if "error" in r:
         _mark_failed(r["error"], r.get("exit", 1) if isinstance(r.get("exit"), int) else 1)
         return 1
     if r.get("interrupted"):
-        _wake_finish(sdir, jid, "failed", error="interrupted", exit_code=130, fields={"interrupted": True}); return 1
+        _wake_finish(sdir, jid, "failed", error="interrupted", exit_code=130, fields={"interrupted": True, **_wvf}); return 1
     code = r.get("exit", 0)
     if code != 0:
         excerpt = " ".join(str(r.get("reply") or "").split())[:160]
-        _mark_failed(f"backend exit {code}" + (f": {excerpt}" if excerpt else ""), code)
+        _wake_finish(sdir, jid, "failed", error=f"backend exit {code}" + (f": {excerpt}" if excerpt else ""),
+            exit_code=code, fields=_wvf or None)
         return 1
-    _wake_finish(sdir, jid, "done", reply=r.get("reply", ""))
+    _wake_finish(sdir, jid, "done", reply=r.get("reply", ""), fields=_wvf or None)
     return 0
 
 # ---- wakes --reap: relaunch jobs lost to a dead worker (exactly once per lost job) ----
@@ -1073,6 +1126,7 @@ def wakes_reap(sdir, queued_only=True, include_running=False, agent=None, max_at
         r = launch_wake_chat(sdir, j["agent"], msg, trigger=j.get("trigger"), exit_code=j.get("exit"),
             notify=j.get("notify", ""), on_done=j.get("on_done", ""), timeout_s=j.get("timeout_s", 0),
             max_runtime_s=j.get("max_runtime_s", 0), stall_s=j.get("stall_s"), job_type=j.get("job"),
+            verify=j.get("verify"), verify_timeout_s=j.get("verify_timeout_s", 600),
             cohort=({"parent": j["parent"], "group": j["group"], "quiet_s": 0} if j.get("group") else None),
             extra={"retry_of": j["id"], "attempts": at + 1})
         if "error" in r:
@@ -9784,20 +9838,31 @@ def do_chat(a):
         if timeout_s is None:
             return emit(a,"chat",error="invalid --timeout: need finite seconds >= 0 (0 = unlimited)",
                 hint="ag chat send NAME --timeout 300 TEXT")
+        vcmd = (getattr(a,"verify",None) or "").strip()
+        vtmo = _valid_runtime(getattr(a,"verify_timeout",600))
+        if vcmd and vtmo is None:
+            return emit(a,"chat",error="invalid --verify-timeout: need finite seconds >= 0",
+                hint='ag chat send NAME --verify "CMD" --verify-timeout 900 TEXT')
         live = not getattr(a,"json",False)
         if getattr(a,"job",None): _event(sdir,"chat_job",a.name,job=a.job)
-        _rc, _h = _rcpt(a, sdir, "chat", a.name, json.dumps([text,cmd,a.sub]))
+        _rc, _h = _rcpt(a, sdir, "chat", a.name, json.dumps([text,cmd,a.sub,vcmd,vtmo]))
         if _rc is not None: return _rc
         r = (agent_steer if a.sub=="steer" else run_turn)(sdir,a.name,text,command=cmd,timeout_s=timeout_s,force=bool(getattr(a,"force",False)),stall_s=getattr(a,"stall_s",None),
             on_event=(lambda n,k,t: print(t) if live and k=="text" and t else print(t,file=sys.stderr) if live and k=="tool" and (t or "").startswith("[mode]") else None)); _rcpt_done(_h, r)
         if "error" in r and not r.get("timed_out"):
             if r.get("exit") == 2: emit(a,"chat",error=r["error"]); return 2
             return emit(a,"chat",error=r["error"])
+        v = None
+        if vcmd:  # turn ran (errors above already returned); run trusted verify in the agent workdir
+            try: v = run_verify(sdir,a.name,vcmd,vtmo)
+            except Exception as e: v = {"cmd":vcmd,"exit":1,"tail":f"verify error: {e}"}
+            verify_log_row(sdir,a.name,v)
         if r.get("slash") and r.get("exit") and getattr(a,"json",False):
             return emit(a,"chat",error=f'/{r["slash"]} failed (exit {r["exit"]})',
                 hint=r["reply"][:300])
         if getattr(a,"json",False):
             data = {"reply":r["reply"],"exit":r["exit"],"sid":r["sid"]}
+            if v: data["verify"] = v
             if r.get("usage"): data["usage"] = r["usage"]
             for _k in ("interrupted","steered"):
                 if r.get(_k): data[_k] = True
@@ -9812,7 +9877,7 @@ def do_chat(a):
             emit(a,"chat",error=r.get("error") or "max-runtime exceeded",
                 hint=f'ag chat log {a.name}')
             return 124
-        return emit(a,"chat",{"_text":f'[exit={r["exit"]}]'})
+        return emit(a,"chat",{"_text":f'[exit={r["exit"]}]' + (f' verify={v["exit"]}' if v else "")})
     if a.sub in ("diff","revert","checkpoints"): return do_chat_ckpt(a,sdir)
     if a.sub=="usage":
         ag_ = next((x for x in load_agents(sdir) if x.get("name")==a.name), None)
@@ -9870,6 +9935,11 @@ def do_wake(a):
         stall_s = _valid_runtime(stall_s)
         if stall_s is None:
             return emit(a,"wake",error="invalid --stall-s: need finite seconds >= 0 (0 = off)")
+    vcmd = (getattr(a,"verify",None) or "").strip()
+    vtmo = _valid_runtime(getattr(a,"verify_timeout",600))
+    if vcmd and vtmo is None:
+        return emit(a,"wake",error="invalid --verify-timeout: need finite seconds >= 0",
+            hint='ag wake <agent> --verify "CMD" --verify-timeout 900 <message>')
     if not agent: return emit(a,"wake",error="no agent given",hint="ag wake <agent> <message>")
     if not text: return emit(a,"wake",error="empty message",hint="ag wake <agent> <message>")
     try: names = [r.get("name") for r in load_agents(sdir)]
@@ -9880,14 +9950,15 @@ def do_wake(a):
     if cerr:
         parent = (getattr(a, "parent", None) or "").strip()
         return emit(a,"wake",error=cerr,hint=_agent_hint(sdir, parent))
-    _rc, _h = _rcpt(a, sdir, "wake", agent, json.dumps([text,notify,on_done,timeout_s,max_runtime_s,stall_s,ck.get("cohort")],default=str))
+    _rc, _h = _rcpt(a, sdir, "wake", agent, json.dumps([text,notify,on_done,timeout_s,max_runtime_s,stall_s,ck.get("cohort"),vcmd,vtmo],default=str))
     if _rc is not None: return _rc
     if agent not in names:  # after _rcpt: failure stays replayable, still no job file / spawn
         r = {"error": f"no such agent: {agent}"}
         _rcpt_done(_h, r)
         return emit(a,"wake",error=r["error"],hint=_agent_hint(sdir, agent))
     r = launch_wake_chat(sdir,agent,text,notify=notify,on_done=on_done,timeout_s=timeout_s,
-        max_runtime_s=max_runtime_s,stall_s=stall_s,job_type=getattr(a,"job",None),extra=({"force": True} if getattr(a,"force",False) else None),**ck); _rcpt_done(_h, r)
+        max_runtime_s=max_runtime_s,stall_s=stall_s,job_type=getattr(a,"job",None),verify=vcmd,verify_timeout_s=vtmo,
+        extra=({"force": True} if getattr(a,"force",False) else None),**ck); _rcpt_done(_h, r)
     if "error" in r:
         if r.get("exit") == 2: emit(a,"wake",error=r["error"]); return 2
         return emit(a,"wake",error=r["error"],hint=_agent_hint(sdir, agent))
@@ -12669,7 +12740,14 @@ def do_delegate(a):
     if timeout_s is None:
         return emit(a,"delegate",error="invalid --timeout: need finite seconds >= 0 (0 = unlimited)",
             hint="ag delegate AGENT --timeout 300 TASK")
-    _rc, _h = _rcpt(a, sdir, "delegate", a.agent, json.dumps([task, getattr(a,"parent",None), getattr(a,"group",None)]) if (getattr(a,"parent",None) or getattr(a,"group",None)) else task)
+    vcmd = (getattr(a,"verify",None) or "").strip()
+    vtmo = _valid_runtime(getattr(a,"verify_timeout",600))
+    if vcmd and vtmo is None:
+        return emit(a,"delegate",error="invalid --verify-timeout: need finite seconds >= 0",
+            hint='ag delegate AGENT --verify "CMD" --verify-timeout 900 TASK')
+    _rk = [task, getattr(a,"parent",None), getattr(a,"group",None)] if (getattr(a,"parent",None) or getattr(a,"group",None)) else None
+    if vcmd: _rk = (_rk or [task]) + [vcmd, vtmo]  # plain delegates keep their old receipt key
+    _rc, _h = _rcpt(a, sdir, "delegate", a.agent, json.dumps(_rk) if _rk else task)
     if _rc is not None: return _rc
     if getattr(a,"parent",None) or getattr(a,"group",None):
         ck, cerr = _cohort_kw(sdir, a)
@@ -12683,7 +12761,7 @@ def do_delegate(a):
             r = {"error": f"no such agent: {a.agent}"}
             _rcpt_done(_h, r)
             return emit(a,"delegate",error=r["error"],hint=_agent_hint(sdir, a.agent))
-        r = launch_wake_chat(sdir,a.agent,task,max_runtime_s=timeout_s,job_type=getattr(a,"job",None),extra=({"force": True} if getattr(a,"force",False) else None),**ck)
+        r = launch_wake_chat(sdir,a.agent,task,max_runtime_s=timeout_s,job_type=getattr(a,"job",None),verify=vcmd,verify_timeout_s=vtmo,extra=({"force": True} if getattr(a,"force",False) else None),**ck)
         _rcpt_done(_h, r)
         if "error" in r:
             if isinstance(r, dict) and r.get("exit") == 2: emit(a,"delegate",error=r["error"]); return 2
@@ -12695,8 +12773,14 @@ def do_delegate(a):
     if "error" in r and not r.get("timed_out"):
         if r.get("exit") == 2: emit(a,"delegate",error=r["error"]); return 2
         return emit(a,"delegate",error=r["error"],hint=_agent_hint(sdir, a.agent))
+    v = None
+    if vcmd:  # turn ran; trusted verify in the agent workdir, same shape as chat send --verify
+        try: v = run_verify(sdir,a.agent,vcmd,vtmo)
+        except Exception as e: v = {"cmd":vcmd,"exit":1,"tail":f"verify error: {e}"}
+        verify_log_row(sdir,a.agent,v)
     if getattr(a,"json",False):
         data = {"reply":r["reply"],"exit":r["exit"],"agent":a.agent}
+        if v: data["verify"] = v
         if r.get("timed_out"):
             data["timed_out"] = True
             data["error"] = r.get("error", "")
@@ -12708,7 +12792,7 @@ def do_delegate(a):
         emit(a,"delegate",error=r.get("error") or "max-runtime exceeded",
             hint=f'ag chat log {a.agent}')
         return 124
-    return emit(a,"delegate",{"_text":f'delegated to {a.agent} (exit={r["exit"]})'})
+    return emit(a,"delegate",{"_text":f'delegated to {a.agent} (exit={r["exit"]})' + (f' verify={v["exit"]}' if v else "")})
 
 # ---- crosscheck: same task to 2+ agents in parallel, compare answers ----
 # ponytail: threads + run_turn (per-agent queue = own session), difflib only.
@@ -16470,7 +16554,7 @@ def build():
     ch = sub.add_parser("chat",help="talk to an agent headless"); chs=ch.add_subparsers(dest="sub",required=True)
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
     chs2.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); chs2.add_argument("--command",default=None,help="opencode native custom command (message becomes its args)")
-    chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); chs2.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); chs2.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); chs2.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
+    chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); chs2.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); chs2.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); chs2.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); chs2.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the turn, ag runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail(40 lines)} in the result + a [verify] row in the chat log (never from the agent's reply)"); chs2.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)")
     chst=chs.add_parser("steer",help="interrupt the running turn, run this next (priority 0, same session)"); chst.add_argument("name"); chst.add_argument("text",nargs="*"); chst.add_argument("--timeout",type=float,default=1800); chst.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
     qu=sub.add_parser("queue",help="per-agent turn queue: list/cancel/hold/release"); qu.add_argument("agent"); qu.add_argument("--cancel",default=None,metavar="ID"); qu.add_argument("--hold",action="store_true"); qu.add_argument("--release",action="store_true")
     sp_=sub.add_parser("stop",help="hold queue, cancel waiters + wakes, interrupt running turn"); sp_.add_argument("agent"); sp_.add_argument("--cascade",action="store_true",help="also stop agents whose jobs record parent == agent")
@@ -16497,7 +16581,7 @@ def build():
     _padd=pvs.add_parser("add",help="add/update a provider (presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova)"); _padd.add_argument("pid",help="provider id"); _padd.add_argument("--base-url",dest="base_url",default=None,help="OpenAI-compat base URL"); _padd.add_argument("--key-ref",dest="key_ref",default=None,help="keychain:NAME or ${VAR} (never a literal secret)"); _padd.add_argument("--npm",default=None,help="AI-SDK package (default @ai-sdk/openai-compatible)"); _padd.add_argument("--privacy",default=None,choices=["zdr","retain","train"],help="data class"); _padd.add_argument("--max-concurrent",dest="max_concurrent",type=int,default=None,help="ratelimit slots for <provider>/*"); _padd.add_argument("--rpd",type=int,default=None,help="known free-tier requests/day"); _padd.add_argument("--model",dest="models",action="append",default=None,help="model id (repeatable)")
     _prm=pvs.add_parser("rm",help="remove a provider"); _prm.add_argument("pid",help="provider id")
     _psh=pvs.add_parser("show",help="show one provider"); _psh.add_argument("pid",help="provider id")
-    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); dg.add_argument("--parent",default=None,help="run as background wake; auto-wake PARENT when its cohort finishes"); dg.add_argument("--group",default=None); dg.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); dg.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); dg.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
+    dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); dg.add_argument("--parent",default=None,help="run as background wake; auto-wake PARENT when its cohort finishes"); dg.add_argument("--group",default=None); dg.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); dg.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the turn (or in the background wake job), run trusted CMD via sh -c in the agent workdir and record {cmd,exit,tail} (never from the agent's reply)"); dg.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); dg.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); dg.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
     cc=sub.add_parser("crosscheck",help="same task to 2+ agents in parallel, compare answers"); cc.add_argument("aname",help="first agent"); cc.add_argument("bname",help="second agent"); cc.add_argument("task",nargs="*",help="self-contained task both agents answer"); cc.add_argument("--more",action="append",nargs="+",default=[],metavar="AGENT",help="extra agent (repeatable or space-separated)"); cc.add_argument("--judge",default=None,metavar="AGENT",help="third agent asked which answer is right and why (one turn)"); cc.add_argument("--timeout",type=float,default=1800,help="per-agent backend budget in seconds (0=unlimited, default 1800)"); cc.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
     cx=sub.add_parser("context",help="scoped guidance + persistent memory"); cxs=cx.add_subparsers(dest="ctxsub",required=False)
     cxs.add_parser("init",help="non-destructive scaffold of context state")
@@ -16508,7 +16592,7 @@ def build():
     cmc=cms.add_parser("config",help="role defaults / per-agent override"); cmc.add_argument("--role",dest="cprole",default=None,choices=["orchestrator","sub"]); cmc.add_argument("--agent",dest="cpagent",default=None); cmc.add_argument("--enable",dest="cpenable",action="store_true",default=None); cmc.add_argument("--disable",dest="cpdisable",action="store_true"); cmc.add_argument("--max-turns",dest="cpmax",type=int,default=None); cmc.add_argument("--tokens",dest="cptokens",type=int,default=None); cmc.add_argument("--keep",dest="cpkeep",type=int,default=None); cmc.add_argument("--timeout",dest="cptimeout",type=int,default=None); cmc.add_argument("--clear",dest="cpclear",action="store_true")
     cmsh=cms.add_parser("show",help="effective settings + stats"); cmsh.add_argument("cpname",nargs="?",default="")
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
-    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
+    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)")
     sc=sub.add_parser("schedule",help="recurring wakes (one global launchd/cron tick)"); scs=sc.add_subparsers(dest="ssub",required=True)
     sca=scs.add_parser("add"); sca.add_argument("agent"); sca.add_argument("message",nargs="+"); sca.add_argument("--every",default=None,help="15m | 2h | 1d (>=60s)"); sca.add_argument("--at",default=None,help="HH:MM local"); sca.add_argument("--days",default=None,help="mon-fri | mon,wed,fri | daily | weekends (with --at)"); sca.add_argument("--max-runtime",dest="max_runtime",type=float,default=0); sca.add_argument("--notify",default=""); sca.add_argument("--on-done",dest="on_done",default=""); sca.add_argument("--job",default=None,choices=JOB_KEYS); sca.add_argument("--overlap",choices=["skip","queue"],default="skip"); sca.add_argument("--catch-up",dest="catch_up",action="store_true",help="fixed-time: fire even if >10min late"); sca.add_argument("--disabled",action="store_true"); sca.add_argument("--id",default=None)
     scl=scs.add_parser("list"); scl.add_argument("--all",action="store_true",help="every registered state dir")

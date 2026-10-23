@@ -4500,6 +4500,7 @@ OPENCODE_EDITS_BASH_ALLOW = ["cd *", "ls", "ls *", "pwd", "cat *", "head *", "ta
     "tsc*", "npx tsc*", "bunx tsc*", "bun test*", "bun run test*", "bun run lint*", "bun run typecheck*", "bun run build*",
     "npm test*", "npm run test*", "npm run lint*", "npm run typecheck*", "npm run build*", "pnpm test*", "pnpm run *",
     "yarn test*", "yarn run *", "pytest*", "python -m pytest*", "python3 -m pytest*", "python -m unittest*", "python3 -m unittest*",
+    ".venv/bin/python -m unittest*", ".venv/bin/python3 -m unittest*", ".venv/bin/python -m pytest*", "venv/bin/python -m unittest*", "node --check*",
     "go test*", "go vet*", "go build*", "cargo test*", "cargo check*", "cargo clippy*", "cargo build*",
     "ruff *", "eslint *", "npx eslint*", "prettier --check*", "make test*", "make check*", "make lint*", "mkdir *"]
 
@@ -4513,12 +4514,13 @@ def opencode_bash_allow(mode):
     except Exception: pass
     return list(OPENCODE_EDITS_BASH_ALLOW) if mode == "edits" else []
 
-def opencode_permission(mode="", plan=False):
+def opencode_permission(mode="", plan=False, extra=()):
     """Pure-ish: opencode `permission` config block for the mode ({} = leave backend default).
     Verified on opencode 1.18 (2026-10-13): a bare "deny" drops the tool and Zen free models 403;
     "*":"ask" overrides every allow rule (whatever the order) and headless runs reject asks;
     "*":"deny" + allow patterns works and keeps the tool. So: ro = ask everything (truly no shell);
-    edits = deny-by-default shell with an allowlist (git/tests/typecheck/lint/read-only)."""
+    edits = deny-by-default shell with an allowlist (git/tests/typecheck/lint/read-only).
+    extra: per-agent --allow-cmd patterns ADDED on top of the resolved edits allowlist."""
     m = "ro" if plan else mode
     # ro/edits: deny every tool by default ("*": "deny"), then allow built-ins. Plugin/MCP tools (e.g. a
     # context-mode ctx_execute that runs shell) are otherwise unaffected by bash/edit rules; the `tools` switch
@@ -4526,14 +4528,22 @@ def opencode_permission(mode="", plan=False):
     base = {"*": "deny", **{t: "allow" for t in OPENCODE_CORE_TOOLS if t not in ("bash", "edit", "write", "patch")}}
     if m == "ro": return {**base, "edit": "ask", "bash": "ask"}
     if m == "edits":
-        allow = opencode_bash_allow("edits")
+        allow = list(opencode_bash_allow("edits"))
+        allow = list(dict.fromkeys(allow + [str(p).strip() for p in (extra or ()) if str(p).strip()]))
         return {**base, "edit": "allow", "bash": ({"*": "deny", **{p: "allow" for p in allow}} if allow else "ask")}
     return {"auto": {"edit": "allow", "bash": "allow"}, "full": {"*": "allow"}}.get(m, {})
+
+def edits_shell_hint(extra=()):
+    """One-line 'what shell is allowed' hint for edits-mode opencode prompts (accident
+    guard, NOT a sandbox: prefixes only, chained commands still ride an allowed prefix)."""
+    allow = list(opencode_bash_allow("edits"))
+    allow = list(dict.fromkeys(allow + [str(p).strip() for p in (extra or ()) if str(p).strip()]))
+    return f"Shell is restricted; allowed command prefixes: {', '.join(allow)}" if allow else ""
 
 def mode_env(sdir, agent, env):
     """Overlay OPENCODE_CONFIG with a generated config carrying the `permission` block,
     merged onto the profile's config (env['OPENCODE_CONFIG']) if any. No-op otherwise."""
-    perm = opencode_permission(agent.get("mode") or "", bool(agent.get("plan"))) if agent.get("backend") == "opencode" else {}
+    perm = opencode_permission(agent.get("mode") or "", bool(agent.get("plan")), agent.get("allow_cmd") if isinstance(agent.get("allow_cmd"), list) else ()) if agent.get("backend") == "opencode" else {}
     if not perm: return env
     base = {}
     if env.get("OPENCODE_CONFIG"):
@@ -6681,7 +6691,7 @@ def do_agents_fork(a, sdir):
         "persona": pers, "system": scol.get("system", "") or "",
         "instructions": list(scol.get("instructions") or []),
         "forked_from": src, "forked_at": now_iso(), "fork_turn": fork_turn}
-    for k in ("mode", "plan", "effort", "transport", "acp_cmd", "profile", "env", "env_unset", "subscription_only", "data", "fallback", "claude_config_dir"):  # data: a fork must not silently change privacy class
+    for k in ("mode", "plan", "effort", "transport", "acp_cmd", "profile", "env", "env_unset", "subscription_only", "data", "fallback", "claude_config_dir", "allow_cmd"):  # data: a fork must not silently change privacy class
         if k == "effort":
             if eff not in (None, ""): row["effort"] = eff
             continue
@@ -6884,9 +6894,11 @@ def do_agents(a):
             wt, err, hint = wt_create(a.name, adir, getattr(a,"base",None))
             if err: return emit(a,"agents",error=err,hint=hint)
             adir = wt["path"]
+        _ac = [s.strip() for s in (getattr(a,"allow_cmd",None) or []) if s.strip()]
         rows.append({"name":a.name,"backend":be,"model":mod,**({"job":job} if job else {}),
             "dir":adir,"role":a.role,"persona":pers,"system":getattr(a,"system",None) or "",
             "instructions":[s for s in (getattr(a,"instructions",None) or []) if (s or "").strip()],
+            **({"allow_cmd": _ac} if _ac else {}),
             **({"mode":a.mode} if getattr(a,"mode",None) else {}),**({"plan":True} if getattr(a,"plan",None) else {}),
             "data":data,
             **({"worktree":wt} if wt else {}),**{k:getattr(a,k) for k in ("transport","acp_cmd","effort") if getattr(a,k,None)}})
@@ -6930,6 +6942,8 @@ def do_agents(a):
             if a.mode not in MODES + ("",): return emit(a, "agents", error=f"bad mode: {a.mode}", hint='|'.join(MODES)+' ("" clears)')
             updates["mode"] = a.mode
         if getattr(a, "plan", None) is not None: updates["plan"] = a.plan
+        if getattr(a, "allow_cmd", None) is not None:
+            updates["allow_cmd"] = [s.strip() for s in a.allow_cmd if s.strip()]
         if getattr(a, "data", None) is not None:
             dv = (a.data or "").strip().lower()
             if dv not in ("work", "public", ""): return emit(a, "agents", error=f"bad --data {a.data!r}: work|public (\"\" clears)")
@@ -8247,6 +8261,10 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
     if sys_txt and backend not in ("claude","codex") and not sid and not command:
         # backends without a native system flag: lead the first turn with the role block
         prompt = f'[system role: {a.get("persona") or "custom"}]\n{sys_txt}\n\n---\n{prompt}'
+    if backend == "opencode" and not command and ("ro" if a.get("plan") else (a.get("mode") or "")) == "edits":
+        # edits deny-by-default shell is invisible to the agent until it wastes a turn: say what runs
+        _sh = edits_shell_hint(a.get("allow_cmd") if isinstance(a.get("allow_cmd"), list) else ())
+        if _sh: prompt = f"{prompt}\n\n{_sh}"
     return prompt, sys_txt, prof_name
 
 def _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, prof_name):
@@ -13338,6 +13356,7 @@ def do_selfcheck(a):
         _e = env_apply({"PATH":"/b","Z":"1"}, {"PATH+":"/d","K":"${NOPE_AG_SC}"}, ["Z"], _n:=[]); assert _e=={"PATH":"/d"+os.pathsep+"/b"} and len(_n)==1, (_e,_n)
         assert backend_argv("claude",prompt="hi",mode="ro")[-3:]==["--permission-mode","dontAsk","hi"] and mode_flags("gemini")==["--approval-mode","default"]
         assert mode_flags("codex","full")==["-s","danger-full-access"] and opencode_permission("full")=={"*":"allow"} and opencode_permission("ro")["*"]=="deny" and opencode_permission("ro")["bash"]=="ask" and opencode_permission("ro")["read"]=="allow" and opencode_permission("edits")["bash"]["*"]=="deny" and opencode_permission("edits")["bash"]["git status*"]=="allow" and "git push*" not in opencode_permission("edits")["bash"] and mode_warning("echo","ro") and not mode_warning("claude","ro")
+        assert opencode_permission("edits", extra=[".venv/bin/pytest*"])["bash"][".venv/bin/pytest*"]=="allow" and edits_shell_hint([".venv/bin/pytest*"]).endswith(".venv/bin/pytest*") and all(p in edits_shell_hint() for p in (".venv/bin/python -m unittest*",".venv/bin/python3 -m unittest*",".venv/bin/python -m pytest*","node --check*")) and opencode_permission("ro")["bash"]=="ask"
         # unknown /word: explicit real route, never model prose
         _r = run_turn(td,"pa","/frobnicate")
         assert _r["exit"]==1 and "NOT sent to the model" in _r["reply"] and "/handoff" in _r["reply"], _r
@@ -16313,10 +16332,10 @@ def build():
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model")
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra opencode edits-mode shell allowlist prefix (repeatable; "" clears)'); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
     agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)')
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra opencode edits-mode shell allowlist prefix (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)')
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)

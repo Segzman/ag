@@ -49,6 +49,7 @@ class StallUnit(unittest.TestCase):
 
     def restore_env(self):
         if self.saved is not None: os.environ["AG_STALL_S"] = self.saved
+        else: os.environ.pop("AG_STALL_S", None)  # tests set it; don't leak into later suites (test_setup_muse selfcheck)
 
     def test_backend_default_when_unset(self):
         self.assertEqual(self.m._turn_stall_s({}, "echo"), 0)          # echo backend: watchdog off

@@ -23,13 +23,14 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 {{AG}} --dir <state> agents ps [--tree]          # live turns/wakes: pids, CPU, RSS, elapsed
 {{AG}} --dir <state> agents add w --backend opencode --role sub [--model ID] [--data work|public] [--job mechanical]
 {{AG}} --dir <state> agents set w --model ID | --backend B | --persona planner | --worktree
-{{AG}} --dir <state> agents rm w [--force]
+{{AG}} --dir <state> agents rm w [--force] [--purge]
+{{AG}} --dir <state> agents reset w               # clear stored session ids; keep config and chat log
 {{AG}} --dir <state> agents fork src new [--backend B] [--model ID] [--effort E] [--worktree]   # clone config + history, fresh session; list shows `<- src`; refused while src busy
 {{AG}} --dir <state> harness use w codex [--budget N]   # switch backend; next turn replays old history bounded by N tokens (default 4000, AG_HANDOFF_BUDGET); harness current w shows it
 {{AG}} --dir <state> models --backend opencode   # valid model ids
 ```
 
-`agents add` without `--model/--mode/--plan/--effort` takes backend defaults from routing (set via `ag setup`). `--job JOB` fills backend+model+effort from routing when `--backend` absent (`ag route` shows `backend/model@effort`). `delegate`/`wake`/`chat send --job` only record the job; never switch an agent. Switches refuse while busy. `default` model = no `-m`. `echo` = keyless test backend. `doctor` probe: logged-out backend fails turns fast (`not logged in to <backend>`), unknown proceeds; cache 60s; `AG_PROBE=0` disables.
+`agents add` without `--model/--mode/--plan/--effort` takes backend defaults from routing (set via `ag setup`). `--job JOB` fills backend+model+effort from routing when `--backend` absent (`ag route` shows `backend/model@effort`). `delegate`/`wake`/`chat send --job` only record the job; never switch an agent. `agents rm` clears stored session ids but keeps chat history; `--purge` also deletes chat log and metadata. Re-adding the name starts a fresh session. `agents reset` clears every backend session id while keeping config and chat history. Switches refuse while busy. `default` model = no `-m`. `echo` = keyless test backend. `doctor` probe: logged-out backend fails turns fast (`not logged in to <backend>`), unknown proceeds; cache 60s; `AG_PROBE=0` disables.
 
 ### Caps and permission modes
 
@@ -175,6 +176,8 @@ Schedules made here can run on another machine (even one accepting no inbound co
 Mailbox layout: `nodes/<node>.json` heartbeats, `schedules/<target>/<origin>--<id>.json`, `results/<origin>/<target>--<id>--<due>.json` — each node writes only its own files, so rebases never conflict. Target materialises inbound schedules into its `--state` (rows `<origin>--<id>`, agents `relay-<origin>-<name>`, workdirs `<workdir>/<origin>`; `agents add` guards and `--max-mode` clamp apply). Results land back in the origin row's state dir `relay/results/` and `relay results --last` prints the newest reply. Prompts and replies live in the mailbox — use a private repo and give the VM credentials. `status` alerts on a peer's differing `ag_commit` or silence > 2x its shortest schedule interval (or 1h). `--dir` on `init` is the mailbox, not the state dir. Dir transport nodes must be synced by their own means (ag does no copy).
 
 Remote schedule: configure both machines with `ag relay init` pointed at the same private git mailbox, using a different `--node` on each. Run `schedule install --write` on both. Then `schedule add w --every 1h --on muse "msg"` publishes work for `muse`; the origin tick never fires it. Pause/resume publish enabled state, `rm` unpublishes, and `run ID` explains that a remote row runs on its target at the next due time. The target's `--max-mode` defaults to `edits`. Prompts and replies are stored in the mailbox, so keep it private and match its access to the data being relayed.
+
+One-shot cloud run: `{{AG}} --dir <state> wake w "task" --on muse` publishes an immediate run. The target fires it on its next tick and reports once; the origin sync ingests the reply, removes the mailbox request, and clears the pending `remote@muse` row from `wakes`. Use the returned ID with `relay results --id ID`. Git mailboxes need credentials on both machines; dir mailboxes need a separate sync mechanism.
 
 ## Reliability
 

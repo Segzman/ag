@@ -233,10 +233,13 @@ ag agents add v --backend api --model PROVIDER/MODEL [--data work|public]   # e.
 ag agents doctor | list
 ag agents add w --backend opencode --role sub [--model ID] [--data work|public] [--dir D] [--persona P|--system TEXT|@file] [--job JOB]
 ag agents set w --backend B --model ID --persona P --worktree      # refused while busy
-ag agents rm w [--force]
+ag agents rm w [--force] [--purge]
+ag agents reset w                           # forget backend session ids; keep config + chat log
 ag agents fork src new [--backend B] [--model ID] [--effort E] [--worktree] [--base REF]   # clone config + chat history, fresh session; list shows `<- src`; refused while src busy
 ag harness use w codex [--model ID] [--budget N] ; ag harness current w     # switch backend; remembers one model + one session id per backend
 ```
+
+`agents rm` clears the stored session ids so re-adding the name starts fresh; it keeps the chat log. Use `--purge` to also delete the chat log and metadata. `agents reset` clears every backend session id for an existing agent while keeping its configuration and chat history.
 
 Switches preserve name/workdir/role/persona, never resume a foreign session id, and refuse while a turn runs (one cross-process flock guard per agent, also covering live native handoffs). A switch stores a pending handoff: the next turn replays the old backend's newest-first user/agent rows until `--budget` tokens (~ chars/4, default 4000, `AG_HANDOFF_BUDGET` overrides), oldest-dropped, prefixed `[handoff from <old>]`; consumed after the first successful turn (`agents set --backend` uses the default budget).
 
@@ -309,7 +312,7 @@ ag chat send w "task" --job implement   # delegate / wake / chat send: records `
 ```sh
 ag chat send w "task" [--timeout S] [--job J]   # one headless turn; read with `ag chat log w`
 ag delegate w "task"                            # orchestrator assigns, logged in its chat
-ag wake w "task" [--max-runtime S] [--timeout S] [--notify X] [--on-done X] [--job J]
+ag wake w "task" [--max-runtime S] [--timeout S] [--notify X] [--on-done X] [--job J] [--on NODE]
 ag wakes [--agent w] [--limit N] [--wait JOB [JOB…] --timeout S] [--wait-group GID --timeout S] [--cancel JOB]
 ag spawn --wake w --wake-message "task" -- ./long-job.sh    # follow-up when the session ends
 ag chat send w --command review "path"          # opencode native command only
@@ -326,6 +329,7 @@ ag chat log w [--limit N | --tail N] [--last] [--no-tools] [--json]
 - `spawn --wake` fires at most once per session (exit/kill/force-kill all count); worker completion never re-fires. Messages are argv, never shell-interpreted. Trail: `events` (`wake`, `wake_done`, `wake_fail`).
 - `chat log` conveniences: `--last` prints the final agent reply of the last turn as raw text (paste-ready final report; `(none)` if no agent reply yet); `--tail N` shows the last N rows (overrides `--limit`); `--no-tools` hides `tool`/`toolout`/`diff`/`reasoning` rows. `--json` returns the same structured rows under `log`.
 - Always-on bots: `spawn --wake` plus `ag schedule` (below) or host cron/launchd re-issuing `ag wake`.
+- One-shot cloud run: `ag wake w "task" --on muse` publishes to the configured relay; the target runs it on its next global tick. `ag wakes` shows `remote@muse` while pending, and `ag relay results --id ID` shows the reply after origin sync.
 
 - `--request-id K` on `wake`/`delegate`/`chat send` makes the call idempotent: receipt `<state>/receipts/<sha1(cmd+agent+K)>.json` (O_EXCL). Same payload replays the original result (wake: same job + `replayed:true`; others: stored reply, or `status:in_progress` + ref while running); different payload = `request id conflict`; a failed original replays its failure. `ag receipts gc [--days 7]` prunes.
 
@@ -396,6 +400,8 @@ ag schedule rm ID
 Rows marked `@NODE` never fire in the origin's local tick. Pause and resume publish the changed enabled state; remove deletes the mailbox request. `schedule run ID` is unavailable for remote rows; they run on the target's next due time. `schedule tick --all --reap` syncs before and after ticking, and reports relay failures as `relay_error` without stopping local schedules.
 
 Prompts and replies are stored in the mailbox repository, so use a private repository and only relay data appropriate for everyone with access to it. Configure `--max-mode` on the target to limit how much access a remote schedule can request.
+
+For an immediate one-shot, run `ag wake w "task" --on muse`. The target's next global tick fires it once and reports the result; the next origin sync ingests the reply and removes the request from the mailbox. The returned wake ID works with `ag relay results --id ID` (or `--last` for the newest reply). `ag wakes` lists the pending run as `remote@muse` until the result arrives. Dir mailboxes need a separate sync mechanism; git mailboxes need credentials on both machines.
 
 ## Reliability
 

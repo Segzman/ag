@@ -1194,6 +1194,12 @@ def do_wakes(a):
                     sess_running, sess_exit = st.get("running"), st.get("exit")
             except Exception: pass
         rows.append({**j, "sess_running": sess_running, "sess_exit": sess_exit})
+    for p in sorted(_relay_remote_wake_dir().glob("*.json")):
+        try: j = json.loads(p.read_text())
+        except Exception: continue
+        if j.get("state") != str(sdir.resolve()): continue
+        if getattr(a, "agent", None) and j.get("agent") != a.agent: continue
+        rows.append({**j, "status": f'remote@{j.get("target", "")}', "remote": True})
     rows.sort(key=lambda j: j.get("ts", ""))
     rows = rows[-(a.limit or 50):]
     if getattr(a, "json", False):
@@ -7042,17 +7048,33 @@ def do_agents(a):
         if _fbl is not None: rows[-1]["fallback"] = _fbl
         if _ss is not None: rows[-1]["stall_s"] = _ss
         rows[-1].update(eup)
+        try: _clear_chat_session(sdir, a.name)
+        except Exception as e:
+            rows.pop()
+            return emit(a, "agents", error=f"could not clear old session for {a.name}: {str(e)[:160]}")
         save_agents(sdir,rows)
         _mw = "\n".join(x for x in (mode_warning(be, getattr(a,"mode",None) or "", bool(getattr(a,"plan",None))),
             f"[setup] backend {be} is disabled in routing (ag setup to enable)" if bkd and not bkd["enabled"] else "", effw) if x)
         if _mw and not wt: return emit(a,"agents",{"_text":f"added {a.name}\n{_mw}","warning":_mw})
         if wt: return emit(a,"agents",{"_text":f"added {a.name}  branch {wt['branch']}  worktree {wt['path']}","worktree":wt})
         return emit(a,"agents",{"_text":f"added {a.name}"})
+    if a.sub=="reset":
+        if not any(r["name"] == a.name for r in rows):
+            return emit(a, "agents", error=f"no such agent: {a.name}", hint="ag agents list")
+        if agent_busy(sdir, a.name):
+            return emit(a, "agents", error=f"{a.name} is busy (turn or handoff running); retry when idle.")
+        try: _clear_chat_session(sdir, a.name)
+        except Exception as e: return emit(a, "agents", error=f"could not reset session for {a.name}: {str(e)[:160]}")
+        try: _event(sdir, "agent_reset", a.name)
+        except Exception: pass
+        return emit(a, "agents", {"_text": f"reset session for {a.name}"})
     if a.sub=="rm":
         old = next((r for r in rows if r["name"]==a.name and r.get("worktree")),None)
         if old:
             err, hint = wt_remove(old["worktree"], getattr(a,"force",False))
             if err: return emit(a,"agents",error=err,hint=hint)
+        try: _clear_chat_session(sdir, a.name, purge=getattr(a, "purge", False))
+        except Exception as e: return emit(a, "agents", error=f"could not clear session for {a.name}: {str(e)[:160]}")
         rows = [r for r in rows if r["name"]!=a.name]
         save_agents(sdir,rows)
         # Drop the removed agent's active assignment so a reused name starts
@@ -7187,6 +7209,20 @@ def load_chat_meta(sdir,name,agent=None):
 
 def save_chat_meta(sdir,name,meta):
     (chat_dir(sdir)/f"{name}.meta.json").write_text(json.dumps(meta,indent=2))
+
+def _clear_chat_session(sdir, name, purge=False):
+    """Forget stored backend session ids; optionally remove the chat log and metadata too."""
+    d = chat_dir(sdir)
+    meta_path, log_path = d / f"{name}.meta.json", chat_log_path(sdir, name)
+    if purge:
+        for p in (meta_path, log_path):
+            try: p.unlink()
+            except FileNotFoundError: pass
+        return
+    if not meta_path.exists(): return
+    meta = load_chat_meta(sdir, name)
+    meta["sid"], meta["sids"] = "", {}
+    save_chat_meta(sdir, name, meta)
 
 def append_chat(sdir,name,role,text,event_id=None,extra=None):
     row = {"ts":now_iso(),"role":role,"text":text[:8000]}
@@ -9917,6 +9953,9 @@ def do_chat(a):
         txt = "\n".join(f'{r.get("role","")}: {(r.get("text","") or "")[:500]}' for r in rows) or "(none)"
         return emit(a,"chat",{"_text":txt})
 
+def _relay_remote_wake_dir():
+    return ag_cache_home() / "relay-wakes"
+
 def do_wake(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     agent = (getattr(a,"agent",None) or "").strip()
@@ -9950,12 +9989,48 @@ def do_wake(a):
     if cerr:
         parent = (getattr(a, "parent", None) or "").strip()
         return emit(a,"wake",error=cerr,hint=_agent_hint(sdir, parent))
-    _rc, _h = _rcpt(a, sdir, "wake", agent, json.dumps([text,notify,on_done,timeout_s,max_runtime_s,stall_s,ck.get("cohort"),vcmd,vtmo],default=str))
+    _wake_payload = [text,notify,on_done,timeout_s,max_runtime_s,stall_s,ck.get("cohort"),vcmd,vtmo]
+    if getattr(a,"on",None): _wake_payload.append(["on",a.on])
+    _rc, _h = _rcpt(a, sdir, "wake", agent, json.dumps(_wake_payload,default=str))
     if _rc is not None: return _rc
     if agent not in names:  # after _rcpt: failure stays replayable, still no job file / spawn
         r = {"error": f"no such agent: {agent}"}
         _rcpt_done(_h, r)
         return emit(a,"wake",error=r["error"],hint=_agent_hint(sdir, agent))
+    target = getattr(a, "on", None)
+    if target:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", target):
+            r = {"error": f"bad relay node {target!r}"}; _rcpt_done(_h, r); return emit(a, "wake", error=r["error"])
+        if ck.get("cohort"):
+            r = {"error": "remote wakes do not support cohorts"}; _rcpt_done(_h, r); return emit(a, "wake", error=r["error"])
+        try: cfg = relay_cfg()
+        except Exception as e: cfg = None
+        if cfg is None:
+            r = {"error": "relay not set up: ag relay init --git URL"}; _rcpt_done(_h, r); return emit(a, "wake", error=r["error"])
+        if target == cfg.get("node"):
+            r = {"error": "--on must name a different relay node"}; _rcpt_done(_h, r); return emit(a, "wake", error=r["error"])
+        origin = cfg["node"]
+        rid_seed = f"{origin}\0{target}\0{agent}\0{getattr(a, 'request_id', None) or time.time()}\0{os.getpid()}\0{text}"
+        rid = "w-" + hashlib.sha1(rid_seed.encode()).hexdigest()[:12]
+        row = {"id": rid, "on": target, "agent": agent, "message": text, "once": True,
+            "at_epoch": int(time.time()), "enabled": True, "max_runtime_s": max_runtime_s,
+            "job": getattr(a, "job", None)}
+        agent_row = next(r for r in load_agents(sdir) if r.get("name") == agent)
+        agent_spec = {k: agent_row.get(k) for k in ("backend", "model", "effort", "mode", "data", "stall_s")}
+        try:
+            relay_publish_schedule(cfg, row, agent_spec)
+            rp = _relay_remote_wake_dir() / f"{rid}.json"
+            rp.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(rp, json.dumps({"id": rid, "agent": agent, "target": target, "message": text,
+                "state": str(sdir.resolve()), "ts": now_iso(), "status": f"remote@{target}"}, indent=1))
+        except Exception as e:
+            r = {"error": f"relay publish failed: {str(e)[:180]}"}; _rcpt_done(_h, r); return emit(a, "wake", error=r["error"])
+        summary = relay_sync(cfg)
+        r = {"job": rid, "id": rid, "target": target, "status": f"remote@{target}",
+            **({"relay_error": summary["error"]} if summary.get("error") else {})}
+        _rcpt_done(_h, r)
+        if getattr(a, "json", False): return emit(a, "wake", {"agent": agent, "launched": True, **r})
+        return emit(a, "wake", {"_text": f"wake sent -> {agent} ({r['status']}, id {rid})", "agent": agent, **r})
     r = launch_wake_chat(sdir,agent,text,notify=notify,on_done=on_done,timeout_s=timeout_s,
         max_runtime_s=max_runtime_s,stall_s=stall_s,job_type=getattr(a,"job",None),verify=vcmd,verify_timeout_s=vtmo,
         extra=({"force": True} if getattr(a,"force",False) else None),**ck); _rcpt_done(_h, r)
@@ -10098,7 +10173,7 @@ def _sched_step(sdir, r, now, dry):
                 act = "error"; r["last_status"] = f"error: {err}"[:200]; _event(sdir, "schedule_fail", None, id=r["id"], reason=str(err)[:200])
             else:
                 r.update(last_due=due, last_job=jid, runs=r.get("runs", 0) + 1, last_status="fired"); _event(sdir, "schedule_fire", None, id=r["id"], job=jid)
-    if not dry: r["next_due"] = _sched_next(r, now)
+    if not dry: r["next_due"] = None if r.get("once") else _sched_next(r, now)
     return act
 
 def _sched_tick_dir(sdir, now, dry, reap):
@@ -10328,7 +10403,9 @@ def relay_publish_schedule(cfg, row, agent_spec):
         "max_runtime_s": row.get("max_runtime_s") or 0, "job": row.get("job"), "enabled": row.get("enabled", True),
         "updated": time.time(),
         "agent_spec": {k: sp[k] for k in ("backend", "model", "effort", "mode", "data", "stall_s") if sp.get(k) not in (None, "")}}
-    if row.get("every_s"): mail["every_s"] = row["every_s"]
+    if row.get("once"):
+        mail["once"], mail["at_epoch"] = True, int(row.get("at_epoch") or time.time())
+    elif row.get("every_s"): mail["every_s"] = row["every_s"]
     elif row.get("at"): mail["at"], mail["days"] = row["at"], row.get("days")
     f = relay_root(cfg) / "schedules" / row["on"] / f'{cfg["node"]}--{row["id"]}.json'
     f.parent.mkdir(parents=True, exist_ok=True)
@@ -10414,10 +10491,16 @@ def _relay_mail(root, node, errs):
     for f in sorted(inbox.glob("*.json")):
         try: m = json.loads(f.read_text())
         except ValueError: errs.append(f"{f.name}: bad json"); continue
-        if not (isinstance(m, dict) and m.get("origin") and m.get("id") and ("every_s" in m or "at" in m)):
+        once = isinstance(m, dict) and m.get("once") is True and isinstance(m.get("at_epoch"), (int, float))
+        recurring = isinstance(m, dict) and not m.get("once") and ("every_s" in m or "at" in m)
+        if not (isinstance(m, dict) and m.get("origin") and m.get("id") and (once or recurring)):
             errs.append(f"{f.name}: bad schedule"); continue
         out.append(m)
     return out
+
+def _relay_once_result_exists(root, node, mail):
+    d = root / "results" / str(mail.get("origin") or "")
+    return d.is_dir() and any(d.glob(f'{node}--{mail.get("id")}--*.json'))
 
 def _relay_materialize(cfg, root, now, out, errs):
     """Target side: upsert inbox schedules into cfg.state (row id <origin>--<id>, agent relay-<origin>-<agent>),
@@ -10435,6 +10518,8 @@ def _relay_materialize(cfg, root, now, out, errs):
             names = {r.get("name") for r in load_agents(sdir)}
             for m in mails:
                 mid = f'{m["origin"]}--{m["id"]}'
+                once = bool(m.get("once"))
+                if once and _relay_once_result_exists(root, node, m): continue
                 row = next((r for r in rows if r.get("id") == mid), None)
                 timing = {k: m[k] for k in ("every_s", "at", "days") if k in m}
                 if row is None:
@@ -10442,9 +10527,15 @@ def _relay_materialize(cfg, root, now, out, errs):
                         "last_status": None, "runs": 0, "missed": 0, "skipped": 0, "notify": None, "on_done": ""}
                     rows.append(row)
                     out["materialized"].append(mid)
-                if row["next_due"] is None or any(row.get(k) != v for k, v in timing.items()):
-                    row.update(timing)
-                    row["next_due"] = _sched_next(row, now)
+                if once:
+                    row.pop("every_s", None); row.pop("at", None); row.pop("days", None)
+                    row.update(once=True, at_epoch=m["at_epoch"])
+                    if row.get("next_due") is None and not row.get("last_job"): row["next_due"] = now
+                else:
+                    row.pop("once", None); row.pop("at_epoch", None)
+                    if row["next_due"] is None or any(row.get(k) != v for k, v in timing.items()):
+                        row.update(timing)
+                        row["next_due"] = _sched_next(row, now)
                 row.update(message=m.get("message", ""), catch_up=bool(m.get("catch_up")), overlap=m.get("overlap", "skip"),
                     max_runtime_s=m.get("max_runtime_s") or 0, job=m.get("job"), enabled=m.get("enabled", True),
                     relay_origin=m["origin"], relay_id=m["id"], agent=f'relay-{m["origin"]}-{m["agent"]}')
@@ -10481,7 +10572,7 @@ def _relay_report(cfg, root, now, out, errs):
     try:
         try: rows = _sched_load(sdir)
         except ValueError as e: errs.append(str(e)); return
-        dirty = False
+        dirty, once_done = False, set()
         for r in rows:
             if not (r.get("relay_origin") and r.get("last_job")) or r.get("relay_reported") == r["last_job"]: continue
             j = _wake_read_job(sdir, r["last_job"])
@@ -10494,6 +10585,7 @@ def _relay_report(cfg, root, now, out, errs):
             res = {"origin": r["relay_origin"], "target": node, "id": r["relay_id"], "due": due, "job": r["last_job"],
                 "status": st, "exit": j.get("backend_exit", j.get("exit")), "reply": _relay_reply(sdir, r, j)[:20000],
                 "error": (j.get("error") or "")[:200], "started": due, "reported": int(now)}
+            if r.get("once"): res["once"] = True
             fin = _relay_epoch(j.get("ended_at"))
             if fin is not None: res["finished"] = fin
             if j.get("verify"): res["verify"] = j["verify"]
@@ -10503,8 +10595,12 @@ def _relay_report(cfg, root, now, out, errs):
             except OSError as e: errs.append(f"{f.name}: {e}"); continue
             r["relay_reported"] = r["last_job"]
             out["reported"].append(str(f))
+            if r.get("once"): once_done.add(r["id"])
             dirty = True
-        if dirty: _sched_save(sdir, rows)
+        if dirty:
+            if once_done: rows = [r for r in rows if r.get("id") not in once_done]
+            _sched_save(sdir, rows)
+            if once_done: _sched_reg_set(sdir, bool(rows))
     finally: ll.close()
 
 def _relay_ing_cache():
@@ -10528,6 +10624,13 @@ def _relay_local_rows(cfg):
         out.append((d, rows))
     return out
 
+def _relay_once_cleanup(cfg, root, res):
+    if not res.get("once"): return
+    try: (root / "schedules" / str(res.get("target") or "") / f'{cfg["node"]}--{res.get("id")}.json').unlink()
+    except OSError: pass
+    try: (_relay_remote_wake_dir() / f'{res.get("id")}.json').unlink()
+    except OSError: pass
+
 def _relay_ingest(cfg, root, now, out, errs):
     """Origin side: copy each fresh result under results/<node>/ into the local row's state dir
     (<row.sdir or dir>/relay/results/), bump the row (runs, last_due, last_status 'remote <st>'),
@@ -10539,7 +10642,9 @@ def _relay_ingest(cfg, root, now, out, errs):
     cache, cpath = _relay_ing_cache()
     local = _relay_local_rows(cfg)
     for f in files:
-        if f.name in cache: continue
+        if f.name in cache:
+            _relay_once_cleanup(cfg, root, {**cache[f.name], "once": cache[f.name].get("once")})
+            continue
         try: res = json.loads(f.read_text())
         except ValueError: errs.append(f"{f.name}: bad json"); continue
         if not (isinstance(res, dict) and res.get("id") and res.get("target")):
@@ -10555,7 +10660,8 @@ def _relay_ingest(cfg, root, now, out, errs):
             _atomic_write(cp, f.read_text())
         except OSError as e: errs.append(f"{f.name}: {e}"); continue
         cache[f.name] = {"ts": int(now), "path": str(cp), "target": res["target"], "id": res["id"],
-            "due": res.get("due"), "status": res.get("status")}
+            "due": res.get("due"), "status": res.get("status"), "once": bool(res.get("once"))}
+        _relay_once_cleanup(cfg, root, res)
         out["ingested"].append(f.name)
         if hit:
             try:
@@ -10651,6 +10757,7 @@ def relay_sync(cfg, now=None):
 def _relay_ago(age):
     return f"{int(age) // 3600}h" if age >= 7200 else f"{max(0, int(age)) // 60}m"
 def _relay_spec(m):
+    if m.get("once"): return "once"
     return f"every {m['every_s']}s" if m.get("every_s") else f"at {m.get('at')} " + \
         ("daily" if m.get("days") is None else ",".join(SCHED_DAYS[i] for i in (m.get("days") or []) if 0 <= i < 7))
 def _relay_status(cfg):
@@ -17562,7 +17669,8 @@ def build():
     ags.add_parser("list")
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
     aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra opencode edits-mode shell allowlist prefix (repeatable; "" clears)'); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model"); aga.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears -> AG_STALL_S/backend default)')
-    agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)")
+    agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)"); agrm.add_argument("--purge",action="store_true",help="also remove chat log and metadata")
+    agrs=ags.add_parser("reset",help="clear stored backend session ids; keep config and chat log"); agrs.add_argument("name")
     agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
     ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra opencode edits-mode shell allowlist prefix (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)')
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
@@ -17616,7 +17724,7 @@ def build():
     cmc=cms.add_parser("config",help="role defaults / per-agent override"); cmc.add_argument("--role",dest="cprole",default=None,choices=["orchestrator","sub"]); cmc.add_argument("--agent",dest="cpagent",default=None); cmc.add_argument("--enable",dest="cpenable",action="store_true",default=None); cmc.add_argument("--disable",dest="cpdisable",action="store_true"); cmc.add_argument("--max-turns",dest="cpmax",type=int,default=None); cmc.add_argument("--tokens",dest="cptokens",type=int,default=None); cmc.add_argument("--keep",dest="cpkeep",type=int,default=None); cmc.add_argument("--timeout",dest="cptimeout",type=int,default=None); cmc.add_argument("--clear",dest="cpclear",action="store_true")
     cmsh=cms.add_parser("show",help="effective settings + stats"); cmsh.add_argument("cpname",nargs="?",default="")
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
-    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)")
+    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); wk.add_argument("--on",default=None,metavar="NODE",help="run once on a relay node")
     sc=sub.add_parser("schedule",help="recurring wakes (one global launchd/cron tick)"); scs=sc.add_subparsers(dest="ssub",required=True)
     sca=scs.add_parser("add"); sca.add_argument("agent"); sca.add_argument("message",nargs="+"); sca.add_argument("--every",default=None,help="15m | 2h | 1d (>=60s)"); sca.add_argument("--at",default=None,help="HH:MM local"); sca.add_argument("--days",default=None,help="mon-fri | mon,wed,fri | daily | weekends (with --at)"); sca.add_argument("--max-runtime",dest="max_runtime",type=float,default=0); sca.add_argument("--notify",default=""); sca.add_argument("--on-done",dest="on_done",default=""); sca.add_argument("--job",default=None,choices=JOB_KEYS); sca.add_argument("--overlap",choices=["skip","queue"],default="skip"); sca.add_argument("--catch-up",dest="catch_up",action="store_true",help="fixed-time: fire even if >10min late"); sca.add_argument("--disabled",action="store_true"); sca.add_argument("--id",default=None); sca.add_argument("--on",default=None,metavar="NODE",help="run schedule on another relay node")
     scl=scs.add_parser("list"); scl.add_argument("--all",action="store_true",help="every registered state dir")

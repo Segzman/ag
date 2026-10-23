@@ -499,6 +499,22 @@ ag --dir <state> relay results [--id ID] [--limit N] [--last]   # ingested repli
 - On a target, inbound schedules materialise into `--state DIR` (`schedules.json` row ids `<origin>--<id>`, agents `relay-<origin>-<agent>`, workdirs `<workdir>/<origin>`); the normal `agents add` guards apply (a refused model parks the row `last_status: error`, no crash) and the target clamps a published mode to its `--max-mode` (default `edits`). Rows materialise exactly as published: disabled mail rows stay disabled, all counters are preserved, and rows whose mail disappears are removed on the next sync.
 - On the origin, finished runs land in the row's state dir as `relay/results/` (reply kept up to 20000 chars) and `relay results` lists them; the mailbox result files are cleaned after 7 days by the origin itself. `relay status` flags a peer whose `ag_commit` differs from ours or unseen for > 2x its shortest schedule interval (or 1h).
 
+## Link (VM -> Mac live view)
+
+A VM with no inbound access shows its sites + long-running jobs on the Mac: one outbound `ssh -N -T -R` supervisor (Mac needs only its sshd). Full spec: [docs/LINK.md](docs/LINK.md).
+
+```sh
+ag link init --to USER@HOST [--key K] [--ports auto|3000,8080] [--base 41000] [--watch-port 7790]
+ag link up [--foreground] [--no-watch] | down | status [--json]
+ag link serve [--port N]         # standalone watch page
+ag link run [--name N] -- CMD... # spawn + print watch URL http://localhost:<port>/#<id>
+ag link mac-key PUBKEY_FILE      # print (never write) the restricted authorized_keys line
+```
+
+`init` creates the key (`ssh-keygen ed25519`, comment `ag-link@<host>`) when missing and prints the restricted `authorized_keys` line for the Mac (`restrict,port-forwarding,permitlisten="localhost:*",command="/bin/echo ag-link only" ...`). Config `$AG_CONFIG_HOME/link.json`: `ports` = `auto` (every VM listener via Linux `ss -Hltn` / macOS `lsof -Fn`, minus exclude + port 22) or explicit; mac port per VM port `map[P]` or `base+(P%1000)`, collisions bump up. `up` restarts ssh with backoff 2,4,8..60 s and re-scans auto ports every 30 s (change -> restart); detached state in `$AG_CACHE_HOME/link-status.json|link.pid|link.log`.
+
+The watch page (`127.0.0.1:<watch_port>`, forwarded to the Mac) lists spawn sessions across the schedule-registry dirs + `~/.agent`, wakes, and forwards as `http://localhost:<mac>` links; JS polls `/api/sessions`, `/api/status` and `/api/tail?dir&id&since` (ANSI-stripped like `snap --clean`) for a live tail of long tests. Read-only: Host must be `localhost`/`127.0.0.1` (DNS-rebinding guard), no kill/send endpoints.
+
 ## Harness profiles
 
 Opt-in named sources (instructions, memory, skills, MCP) shared by N agents. Files live in `<state>/profiles_effective/<name>/`; no home/global config is written.
@@ -521,7 +537,7 @@ System-prompt presets per agent: `ag roles list|show|add|set|rm|reset NAME`. Bui
 
 ## Docs
 
-[INSTALL](docs/INSTALL.md) · [HARNESS_ROLES](docs/HARNESS_ROLES.md) · [AGENT_CONTEXT](docs/AGENT_CONTEXT.md) · [AUTO_COMPACTION](docs/AUTO_COMPACTION.md) · [WAKE_CONTROL](docs/WAKE_CONTROL.md) · [WAKE_STATE](docs/WAKE_STATE.md) · [WAKE_STATUS](docs/WAKE_STATUS.md) · [STREAMING](docs/STREAMING.md) · [MULTI_HOST](docs/MULTI_HOST.md) · [UI_DESIGN](docs/UI_DESIGN.md) · [MUSE_FEEDBACK](docs/MUSE_FEEDBACK.md)
+[INSTALL](docs/INSTALL.md) · [HARNESS_ROLES](docs/HARNESS_ROLES.md) · [AGENT_CONTEXT](docs/AGENT_CONTEXT.md) · [AUTO_COMPACTION](docs/AUTO_COMPACTION.md) · [WAKE_CONTROL](docs/WAKE_CONTROL.md) · [WAKE_STATE](docs/WAKE_STATE.md) · [WAKE_STATUS](docs/WAKE_STATUS.md) · [STREAMING](docs/STREAMING.md) · [MULTI_HOST](docs/MULTI_HOST.md) · [UI_DESIGN](docs/UI_DESIGN.md) · [MUSE_FEEDBACK](docs/MUSE_FEEDBACK.md) · [RELAY](docs/RELAY.md) · [LINK](docs/LINK.md)
 
 ## Limitations (honest)
 

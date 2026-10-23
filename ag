@@ -723,11 +723,18 @@ def _cohort_write(sdir, g):
 def _cohort_lock(sdir, gid): return _acquire_wake_job(sdir, "grp-" + re.sub(r"[^A-Za-z0-9_.-]", "_", gid)[:56])
 
 def _cohort_kw(sdir, a):
-    """(launch kwargs, error) from --parent/--group/--quiet; ({}, None) if no --parent."""
+    """(launch kwargs, error) from --parent/--group/--quiet; ({}, None) if neither given.
+    --group without --parent: parentless cohort (jobs grouped for wakes --group /
+    --wait-group; no delivery wake, no parent required)."""
     parent = (getattr(a, "parent", None) or "").strip()
-    if not parent: return {}, None
+    gid = (getattr(a, "group", None) or "").strip()
+    if not parent:
+        if not gid: return {}, None
+        g = _cohort_read(sdir, gid)
+        if g and g.get("parent"): return {}, f"group {gid} belongs to {g.get('parent')}"
+        return {"cohort": {"parent": None, "group": gid, "quiet_s": float(getattr(a, "quiet", 0) or 0)}}, None
     if parent not in [r.get("name") for r in load_agents(sdir)]: return {}, f"no such agent: {parent}"
-    gid = (getattr(a, "group", None) or "").strip() or f"{parent}-{time.strftime('%Y%m%d-%H%M%S')}"
+    gid = gid or f"{parent}-{time.strftime('%Y%m%d-%H%M%S')}"
     g = _cohort_read(sdir, gid)
     if g and g.get("parent") != parent: return {}, f"group {gid} belongs to {g.get('parent')}"
     return {"cohort": {"parent": parent, "group": gid, "quiet_s": float(getattr(a, "quiet", 0) or 0)}}, None
@@ -774,6 +781,8 @@ def _cohort_on_finish(sdir, job, status):
         batch = [e for e in g["done"] if e.get("batch") is None or (queued and e.get("batch") == djid)]
         if due and batch:
             msg, outc = _cohort_message(g, batch); g["outcome"] = outc
+            if not g.get("parent"):  # parentless cohort: tracking only, never delivers
+                return _cohort_write(sdir, g)
             done_rewrite = False
             if queued:
                 jl = _acquire_wake_job(sdir, djid)
@@ -808,7 +817,7 @@ def do_wakes_group(a, sdir):
     g = _cohort_read(sdir, gid)
     if not g: return emit(a, "wakes", error=f"no such group: {gid}", hint="ag wakes")
     if getattr(a, "json", False): return emit(a, "wakes", g)
-    L = [f"group {gid} parent={g['parent']} {g['disposition']} delivery={g.get('delivery_jid') or '-'}"
+    L = [f"group {gid} parent={g.get('parent') or '-'} {g['disposition']} delivery={g.get('delivery_jid') or '-'}"
         + (f" deliver_error={g['deliver_error']}" if g.get("deliver_error") else "")]
     L += [f"  pending {j}" for j in g["pending"]]
     L += [f"  {e['status']:6} {e['agent']}: {e['summary'][:80]}" for e in g["done"]]
@@ -1091,9 +1100,9 @@ def do_wakes_reap(a, sdir):
 def do_wakes(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     if getattr(a, "reap", False): return do_wakes_reap(a, sdir)
-    if getattr(a, "cancel", None) and getattr(a, "wait", None):
+    if getattr(a, "cancel", None) and (getattr(a, "wait", None) or getattr(a, "wait_group", None)):
         return emit(a, "wakes", error="--cancel and --wait are incompatible",
-            hint="ag wakes --cancel JOB  or  ag wakes --wait JOB")
+            hint="ag wakes --cancel JOB  or  ag wakes --wait JOB|--wait-group G")
     if getattr(a, "cancel", None):
         r = agent_cancel(sdir, getattr(a, "cancel"))
         if "error" in r:
@@ -1108,7 +1117,7 @@ def do_wakes(a):
         return emit(a, "wakes", {"_text": f'{j.get("id","")} cancelled',
             **j, "cancelled": True})
     if getattr(a, "group", None): return do_wakes_group(a, sdir)
-    if getattr(a, "wait", None):
+    if getattr(a, "wait", None) or getattr(a, "wait_group", None):
         return do_wakes_wait(a, sdir)
     _, jobs, _ = _wake_dirs(sdir)
     rows = []
@@ -1141,44 +1150,111 @@ def do_wakes(a):
     return emit(a, "wakes", {"_text": txt})
 
 def do_wakes_wait(a, sdir):
-    """Block until a wake job finishes. Returns on done/failed/stalled or
-    budget expiry. Mirrors `wait` (opt-in blocking only)."""
-    jid = (getattr(a, "wait", None) or "").strip()
+    """Block until wake jobs finish: `--wait JOB [JOB…]` or `--wait-group GID`
+    (all of that cohort's child jobs, snapshot at call time). Returns on
+    done/failed/stalled or budget expiry. Mirrors `wait` (opt-in blocking
+    only). Exit codes: 0 = all finished ok, 1 = at least one failed,
+    124 = timed out."""
+    waitg = (getattr(a, "wait_group", None) or "").strip()
+    ids = []
+    if waitg:
+        g = _cohort_read(sdir, waitg)
+        if not g: return emit(a, "wakes", error=f"no such group: {waitg}", hint="ag wakes")
+        ids = [j for j in g.get("pending", []) if j] + [e.get("jid") for e in g.get("done", []) if e.get("jid")]
+    else:
+        ids = [w.strip() for w in (getattr(a, "wait", None) or []) if (w or "").strip()]
     try: budget = float(getattr(a, "timeout", 30) or 0)
     except Exception: budget = 30
     if budget < 0: budget = 0
     t0 = time.time()
-    cur = {}
-    while True:
-        try: cur = _wake_reconcile(sdir, _wake_read_job(sdir, jid))
-        except Exception: cur = {}
-        if not cur:
-            return emit(a, "wakes", error=f"no such job: {jid}",
-                hint="ag wakes")
-        if cur.get("status") in ("done", "failed") or cur.get("stalled"):
-            break
-        if budget and time.time() - t0 > budget:
-            if getattr(a, "json", False):
-                return emit(a, "wakes", {**cur, "timed_out": True})
-            return emit(a, "wakes", error=f"timeout after {budget:g}s",
-                hint=f"ag wakes --wait {jid}")
-        time.sleep(0.2)
-    sid = cur.get("session")
-    sess_running, sess_exit = None, None
-    if sid:
-        try:
-            st = _sstatus(_sroot(sdir) / sid)
-            if st:
-                sess_running, sess_exit = st.get("running"), st.get("exit")
-        except Exception: pass
-    data = {**cur, "sess_running": sess_running, "sess_exit": sess_exit}
+    if waitg and not ids:
+        if getattr(a, "json", False): return emit(a, "wakes", {"jobs": [], "pending": [], "timed_out": False})
+        return emit(a, "wakes", {"_text": "(no jobs in cohort)"})
+    if not waitg and len(ids) <= 1:
+        jid = (getattr(a, "wait", None) or [ids[0] if ids else ""])[0].strip()
+        cur = {}
+        while True:
+            try: cur = _wake_reconcile(sdir, _wake_read_job(sdir, jid))
+            except Exception: cur = {}
+            if not cur:
+                return emit(a, "wakes", error=f"no such job: {jid}",
+                    hint="ag wakes")
+            if cur.get("status") in ("done", "failed") or cur.get("stalled"):
+                break
+            if budget and time.time() - t0 > budget:
+                if getattr(a, "json", False):
+                    emit(a, "wakes", {**cur, "timed_out": True})
+                    return 124
+                emit(a, "wakes", error=f"timeout after {budget:g}s",
+                    hint=f"ag wakes --wait {jid}")
+                return 124
+            time.sleep(0.2)
+        sid = cur.get("session")
+        sess_running, sess_exit = None, None
+        if sid:
+            try:
+                st = _sstatus(_sroot(sdir) / sid)
+                if st:
+                    sess_running, sess_exit = st.get("running"), st.get("exit")
+            except Exception: pass
+        data = {**cur, "sess_running": sess_running, "sess_exit": sess_exit}
+        rc = 1 if cur.get("status") == "failed" else 0
+        if getattr(a, "json", False):
+            emit(a, "wakes", data)
+        else:
+            tail = (cur.get("reply") or cur.get("error") or "")[:200]
+            emit(a, "wakes", {**data,
+                "_text": f'{cur.get("id","")} {cur.get("status","")}'
+                    + (" stalled" if cur.get("stalled") else "")
+                    + f' {cur.get("agent","")} {tail}'})
+        return rc
+    todo = list(dict.fromkeys(ids))
+    unfinished = set(todo)
+    rows = {}
+    while unfinished:
+        for jid in list(unfinished):
+            try: cur = _wake_reconcile(sdir, _wake_read_job(sdir, jid))
+            except Exception: cur = {}
+            if cur and (cur.get("status") in ("done", "failed") or cur.get("stalled")):
+                sid = cur.get("session"); sr = se = None
+                if sid:
+                    try:
+                        st = _sstatus(_sroot(sdir) / sid)
+                        if st: sr, se = st.get("running"), st.get("exit")
+                    except Exception: pass
+                rows[jid] = {**cur, "sess_running": sr, "sess_exit": se}
+                unfinished.discard(jid)
+        if unfinished and budget and time.time() - t0 > budget: break
+        if unfinished: time.sleep(0.2)
+    timed_out = bool(unfinished)
+    rc = 0
+    if timed_out: rc = 124
+    elif any(j.get("status") == "failed" for j in rows.values()): rc = 1
     if getattr(a, "json", False):
-        return emit(a, "wakes", data)
-    tail = (cur.get("reply") or cur.get("error") or "")[:200]
-    return emit(a, "wakes", {**data,
-        "_text": f'{cur.get("id","")} {cur.get("status","")}'
-            + (" stalled" if cur.get("stalled") else "")
-            + f' {cur.get("agent","")} {tail}'})
+        jobs = []
+        for jid in todo:
+            j = rows.get(jid)
+            if j is None:
+                try: j = _wake_read_job(sdir, jid) or {}
+                except Exception: j = {}
+                if not j: j = {"id": jid, "status": "missing"}
+            jobs.append(j)
+        emit(a, "wakes", {"jobs": jobs, "pending": sorted(unfinished), "timed_out": timed_out})
+        return rc
+    L = []
+    for jid in todo:
+        j = rows.get(jid) or {}
+        tail = " ".join(str(j.get("reply") or j.get("error") or "").split())[:200]
+        L.append(f'{j.get("id", jid)} {j.get("status", "pending")}'
+            + (" stalled" if j.get("stalled") else "")
+            + (f' {j.get("agent", "")} {tail}' if j.get("agent") or tail else ""))
+    if timed_out:
+        emit(a, "wakes", {"_text": "\n".join(L) or "(no wake jobs matched)"})
+        emit(a, "wakes", error=f"timeout after {budget:g}s waiting for {len(unfinished)} job(s)",
+            hint="ag wakes --wait JOB|--wait-group G --timeout S")
+        return 124
+    emit(a, "wakes", {"_text": "\n".join(L) or "(no wake jobs matched)"})
+    return rc
 
 def maybe_fire_wake(sdir, sp, st=None, code=None):
     """Fire stored --wake once. Atomic claim file + wake_fired flag (no duplicates)."""
@@ -12530,9 +12606,9 @@ def do_delegate(a):
     if timeout_s is None:
         return emit(a,"delegate",error="invalid --timeout: need finite seconds >= 0 (0 = unlimited)",
             hint="ag delegate AGENT --timeout 300 TASK")
-    _rc, _h = _rcpt(a, sdir, "delegate", a.agent, json.dumps([task, getattr(a,"parent",None), getattr(a,"group",None)]) if getattr(a,"parent",None) else task)
+    _rc, _h = _rcpt(a, sdir, "delegate", a.agent, json.dumps([task, getattr(a,"parent",None), getattr(a,"group",None)]) if (getattr(a,"parent",None) or getattr(a,"group",None)) else task)
     if _rc is not None: return _rc
-    if getattr(a,"parent",None):
+    if getattr(a,"parent",None) or getattr(a,"group",None):
         ck, cerr = _cohort_kw(sdir, a)
         if cerr:
             r = {"error": cerr}
@@ -16373,7 +16449,7 @@ def build():
     sct=scs.add_parser("tick"); sct.add_argument("--all",action="store_true"); sct.add_argument("--now",default=None,help="ISO time (tests)"); sct.add_argument("--reap",action="store_true"); sct.add_argument("--dry-run",dest="dry_run",action="store_true")
     sci=scs.add_parser("install"); sci.add_argument("--write",action="store_true"); sci.add_argument("--cron",action="store_true"); sci.add_argument("--interval",type=int,default=60)
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
-    ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50); ws.add_argument("--wait",default=None); ws.add_argument("--timeout",type=int,default=30); ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3)
+    ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50);     ws.add_argument("--wait",default=None,nargs="+",help="block until one or more wake jobs finish (exit 0 ok, 1 failed, 124 timeout)"); ws.add_argument("--wait-group",dest="wait_group",default=None,help="block until all jobs of cohort GROUP finish (same exit codes)"); ws.add_argument("--timeout",type=int,default=30);  ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3)
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
     sub.add_parser("_acp",help=argparse.SUPPRESS).add_argument("spec")
     hosts=sub.add_parser("hosts",help="outbound SSH host and project mappings"); hsub=hosts.add_subparsers(dest="hostsub",required=True)

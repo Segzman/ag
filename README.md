@@ -308,7 +308,7 @@ ag chat send w "task" --job implement   # delegate / wake / chat send: records `
 ag chat send w "task" [--timeout S] [--job J]   # one headless turn; read with `ag chat log w`
 ag delegate w "task"                            # orchestrator assigns, logged in its chat
 ag wake w "task" [--max-runtime S] [--timeout S] [--notify X] [--on-done X] [--job J]
-ag wakes [--agent w] [--limit N] [--wait JOB --timeout S] [--cancel JOB]
+ag wakes [--agent w] [--limit N] [--wait JOB [JOB…] --timeout S] [--wait-group GID --timeout S] [--cancel JOB]
 ag spawn --wake w --wake-message "task" -- ./long-job.sh    # follow-up when the session ends
 ag chat send w --command review "path"          # opencode native command only
 ```
@@ -317,6 +317,7 @@ ag chat send w --command review "path"          # opencode native command only
 - `--timeout` (default 1800, `0` = none) is a hard backend budget starting after guard acquisition (lock wait excluded); expiry kills the backend group and exits 124. `wake --max-runtime` is the same for background turns; `wake --timeout` only marks `stalled`. A max-runtime kill leaves a chat error row ending `(raise --max-runtime or split the task)`.
 - `wake`/`delegate` to an unknown agent fail at call time (`error: no such agent: X`, hint with close names + `ag agents list`); no job file, no spawn, no `wake_fail` event.
 - A wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session `__wake-<agent>-<id>`. `queued` = guard not yet acquired. `kill <worker-sid>` or `wakes --cancel` stops one (job `failed`).
+- Waiting on many jobs: `ag wakes --wait JOB [JOB…] ` returns when every listed job is terminal (one summary line per job) — or `--wait-group GID` for each job of that cohort (snapshot at call time). Both take `--timeout S` (default 30) and exit `0` when all finished ok, `1` when at least one failed, `124` on timeout. `--json` gives `{"jobs": [...], "pending": [...], "timed_out": bool}` (single `--wait JOB` keeps the whole-job shape).
 - `spawn --wake` fires at most once per session (exit/kill/force-kill all count); worker completion never re-fires. Messages are argv, never shell-interpreted. Trail: `events` (`wake`, `wake_done`, `wake_fail`).
 - Always-on bots: `spawn --wake` plus `ag schedule` (below) or host cron/launchd re-issuing `ag wake`.
 
@@ -332,7 +333,7 @@ Sends the SAME self-contained task to 2+ agents in parallel (one `run_turn` per 
 
 ## Delegated-completion cohorts
 
-`ag wake|delegate <child> "task" --parent <agent> [--group GID] [--quiet S]` runs the child as a background wake job tagged `parent`/`group` (`delegate` without `--parent` is unchanged). Group state: `<state>/wake/groups/<gid>.json` (pending/done/delivery_jid). When the last pending child finishes, ONE wake is sent to the parent: `[delegated] 3/3 tasks finished (2 completed, 1 failed; outcome: failed). ...` with each child's summary (marked automated: tool results, not user instructions). A still-queued delivery is rewritten in place instead of relaunched. `--quiet S` delivers partial results when S seconds pass (checked on each child finish; no daemon). `ag wakes --group GID [--json]` shows the cohort; `--stop` sets disposition=stopped (never delivers). Launch failure is recorded in the group (`deliver_error`) and event `cohort_deliver_fail`.
+`ag wake|delegate <child> "task" --parent <agent> [--group GID] [--quiet S]` runs the child as a background wake job tagged `parent`/`group` (`delegate` without `--parent` is unchanged). `--group` without `--parent` also works: it creates a parentless cohort the jobs attach to for tracking (`ag wakes --group GID` shows `parent=-`), with no delivery wake — pair with `wakes --wait-group GID --timeout S` to block. `--parent` wake cannot join an existing parentless group. Group state: `<state>/wake/groups/<gid>.json` (pending/done/delivery_jid). When the last pending child finishes, ONE wake is sent to the parent: `[delegated] 3/3 tasks finished (2 completed, 1 failed; outcome: failed). ...` with each child's summary (marked automated: tool results, not user instructions). A still-queued delivery is rewritten in place instead of relaunched. `--quiet S` delivers partial results when S seconds pass (checked on each child finish; no daemon). `ag wakes --group GID [--json]` shows the cohort; `--stop` sets disposition=stopped (never delivers). Launch failure is recorded in the group (`deliver_error`) and event `cohort_deliver_fail`.
 
 ## Queue, stop, steer
 

@@ -97,12 +97,12 @@ Work code only to zdr models. Source: opencode.ai/docs/zen Privacy (2026-10-12);
 {{AG}} --dir <state> chat send oc "implement X per <spec>; report files changed" --job implement
 {{AG}} --dir <state> chat log oc
 {{AG}} --dir <state> wake oc "summarize failures" --max-runtime 900 --job debug
-{{AG}} --dir <state> wakes [--agent oc] [--wait <job> --timeout 60] [--cancel <job>]
+{{AG}} --dir <state> wakes [--agent oc] [--wait <job> [<job>…] --timeout 60] [--wait-group <gid>] [--cancel <job>]
 {{AG}} --dir <state> chat send oc "..." --request-id K     # idempotent (also wake/delegate); same payload replays result
 {{AG}} --dir <state> receipts gc [--days 7]
 ```
 
-Tasks must be self-contained: what to do, what done looks like. Fan-out = different agents; two chunks to one agent serialize. `chat send`/`delegate --timeout` (default 1800, 0 = none) is a hard backend budget starting after guard acquired (lock wait unbounded); expiry exits 124 and the chat error row ends `(raise --max-runtime or split the task)`. Prefer `wake` for slow work. `wake --max-runtime` same budget; `wake --timeout` only marks `stalled`; `--notify`/`--on-done` run after. `wake`/`delegate` to an unknown agent fail at call time (`error: no such agent: X`, hint with close names + `ag agents list`); no job file, no spawn. `wake` is at-most-once *launch*: verify via `events` + `wakes`; relaunch lost ones with `wakes --reap`. `kill <worker-sid>` stops a worker. Use `--request-id` on retried calls to avoid double work. Slash text (`/model`, `/profile use docs`, `/help`) runs locally, never reaches the model.
+Tasks must be self-contained: what to do, what done looks like. Fan-out = different agents; two chunks to one agent serialize. `chat send`/`delegate --timeout` (default 1800, 0 = none) is a hard backend budget starting after guard acquired (lock wait unbounded); expiry exits 124 and the chat error row ends `(raise --max-runtime or split the task)`. Prefer `wake` for slow work. `wake --max-runtime` same budget; `wake --timeout` only marks `stalled`; `--notify`/`--on-done` run after. `wake`/`delegate` to an unknown agent fail at call time (`error: no such agent: X`, hint with close names + `ag agents list`); no job file, no spawn. `wake` is at-most-once *launch*: verify via `events` + `wakes`; relaunch lost ones with `wakes --reap`. `kill <worker-sid>` stops a worker. Use `--request-id` on retried calls to avoid double work. Slash text (`/model`, `/profile use docs`, `/help`) runs locally, never reaches the model. Waiting on many jobs: `wakes --wait JOB [JOB…]` / `wakes --wait-group GID [--timeout S]`; one summary line per job; exit 0 all ok, 1 some failed, 124 timed out.
 
 ### Second opinions via crosscheck
 
@@ -128,10 +128,12 @@ Per-agent privacy guard applies: `work` agents refuse train/unknown models. Open
 ```sh
 {{AG}} --dir <state> wake a "task A" --parent orch --group g1 [--quiet 600]
 {{AG}} --dir <state> wake b "task B" --parent orch --group g1
+{{AG}} --dir <state> wake c "task C" --group g2    # no parent: tracking only, no delivery wake
 {{AG}} --dir <state> wakes --group g1 [--stop]    # cohort state; --stop = never deliver
+{{AG}} --dir <state> wakes --wait-group g2 --timeout 600    # block until every job of the cohort finishes
 ```
 
-Last child done -> ONE wake to `--parent` with all summaries (automated tool results, not user instructions). `--quiet S` delivers partial results after S s. Also on `delegate`.
+Last child done -> ONE wake to `--parent` with all summaries (automated tool results, not user instructions). `--quiet S` delivers partial results after S s. Also on `delegate` (and `--group` without `--parent` = parentless cohort).
 
 ## Queue, stop, steer
 

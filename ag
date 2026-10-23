@@ -9789,8 +9789,24 @@ def do_chat(a):
                else 'compaction occupancy: n/a (no live session; chars//4 used)'))
         return emit(a,"chat",{"_text":txt})
     if a.sub=="log":
-        rows = load_chat_log(sdir,a.name)[-(a.limit or 20):]
+        rows = load_chat_log(sdir,a.name)
+        if getattr(a,"no_tools",False):
+            rows = [r for r in rows if r.get("role") not in ("tool","toolout","diff","reasoning")]
+        if getattr(a,"last",False):
+            # the 'agent' row is a whole-turn summary (all narration); the last 'assistant' row of the
+            # last turn is the actual final reply when the backend streams messages
+            turn = rows[max([i for i,r in enumerate(rows) if r.get("role")=="user"] or [-1])+1:]
+            rows = ([r for r in turn if r.get("role")=="assistant"] or [r for r in rows if r.get("role")=="agent"])[-1:]
+        else:
+            t = getattr(a,"tail",None)
+            if t is not None:
+                if t < 0: return emit(a,"chat",error="invalid --tail: need N >= 0",hint="ag chat log NAME --tail 50")
+                rows = (rows[-t:] if t else [])
+            else: rows = rows[-(a.limit or 20):]
         if getattr(a,"json",False): return emit(a,"chat",{"log":rows})
+        if getattr(a,"last",False):
+            txt = (rows[-1].get("text","") if rows else "") or "(none)"
+            return emit(a,"chat",{"_text":txt})
         txt = "\n".join(f'{r.get("role","")}: {(r.get("text","") or "")[:500]}' for r in rows) or "(none)"
         return emit(a,"chat",{"_text":txt})
 
@@ -16412,6 +16428,9 @@ def build():
     sp_=sub.add_parser("stop",help="hold queue, cancel waiters + wakes, interrupt running turn"); sp_.add_argument("agent"); sp_.add_argument("--cascade",action="store_true",help="also stop agents whose jobs record parent == agent")
     chu=chs.add_parser("usage",help="last-turn + total provider token usage"); chu.add_argument("name")
     chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--limit",type=int,default=20)
+    chl.add_argument("--tail",type=int,default=None,help="show last N rows (overrides --limit)")
+    chl.add_argument("--last",action="store_true",help="print only the final agent reply of the last turn (raw text)")
+    chl.add_argument("--no-tools",dest="no_tools",action="store_true",help="hide tool/toolout/diff/reasoning rows")
     chd=chs.add_parser("diff",help="patch of one turn's changes (git checkpoints)"); chd.add_argument("name"); chd.add_argument("--turn",type=int,default=None); chd.add_argument("--stat",action="store_true")
     chv=chs.add_parser("revert",help="restore workdir to before turn N (default latest)"); chv.add_argument("name"); chv.add_argument("--turn",type=int,default=None)
     chc=chs.add_parser("checkpoints",help="list checkpointed turns"); chc.add_argument("name")

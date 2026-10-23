@@ -313,6 +313,7 @@ ag wake w "task" [--max-runtime S] [--timeout S] [--notify X] [--on-done X] [--j
 ag wakes [--agent w] [--limit N] [--wait JOB [JOB…] --timeout S] [--wait-group GID --timeout S] [--cancel JOB]
 ag spawn --wake w --wake-message "task" -- ./long-job.sh    # follow-up when the session ends
 ag chat send w --command review "path"          # opencode native command only
+ag chat log w [--limit N | --tail N] [--last] [--no-tools] [--json]
 ```
 
 - Same agent serializes (flock + FIFO ticket queue, see below); different agents run in parallel. Fan-out = different agents.
@@ -321,6 +322,7 @@ ag chat send w --command review "path"          # opencode native command only
 - A wake is a durable job (`wake/jobs/<id>.json`) run by a tracked worker session `__wake-<agent>-<id>`. `queued` = guard not yet acquired. `kill <worker-sid>` or `wakes --cancel` stops one (job `failed`).
 - Waiting on many jobs: `ag wakes --wait JOB [JOB…] ` returns when every listed job is terminal (one summary line per job) — or `--wait-group GID` for each job of that cohort (snapshot at call time). Both take `--timeout S` (default 30) and exit `0` when all finished ok, `1` when at least one failed, `124` on timeout. `--json` gives `{"jobs": [...], "pending": [...], "timed_out": bool}` (single `--wait JOB` keeps the whole-job shape).
 - `spawn --wake` fires at most once per session (exit/kill/force-kill all count); worker completion never re-fires. Messages are argv, never shell-interpreted. Trail: `events` (`wake`, `wake_done`, `wake_fail`).
+- `chat log` conveniences: `--last` prints the final agent reply of the last turn as raw text (paste-ready final report; `(none)` if no agent reply yet); `--tail N` shows the last N rows (overrides `--limit`); `--no-tools` hides `tool`/`toolout`/`diff`/`reasoning` rows. `--json` returns the same structured rows under `log`.
 - Always-on bots: `spawn --wake` plus `ag schedule` (below) or host cron/launchd re-issuing `ag wake`.
 
 - `--request-id K` on `wake`/`delegate`/`chat send` makes the call idempotent: receipt `<state>/receipts/<sha1(cmd+agent+K)>.json` (O_EXCL). Same payload replays the original result (wake: same job + `replayed:true`; others: stored reply, or `status:in_progress` + ref while running); different payload = `request id conflict`; a failed original replays its failure. `ag receipts gc [--days 7]` prunes.

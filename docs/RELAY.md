@@ -151,3 +151,27 @@ becomes a chat message/notification to the user, then is archived. Write atomica
 - Tests offline: dir mailbox two-node round trip for every op, unknown op rejected, admin_ops [] disables, ls-remote
   sha compare (fake git on PATH), pinned-sha download URL, dev interval, tick runs the check in dev mode only.
   README + skills docs.
+
+### Part 5 revision (user, 2026-10-23) — supersedes the dev-mode polling above
+- NO 60 s polling. Auto-update stays daily (`UPDATE_EVERY_S` 86400) for everyone; drop `--dev`, `AG_UPDATE_EVERY_S`
+  and the tick-driven check. Keep: cheap ls-remote sha check + pinned-sha download + `update-commit` + heartbeat commit
+  + `update --status` showing the installed commit.
+- Push-driven updates: `ag push [GIT_PUSH_ARGS…]` (only inside a git checkout of ag): runs `git push` (args passed
+  through), and on success (a) publishes relay admin `update` to every peer in `nodes/` except self, (b) `ag notify
+  "ag pushed" "<branch> <old>..<new> → updating <peers>"` locally. Peers run the admin op on their next sync/tick,
+  update, and `ag notify "ag updated" "<node>: <old> → <new>"` (Muse on the VM turns that into a message).
+- Notify channels: `notify.json` `{"dir": PATH, "macos": bool}`; `ag notify --set-dir D` and `--macos on|off`.
+  macOS channel = `osascript -e 'display notification BODY with title TITLE'` (escape quotes; no-op off macOS).
+  Default on macOS when no dir is set: macos channel on. Both channels may be on.
+- Relay admin ops unchanged (update | notify-dir PATH | status; drop dev-on/dev-off).
+
+### Part 5 revision 2 (user, 2026-10-23) — supersedes revision 1's user-facing notifications
+- "Notify" = node-to-node only. NO user-facing notifications from this feature: drop the local `ag notify` on push,
+  the `ag updated` notify on peers, and the macOS notify channel. `ag notify` / `--notify-done` stay as they are.
+- `ag push [GIT_PUSH_ARGS…]`: `git push`; on success publish relay admin `update` to every peer in `nodes/` except
+  self and run `relay sync`; print which peers were signalled. Peers update silently on their next sync and the new
+  commit shows in their heartbeat / `relay status`.
+- `schedule tick` must also run the normal daily update check (same 86400 s stamp, inline, never raises, ≤20 s) —
+  today `schedule`/`_wake_run` are in UPDATE_SKIP, so a node only ever driven by its tick (the VM) never updates.
+- Relay results: if the backend exits non-zero with no reply, `error_tail` must carry the backend's stderr tail
+  (the VM shows only `(exit 1) (failed)` today).

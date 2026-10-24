@@ -1087,20 +1087,21 @@ def do__wake_run(a):
         except Exception as e: r["verify"] = {"cmd": vcmd, "exit": 1, "tail": f"verify error: {e}"}
         verify_log_row(sdir, agent, r["verify"])
         _wvf = {"verify": r["verify"]}
+    _we = {"backend_stderr": str(r.get("stderr") or "")[-8000:]} if r.get("stderr") else {}
     if r.get("timed_out"):
         _wake_finish(sdir, jid, "failed", error=r.get("error", "max-runtime exceeded"),
-            exit_code=124, fields={"timed_out": True, **_wvf})
+            exit_code=124, fields={"timed_out": True, **_wvf, **_we})
         return 1
     if "error" in r:
         _mark_failed(r["error"], r.get("exit", 1) if isinstance(r.get("exit"), int) else 1)
         return 1
     if r.get("interrupted"):
-        _wake_finish(sdir, jid, "failed", error="interrupted", exit_code=130, fields={"interrupted": True, **_wvf}); return 1
+        _wake_finish(sdir, jid, "failed", error="interrupted", exit_code=130, fields={"interrupted": True, **_wvf, **_we}); return 1
     code = r.get("exit", 0)
     if code != 0:
         excerpt = " ".join(str(r.get("reply") or "").split())[:160]
         _wake_finish(sdir, jid, "failed", error=f"backend exit {code}" + (f": {excerpt}" if excerpt else ""),
-            exit_code=code, fields=_wvf or None)
+            exit_code=code, fields={**_wvf, **_we} or None)
         return 1
     _wake_finish(sdir, jid, "done", reply=r.get("reply", ""), fields=_wvf or None)
     return 0
@@ -2659,10 +2660,21 @@ def _notify_target_dir(explicit=None):
     value = explicit or os.environ.get("AG_NOTIFY_DIR")
     if not value:
         cfg = _json_or_empty(ag_config_home() / "notify.json")
-        if isinstance(cfg, dict): value = cfg.get("notify_dir")
+        if isinstance(cfg, dict): value = cfg.get("notify_dir") or cfg.get("dir")
     if not value:
         raise ValueError("notify dir not set up; use ag notify --set-dir ~/.notify-muse")
     return Path(os.path.expanduser(str(value))).absolute()
+
+def _notify_set_dir(directory):
+    """Persist the notification inbox in notify.json. -> Path. Raises on bad input."""
+    path = Path(os.path.expanduser(str(directory))).absolute()
+    cfg = _json_or_empty(ag_config_home() / "notify.json")
+    if not isinstance(cfg, dict): cfg = {}
+    cfg["notify_dir"] = str(path)
+    cfg["dir"] = str(path)  # relay admin / docs use the short key
+    p = ag_config_home() / "notify.json"; p.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(p, json.dumps(cfg, indent=1))
+    return path
 
 def _notify_clip(value, limit):
     value = str(value or "")
@@ -2691,12 +2703,7 @@ def _notify_completion(agent, status, reply="", error="", job=None, verify=None)
 def do_notify(a):
     if getattr(a, "set_dir", None):
         try:
-            path = Path(os.path.expanduser(a.set_dir)).absolute()
-            cfg = _json_or_empty(ag_config_home() / "notify.json")
-            if not isinstance(cfg, dict): cfg = {}
-            cfg["notify_dir"] = str(path)
-            p = ag_config_home() / "notify.json"; p.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write(p, json.dumps(cfg, indent=1))
+            path = _notify_set_dir(a.set_dir)
             return emit(a, "notify", {"_text": f"notify dir set: {path}", "dir": str(path)})
         except Exception as e: return emit(a, "notify", error=f"cannot set notify dir: {str(e)[:160]}")
     title = (getattr(a, "title", None) or "").strip()
@@ -8971,6 +8978,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         _event(sdir,"chat",name,exit=rc)
         if on_event: on_event(name,"exit",str(rc))
         out = {"sid":sid_new or sid,"exit":rc,"reply":full}
+        if rc != 0 and (err or "").strip(): out["stderr"] = err[-8000:]
         _ck_sum = ckpt_end(sdir, name, _ck, on_event)
         if _ck_sum: out["checkpoint"] = _ck_sum
         if _usage:
@@ -10350,6 +10358,7 @@ def do_schedule(a):
     if sub == "tick":
         try: now = datetime.fromisoformat(a.now).astimezone().timestamp() if a.now else time.time()
         except ValueError: return err(f"bad --now {a.now!r}: need ISO time")
+        upd = _update_check_inline()  # daily stamp; tick-driven nodes still update
         cfg = None; relay_errors = []
         if a.all:
             try: cfg = relay_cfg()
@@ -10368,6 +10377,7 @@ def do_schedule(a):
             except Exception as e: relay_errors.append(f"after tick: {str(e)[:200]}")
         txt = [f"{r['dir']}: " + (f"error: {r['error']}" if r.get("error") else "busy" if r.get("busy") else ", ".join(f"{x['id']}={x['action']}" for x in r["actions"]) or "nothing due") for r in res]
         data = {"_text": "\n".join(txt) or "no schedule dirs registered", "dirs": res, "dry_run": a.dry_run}
+        if upd: data["update"] = upd
         if relay_errors:
             data["relay_error"] = "; ".join(relay_errors)[:500]
             data["_text"] += "\nrelay error: " + data["relay_error"]
@@ -10491,6 +10501,8 @@ def _relay_node_name():
     try: import socket
     except Exception: return "node"
     return re.sub(r"[^a-z0-9-]", "", (socket.gethostname() or "").split(".")[0].lower())[:24] or "node"
+RELAY_ADMIN_OPS = ("update", "notify-dir", "status")
+
 def relay_cfg():
     """$AG_CONFIG_HOME/relay.json with ~-expanded paths, or None (missing/corrupt/incomplete)."""
     cfg = _json_or_empty(ag_config_home() / "relay.json")
@@ -10500,6 +10512,8 @@ def relay_cfg():
         cfg[k] = os.path.expanduser(cfg[k])
     if cfg["transport"] not in ("git", "dir"): return None
     cfg["checkout"] = os.path.expanduser(cfg.get("checkout") or "")
+    ops = cfg.get("admin_ops")
+    cfg["admin_ops"] = [x for x in ops if isinstance(x, str)] if isinstance(ops, list) else list(RELAY_ADMIN_OPS)
     return cfg
 def relay_root(cfg):
     """Path of the mailbox: the git checkout, or the dir-transport folder."""
@@ -10527,6 +10541,14 @@ def relay_unpublish_schedule(cfg, target, sid):
     try: f.unlink()
     except OSError: return False
     return True
+def relay_publish_admin(cfg, target, op, arg=None):
+    """Write admin/<target>/<node>--<id>.json (origin only). Returns the record. No git ops."""
+    aid = "a-" + hashlib.sha1(f'{cfg["node"]}\0{target}\0{op}\0{arg}\0{time.time()}\0{os.getpid()}'.encode()).hexdigest()[:12]
+    rec = {"op": op, "arg": arg, "origin": cfg["node"], "target": target, "id": aid, "ts": time.time()}
+    f = relay_root(cfg) / "admin" / target / f'{cfg["node"]}--{aid}.json'
+    f.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(f, json.dumps(rec, indent=1))
+    return rec
 def _relay_state(cfg): return Path(os.path.expanduser(str(cfg["state"])))
 def _relay_jload(p):
     try: return json.loads(p.read_text())
@@ -10821,14 +10843,79 @@ def _relay_ingest(cfg, root, now, out, errs):
             _atomic_write(cpath, json.dumps(cache, indent=1))
         except Exception: pass
 
-def _relay_commit():
-    """Short HEAD sha of the ag checkout itself, else None."""
+def _relay_admin_cache():
+    p = ag_cache_home() / "relay-admin-done.json"
+    try: d = json.loads(p.read_text())
+    except Exception: d = {}
+    return (d if isinstance(d, dict) else {}), p
+
+def _relay_admin_apply(cfg, op, arg):
+    """Run one allowlisted admin op locally. -> (ok|error, detail). Never a shell, never another op."""
     try:
-        g = subprocess.run(["git", "-C", str(Path(ag_script_path()).parent), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=10)
-    except Exception:
-        return None
-    return (g.stdout.strip()[:12] or None) if g.returncode == 0 else None
+        if op == "update":
+            status, detail = self_update()
+            return ("ok" if status != "error" else "error"), f"{status}: {detail}"
+        if op == "notify-dir":
+            if not arg: return "error", "notify-dir needs PATH"
+            path = _notify_set_dir(arg)
+            return "ok", f"notify dir set: {path}"
+        if op == "status":
+            u = _update_status_data(); r = _relay_status(cfg)
+            peers = ", ".join(f'{p["node"]}={p.get("commit") or "-"}' for p in r["peers"]) or "none"
+            detail = "\n".join([f"update: {u['mode']} every {u['interval_s']}s installed {u['installed_commit'] or '-'} "
+                f"last check {u['last_check']} last result {u['last_result'] or 'never'}",
+                f"relay: {r['node']} commit {r['commit'] or '-'} peers {peers}",
+                f"alerts: {'; '.join(r['alerts']) or 'none'}"])
+            return "ok", detail
+        return "error", f"unknown admin op: {op}"
+    except Exception as e:
+        return "error", f"{type(e).__name__}: {str(e)[:180]}"
+
+def _relay_admin(cfg, root, now, out, errs):
+    """Target side: run each inbox admin op once, write results/<origin>/<target>--<id>--admin.json."""
+    node = cfg["node"]
+    inbox = root / "admin" / node
+    files = sorted(inbox.glob("*.json")) if inbox.is_dir() else []
+    if not files: return
+    allowed = cfg.get("admin_ops") or []
+    cache, cpath = _relay_admin_cache()
+    dirty = False
+    for f in files:
+        if f.name in cache: continue
+        try: m = json.loads(f.read_text())
+        except ValueError: errs.append(f"{f.name}: bad json"); continue
+        if not (isinstance(m, dict) and m.get("origin") and m.get("id") and m.get("op")):
+            errs.append(f"{f.name}: bad admin"); continue
+        op = str(m["op"])
+        if op not in allowed: continue  # skipped, not marked: enabling it later makes it run
+        status, detail = _relay_admin_apply(cfg, op, m.get("arg"))
+        res = {"origin": m["origin"], "target": node, "id": m["id"], "op": op,
+            "status": status, "detail": str(detail or "")[:20000], "reported": int(now)}
+        out["admin"].append(m["id"])
+        rf = root / "results" / m["origin"] / f'{node}--{m["id"]}--admin.json'
+        try:
+            rf.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(rf, json.dumps(res, indent=1))
+        except OSError as e:
+            errs.append(f"{rf.name}: {e}"); continue
+        cache[f.name] = int(now); dirty = True
+    if dirty:
+        try:
+            cpath.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(cpath, json.dumps(cache, indent=1))
+        except Exception: pass
+
+def _relay_result_record(cfg, rid):
+    cache = _relay_ing_cache()[0]
+    for n, m in sorted(cache.items(), key=lambda kv: (kv[1].get("ts", 0), kv[0]), reverse=True):
+        if m.get("id") != rid: continue
+        d = _relay_jload(Path(m.get("path") or "")) or {}
+        return {**m, "file": n, "reply": d.get("reply", ""), "detail": d.get("detail", ""), "op": d.get("op")}
+    return None
+
+def _relay_commit():
+    """Installed ag commit: git HEAD, else the update-commit sha recorded by copy installs."""
+    return update_installed_commit()
 def _relay_backends():
     """Usable backend names from the cached provider probe ($AG_CACHE_HOME/providers.json)."""
     d = _relay_jload(ag_cache_home() / "providers.json")
@@ -10867,13 +10954,14 @@ def relay_sync(cfg, now=None):
     heartbeat, git push. Returns {"pulled", "materialized", "removed", "reported", "ingested", "pushed", "error"}.
     Never raises."""
     now = time.time() if now is None else float(now)
-    out = {"pulled": False, "materialized": [], "removed": [], "reported": [], "ingested": [], "pushed": False, "error": None}
+    out = {"pulled": False, "materialized": [], "removed": [], "reported": [], "ingested": [], "admin": [], "pushed": False, "error": None}
     errs = []
     try:
         if _relay_pull(cfg, out, errs):
             root = relay_root(cfg)
             _relay_materialize(cfg, root, now, out, errs)
             _relay_report(cfg, root, now, out, errs)
+            _relay_admin(cfg, root, now, out, errs)
             _relay_ingest(cfg, root, now, out, errs)
             _relay_heartbeat(cfg, root, now, _relay_ing_cache()[0])
             if cfg["transport"] == "git": _relay_push(cfg, out, errs)
@@ -10956,7 +11044,7 @@ def do_relay(a):
     if a.rsub == "sync":
         out = relay_sync(cfg)
         txt = f"relay {cfg['node']}: pulled={int(out['pulled'])} materialized={len(out['materialized'])} removed={len(out['removed'])}" \
-            f" reported={len(out['reported'])} ingested={len(out['ingested'])} pushed={int(out['pushed'])}"
+            f" reported={len(out['reported'])} ingested={len(out['ingested'])} admin={len(out.get('admin') or [])} pushed={int(out['pushed'])}"
         return emit(a, cmd, {**out, "_text": txt}, error=out["error"])
     if a.rsub == "status":
         st = _relay_status(cfg)
@@ -10977,14 +11065,37 @@ def do_relay(a):
         rws = rws[:max(0, int(getattr(a, "limit", 20) or 20))]
         recs = []
         for n, m in rws:
-            r = dict(m, file=n, reply=(_relay_jload(Path(m.get("path") or "")) or {}).get("reply", ""))
-            recs.append(r)
+            d = _relay_jload(Path(m.get("path") or "")) or {}
+            recs.append(dict(m, file=n, reply=d.get("reply", ""), detail=d.get("detail", ""), op=d.get("op")))
         if getattr(a, "last", False):
             top = recs[0] if recs else None
-            return emit(a, cmd, {"_text": (top and top.get("reply")) or "(no results)", "last": top})
-        return emit(a, cmd, {"_text": "\n".join(f'{_sched_ts(x["ts"])}  {x["id"]:14} {x.get("target") or "-":10} {x.get("status") or "-"}' for x in recs) or "(no results)",
+            return emit(a, cmd, {"_text": (top and (top.get("reply") or top.get("detail"))) or "(no results)", "last": top})
+        return emit(a, cmd, {"_text": "\n".join(f'{_sched_ts(x["ts"])}  {x["id"]:14} {x.get("target") or "-":10} {x.get("status") or "-"}' +
+            (f' {x["op"]}' if x.get("op") else "") + (f'  {str(x.get("detail") or "").splitlines()[0][:80]}' if x.get("detail") else "") for x in recs) or "(no results)",
             "results": recs})
-    return err("relay: init | sync | status | results")
+    if a.rsub == "admin":
+        op = (getattr(a, "op", "") or "").strip()
+        if op not in RELAY_ADMIN_OPS: return err(f"unknown admin op: {op}", "update | notify-dir PATH | status")
+        target = (getattr(a, "node", "") or "").strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", target): return err(f"bad relay node {target!r}")
+        arg = getattr(a, "arg", None)
+        if op == "notify-dir" and not arg: return err("notify-dir needs PATH", "ag relay admin muse notify-dir ~/.notify-muse")
+        try: rec = relay_publish_admin(cfg, target, op, arg)
+        except Exception as e: return err(f"admin publish failed: {str(e)[:180]}")
+        out = relay_sync(cfg)
+        wait = max(0.0, float(getattr(a, "wait", 0) or 0))
+        deadline = time.time() + wait
+        hit = _relay_result_record(cfg, rec["id"])
+        while hit is None and wait > 0 and time.time() < deadline:
+            time.sleep(min(10.0, max(0.0, deadline - time.time())))
+            if time.time() > deadline: break
+            out = relay_sync(cfg)
+            hit = _relay_result_record(cfg, rec["id"])
+        data = {**out, "admin": rec, "result": hit}
+        txt = f'admin {op} -> {target} queued (id {rec["id"]})'
+        if hit: txt = f'admin {op} -> {target}: {hit.get("status") or "-"} {hit.get("detail") or ""}'.strip()
+        return emit(a, cmd, {"_text": txt, **data}, error=out.get("error"))
+    return err("relay: init | sync | status | results | admin")
 
 def orch_snapshot(sdir):
     ensure_state(sdir)
@@ -17872,6 +17983,7 @@ def build():
     rys.add_parser("sync",help="pull mailbox, materialise/report inbound schedules, ingest results, heartbeat, push")
     rys.add_parser("status",help="this node + peers, schedules in flight, recent results")
     ryr=rys.add_parser("results",help="ingested remote results, newest first"); ryr.add_argument("--id",default=None,help="filter by schedule id"); ryr.add_argument("--limit",type=int,default=20); ryr.add_argument("--last",action="store_true",help="print only the newest result's reply text")
+    rya=rys.add_parser("admin",help="run a relay admin op on another node (update | notify-dir PATH | status)"); rya.add_argument("node"); rya.add_argument("op"); rya.add_argument("arg",nargs="?",default=None); rya.add_argument("--wait",type=float,default=0,help="poll sync every 10s up to S seconds for the result")
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50);     ws.add_argument("--wait",default=None,nargs="+",help="block until one or more wake jobs finish (exit 0 ok, 1 failed, 124 timeout)"); ws.add_argument("--wait-group",dest="wait_group",default=None,help="block until all jobs of cohort GROUP finish (same exit codes)"); ws.add_argument("--timeout",type=int,default=30);  ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3)
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
@@ -17892,6 +18004,7 @@ def build():
     sub.add_parser("shell",help="interactive REPL")
     sub.add_parser("selfcheck",help="run built-in checks")
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
+    pu = sub.add_parser("push",help="git push, then signal relay peers to update and sync"); pu.add_argument("push_args",nargs=argparse.REMAINDER,help="git push arguments (e.g. origin master)")
     mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by Artificial Analysis intelligence/coding/agentic score, speed, tier (openrouter.ai/rankings + models.dev)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only"); mo.add_argument("--sort",choices=("intel","coding","speed","popular"),default=None,help="rank order (implies --rank)"); mo.add_argument("--auto",choices=("on","off"),default=None,help="toggle background catalog refresh (config.json catalog_auto)"); mo.add_argument("--status",action="store_true",help="last fetch per catalog source + auto state"); mo.add_argument("--zdr",action="store_true",help="zero-retention models only (data privacy)"); mo.add_argument("--bg",action="store_true",help=argparse.SUPPRESS)
     rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS); rt.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile to show (default: detected harness)"); rt.add_argument("--json",action="store_true",default=argparse.SUPPRESS); rt.add_argument("--check",action="store_true",help="per-project setup check: configured? + questions to ask the user")
     rl=sub.add_parser("ratelimit",help="rate-limit slots + cooldowns (opencode free-tier)"); rl.add_argument("op",nargs="?",default=None,help="clear"); rl.add_argument("key",nargs="?",default=None,help="cooldown key backend/model (clear one)")
@@ -18305,11 +18418,19 @@ def do_sync(a):
 # ---- self-update from GitHub (fast-forward only; detached, <=1 check/day) ----
 # git checkout (install = symlink to clone): fetch + merge --ff-only, only when the
 # tree is clean, on a branch tracking a remote, and not ahead. Copy installs:
-# download raw `ag`, py_compile it, atomic replace. Off: `ag update --auto off`
-# or AG_AUTO_UPDATE=0. Takes effect on the next invocation, never mid-command.
-UPDATE_RAW_URL = "https://raw.githubusercontent.com/Segzman/ag/master/ag"
+# one cheap `git ls-remote` sha check, then download that pinned sha from raw
+# (never a moving master), py_compile it, atomic replace, record the sha.
+# Off: `ag update --auto off` or AG_AUTO_UPDATE=0. Takes effect on the next
+# invocation, never mid-command. The daily stamp also gates the inline check
+# `schedule tick` runs, so a tick-only node (the VM) still updates.
+UPDATE_REPO = "https://github.com/Segzman/ag"
+UPDATE_BRANCH = "master"
+UPDATE_RAW_URL = f"https://raw.githubusercontent.com/Segzman/ag/{UPDATE_BRANCH}/ag"
+UPDATE_RAW_PINNED = "https://raw.githubusercontent.com/Segzman/ag/{sha}/ag"
+UPDATE_API_URL = f"https://api.github.com/repos/Segzman/ag/commits/{UPDATE_BRANCH}"
 UPDATE_EVERY_S = 86400
-UPDATE_SKIP = {"schedule", "relay", "_daemon", "_wake_run", "_acp", "_sudo", "askpass", "selfcheck", "update", "tui", "attach", "shell"}
+UPDATE_NET_TIMEOUT_S = 15
+UPDATE_SKIP = {"schedule", "relay", "push", "_daemon", "_wake_run", "_acp", "_sudo", "askpass", "selfcheck", "update", "tui", "attach", "shell"}
 
 def _ag_conf_path():
     return Path(os.environ.get("AG_CONFIG_HOME") or Path.home()/".config/ag")/"config.json"
@@ -18324,6 +18445,46 @@ def auto_update_on():
 def _update_stamp():
     return Path(os.environ.get("AG_CACHE_HOME") or Path.home()/".cache/ag")/"update-check"
 
+def _update_commit_path():
+    return Path(os.environ.get("AG_CACHE_HOME") or Path.home()/".cache/ag")/"update-commit"
+
+def _update_commit_read():
+    try: return _update_commit_path().read_text().strip() or None
+    except Exception: return None
+
+def _update_commit_write(sha):
+    try:
+        p = _update_commit_path(); p.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(p, str(sha).strip() + "\n")
+    except Exception: pass
+
+def update_installed_commit():
+    """Short HEAD for a git checkout, else the sha copy installs recorded in update-commit."""
+    try:
+        p = subprocess.run(["git", "-C", str(Path(ag_script_path()).resolve().parent), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+        if p.returncode == 0 and p.stdout.strip(): return p.stdout.strip()[:12]
+    except Exception: pass
+    return _update_commit_read()
+
+def _update_remote_sha(timeout=UPDATE_NET_TIMEOUT_S):
+    """Remote master sha via `git ls-remote`; GitHub API when git is unavailable/fails. None on error."""
+    try:
+        p = subprocess.run(["git", "ls-remote", UPDATE_REPO, f"refs/heads/{UPDATE_BRANCH}"],
+            capture_output=True, text=True, timeout=timeout)
+        if p.returncode == 0:
+            sha = (p.stdout.strip().split() or [""])[0]
+            if re.fullmatch(r"[0-9a-f]{40}", sha): return sha
+    except Exception: pass
+    try:
+        import urllib.request
+        req = urllib.request.Request(UPDATE_API_URL, headers={"User-Agent": "ag-self-update"})
+        with urllib.request.urlopen(req, timeout=timeout) as r: d = json.loads(r.read())
+        sha = str((d or {}).get("sha") or "")
+        if re.fullmatch(r"[0-9a-f]{40}", sha): return sha
+    except Exception: pass
+    return None
+
 def maybe_auto_update(subcmd):
     """At most once per UPDATE_EVERY_S, fire a detached `ag update --quiet`. Never blocks or raises."""
     if subcmd in UPDATE_SKIP or not auto_update_on(): return
@@ -18336,10 +18497,27 @@ def maybe_auto_update(subcmd):
             start_new_session=True)
     except Exception: pass
 
+def _update_check_inline():
+    """Daily update check for tick-driven nodes. Same stamp as maybe_auto_update,
+    inline (no detach), never raises, network bounded by UPDATE_NET_TIMEOUT_S."""
+    if not auto_update_on(): return None
+    try:
+        st = _update_stamp()
+        if st.exists() and time.time() - st.stat().st_mtime < UPDATE_EVERY_S: return None
+        st.parent.mkdir(parents=True, exist_ok=True); st.touch()
+    except Exception: return None
+    try: status, detail = self_update()
+    except Exception as e: status, detail = "error", f"{type(e).__name__}: {str(e)[:150]}"
+    try:
+        lg = _update_stamp().with_name("update.log"); lg.parent.mkdir(parents=True, exist_ok=True)
+        with open(lg, "a") as f: f.write(f"{now_iso()} {status} {detail}\n")
+    except Exception: pass
+    return {"status": status, "detail": detail}
+
 def self_update(src=None):
     """-> (status, detail). status: updated|current|skipped|error."""
     src = Path(src or ag_script_path()); repo = src.parent
-    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=60)
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=UPDATE_NET_TIMEOUT_S)
     try: in_git = g("rev-parse", "--is-inside-work-tree").stdout.strip() == "true"
     except Exception: in_git = False
     if in_git:
@@ -18355,10 +18533,16 @@ def self_update(src=None):
         if m.returncode: return "error", "git merge: " + m.stderr.strip()[:200]
         return "updated", f"{old} -> {g('rev-parse', '--short', 'HEAD').stdout.strip()} ({behind} commits)"
     import urllib.request, py_compile, tempfile
+    sha, have = _update_remote_sha(), _update_commit_read()
+    if sha and have and (sha == have or sha.startswith(have) or have.startswith(sha)):
+        return "current", sha[:12]
+    url = UPDATE_RAW_PINNED.format(sha=sha) if sha else UPDATE_RAW_URL
     try:
-        with urllib.request.urlopen(UPDATE_RAW_URL, timeout=30) as r: new = r.read()
+        with urllib.request.urlopen(url, timeout=UPDATE_NET_TIMEOUT_S) as r: new = r.read()
     except Exception as e: return "error", f"download: {e}"
-    if new == src.read_bytes(): return "current", VERSION
+    if new == src.read_bytes():
+        if sha: _update_commit_write(sha)
+        return "current", (sha or VERSION)[:12]
     fd, tmp = tempfile.mkstemp(dir=str(repo), prefix=".ag-update-")
     try:
         with os.fdopen(fd, "wb") as f: f.write(new)
@@ -18368,13 +18552,26 @@ def self_update(src=None):
         try: os.unlink(tmp)
         except OSError: pass
         return "error", f"install: {e}"
-    return "updated", f"replaced {src}"
+    if sha: _update_commit_write(sha)
+    return "updated", f"replaced {src}" + (f" ({have[:12] if have else '?'} -> {sha[:12]})" if sha else "")
 
 def _update_catalog():
     """Daily piggyback: refresh live model lists, models.dev, OpenRouter rankings (+AA API). Off via `ag models --auto off`; never affects the update result."""
     try:
         if catalog_auto_on(): catalog_refresh_all()
     except Exception: pass
+
+def _update_status_data():
+    st = _update_stamp()
+    last = datetime.fromtimestamp(st.stat().st_mtime, timezone.utc).isoformat(timespec="seconds") if st.exists() else "never"
+    on = auto_update_on()
+    try:
+        lg = st.with_name("update.log")
+        result = (lg.read_text().strip().splitlines() or [None])[-1] if lg.exists() else None
+    except Exception: result = None
+    commit = update_installed_commit()
+    return {"mode": "daily" if on else "off", "interval_s": UPDATE_EVERY_S, "installed_commit": commit,
+        "auto_update": on, "last_check": last, "last_result": result, "source": str(Path(ag_script_path()).parent)}
 
 def do_update(a):
     if a.auto:
@@ -18383,10 +18580,9 @@ def do_update(a):
         tmp = p.with_suffix(".tmp"); tmp.write_text(json.dumps(c, indent=2) + "\n"); os.replace(tmp, p)
         return emit(a, "update", {"_text": f"auto-update {a.auto} ({p})", "auto_update": c["auto_update"]})
     if a.status:
-        st = _update_stamp()
-        last = datetime.fromtimestamp(st.stat().st_mtime, timezone.utc).isoformat(timespec="seconds") if st.exists() else "never"
-        on = auto_update_on()
-        return emit(a, "update", {"_text": f"auto-update {'on' if on else 'off'}; last check {last}; source {Path(ag_script_path()).parent}", "auto_update": on, "last_check": last})
+        data = _update_status_data()
+        return emit(a, "update", {"_text": f"auto-update {data['mode']} (every {UPDATE_EVERY_S}s); installed {data['installed_commit'] or '-'}; "
+            f"last check {data['last_check']}; last result {data['last_result'] or 'never'}; source {data['source']}", **data})
     status, detail = self_update()
     try:
         lg = _update_stamp().with_name("update.log"); lg.parent.mkdir(parents=True, exist_ok=True)
@@ -18396,6 +18592,66 @@ def do_update(a):
     if a.quiet: return 0 if status != "error" else 1
     if status == "error": return emit(a, "update", error=detail)
     return emit(a, "update", {"_text": f"{status}: {detail}", "status": status, "detail": detail})
+
+def _ag_git_repo():
+    """Root of the ag git checkout, or None when `ag` is a copy install."""
+    try:
+        repo = Path(ag_script_path()).resolve().parent
+        p = subprocess.run(["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10)
+        if p.returncode != 0 or Path(p.stdout.strip()).resolve() != repo: return None
+        if not (repo / "ag").is_file(): return None
+        return repo
+    except Exception: return None
+
+def _git_short(repo, ref="HEAD"):
+    try:
+        p = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", ref],
+            capture_output=True, text=True, timeout=10)
+        return p.stdout.strip() if p.returncode == 0 else ""
+    except Exception: return ""
+
+def do_push(a):
+    """git push; on success ask every relay peer to run the `update` admin op, then sync."""
+    cmd = "push"
+    repo = _ag_git_repo()
+    if not repo:
+        return emit(a, cmd, error=f"not inside a git checkout of ag: {Path(ag_script_path()).parent}",
+            hint="run ag push from the ag clone (copy installs use ag update)")
+    args = list(getattr(a, "push_args", None) or [])
+    if args and args[0] == "--": args = args[1:]
+    old, branch = _git_short(repo), ""
+    try:
+        p = subprocess.run(["git", "-C", str(repo), "branch", "--show-current"],
+            capture_output=True, text=True, timeout=10)
+        branch = p.stdout.strip() if p.returncode == 0 else ""
+    except Exception: pass
+    p = subprocess.run(["git", "-C", str(repo), "push", *args], capture_output=True, text=True)
+    if p.returncode:
+        tail = ([x for x in ((p.stderr or "") + "\n" + (p.stdout or "")).strip().splitlines() if x.strip()] or [f"exit {p.returncode}"])[-1]
+        return emit(a, cmd, error=f"git push failed: {tail[:200]}")
+    new = _git_short(repo)
+    relay_error, peers, signalled = None, [], []
+    try: cfg = relay_cfg()
+    except Exception as e: cfg, relay_error = None, f"config: {str(e)[:150]}"
+    if cfg:
+        root = relay_root(cfg)
+        peers = [f.stem for f in sorted((root / "nodes").glob("*.json")) if f.stem != cfg["node"]]
+        for peer in peers:
+            try:
+                relay_publish_admin(cfg, peer, "update")
+                signalled.append(peer)
+            except Exception as e: relay_error = f"{peer}: {str(e)[:150]}"
+        try:
+            out = relay_sync(cfg)
+            if out.get("error"): relay_error = out["error"]
+        except Exception as e: relay_error = f"sync: {str(e)[:150]}"
+    else:
+        relay_error = relay_error or "relay not set up"
+    txt = f"pushed {branch} {old}..{new}"
+    txt += (f"; signalled {', '.join(signalled)}" if signalled else ("; relay: " + relay_error if not cfg else "; no relay peers"))
+    return emit(a, cmd, {"_text": txt, "pushed": True, "branch": branch, "old": old, "new": new,
+        "peers": peers, "signalled": signalled, "relay_error": relay_error})
 
 def _lift_trailing_dir(argv, subs):
     # argparse takes global flags only BEFORE the subcommand; lift a state-dir
@@ -18454,7 +18710,7 @@ def main(argv=None):
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,"providers":do_providers,
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
-        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"relay":do_relay,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
+        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
         "access":do_access,"usage":do_usage,"budget":do_budget,"link":do_link}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)

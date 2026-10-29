@@ -1415,8 +1415,8 @@ def secret_sanitize(text, cap=200):
     if len(s) > cap: s = s[:cap-1] + "…"
     return s or "Secret input requested"
 
-def secret_dialog(prompt):
-    """(status, value): ok|cancel|error. AG_ASKPASS_CMD = test override whose
+def secret_dialog(prompt, timeout=600):
+    """(status, value): ok|cancel|timeout|error. AG_ASKPASS_CMD = test override whose
     stdout is the secret (prompt in $AG_ASKPASS_PROMPT); nonzero exit = cancel."""
     if os.environ.get("AG_SECRET_POPUP", "1") == "0": return "error", None
     prompt = secret_sanitize(prompt)
@@ -1427,7 +1427,8 @@ def secret_dialog(prompt):
         argv = ["osascript"] + [x for l in SECRET_OSA for x in ("-e", l)] + [SECRET_TITLE, prompt]
     else: return "error", None
     try: p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
-            text=True, timeout=600, env=env)
+            text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired: return "timeout", None
     except Exception: return "error", None
     if p.returncode != 0:
         return ("cancel" if cmd or "-128" in (p.stderr or "") else "error"), None

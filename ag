@@ -1656,6 +1656,110 @@ def do_askpass(a):
     sys.stdout.write(val + "\n"); sys.stdout.flush(); val = None
     return 0
 
+# ---- `ag ui`: native macOS notifications/dialogs so agents reach the user only when input is needed ----
+# Text goes through `on run argv` (never interpolated into AppleScript). AG_UI_CMD = test override
+# program run instead of osascript (same -e args); stdout = answer, exit 1 + "-128" stderr = cancel.
+# Answers go to the caller only; events log kind + outcome, never the value.
+UI_TITLE = "ag"
+UI_DEFAULT_TIMEOUT = 600
+UI_OSA = {
+    "notify": ('on run argv', 'if (item 3 of argv) is "1" then',
+        'display notification (item 1 of argv) with title (item 2 of argv) sound name "Glass"',
+        'else', 'display notification (item 1 of argv) with title (item 2 of argv)', 'end if', 'end run'),
+    "confirm": ('on run argv', 'activate',
+        'set r to display dialog (item 1 of argv) with title (item 4 of argv) buttons {item 3 of argv, item 2 of argv} '
+        'default button (item 2 of argv) giving up after (item 5 of argv as integer)',
+        'if gave up of r then error "ag-timeout" number 1000', 'return button returned of r', 'end run'),
+    "ask": ('on run argv', 'activate',
+        'set r to display dialog (item 1 of argv) default answer (item 2 of argv) with title (item 3 of argv) '
+        'giving up after (item 4 of argv as integer)',
+        'if gave up of r then error "ag-timeout" number 1000', 'return text returned of r', 'end run'),
+    "choose": ('on run argv', 'activate',
+        'set r to choose from list (items 4 thru -1 of argv) with title (item 2 of argv) with prompt (item 1 of argv) '
+        'multiple selections allowed ((item 3 of argv) is "1")',
+        'if r is false then error number -128', "set AppleScript's text item delimiters to linefeed",
+        'return r as text', 'end run'),
+}
+UI_OUTCOME = {"ok": "answered", "cancel": "cancelled", "timeout": "timeout"}
+
+def ui_enabled():
+    return bool(os.environ.get("AG_UI_CMD")) or sys.platform == "darwin"
+
+def ui_run(kind, args, timeout=None):
+    """(outcome, stdout): ok|cancel|timeout|error."""
+    cmd = os.environ.get("AG_UI_CMD")
+    argv = (shlex.split(cmd) if cmd else ["osascript"]) + [x for l in UI_OSA[kind] for x in ("-e", l)] + [str(x) for x in args]
+    try: p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=(timeout + 10) if timeout else 30)
+    except subprocess.TimeoutExpired: return "timeout", ""
+    except Exception: return "error", ""
+    if p.returncode != 0:
+        err = p.stderr or ""
+        return ("timeout" if "ag-timeout" in err else "cancel" if "-128" in err else "error"), ""
+    return "ok", p.stdout[:-1] if p.stdout.endswith("\n") else p.stdout
+
+def _ui_fail(a, rc, msg, hint=None):
+    emit(a, "ui", error=msg, hint=hint); return rc
+
+def _ui_event(a, kind, outcome):
+    sdir = state_dir(a.dir)
+    if sdir.is_dir(): _event(sdir, "ui", None, kind=kind, outcome=outcome)
+
+def _ui_secret(a):
+    """ask --secret: the value only reaches the child's env (--to-env) or a piped stdout (--stdout)."""
+    cmd = list(a.cmd)
+    if a.to_env:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", a.to_env): return _ui_fail(a, 2, f"bad env var name {a.to_env!r}")
+        if not cmd: return _ui_fail(a, 2, "--to-env needs a command", "ag ui ask Q --secret --to-env VAR -- CMD ...")
+    elif cmd: return _ui_fail(a, 2, "a command needs --to-env VAR")
+    elif not (a.stdout and not sys.stdout.isatty()):
+        return _ui_fail(a, 2, "refusing to print a secret: it would land in the caller's context",
+            "use --to-env VAR -- CMD (preferred), or --stdout with stdout piped (not a TTY)")
+    elif getattr(a, "json", False): return _ui_fail(a, 2, "--stdout and --json are exclusive (the value is never put in JSON)")
+    if not secret_enabled(): return _ui_fail(a, 3, "secret dialog unavailable (macOS only; AG_SECRET_POPUP=0 disables)")
+    st, val = secret_dialog(a.question, timeout=a.timeout)
+    out = UI_OUTCOME.get(st)
+    if out is None: return _ui_fail(a, 1, "secret dialog failed")
+    _ui_event(a, "ask-secret", out)
+    if st != "ok":
+        if getattr(a, "json", False): emit(a, "ui", {"outcome": out})
+        return 2
+    if a.to_env:
+        env = dict(os.environ); env[a.to_env] = val; val = None
+        try: os.execvpe(cmd[0], cmd, env)
+        except OSError as e: return _ui_fail(a, 127, f"cannot run {cmd[0]}: {e.strerror}")
+    sys.stdout.write(val + "\n"); sys.stdout.flush(); val = None
+    return 0
+
+def do_ui(a):
+    k = a.ui_cmd
+    if k == "ask" and a.secret: return _ui_secret(a)
+    if not ui_enabled(): return _ui_fail(a, 3, "ag ui needs macOS (osascript)")
+    if k == "notify":
+        st, _ = ui_run("notify", [a.msg, a.title, "1" if a.sound else "0"])
+        if st != "ok": return _ui_fail(a, 1, "notification failed")
+        _ui_event(a, k, "sent")
+        emit(a, "ui", {"_text": "sent", "outcome": "sent"}); return 0
+    if k == "confirm":
+        st, out = ui_run("confirm", [a.question, a.yes, a.no, a.title, a.timeout], a.timeout)
+        if st == "error": return _ui_fail(a, 1, "dialog failed")
+        ans = ("yes" if out == a.yes else "no") if st == "ok" else "timeout" if st == "timeout" else "no"
+        _ui_event(a, k, "timeout" if st == "timeout" else "answered" if st == "ok" else "cancelled")
+        emit(a, "ui", {"_text": ans, "answer": ans})
+        return {"yes": 0, "no": 1}.get(ans, 2)
+    if k == "choose": st, out = ui_run("choose", [a.question, a.title, "1" if a.multi else "0", *a.options], a.timeout)
+    else: st, out = ui_run("ask", [a.question, a.default, a.title, a.timeout], a.timeout)
+    if st == "error": return _ui_fail(a, 1, "dialog failed")
+    _ui_event(a, k, UI_OUTCOME[st])
+    if st != "ok":
+        if getattr(a, "json", False): emit(a, "ui", {"outcome": UI_OUTCOME[st]})
+        return 2
+    if k == "choose":
+        vals = out.split("\n")
+        emit(a, "ui", {"_text": out, "choices": vals})
+    else: emit(a, "ui", {"_text": out, "answer": out})
+    return 0
+
 def do__sudo(a):
     """PATH shim target: exec the real sudo, adding -A so it uses askpass."""
     args = list(a.args or [])
@@ -17891,6 +17995,16 @@ def build():
     s.add_argument("--no-secret-popup",action="store_true",help="no secret dialog / askpass wiring")
     se.add_argument("--secret",action="store_true",help="value from a secure dialog; never logged")
     aq = sub.add_parser("askpass",help="secure macOS secret dialog (askpass protocol)"); aq.add_argument("prompt",nargs=argparse.REMAINDER)
+    ui = sub.add_parser("ui", help="native macOS notifications/dialogs to reach the user (notify|confirm|choose|ask)")
+    uis = ui.add_subparsers(dest="ui_cmd", required=True)
+    u = uis.add_parser("notify", help="macOS notification (no focus change)"); u.add_argument("msg"); u.add_argument("--sound", action="store_true")
+    u = uis.add_parser("confirm", help="yes/no dialog; prints yes|no|timeout, exit 0/1/2"); u.add_argument("question"); u.add_argument("--yes", default="Yes"); u.add_argument("--no", default="No")
+    u = uis.add_parser("choose", help="pick from a list; exit 2 on cancel/timeout"); u.add_argument("question"); u.add_argument("options", nargs="+"); u.add_argument("--multi", action="store_true")
+    u = uis.add_parser("ask", help="text dialog; --secret hides the answer (never printed unless --stdout)"); u.add_argument("question"); u.add_argument("--default", default="")
+    u.add_argument("--secret", action="store_true"); u.add_argument("--to-env", default=""); u.add_argument("--stdout", action="store_true"); u.set_defaults(cmd=[])
+    for u in uis.choices.values():
+        u.add_argument("--title", default=UI_TITLE)
+        if u is not uis.choices["notify"]: u.add_argument("--timeout", type=int, default=UI_DEFAULT_TIMEOUT, help="seconds before giving up")
     su = sub.add_parser("_sudo",help=argparse.SUPPRESS); su.add_argument("args",nargs=argparse.REMAINDER)
     sn = sub.add_parser("snap",help="snapshot live output (many readers OK)"); sn.add_argument("sess"); sn.add_argument("--lines",type=int,default=40); sn.add_argument("--since",type=int,default=None,help="byte offset from prior snap"); sn.add_argument("--clean",action="store_true",help="strip ANSI codes")
     sub.add_parser("sessions",help="list sessions")
@@ -18431,7 +18545,7 @@ UPDATE_RAW_PINNED = "https://raw.githubusercontent.com/Segzman/ag/{sha}/ag"
 UPDATE_API_URL = f"https://api.github.com/repos/Segzman/ag/commits/{UPDATE_BRANCH}"
 UPDATE_EVERY_S = 86400
 UPDATE_NET_TIMEOUT_S = 15
-UPDATE_SKIP = {"schedule", "relay", "push", "_daemon", "_wake_run", "_acp", "_sudo", "askpass", "selfcheck", "update", "tui", "attach", "shell"}
+UPDATE_SKIP = {"schedule", "relay", "push", "_daemon", "_wake_run", "_acp", "_sudo", "askpass", "ui", "selfcheck", "update", "tui", "attach", "shell"}
 
 def _ag_conf_path():
     return Path(os.environ.get("AG_CONFIG_HOME") or Path.home()/".config/ag")/"config.json"
@@ -18694,7 +18808,11 @@ def main(argv=None):
     p = build()
     subs = next((s.choices for s in p._actions if isinstance(s, argparse._SubParsersAction)), {})
     argv, dirlift = _lift_trailing_dir(argv, subs)
+    ui_cmd = None  # `ui ask ... --to-env V -- CMD`: REMAINDER would swallow ask's own flags
+    if "--" in argv and next((t for t in argv if t in subs), "") == "ui":
+        c = argv.index("--"); argv, ui_cmd = argv[:c], argv[c+1:]
     a = p.parse_args(argv)
+    if ui_cmd is not None: a.cmd = ui_cmd
     if dirlift is not None: a.dir = dirlift
     if want_json: a.json = True
     if getattr(a, "version", False): print(VERSION); return 0
@@ -18710,7 +18828,7 @@ def main(argv=None):
         "handoff":do_handoff,"hosts":do_hosts,"sync":do_sync,
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,"providers":do_providers,
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
-        "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"_sudo":do__sudo,"update":do_update,
+        "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
         "access":do_access,"usage":do_usage,"budget":do_budget,"link":do_link}[a.subcmd]
     maybe_auto_update(a.subcmd)

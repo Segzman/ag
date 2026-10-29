@@ -10,7 +10,7 @@ State lives in `./.agent/` (override: `--dir`, `$AGENT_CLI_DIR`). Every command 
 ## Contents
 
 - [Quickstart](#quickstart) · [Capability matrix](#capability-matrix)
-- [Part 1 — CLI](#part-1--cli): [Install and updates](#install) · [State dir](#state-dir) · [Sessions](#sessions-pty) · [run / approvals / rtk](#run-approvals-rtk) · [Secrets](#secrets) · [Notes / todos](#notes-and-todos) · [Models](#models) · [Setup](#setup) · [TUI](#tui)
+- [Part 1 — CLI](#part-1--cli): [Install and updates](#install) · [State dir](#state-dir) · [Sessions](#sessions-pty) · [run / approvals / rtk](#run-approvals-rtk) · [Secrets](#secrets) · [Talk to the user](#talk-to-the-user-ag-ui) · [Notes / todos](#notes-and-todos) · [Models](#models) · [Setup](#setup) · [TUI](#tui)
 - [Part 2 — Agents](#part-2--agents): [Roster and env](#roster-and-backends) · [Capabilities / modes](#capabilities-and-permission-modes) · [ACP](#acp-transport) · [Routing](#routing) · [Delegation / wake](#delegation-and-wake) · [Cohorts](#delegated-completion-cohorts) · [Queue / stop / steer](#queue-stop-steer) · [Scheduled tasks](#scheduled-tasks) · [Reliability](#reliability) · [Reap / ps](#reap-lost-wakes-process-view) · [Isolation](#isolation-worktree-per-agent) · [Checkpoints](#checkpoints) · [Usage](#usage) · [Context](#context-and-handoff) · [Multi-host](#multi-host) · [Harness profiles](#harness-profiles) · [Roles](#roles)
 - [Docs](#docs) · [Limitations](#limitations-honest)
 
@@ -110,6 +110,22 @@ ag spawn --no-secret-popup -- ... # opt out per session; AG_SECRET_POPUP=0 globa
 - **Backend turns and spawned sessions:** env gets `SUDO_ASKPASS`, `SSH_ASKPASS` (+ `SSH_ASKPASS_REQUIRE=force`), `GIT_ASKPASS` -> `<state>/bin/ag-askpass`; `<state>/bin` is prepended to `PATH` with a `sudo` shim adding `-A` (unless `-A/-S/-n` given). Your own variables are never overridden. A still-blocked prompt logs `secret_needed` and adds one retry note. `ag askpass` answers only when its parent process is sudo/ssh/git, so an agent cannot read a secret back.
 - **Guarantee:** never written to disk in plaintext; lives in memory and pipes only (osascript -> ag -> PTY fd, or askpass stdout -> sudo/ssh/git). `input.log` has `[secret input redacted]`.
 - **Limits:** the receiving program gets plaintext; Python can't zero strings; a program that echoes its own input can leak to `output.log`; keyword detection is heuristic (Cancel sends nothing); the parent-name check can be spoofed, so every dialog names the requesting command in `[brackets]`. macOS only (`osascript`); elsewhere injection/detection are off.
+
+## Talk to the user (`ag ui`)
+
+Native macOS notifications/dialogs so agents reach you without stealing your screen unless input is needed.
+
+```sh
+ag ui notify "build done" [--title T] [--sound]            # notification, no focus change
+ag ui confirm "Deploy?" [--yes L] [--no L] [--timeout S]   # prints yes|no|timeout; exit 0/1/2
+ag ui choose "Which?" a b c [--multi] [--timeout S]        # one choice per line; exit 2 on cancel/timeout
+ag ui ask "Name?" [--default D] [--timeout S]              # prints the answer; exit 2 on cancel/timeout
+ag ui ask "Token?" --secret --to-env VAR -- CMD ...        # hidden dialog; runs CMD with VAR set
+```
+
+- All accept `--json` and `--title`; exit 3 off macOS. The `events` log gets `ui` with kind + outcome (`sent|answered|cancelled|timeout`), never the value. Text is passed as AppleScript arguments, not interpolated.
+- `--secret` reuses the askpass dialog. The value is never printed, logged, or written to disk: it only goes into CMD's environment. Without `--to-env` it refuses (exit 2) unless `--stdout` is given and stdout is not a TTY (e.g. piped into another program); `--stdout` and `--json` are exclusive.
+- Backend agents get a prompt hint naming `ag ui` (notify first, dialogs only when input is needed). Tests/CI: `AG_UI_CMD` replaces `osascript`.
 
 ## Keys and providers
 

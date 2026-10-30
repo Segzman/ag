@@ -758,6 +758,9 @@ def _wake_finish(sdir, jid, status, reply="", error="", exit_code=0,
     if cur.get("group"):
         try: _cohort_on_finish(sdir, cur, status)
         except Exception: pass
+    if cur.get("channel"):
+        try: _chan_reply(sdir, cur, status, reply, error)
+        except Exception: pass
     return cur
 
 # ---- cohorts: parent auto-woken once its delegated wake jobs finish ----
@@ -10187,6 +10190,97 @@ def do_chat(a):
 def _relay_remote_wake_dir():
     return ag_cache_home() / "relay-wakes"
 
+# ---- channels: shared room; @member mentions wake that agent, its reply is posted back (hand-off chain) ----
+# <state>/channels/NAME.jsonl (append-only {ts,from,text}) + NAME.json ({members}). Wake jobs carry
+# channel={name,left}: `left` = remaining auto-wake budget (--max-hops), decremented per hop down the chain.
+# ponytail: budget is per chain branch (a post mentioning k agents may fan out k wakes each with left-1);
+# ceiling: no cross-branch counter. Upgrade: shared counter file under flock.
+CHAN_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+CHAN_MENTION = re.compile(r"(?<![\w@.])@([A-Za-z0-9][A-Za-z0-9_.-]*)")
+
+def _chan_paths(sdir, name):
+    d = sdir / "channels"; return d / f"{name}.jsonl", d / f"{name}.json"
+
+def _chan_meta(sdir, name):
+    try: return json.loads(_chan_paths(sdir, name)[1].read_text())
+    except Exception: return None
+
+def _chan_read(sdir, name):
+    rows = []
+    try:
+        for l in _chan_paths(sdir, name)[0].read_text().splitlines():
+            try: rows.append(json.loads(l))
+            except Exception: pass
+    except Exception: pass
+    return rows
+
+def _chan_post(sdir, name, sender, text, left=8, ctx=20, wake=True):
+    """Append + wake mentioned members (not the sender). Returns {woke, ignored, skipped}."""
+    meta = _chan_meta(sdir, name); text = str(text).strip()[:4000]
+    with open(_chan_paths(sdir, name)[0], "a", encoding="utf-8") as f: f.write(json.dumps({"ts": now_iso(), "from": sender, "text": text}) + "\n")
+    out = {"woke": [], "ignored": [], "skipped": []}
+    if not wake: return out
+    members = meta.get("members", []); seen = set()
+    for m in CHAN_MENTION.findall(text):
+        m = m.rstrip(".-")
+        if m in seen or m == sender: continue
+        seen.add(m)
+        if m not in members:
+            if m != "user": out["ignored"].append(m)
+            continue
+        if left <= 0: out["skipped"].append({"agent": m, "reason": "hop limit"}); continue
+        hist = "\n".join(f"[{r.get('from')}] {r.get('text')}" for r in _chan_read(sdir, name)[-max(1, ctx):])
+        msg = (f"[channel {name}] {sender} mentioned you. Members: {', '.join(members)}. Last messages (oldest first):\n{hist}\n\n"
+            f"Your reply is posted back to channel {name} automatically. Write @ + a member's name in it to hand off to that member "
+            f"(never yourself). Extra mid-turn message: `{ag_script_path()} --dir {sdir} channel post {name} \"...\" --as {m}`.")
+        r = launch_wake_chat(sdir, m, msg, trigger="channel", extra={"channel": {"name": name, "left": left - 1, "ctx": ctx}})
+        if "error" in r: out["skipped"].append({"agent": m, "reason": r["error"]})
+        else: out["woke"].append({"agent": m, "job": r.get("job")})
+    return out
+
+def _chan_reply(sdir, job, status, reply, error):
+    c = job["channel"]
+    if not _chan_meta(sdir, c["name"]): return
+    if status == "done":
+        if str(reply or "").strip(): _chan_post(sdir, c["name"], job["agent"], reply, left=c.get("left", 0), ctx=c.get("ctx", 20))
+    else: _chan_post(sdir, c["name"], job["agent"], f"(wake failed: {str(error or '')[:200]})", wake=False)
+
+def do_channel(a):
+    sdir = state_dir(a.dir); ensure_state(sdir); sub = a.csub; cmd = "channel"
+    name = getattr(a, "name", None)
+    if name is not None and not CHAN_RE.match(name):
+        return emit(a, cmd, error=f"bad channel name {name!r}", hint="use [a-z0-9][a-z0-9-]*")
+    if sub == "list":
+        d = sdir / "channels"; rows = []
+        for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+            m = _chan_meta(sdir, p.stem) or {}; rows.append({"name": p.stem, "members": m.get("members", []), "messages": len(_chan_read(sdir, p.stem))})
+        return emit(a, cmd, {"_text": "\n".join(f"{r['name']}  {','.join(r['members']) or '-'}  {r['messages']} msgs" for r in rows) or "(no channels)", "channels": rows})
+    jp, mp = _chan_paths(sdir, name); meta = _chan_meta(sdir, name)
+    if sub == "create":
+        if meta: return emit(a, cmd, error=f"channel exists: {name}")
+        mem = [x.strip() for x in (a.agents or "").split(",") if x.strip()]
+        have = [r.get("name") for r in load_agents(sdir)]
+        bad = [x for x in mem if x not in have]
+        if bad: return emit(a, cmd, error=f"no such agent: {', '.join(bad)}", hint=_agent_hint(sdir, bad[0]))
+        jp.parent.mkdir(parents=True, exist_ok=True); jp.touch()
+        mem = list(dict.fromkeys(mem)); _atomic_write(mp, json.dumps({"members": mem, "created": now_iso()}))
+        return emit(a, cmd, {"_text": f"channel {name} created ({', '.join(mem) or 'no members'})", "name": name, "members": mem})
+    if not meta: return emit(a, cmd, error=f"no such channel: {name}", hint="ag channel create NAME --agents a,b")
+    if sub == "rm":
+        jp.unlink(missing_ok=True); mp.unlink(missing_ok=True)
+        return emit(a, cmd, {"_text": f"channel {name} removed", "name": name})
+    if sub == "log":
+        rows = _chan_read(sdir, name); rows = rows[-a.tail:] if a.tail else rows
+        return emit(a, cmd, {"_text": "\n".join(f"{r.get('ts','')} {r.get('from')}: {r.get('text')}" for r in rows) or "(empty)", "name": name, "messages": rows})
+    sender = (a.as_ or os.environ.get("AG_PARENT_AGENT") or "user").strip()
+    if sender != "user" and sender not in [r.get("name") for r in load_agents(sdir)]:
+        return emit(a, cmd, error=f"no such agent: {sender}", hint=_agent_hint(sdir, sender))
+    text = " ".join(a.text).strip()
+    if not text: return emit(a, cmd, error="empty message")
+    r = _chan_post(sdir, name, sender, text, left=a.max_hops, ctx=a.context)
+    return emit(a, cmd, {"_text": f"posted to {name}" + "".join(f"; woke {w['agent']} (job {w['job']})" for w in r["woke"])
+        + (f"; ignored @{', @'.join(r['ignored'])}" if r["ignored"] else "") + "".join(f"; skipped {x['agent']}: {x['reason']}" for x in r["skipped"]), "name": name, "from": sender, **r})
+
 def do_wake(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     agent = (getattr(a,"agent",None) or "").strip()
@@ -18171,6 +18265,11 @@ def build():
     cmsh=cms.add_parser("show",help="effective settings + stats"); cmsh.add_argument("cpname",nargs="?",default="")
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
     wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the wake finishes"); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--escalate",dest="escalate",default=None,metavar="MODEL[,MODEL...]",help="needs --verify: on failed verify/turn, the worker retries the same session on each next model (one-turn override, roster unchanged); job gains escalation[]"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); wk.add_argument("--on",default=None,metavar="NODE",help="run once on a relay node")
+    ch_=sub.add_parser("channel",help="shared room: @agent mentions wake members, replies post back"); chs=ch_.add_subparsers(dest="csub",required=True)
+    chc=chs.add_parser("create"); chc.add_argument("name"); chc.add_argument("--agents",default="",help="comma-separated members")
+    chs.add_parser("list"); chs.add_parser("rm").add_argument("name")
+    chp=chs.add_parser("post"); chp.add_argument("name"); chp.add_argument("text",nargs="+"); chp.add_argument("--as",dest="as_",default=None,help="sender: agent | user (default $AG_PARENT_AGENT, else user)"); chp.add_argument("--max-hops",dest="max_hops",type=int,default=8,help="auto-wake budget down the hand-off chain"); chp.add_argument("--context",type=int,default=20,help="last N messages given to woken agents")
+    chl=chs.add_parser("log"); chl.add_argument("name"); chl.add_argument("--tail",type=int,default=0)
     sc=sub.add_parser("schedule",help="recurring wakes (one global launchd/cron tick)"); scs=sc.add_subparsers(dest="ssub",required=True)
     sca=scs.add_parser("add"); sca.add_argument("agent"); sca.add_argument("message",nargs="+"); sca.add_argument("--every",default=None,help="15m | 2h | 1d (>=60s)"); sca.add_argument("--at",default=None,help="HH:MM local"); sca.add_argument("--tz",default=None,help="zone for --at: IANA (America/Toronto) or +HH:MM"); sca.add_argument("--days",default=None,help="mon-fri | mon,wed,fri | daily | weekends (with --at)"); sca.add_argument("--max-runtime",dest="max_runtime",type=float,default=0); sca.add_argument("--notify",default=""); sca.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification after each run"); sca.add_argument("--on-done",dest="on_done",default=""); sca.add_argument("--job",default=None,choices=JOB_KEYS); sca.add_argument("--overlap",choices=["skip","queue"],default="skip"); sca.add_argument("--catch-up",dest="catch_up",action="store_true",help="fixed-time: fire even if >10min late"); sca.add_argument("--disabled",action="store_true"); sca.add_argument("--id",default=None); sca.add_argument("--on",default=None,metavar="NODE",help="run schedule on another relay node")
     scl=scs.add_parser("list"); scl.add_argument("--all",action="store_true",help="every registered state dir")
@@ -18917,7 +19016,7 @@ def main(argv=None):
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,"providers":do_providers,
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"_sudo":do__sudo,"update":do_update,
-        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
+        "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"channel":do_channel,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
         "access":do_access,"usage":do_usage,"budget":do_budget,"link":do_link}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)

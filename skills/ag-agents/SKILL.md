@@ -106,6 +106,9 @@ Work code only to zdr models. Source: opencode.ai/docs/zen Privacy (2026-10-12);
 {{AG}} --dir <state> chat log oc --tail 50 --no-tools   # --tail N (overrides --limit); --no-tools hides tool/toolout/diff/reasoning
 {{AG}} --dir <state> wake oc "summarize failures" --max-runtime 900 --job debug
 {{AG}} --dir <state> wake oc "summarize failures" --notify-done
+{{AG}} --dir <state> channel create room --agents a,b      # shared room: @member in a post wakes that agent; its reply posts back (hand-off chain)
+{{AG}} --dir <state> channel post room "@a review, then @b ship" [--as AGENT|user] [--max-hops 8] [--context 20]   # --as defaults to $AG_PARENT_AGENT; unknown @names reported under `ignored`
+{{AG}} --dir <state> channel log room [--tail N] | list | rm room   # inside a turn: `channel post room "..." --as <self>` (final reply is auto-posted)
 {{AG}} --dir <state> wakes [--agent oc] [--wait <job> [<job>…] --timeout 60] [--wait-group <gid>] [--cancel <job>]
 {{AG}} --dir <state> chat send oc "..." --request-id K     # idempotent (also wake/delegate); same payload replays result
 {{AG}} --dir <state> receipts gc [--days 7]

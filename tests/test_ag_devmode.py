@@ -189,6 +189,21 @@ class Push(unittest.TestCase):
         self.assertEqual(len(files), 1)
         self.assertEqual(json.loads(files[0].read_text())["op"], "update")
 
+    def test_push_reports_remote_old_to_new(self):
+        git = lambda *a: subprocess.run(["git", "-C", str(self.repo), *a], check=True, capture_output=True, text=True).stdout.strip()
+        git("push", "-q", "-u", "origin", "master")
+        v1 = git("rev-parse", "--short", "HEAD")
+        (self.repo / "note.txt").write_text("v2")
+        git("add", "note.txt"); git("commit", "-qm", "v2")
+        v2 = git("rev-parse", "--short", "HEAD")
+        args = ag.build().parse_args(["--json", "push", "origin", "master"])
+        buf = io.StringIO()
+        with patch.dict(os.environ, self.env), patch.object(ag, "ag_script_path", return_value=str(self.repo / "ag")), \
+                contextlib.redirect_stdout(buf):
+            self.assertEqual(ag.do_push(args), 0)
+        d = json.loads(buf.getvalue())["data"]
+        self.assertEqual((d["old"], d["new"]), (v1, v2))
+
 
 if __name__ == "__main__":
     unittest.main()

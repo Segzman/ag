@@ -18622,12 +18622,16 @@ def do_push(a):
             hint="run ag push from the ag clone (copy installs use ag update)")
     args = list(getattr(a, "push_args", None) or [])
     if args and args[0] == "--": args = args[1:]
-    old, branch = _git_short(repo), ""
+    branch = ""
     try:
         p = subprocess.run(["git", "-C", str(repo), "branch", "--show-current"],
             capture_output=True, text=True, timeout=10)
         branch = p.stdout.strip() if p.returncode == 0 else ""
     except Exception: pass
+    # the remote branch's commit before the push (HEAD itself doesn't move on push)
+    pos = [x for x in args if not x.startswith("-")]
+    old = _git_short(repo, "@{push}") or _git_short(repo, "@{upstream}") or \
+        (_git_short(repo, f"refs/remotes/{pos[0]}/{branch}") if pos and branch else "")
     p = subprocess.run(["git", "-C", str(repo), "push", *args], capture_output=True, text=True)
     if p.returncode:
         tail = ([x for x in ((p.stderr or "") + "\n" + (p.stdout or "")).strip().splitlines() if x.strip()] or [f"exit {p.returncode}"])[-1]

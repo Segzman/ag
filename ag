@@ -9665,7 +9665,7 @@ def api_validate(backend, model):
         if backend != "api": return None
         pid, mid = api_split_model(model)
         if not pid: return "need --model PROVIDER/MODEL (e.g. groq/llama-3.3-70b-versatile; ag providers list)"
-        try: ps = providers_load()
+        try: ps = providers_all()
         except Exception: ps = {}
         if not isinstance(ps, dict) or pid not in ps: return f"no such provider: {pid} (ag providers list)"
     except Exception: pass
@@ -9681,7 +9681,7 @@ def _api_http_once(base_url, key, model_id, messages, timeout_s, stream=True, _e
     try: data = json.dumps(body).encode()
     except Exception as e: return "", {}, None, f"api: cannot encode request: {e}"
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json",
-        "Authorization": "Bearer " + (key or ""), "User-Agent": "ag-cli", "Accept": "text/event-stream"}, method="POST")
+        **({"Authorization": "Bearer " + key} if key else {}), "User-Agent": "ag-cli", "Accept": "text/event-stream"}, method="POST")
     try: resp = urllib.request.urlopen(req, timeout=(timeout_s or 60) if (timeout_s or 0) > 0 else 60)
     except urllib.error.HTTPError as h:
         if h.code == 429:
@@ -9821,7 +9821,7 @@ def _api_turn(sdir, name, text, on_event=None, command=None, on_start=None, time
                         except Exception: pass
             except Exception: pass
             pid, mid = api_split_model(model)
-            try: provs = providers_load()
+            try: provs = providers_all()
             except Exception: provs = {}
             ent = provs.get(pid) if isinstance(provs, dict) else None
             if not isinstance(ent, dict):
@@ -9836,7 +9836,7 @@ def _api_turn(sdir, name, text, on_event=None, command=None, on_start=None, time
                 except Exception: pass
                 return {"error": _e, "exit": 2, "sid": "", "reply": _e}
             key = api_resolve_key(ent)
-            if not key:
+            if not key and (ent.get("key_ref") or "").strip():
                 _e = f"provider {pid}: key ref unresolved (ag keys set NAME; ag providers show {pid})"
                 try: append_chat(sdir, name, "error", _e); _event(sdir, "api_error", name, error="key unresolved")
                 except Exception: pass
@@ -9844,7 +9844,7 @@ def _api_turn(sdir, name, text, on_event=None, command=None, on_start=None, time
                     try: on_event(name, "tool", _e)
                     except Exception: pass
                 return {"error": _e, "exit": 2, "sid": "", "reply": _e}
-            key = str(key)
+            key = str(key or "")
             try: sys_txt = eff_system(sdir, a)
             except Exception: sys_txt = ""
             try:
@@ -9883,12 +9883,12 @@ def _api_turn(sdir, name, text, on_event=None, command=None, on_start=None, time
                     cent = (provs.get(cpid) if isinstance(provs, dict) else None) if cpid else None
                     ckey = api_resolve_key(cent) if isinstance(cent, dict) else key
                     cbase = ((cent.get("base_url") or "").strip() if isinstance(cent, dict) else "") or base
-                    if not ckey:
+                    if not ckey and isinstance(cent, dict) and (cent.get("key_ref") or "").strip():
                         _e = f"provider {cpid}: key ref unresolved"
                         try: buf.error(_e); append_chat(sdir, name, "error", _e)
                         except Exception: pass
                         return {"error": _e, "exit": 2, "sid": "", "reply": _e}
-                    ckey = str(ckey)
+                    ckey = str(ckey or "")
                     txt, us, rls, err = _api_http_once(cbase, ckey, cmid or mid, msgs, 0, stream=True,
                         _extra=or_work_body(backend, cur, agent_data(a)))
                     if err == "429":
@@ -13482,20 +13482,26 @@ PROVIDER_PRESETS = {
     "mistral": {"base_url": "https://api.mistral.ai/v1", "privacy": "train", "max_concurrent": 1, "rpd": None, "npm": "@ai-sdk/openai-compatible"},
     "sambanova": {"base_url": "https://api.sambanova.ai/v1", "privacy": "retain", "max_concurrent": 1, "rpd": 20, "npm": "@ai-sdk/openai-compatible"},
 }
+LOCAL_PROVIDERS = {"ollama": "http://localhost:11434/v1", "lmstudio": "http://localhost:1234/v1"}  # keyless, data never leaves the machine
+def _loopback(url):
+    try: from urllib.parse import urlparse; return (urlparse(url or "").hostname or "").lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+    except Exception: return False
 def custom_providers_path(): return ag_config_home()/"providers.json"
 def providers_load():
     """{id: entry} from $AG_CONFIG_HOME/providers.json ({} when missing). Never contains secrets."""
     try: d = json.loads(custom_providers_path().read_text())
     except Exception: return {}
     return d if isinstance(d, dict) else {}
+def providers_all():
+    """Registry + built-in local presets (registry wins). Local entries: local=True, privacy zdr, no key_ref."""
+    return {**{k: {"base_url": v, "privacy": "zdr", "local": True} for k, v in LOCAL_PROVIDERS.items()}, **providers_load()}
 def providers_save(d):
     p = custom_providers_path(); p.parent.mkdir(parents=True, exist_ok=True); _atomic_write(p, json.dumps(d, indent=2) + "\n")
 def provider_env_key(pid): return "AG_KEY_" + re.sub(r"[^A-Za-z0-9_]", "_", pid or "x").upper()
 def provider_privacy(backend, model):
     """Privacy class for <provider>/* models from the registry, else None. Called via globals from model_privacy."""
     try:
-        ps = providers_load()
-        if not ps: return None
+        ps = providers_all()
         m = (model or "").strip()
         cand = []
         if backend and backend in ps: cand.append(ps[backend])
@@ -13504,7 +13510,7 @@ def provider_privacy(backend, model):
             if m == pid or m.startswith(pid + "/") or m.startswith("opencode/" + pid + "/") or m == "opencode/" + pid: cand.append(e)
         for e in cand:
             p = (e.get("privacy") or "").strip().lower()
-            if p in ("zdr", "retain", "train"): return p
+            if p in ("zdr", "retain", "train", "unknown"): return p
     except Exception: pass
     return None
 def provider_limit(backend, model):
@@ -13524,7 +13530,7 @@ def providers_opencode_fragment():
     prov = {}
     for pid, e in providers_load().items():
         if not isinstance(e, dict) or not (e.get("base_url") or "").strip(): continue
-        b = {"options": {"baseURL": e["base_url"].strip(), "apiKey": "{env:%s}" % provider_env_key(pid)}}
+        b = {"options": {"baseURL": e["base_url"].strip(), **({"apiKey": "{env:%s}" % provider_env_key(pid)} if (e.get("key_ref") or "").strip() else {})}}
         if (e.get("npm") or "").strip(): b["npm"] = e["npm"].strip()
         prov[pid] = b
     return {"provider": prov} if prov else {}
@@ -13628,15 +13634,17 @@ def do_providers(a):
         base = (getattr(a, "base_url", None) or "").strip() or pre.get("base_url") or ""
         if not base: return emit(a, "providers", error=f"need --base-url URL (no preset for {pid!r})", hint="ag providers add ID --base-url URL --key-ref keychain:NAME")
         kr = (getattr(a, "key_ref", None) or "").strip()
-        if not kr: return emit(a, "providers", error="need --key-ref keychain:NAME", hint=f"ag keys set NAME --from-env VAR; ag providers add {pid} --key-ref keychain:NAME")
-        nkr = _normalize_key_ref(kr) or (_codex_env_ref(kr) and kr.strip())
-        if _normalize_key_ref(kr): kr = _normalize_key_ref(kr)
+        keyless = bool(getattr(a, "no_key", False)) or (pid in LOCAL_PROVIDERS and not kr)
+        if not kr and not keyless: return emit(a, "providers", error="need --key-ref keychain:NAME (or --no-key for keyless servers)", hint=f"ag keys set NAME --from-env VAR; ag providers add {pid} --key-ref keychain:NAME")
+        if keyless: kr = ""
+        elif _normalize_key_ref(kr): kr = _normalize_key_ref(kr)
         elif _codex_env_ref(kr): pass
         else: return emit(a, "providers", error=f"bad --key-ref {kr!r} (want keychain:NAME or ${{VAR}})", hint="never a literal secret")
         if len(kr) > 200: return emit(a, "providers", error="key-ref too long")
         npm = (getattr(a, "npm", None) or "").strip() or pre.get("npm") or "@ai-sdk/openai-compatible"
-        priv = ((getattr(a, "privacy", None) or "").strip().lower() or pre.get("privacy") or "retain").lower()
-        if priv not in ("zdr", "retain", "train"): return emit(a, "providers", error=f"bad --privacy {priv!r}: zdr|retain|train")
+        local = _loopback(base) or pid in LOCAL_PROVIDERS
+        priv = ((getattr(a, "privacy", None) or "").strip().lower() or ("zdr" if getattr(a, "zdr", False) or local else "") or pre.get("privacy") or ("retain" if kr else "unknown")).lower()
+        if priv not in ("zdr", "retain", "train", "unknown"): return emit(a, "providers", error=f"bad --privacy {priv!r}: zdr|retain|train")
         try: mc = pre.get("max_concurrent") if getattr(a, "max_concurrent", None) is None else getattr(a, "max_concurrent", None)
         except Exception: mc = None
         try: rpd = pre.get("rpd") if getattr(a, "rpd", None) is None else getattr(a, "rpd", None)
@@ -13645,7 +13653,7 @@ def do_providers(a):
         if rpd is not None and (not isinstance(rpd, int) or rpd < 0): return emit(a, "providers", error="--rpd must be an int >= 0")
         ms = [s.strip() for s in (getattr(a, "models", None) or []) if (s or "").strip()]
         ps = providers_load()
-        ps[pid] = {"base_url": base, "key_ref": kr, "npm": npm, "privacy": priv}
+        ps[pid] = {"base_url": base, "key_ref": kr, "npm": npm, "privacy": priv, **({"local": True} if local else {})}
         if mc is not None: ps[pid]["max_concurrent"] = mc
         elif "max_concurrent" in ps[pid]: ps[pid].pop("max_concurrent", None)
         if rpd is not None: ps[pid]["rpd"] = rpd
@@ -13653,7 +13661,7 @@ def do_providers(a):
         if ms: ps[pid]["models"] = sorted(set(ms))
         elif "models" in ps[pid]: pass
         providers_save(ps)
-        return emit(a, "providers", {"_text": f"provider {pid}: {base} ({priv}, key {kr})", "id": pid, **ps[pid]})
+        return emit(a, "providers", {"_text": f"provider {pid}: {base} ({priv}, key {kr or 'none'})", "id": pid, **ps[pid]})
     if op == "list":
         ps = providers_load()
         rows = [{"id": k, "base_url": (v or {}).get("base_url", ""), "privacy": (v or {}).get("privacy", ""), "models": (v or {}).get("models", []), "rpd": (v or {}).get("rpd"), "max_concurrent": (v or {}).get("max_concurrent")} for k, v in sorted(ps.items())]
@@ -13661,7 +13669,7 @@ def do_providers(a):
         return emit(a, "providers", {"_text": "\n".join(f'{r["id"]:12} {r["base_url"]:48} {r["privacy"] or "-":6} models={len(r["models"])}' for r in rows) or "(no providers)", "providers": rows})
     if op == "show":
         pid = (getattr(a, "pid", None) or "").strip()
-        e = providers_load().get(pid)
+        e = providers_all().get(pid)
         if not isinstance(e, dict): return emit(a, "providers", error=f"no such provider: {pid}", hint="ag providers list")
         if getattr(a, "json", False): return emit(a, "providers", {"id": pid, **e})
         L = [f'id: {pid}'] + [f"{k}: {e.get(k)}" for k in ("base_url", "key_ref", "npm", "privacy", "max_concurrent", "rpd")] + [f'models: {", ".join(e.get("models") or []) or "-"}']
@@ -14956,6 +14964,14 @@ def effort_for_turn(backend, model, effort):
     if d and d in vs: return d, f"[effort] {e!r} not in {backend}/{disp} variants ({'|'.join(vs)}); using default {d!r}"
     return "", f"[effort] {e!r} not in {backend}/{disp} variants ({'|'.join(vs)}); dropping --effort"
 
+def _models_api(a):
+    """`ag models --backend api --provider ID`: GET {base}/models of an OpenAI-compat server (ollama/lmstudio/custom)."""
+    pid = (getattr(a, "provider", None) or "").strip(); e = providers_all().get(pid)
+    if not isinstance(e, dict): return emit(a, "models", error=f"need --provider ID of a known provider: {pid or '(none)'}", hint="ag providers list (built-in: " + ", ".join(LOCAL_PROVIDERS) + ")")
+    url = (e.get("base_url") or "").strip().rstrip("/") + "/models"; key = api_resolve_key(e)
+    try: ids = [m["id"] for m in (_http_json(url, {"User-Agent": "ag-cli", **({"Authorization": "Bearer " + key} if key else {})}, 10).get("data") or []) if isinstance(m, dict) and m.get("id")]
+    except Exception as ex: return emit(a, "models", error=f"{pid}: cannot reach {url}: {str(ex)[:160]}", hint=f"is the server running? (ag providers show {pid})")
+    return emit(a, "models", {"provider": pid, "source": url, "models": ids, "_text": f"{pid} ({len(ids)}, {url})\n" + "\n".join(f"  {m}" for m in ids)})
 def do_models(a):
     if a.bg: catalog_refresh_all(); return 0   # detached background refresh (catalog_bg_refresh / update --quiet)
     if a.auto or a.status:
@@ -14972,6 +14988,7 @@ def do_models(a):
             f'  openrouter policies  {fa(src["openrouter"]["openrouter_policies"]["fetched_at"])} ({src["openrouter"]["openrouter_policies"]["models"]} models)']
         t += [f"  {b} model list".ljust(23) + fa(v) for b, v in src["model_lists"].items()]
         return emit(a, "models", {"status": True, "sources": src, "_text": "\n".join(t)})
+    if getattr(a, "backend", None) == "api": return _models_api(a)
     if getattr(a, "backend", None) == "openrouter":  # tools-support rows + endpoint dataPolicy class
         rows = or_catalog_rows(free=bool(a.free), zdr=bool(getattr(a, "zdr", False)), tier=a.tier, sort=a.sort or "intel", refresh=bool(a.refresh))
         src = catalog_sources()
@@ -15482,6 +15499,7 @@ def usage_cost(backend, model, acc):
     """(cost|None, subscription): free=$0, claude/codex=subscription/null, else tokens x models.dev prices (fallback: backend-reported cost). Never raises."""
     try:
         if backend in ("claude", "codex"): return None, True
+        if backend == "api" and (providers_all().get(api_split_model(model)[0]) or {}).get("local"): return 0.0, False  # local server: no spend
         acc = acc or {}
         ci, co, free = None, None, False
         try:
@@ -18156,7 +18174,7 @@ def build():
     _kt=kxs.add_parser("test",help="cheap authenticated GET to the provider /models (never prints the key)"); _kt.add_argument("key_name",help="account name"); _kt.add_argument("--provider",dest="provider",default=None,help="provider id from providers registry")
     pv=sub.add_parser("providers",help="opencode-compatible provider registry (refs only, no secrets)"); pvs=pv.add_subparsers(dest="psub",required=True)
     pvs.add_parser("list",help="list providers")
-    _padd=pvs.add_parser("add",help="add/update a provider (presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova)"); _padd.add_argument("pid",help="provider id"); _padd.add_argument("--base-url",dest="base_url",default=None,help="OpenAI-compat base URL"); _padd.add_argument("--key-ref",dest="key_ref",default=None,help="keychain:NAME or ${VAR} (never a literal secret)"); _padd.add_argument("--npm",default=None,help="AI-SDK package (default @ai-sdk/openai-compatible)"); _padd.add_argument("--privacy",default=None,choices=["zdr","retain","train"],help="data class"); _padd.add_argument("--max-concurrent",dest="max_concurrent",type=int,default=None,help="ratelimit slots for <provider>/*"); _padd.add_argument("--rpd",type=int,default=None,help="known free-tier requests/day"); _padd.add_argument("--model",dest="models",action="append",default=None,help="model id (repeatable)")
+    _padd=pvs.add_parser("add",help="add/update a provider (presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova; built-in keyless local: ollama|lmstudio)"); _padd.add_argument("pid",help="provider id"); _padd.add_argument("--base-url",dest="base_url",default=None,help="OpenAI-compat base URL"); _padd.add_argument("--key-ref",dest="key_ref",default=None,help="keychain:NAME or ${VAR} (never a literal secret)"); _padd.add_argument("--no-key",dest="no_key",action="store_true",help="keyless server (no Authorization header)"); _padd.add_argument("--zdr",action="store_true",help="mark zero-retention (same as --privacy zdr)"); _padd.add_argument("--npm",default=None,help="AI-SDK package (default @ai-sdk/openai-compatible)"); _padd.add_argument("--privacy",default=None,choices=["zdr","retain","train","unknown"],help="data class"); _padd.add_argument("--max-concurrent",dest="max_concurrent",type=int,default=None,help="ratelimit slots for <provider>/*"); _padd.add_argument("--rpd",type=int,default=None,help="known free-tier requests/day"); _padd.add_argument("--model",dest="models",action="append",default=None,help="model id (repeatable)")
     _prm=pvs.add_parser("rm",help="remove a provider"); _prm.add_argument("pid",help="provider id")
     _psh=pvs.add_parser("show",help="show one provider"); _psh.add_argument("pid",help="provider id")
     dg=sub.add_parser("delegate",help="orchestrator assigns harness-linked task to a sub"); dg.add_argument("agent"); dg.add_argument("text",nargs="*"); dg.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); dg.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the turn finishes"); dg.add_argument("--parent",default=None,help="run as background wake; auto-wake PARENT when its cohort finishes"); dg.add_argument("--group",default=None); dg.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); dg.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); dg.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the turn (or in the background wake job), run trusted CMD via sh -c in the agent workdir and record {cmd,exit,tail} (never from the agent's reply)"); dg.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); dg.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); dg.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
@@ -18204,7 +18222,7 @@ def build():
     sub.add_parser("selfcheck",help="run built-in checks")
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
     pu = sub.add_parser("push",help="git push, then signal relay peers to update and sync"); pu.add_argument("push_args",nargs=argparse.REMAINDER,help="git push arguments (e.g. origin master)")
-    mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by Artificial Analysis intelligence/coding/agentic score, speed, tier (openrouter.ai/rankings + models.dev)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only"); mo.add_argument("--sort",choices=("intel","coding","speed","popular"),default=None,help="rank order (implies --rank)"); mo.add_argument("--auto",choices=("on","off"),default=None,help="toggle background catalog refresh (config.json catalog_auto)"); mo.add_argument("--status",action="store_true",help="last fetch per catalog source + auto state"); mo.add_argument("--zdr",action="store_true",help="zero-retention models only (data privacy)"); mo.add_argument("--bg",action="store_true",help=argparse.SUPPRESS)
+    mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS+("api",)); mo.add_argument("--provider",default=None,help="with --backend api: list GET {base}/models of this provider (ollama|lmstudio|custom)"); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by Artificial Analysis intelligence/coding/agentic score, speed, tier (openrouter.ai/rankings + models.dev)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only"); mo.add_argument("--sort",choices=("intel","coding","speed","popular"),default=None,help="rank order (implies --rank)"); mo.add_argument("--auto",choices=("on","off"),default=None,help="toggle background catalog refresh (config.json catalog_auto)"); mo.add_argument("--status",action="store_true",help="last fetch per catalog source + auto state"); mo.add_argument("--zdr",action="store_true",help="zero-retention models only (data privacy)"); mo.add_argument("--bg",action="store_true",help=argparse.SUPPRESS)
     rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS); rt.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile to show (default: detected harness)"); rt.add_argument("--json",action="store_true",default=argparse.SUPPRESS); rt.add_argument("--check",action="store_true",help="per-project setup check: configured? + questions to ask the user")
     rl=sub.add_parser("ratelimit",help="rate-limit slots + cooldowns (opencode free-tier)"); rl.add_argument("op",nargs="?",default=None,help="clear"); rl.add_argument("key",nargs="?",default=None,help="cooldown key backend/model (clear one)")
     ac=sub.add_parser("access",help="allow/deny backend/model globs (routing.json access)"); acs=ac.add_subparsers(dest="sub",required=True)

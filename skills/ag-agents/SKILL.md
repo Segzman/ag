@@ -60,6 +60,7 @@ Route to an added provider (opencode backend, model `<provider>/<model>`; privac
 
 ```sh
 {{AG}} --dir <state> providers add groq --key-ref keychain:MYKEY   # presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova
+{{AG}} --dir <state> agents add l --backend api --model ollama/qwen3:8b   # local keyless presets ollama|lmstudio (zdr, cost 0); custom: providers add ID --base-url URL --no-key [--zdr]; list: models --backend api --provider ollama
 {{AG}} --dir <state> providers list | show groq | rm groq
 {{AG}} --dir <state> keys set MYKEY --from-env GROQ_API_KEY
 {{AG}} --dir <state> keys test MYKEY --provider groq

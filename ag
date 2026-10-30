@@ -4809,7 +4809,7 @@ def do_caps(a):
     txt = "\n".join(f'{r["backend"]:9} resume={f(r["resume"])} sys={f(r["system_flag"])} mcp={f(r["mcp_flag"])} skills={f(r["skills"])} intr={f(r["interrupt"])} usage={f(r["usage"])} plan={f(r["plan"])} modes={f(r["modes"]) or "-"} enforce={"native" if r["native_enforce"] else "advisory"}' for r in rows)
     return emit(a, "agents", {"_text": txt})
 
-def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system="", command="", mode="", plan=False, effort=""):
+def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system="", command="", mode="", plan=False, effort="", allow_cmd=()):
     m = eff_model(backend, model)
     mf = mode_flags(backend, mode or "", plan)
     ef = {"claude": ["--effort", effort], "opencode": ["--variant", effort], "codex": ["-c", f"model_reasoning_effort={json.dumps(effort)}"]}.get(backend, []) if effort else []
@@ -4820,6 +4820,8 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system=""
         argv += ef
         if system: argv += ["--append-system-prompt",system]
         if sid: argv += ["--resume",sid]
+        if mode == "edits" and not plan and allow_cmd:  # variadic flag: mf (a --flag) must follow it so the prompt isn't swallowed
+            argv += ["--allowedTools"] + [f"Bash({p}*)" for p in allow_cmd]
         return argv + mf + [prompt]
     if backend=="opencode":
         argv = [_opencode_bin(),"run","--format","json","--thinking"]
@@ -8529,7 +8531,8 @@ def _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, 
     argv = backend_argv(backend,model=model,workdir=workdir,sid=sid,prompt=prompt,
         system=sys_txt if backend=="claude" else "",command=command or "",
         **({"mode":a.get("mode") or "","plan":bool(a.get("plan"))} if a.get("mode") or a.get("plan") else {}),
-        **({"effort":a["effort"]} if a.get("effort") else {}))
+        **({"effort":a["effort"]} if a.get("effort") else {}),
+        **({"allow_cmd":a["allow_cmd"]} if backend=="claude" and isinstance(a.get("allow_cmd"),list) and a["allow_cmd"] else {}))
     if prof_name: argv = list(argv) + backend_argv_extra(backend, sdir, prof_name)
     if backend=="codex" and sys_txt and not command:
         # verified: `codex exec` and `exec resume` honor -c developer_instructions=<toml string>; no first-turn prepend
@@ -8554,8 +8557,9 @@ def _turn_source(p):
     """Iterator of backend stdout lines."""
     return p.stdout
 
-def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0,_rs=None,force=False,stall_s=None):
+def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0,_rs=None,force=False,stall_s=None,model=None):
     """One prompt turn. on_event(name,kind,text). Returns {sid,exit,reply} or {error}.
+    model: one-turn model override (never written to the roster).
     command: opencode-only native custom command (opencode run --command);
     message text becomes its args (bare, no history/role prepend). Others reject.
     on_start(): fired once right after the per-agent turn guard is acquired
@@ -8578,7 +8582,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         meta2 = load_chat_meta(sdir,name,agent=a)
         return {"sid":meta2.get("sid",""),"exit":0 if ok else 1,"reply":reply,"slash":cmd}
     backend = a.get("backend","claude")
-    model = a.get("model","default") or "default"
+    model = model or a.get("model","default") or "default"
+    _mo = model if model != (a.get("model","default") or "default") else None
     if backend == "api":
         return _api_turn(sdir, name, text, on_event=on_event, command=command, on_start=on_start, timeout_s=timeout_s, _rs=_rs, force=force)
     workdir = os.path.abspath(a.get("dir",".") or ".")
@@ -8640,7 +8645,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             return {"error":f"no such agent: {name} (ag agents list)"}
         a = agents[name]
         backend = a.get("backend","claude")
-        model = a.get("model","default") or "default"
+        model = _mo or a.get("model","default") or "default"
         if _rs and _rs.get("fb"): model = _rs["fb"]  # ratelimit fallback: this attempt runs on the fallback model
         workdir = os.path.abspath(a.get("dir",".") or ".")
         if command and backend != "opencode":
@@ -8939,7 +8944,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         _nx = None if command else _retry_plan(sdir,name,backend,sid,rc,(err+"\n"+_erows).strip(),_timed_out["hit"] or _intr,bool(full) or any(r.get("role") not in ("user","error") for r in buf.rows.values()),_rs,_turn_lock,_t_guard,timeout_s,on_event)
         if _nx: _nx["ck"] = _ck
         if _nx and _force: _nx["force"] = True
-        if _nx: return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs=_nx,force=_force,stall_s=stall_s)
+        if _nx: return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs=_nx,force=_force,stall_s=stall_s,model=_mo)
         if rc != 0 and not _intr:
             # record failure even when prose already streamed; never fake ok.
             _emsg = f"(exit {rc}) " + ((err.strip().splitlines()[-3:] or [""])[-1][:300] or "turn failed")
@@ -9953,19 +9958,40 @@ def do_chat(a):
         if vcmd and vtmo is None:
             return emit(a,"chat",error="invalid --verify-timeout: need finite seconds >= 0",
                 hint='ag chat send NAME --verify "CMD" --verify-timeout 900 TEXT')
+        esc_ms = None
+        if getattr(a,"escalate",None) is not None:
+            if not vcmd: return emit(a,"chat",error="--escalate needs --verify",hint='ag chat send NAME --verify "CMD" --escalate m2,m3 TEXT')
+            esc_ms = [m.strip() for m in a.escalate.split(",") if m.strip()]
         live = not getattr(a,"json",False)
         if getattr(a,"job",None): _event(sdir,"chat_job",a.name,job=a.job)
-        _payload = [text,cmd,a.sub,vcmd,vtmo] + (["notify_done"] if notify_done else [])
+        _payload = [text,cmd,a.sub,vcmd,vtmo] + (["escalate",esc_ms] if esc_ms is not None else []) + (["notify_done"] if notify_done else [])
         _rc, _h = _rcpt(a, sdir, "chat", a.name, json.dumps(_payload))
         if _rc is not None: return _rc
-        r = (agent_steer if a.sub=="steer" else run_turn)(sdir,a.name,text,command=cmd,timeout_s=timeout_s,force=bool(getattr(a,"force",False)),stall_s=getattr(a,"stall_s",None),
-            on_event=(lambda n,k,t: print(t) if live and k=="text" and t else print(t,file=sys.stderr) if live and k=="tool" and (t or "").startswith("[mode]") else None)); _rcpt_done(_h, r)
+        def _run(msg, **kw): return (agent_steer if a.sub=="steer" else run_turn)(sdir,a.name,msg,command=cmd,timeout_s=timeout_s,force=bool(getattr(a,"force",False)),stall_s=getattr(a,"stall_s",None),
+            on_event=(lambda n,k,t: print(t) if live and k=="text" and t else print(t,file=sys.stderr) if live and k=="tool" and (t or "").startswith("[mode]") else None), **kw)
+        r = _run(text); v = esc = None
+        if esc_ms is not None:  # escalation ladder: each failed attempt (backend error or verify != 0) retries the same session on the next model
+            cur = next((x.get("model") or "default" for x in load_agents(sdir) if x.get("name")==a.name), "default"); esc = []
+            for i in range(len(esc_ms)+1):
+                if i:
+                    _row = f"[escalate] -> {cur} (verify exit {v['exit']})"
+                    try: append_chat(sdir,a.name,"tool",_row)
+                    except Exception: pass
+                    r = _run(f"{text}\n\nThe previous attempt failed verification (`{vcmd}`, exit {v['exit']}). Output:\n{v['tail']}\nFix it.", model=cur)
+                if "error" in r and not r.get("timed_out"): v = {"cmd":vcmd,"exit":-1,"tail":str(r["error"])[:2000]}
+                else:
+                    try: v = run_verify(sdir,a.name,vcmd,vtmo)
+                    except Exception as e: v = {"cmd":vcmd,"exit":1,"tail":f"verify error: {e}"}
+                    verify_log_row(sdir,a.name,v)
+                esc.append({"model":cur,"exit":r.get("exit"),"verify_exit":v["exit"]})
+                if v["exit"] == 0 or i == len(esc_ms): break
+                cur = esc_ms[i]
+        _rcpt_done(_h, r)
         if "error" in r and not r.get("timed_out"):
             if notify_done: _notify_completion(a.name, "failed", error=r.get("error"))
             if r.get("exit") == 2: emit(a,"chat",error=r["error"]); return 2
             return emit(a,"chat",error=r["error"])
-        v = None
-        if vcmd:  # turn ran (errors above already returned); run trusted verify in the agent workdir
+        if vcmd and esc is None:  # turn ran (errors above already returned); run trusted verify in the agent workdir
             try: v = run_verify(sdir,a.name,vcmd,vtmo)
             except Exception as e: v = {"cmd":vcmd,"exit":1,"tail":f"verify error: {e}"}
             verify_log_row(sdir,a.name,v)
@@ -9978,6 +10004,7 @@ def do_chat(a):
         if getattr(a,"json",False):
             data = {"reply":r["reply"],"exit":r["exit"],"sid":r["sid"]}
             if v: data["verify"] = v
+            if esc is not None: data["escalation"] = esc
             if r.get("usage"): data["usage"] = r["usage"]
             for _k in ("interrupted","steered"):
                 if r.get(_k): data[_k] = True
@@ -17917,11 +17944,11 @@ def build():
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra opencode edits-mode shell allowlist prefix (repeatable; "" clears)'); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model"); aga.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears -> AG_STALL_S/backend default)')
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model"); aga.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears -> AG_STALL_S/backend default)')
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)"); agrm.add_argument("--purge",action="store_true",help="also remove chat log and metadata")
     agrs=ags.add_parser("reset",help="clear stored backend session ids; keep config and chat log"); agrs.add_argument("name")
     agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra opencode edits-mode shell allowlist prefix (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)')
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)')
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)
@@ -17935,7 +17962,7 @@ def build():
     ch = sub.add_parser("chat",help="talk to an agent headless"); chs=ch.add_subparsers(dest="sub",required=True)
     chs2=chs.add_parser("send"); chs2.add_argument("name"); chs2.add_argument("text",nargs="*")
     chs2.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in events"); chs2.add_argument("--command",default=None,help="opencode native custom command (message becomes its args)")
-    chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); chs2.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); chs2.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); chs2.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); chs2.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the turn finishes"); chs2.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the turn, ag runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail(40 lines)} in the result + a [verify] row in the chat log (never from the agent's reply)"); chs2.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)")
+    chs2.add_argument("--timeout",type=float,default=1800,help="hard backend runtime limit in seconds (0=unlimited, default 1800); starts after guard acquired, lock wait excluded"); chs2.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); chs2.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original result"); chs2.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); chs2.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the turn finishes"); chs2.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the turn, ag runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail(40 lines)} in the result + a [verify] row in the chat log (never from the agent's reply)"); chs2.add_argument("--escalate",dest="escalate",default=None,metavar="MODEL[,MODEL...]",help="needs --verify: on failed verify/turn, retry the same session on each next model (one-turn override, roster unchanged); result gains escalation[]"); chs2.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)")
     chst=chs.add_parser("steer",help="interrupt the running turn, run this next (priority 0, same session)"); chst.add_argument("name"); chst.add_argument("text",nargs="*"); chst.add_argument("--timeout",type=float,default=1800); chst.add_argument("--force",action="store_true",help="bypass budget limits once (logged)")
     qu=sub.add_parser("queue",help="per-agent turn queue: list/cancel/hold/release"); qu.add_argument("agent"); qu.add_argument("--cancel",default=None,metavar="ID"); qu.add_argument("--hold",action="store_true"); qu.add_argument("--release",action="store_true")
     sp_=sub.add_parser("stop",help="hold queue, cancel waiters + wakes, interrupt running turn"); sp_.add_argument("agent"); sp_.add_argument("--cascade",action="store_true",help="also stop agents whose jobs record parent == agent")

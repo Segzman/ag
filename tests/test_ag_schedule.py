@@ -63,10 +63,39 @@ class Parse(unittest.TestCase):
             else: os.environ["TZ"] = old
             time.tzset()
 
+    def test_tz_rows_ignore_process_zone(self):
+        old = os.environ.get("TZ"); os.environ["TZ"] = "UTC"; time.tzset()
+        try:
+            utc = lambda *t: datetime(*t, tzinfo=timezone.utc).timestamp()
+            # Fri 2026-03-06 23:30 UTC = Fri 18:30 Toronto -> next mon-fri 09:00 Toronto is Mon 03-09 13:00 UTC (EDT)
+            n = ag._sched_next({"at": "09:00", "days": [0, 1, 2, 3, 4], "tz": "America/Toronto"}, utc(2026, 3, 6, 23, 30))
+            self.assertEqual(n, utc(2026, 3, 9, 13, 0))
+            # Sat 01:00 UTC is still Fri 20:00 in Toronto: a fri-only 21:00 row fires in 1h, not a week later
+            n = ag._sched_next({"at": "21:00", "days": [4], "tz": "America/Toronto"}, utc(2026, 3, 7, 1, 0))
+            self.assertEqual(n, utc(2026, 3, 7, 2, 0))
+            n = ag._sched_next({"at": "09:00", "days": None, "tz": "+05:30"}, utc(2026, 3, 6, 0, 0))
+            self.assertEqual(n, utc(2026, 3, 6, 3, 30))
+            self.assertEqual(ag._sched_next({"at": "09:00", "days": None}, utc(2026, 3, 6, 0, 0)), utc(2026, 3, 6, 9, 0))  # no tz: local
+            for bad in ("Mars/Base", "+25:00", "5", "../etc/passwd"): self.assertRaises(ValueError, ag._sched_tz, bad)
+            os.environ["TZ"] = "America/Toronto"; self.assertEqual(ag._sched_local_tz(), "America/Toronto")
+            os.environ["TZ"] = "Nope/Zone"; self.assertTrue(ag._sched_local_tz())
+        finally:
+            if old is None: os.environ.pop("TZ", None)
+            else: os.environ["TZ"] = old
+            time.tzset()
+
     def test_update_skip(self): self.assertIn("schedule", ag.UPDATE_SKIP)
 
 
 class Cli(Env):
+    def test_add_tz(self):
+        p, o = self.add("--at", "09:00", "--tz", "America/Toronto", "--id", "t1", "ping"); self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(o["data"]["schedule"]["tz"], "America/Toronto")
+        p, o = self.add("--at", "09:00", "--id", "t2", "ping"); self.assertNotIn("tz", o["data"]["schedule"])
+        p = self.run_ag("schedule", "add", "w1", "--at", "09:00", "--tz", "Mars/Base", "x")
+        self.assertNotEqual(p.returncode, 0); self.assertIn("invalid --tz", p.stdout + p.stderr)
+        self.assertNotEqual(self.add("--every", "15m", "--tz", "UTC", "x")[0].returncode, 0)
+
     def add(self, *a): return self.j("schedule", "add", "w1", *a)
 
     def test_add_list_registry_rm(self):

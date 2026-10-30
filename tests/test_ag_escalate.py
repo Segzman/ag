@@ -74,6 +74,46 @@ class Escalate(Setup):
         self.assertIn("[escalate] -> m2", log)
 
 
+class WakeEscalate(Setup):
+    """Same ladder in the background wake worker; fake spawn, worker body run in-process."""
+    def setUp(self):
+        super().setUp()
+        self.m = m = load()
+        m._spawn_wake_session = lambda sd, agent, jid, sid=None, pre_fork=None: (pre_fork and pre_fork(sid or "s", None)) or sid or "s"
+
+    def wake(self, verify, esc):
+        r = self.m.launch_wake_chat(self.state, "e", "fix the thing", verify=verify, escalate=esc)
+        self.assertEqual(self.m._wake_read_job(self.state, r["job"]).get("escalate"), esc)
+        self.m.do__wake_run(self.m.build().parse_args(["--dir", str(self.state), "_wake_run", r["job"]]))
+        return self.m._wake_read_job(self.state, r["job"])
+
+    def test_escalates_until_verify_passes(self):
+        j = self.wake(self.pass_on(3), ["m2", "m3"])
+        self.assertEqual([(x["model"], x["verify_exit"]) for x in j["escalation"]], [("m1", 1), ("m2", 1), ("m3", 0)])
+        self.assertEqual(j["verify"]["exit"], 0); self.assertEqual(j["status"], "done")
+        rows = self.m.load_chat_log(self.state, "e"); log = [x["text"] for x in rows]
+        last = [x["text"] for x in rows if x.get("role") == "user"][-1]  # job reply is truncated; the prompt is in the log
+        self.assertIn("FAILMARK2", last); self.assertIn("fix the thing", last)
+        self.assertEqual([t for t in log if t.startswith("[escalate]")], ["[escalate] -> m2 (verify exit 1)", "[escalate] -> m3 (verify exit 1)"])
+        rows = json.loads(self.ag("--json", "agents", "list").stdout)["data"]
+        rows = rows.get("agents", rows) if isinstance(rows, dict) else rows
+        self.assertEqual(next(r for r in rows if r["name"] == "e")["model"], "m1")
+
+    def test_stops_early_and_all_fail(self):
+        self.assertEqual([x["model"] for x in self.wake("true", ["m2"])["escalation"]], ["m1"])
+        j = self.wake("echo nope; exit 2", ["m2"])
+        self.assertEqual([(x["model"], x["verify_exit"]) for x in j["escalation"]], [("m1", 2), ("m2", 2)])
+        self.assertEqual(j["verify"]["exit"], 2)
+
+    def test_no_escalate_unchanged(self):
+        r = self.m.launch_wake_chat(self.state, "e", "x", verify="true")
+        self.assertNotIn("escalate", self.m._wake_read_job(self.state, r["job"]))
+
+    def test_cli_requires_verify(self):
+        p = self.ag("wake", "e", "go", "--escalate", "m2", ok=False)
+        self.assertIn("--escalate needs --verify", p.stdout + p.stderr)
+
+
 class AllowCmdClaude(unittest.TestCase):
     def test_edits_mode_adds_allowed_tools(self):
         m = load()

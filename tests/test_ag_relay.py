@@ -218,6 +218,19 @@ class Flow(Env):
         self.assertTrue(r["last_status"].startswith("error:"))
         self.assertIsNone(r["next_due"])  # parked: never fires while the agent is missing
 
+    def test_at_row_carries_origin_tz(self):
+        self.init(self.t); self.init(self.o); self.add_agent(self.o, "w1")
+        self.o["env"]["TZ"] = "America/Toronto"; self.t["env"]["TZ"] = "UTC"
+        self.run_ag(self.o, "schedule", "add", "w1", "--at", "09:00", "--days", "mon-fri", "--on", "muse", "--id", "s1", "ping")
+        self.run_ag(self.o, "schedule", "add", "w1", "--at", "09:00", "--tz", "+05:30", "--on", "muse", "--id", "s2", "ping")
+        mail = lambda sid: json.loads((self.root / "schedules" / "muse" / f"mac--{sid}.json").read_text())
+        self.assertEqual(mail("s1")["tz"], "America/Toronto"); self.assertEqual(mail("s2")["tz"], "+05:30")
+        self.sync(self.t)
+        r = self.row(self.t, "mac--s1"); self.assertEqual(r["tz"], "America/Toronto")
+        due = datetime.fromtimestamp(r["next_due"], ag._sched_tz("America/Toronto"))
+        self.assertEqual((due.strftime("%H:%M"), due.weekday() < 5), ("09:00", True))
+        self.assertEqual(self.row(self.t, "mac--s2")["tz"], "+05:30")
+
     def test_unpublished_mail_pruned(self):  # mail file vanishes without unpublish (user --force rm)
         self.init(self.t); self.init(self.o); self.add_agent(self.o, "w1"); self.publish("s1", "muse", spec={"backend": "echo"})
         self.sync(self.o); self.sync(self.t)

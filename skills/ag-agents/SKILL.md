@@ -113,7 +113,7 @@ Work code only to zdr models. Source: opencode.ai/docs/zen Privacy (2026-10-12);
 
 Tasks must be self-contained: what to do, what done looks like. Fan-out = different agents; two chunks to one agent serialize. `chat send`/`delegate --timeout` (default 1800, 0 = none) is a hard backend budget starting after guard acquired (lock wait unbounded); expiry exits 124 and the chat error row ends `(raise --max-runtime or split the task)`. Prefer `wake` for slow work. `wake --max-runtime` same budget; `wake --timeout` only marks `stalled`; `--notify`/`--on-done` run after. `wake`/`delegate` to an unknown agent fail at call time (`error: no such agent: X`, hint with close names + `ag agents list`); no job file, no spawn. `wake` is at-most-once *launch*: verify via `events` + `wakes`; relaunch lost ones with `wakes --reap`. `kill <worker-sid>` stops a worker. Use `--request-id` on retried calls to avoid double work. Slash text (`/model`, `/profile use docs`, `/help`) runs locally, never reaches the model. Waiting on many jobs: `wakes --wait JOB [JOB…]` / `wakes --wait-group GID [--timeout S]`; one summary line per job; exit 0 all ok, 1 some failed, 124 timed out.
 
-Agent self-reports lie: `--verify "<cmd>"` (`chat send`/`delegate`/`wake`, `--verify-timeout S` default 600) makes ag run your trusted command via `sh -c` in the agent's workdir after the turn and record `verify: {cmd, exit, tail (last 40 lines)}` in the turn result / wake job (`--json`), a `[verify] exit=N` chat-log row, and `[verify exit=N]` in the cohort summary. The verify exit is separate from the backend exit; timeout = exit 124. The command comes from the orchestrator, never from the agent's reply. Prefer real checks: `--verify "python3 -m unittest tests.test_x"`, `--verify "node --check x.js"`. `chat send ... --verify CMD --escalate m2,m3` retries a failed attempt on the same session with each next model (one-turn override, roster unchanged) until verify passes; `--json` adds `escalation: [{model, exit, verify_exit}]`. Needs `--verify`; not for `delegate`/`wake` yet.
+Agent self-reports lie: `--verify "<cmd>"` (`chat send`/`delegate`/`wake`, `--verify-timeout S` default 600) makes ag run your trusted command via `sh -c` in the agent's workdir after the turn and record `verify: {cmd, exit, tail (last 40 lines)}` in the turn result / wake job (`--json`), a `[verify] exit=N` chat-log row, and `[verify exit=N]` in the cohort summary. The verify exit is separate from the backend exit; timeout = exit 124. The command comes from the orchestrator, never from the agent's reply. Prefer real checks: `--verify "python3 -m unittest tests.test_x"`, `--verify "node --check x.js"`. `chat send ... --verify CMD --escalate m2,m3` retries a failed attempt on the same session with each next model (one-turn override, roster unchanged) until verify passes; `--json` adds `escalation: [{model, exit, verify_exit}]`. Needs `--verify`. Same on background wakes: `wake <agent> "<task>" --verify "<cmd>" --escalate <m2>,<m3>` (job gets `escalation` + last `verify`); not for `delegate` yet.
 
 ### Second opinions via crosscheck
 
@@ -160,11 +160,11 @@ Interrupted turns exit 130, keep partial reply, never retried. `stop` leaves HOL
 
 ```sh
 {{AG}} --dir <state> schedule add w --every 15m "msg" [--job J] [--overlap skip|queue] [--max-runtime S] [--id NAME] [--on NODE] [--notify-done]
-{{AG}} --dir <state> schedule add w --at 09:00 --days mon-fri "msg" [--catch-up] [--disabled] [--notify X] [--notify-done] [--on-done CMD]
+{{AG}} --dir <state> schedule add w --at 09:00 --days mon-fri [--tz America/Toronto|+HH:MM] "msg" [--catch-up] [--disabled] [--notify X] [--notify-done] [--on-done CMD]
 {{AG}} --dir <state> schedule list [--all] | pause ID | resume ID | run ID | rm ID
 ```
 
-Needs the global tick installed once (`schedule install --write`, see `ag-cli`); else nothing fires. Local clock, min 60s. Missed fixed-time >10min late skipped unless `--catch-up`. Default `--overlap skip`. Double ticks never double-fire.
+Needs the global tick installed once (`schedule install --write`, see `ag-cli`); else nothing fires. Local clock (or `--tz` zone; `--at --on NODE` carries the origin's zone), min 60s. Missed fixed-time >10min late skipped unless `--catch-up`. Default `--overlap skip`. Double ticks never double-fire.
 
 ## Relay: schedules on another machine
 

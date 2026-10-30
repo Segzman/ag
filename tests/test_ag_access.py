@@ -115,6 +115,12 @@ class Access(unittest.TestCase):
         self.assertIn("not allowed by access policy", o["error"])
         self.agj("agents", "add", "a1", "--backend", "echo", "--model", "default")
 
+    def test_usage_ledger_cost_equiv_for_subscription(self):
+        ag = self.lib()
+        r = ag.usage_log_turn(self.root / "state", "c1", "claude", "opus", {"in": 10, "out": 5, "cost": 0.0123})
+        self.assertIsNone(r["cost"]); self.assertTrue(r["subscription"]); self.assertEqual(r["cost_equiv"], 0.0123)
+        self.assertNotIn("cost_equiv", ag.usage_log_turn(self.root / "state", "c1", "claude", "opus", {"in": 1}))
+
     def test_usage_ledger_and_command(self):
         self.agj("agents", "add", "u1", "--backend", "opencode", "--model", "opencode/space-bunny-free", "--data", "public")
         p = self.run_ag("--json", "chat", "send", "u1", "hi")

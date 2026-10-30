@@ -465,7 +465,7 @@ ag chat send w "task" --force | ag wake w "task" --force | ag delegate w "task" 
 ```
 
 - **Access:** `routing.json` `access: {allow:[globs], deny:[globs]}` (global < project, unioned; per-data `access.work`/`access.public` unioned over base) matching `backend/model` and `provider/*` (deny wins). Enforced at `agents add/set` and at turn time (exit 2, error row, never sent).
-- **Ledger:** one JSON line per finished turn to `$AG_CACHE_HOME/usage.jsonl` (global): ts, agent, project, backend, model, provider, in/out/cache, requests=1, exit, cost (tokens x models.dev via `catalog_info`; free=$0; claude/codex=`subscription`, cost null).
+- **Ledger:** one JSON line per finished turn to `$AG_CACHE_HOME/usage.jsonl` (global): ts, agent, project, backend, model, provider, in/out/cache, requests=1, exit, cost (tokens x models.dev via `catalog_info`; free=$0; claude/codex=`subscription`, cost null, plus `cost_equiv` = the CLI-reported API-equivalent USD when the backend gives one, e.g. claude `total_cost_usd`).
 - **Usage:** totals + per-provider daily requests vs `providers.json` rpd with % used; `--by` groups, `--since` filters.
 - **Budgets:** daily/monthly USD + per-provider rpd; at turn start a breach refuses (exit 2) unless `--force`; at 80% one `[budget]` warning row.
 

@@ -15330,6 +15330,8 @@ def usage_log_turn(sdir, name, backend, model, acc, exit_code=0):
             "cache_read": int(acc.get("cache_read") or 0), "cache_write": int(acc.get("cache_write") or 0),
             "cache": int(acc.get("cache_read") if acc.get("cache_read") is not None else acc.get("cache") or 0),
             "reasoning": int(acc.get("reasoning") or 0), "cost": cost, "subscription": bool(sub), "requests": 1, "exit": int(exit_code or 0)}
+        # subscription turns keep cost null (budgets), but record the CLI's API-equivalent figure for receipts
+        if sub and isinstance(acc.get("cost"), (int, float)): row["cost_equiv"] = round(float(acc["cost"]), 6)
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "a") as f: f.write(json.dumps(row) + "\n")
         return row

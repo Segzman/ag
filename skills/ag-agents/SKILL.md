@@ -38,7 +38,7 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 {{AG}} --dir <state> agents caps [BACKEND]       # per-backend capability table (modes, plan, resume, interrupt)
 {{AG}} --dir <state> agents add w --backend codex --mode edits [--plan]
 {{AG}} --dir <state> agents set w --mode ro|edits|auto|full | --mode "" | --plan | --no-plan
-{{AG}} --dir <state> agents set w --allow-cmd '.venv/bin/python -m unittest*' --allow-cmd 'node --check*'   # extra opencode edits-shell prefixes for this agent (repeatable; "" clears)
+{{AG}} --dir <state> agents set w --allow-cmd '.venv/bin/python -m unittest*' --allow-cmd 'node --check*'   # extra edits-shell prefixes for this agent (opencode allowlist; claude --allowedTools Bash(P*)) (repeatable; "" clears)
 {{AG}} --dir <state> agents set w --effort high           # reasoning effort, checked per model: opencode --variant (Muse Spark top = xhigh, no max), claude --effort, codex model_reasoning_effort; highest|lowest resolve, "" clears, unset = routing/backend default; stale stored effort falls back to the model default with an [effort] row
 {{AG}} --dir <state> agents set w --stall-s 900           # per-agent stall watchdog seconds; 0 = off, "" clears -> AG_STALL_S/backend default; shown in agents list --json; wake/chat send --stall-s N overrides one turn (per-turn > agent > AG_STALL_S > backend default)
 ```
@@ -96,6 +96,7 @@ Work code only to zdr models. Source: opencode.ai/docs/zen Privacy (2026-10-12);
 | Follow-up when a session ends | `spawn --wake <agent> --wake-message "<task>" -- <cmd>` (once) |
 | opencode native command | `chat send oc --command review "path"` (opencode only) |
 | Check the work, not the self-report | `chat send|delegate|wake <agent> "<task>" --verify "<cmd>" [--verify-timeout S]` |
+| Cheap first, escalate on failed check | `chat send <agent> "<task>" --verify "<cmd>" --escalate <m2>,<m3>` |
 | Notify when a turn finishes | Add `--notify-done` to `chat send`, `delegate`, or `wake`; `schedule add` can notify after every run |
 
 ```sh
@@ -112,7 +113,7 @@ Work code only to zdr models. Source: opencode.ai/docs/zen Privacy (2026-10-12);
 
 Tasks must be self-contained: what to do, what done looks like. Fan-out = different agents; two chunks to one agent serialize. `chat send`/`delegate --timeout` (default 1800, 0 = none) is a hard backend budget starting after guard acquired (lock wait unbounded); expiry exits 124 and the chat error row ends `(raise --max-runtime or split the task)`. Prefer `wake` for slow work. `wake --max-runtime` same budget; `wake --timeout` only marks `stalled`; `--notify`/`--on-done` run after. `wake`/`delegate` to an unknown agent fail at call time (`error: no such agent: X`, hint with close names + `ag agents list`); no job file, no spawn. `wake` is at-most-once *launch*: verify via `events` + `wakes`; relaunch lost ones with `wakes --reap`. `kill <worker-sid>` stops a worker. Use `--request-id` on retried calls to avoid double work. Slash text (`/model`, `/profile use docs`, `/help`) runs locally, never reaches the model. Waiting on many jobs: `wakes --wait JOB [JOB…]` / `wakes --wait-group GID [--timeout S]`; one summary line per job; exit 0 all ok, 1 some failed, 124 timed out.
 
-Agent self-reports lie: `--verify "<cmd>"` (`chat send`/`delegate`/`wake`, `--verify-timeout S` default 600) makes ag run your trusted command via `sh -c` in the agent's workdir after the turn and record `verify: {cmd, exit, tail (last 40 lines)}` in the turn result / wake job (`--json`), a `[verify] exit=N` chat-log row, and `[verify exit=N]` in the cohort summary. The verify exit is separate from the backend exit; timeout = exit 124. The command comes from the orchestrator, never from the agent's reply. Prefer real checks: `--verify "python3 -m unittest tests.test_x"`, `--verify "node --check x.js"`.
+Agent self-reports lie: `--verify "<cmd>"` (`chat send`/`delegate`/`wake`, `--verify-timeout S` default 600) makes ag run your trusted command via `sh -c` in the agent's workdir after the turn and record `verify: {cmd, exit, tail (last 40 lines)}` in the turn result / wake job (`--json`), a `[verify] exit=N` chat-log row, and `[verify exit=N]` in the cohort summary. The verify exit is separate from the backend exit; timeout = exit 124. The command comes from the orchestrator, never from the agent's reply. Prefer real checks: `--verify "python3 -m unittest tests.test_x"`, `--verify "node --check x.js"`. `chat send ... --verify CMD --escalate m2,m3` retries a failed attempt on the same session with each next model (one-turn override, roster unchanged) until verify passes; `--json` adds `escalation: [{model, exit, verify_exit}]`. Needs `--verify`; not for `delegate`/`wake` yet.
 
 ### Second opinions via crosscheck
 

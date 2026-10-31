@@ -136,9 +136,13 @@ ag keys set NAME [--from-env VAR]          # value from secure dialog (getpass o
 ag keys list                               # names + created/updated, never values
 ag keys rm NAME                            # delete from Keychain
 ag keys test NAME --provider P             # cheap GET to the provider /models (prints ok/401, never the key)
-ag providers add ID --base-url URL --key-ref keychain:NAME [--npm @ai-sdk/openai-compatible] [--privacy zdr|retain|train] [--max-concurrent N] [--rpd N] [--model ID ...]
+ag providers add ID --base-url URL --key-ref keychain:NAME [--npm @ai-sdk/openai-compatible] [--privacy zdr|retain|train|unknown] [--no-key] [--zdr] [--max-concurrent N] [--rpd N] [--model ID ...]
 ag providers list | show ID | rm ID        # stored in $AG_CONFIG_HOME/providers.json (refs only, never secrets)
 ag providers add groq --key-ref keychain:NAME        # presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova
+# local / any OpenAI-compatible server (/v1/chat/completions): built-in keyless presets ollama (localhost:11434/v1) + lmstudio (localhost:1234/v1), zero config:
+ag agents add l --backend api --model ollama/qwen3:8b     # presets = zero-retention (ok for --data work), ledger cost 0; ollama *-cloud models are not (run on ollama.com)
+ag providers add gw --base-url https://host/v1 --no-key [--zdr]   # custom URL: privacy "unknown" (refused for --data work) unless --zdr/--privacy; a localhost URL is not trusted on its own (may proxy a cloud API): add --zdr if it is really local
+ag models --backend api --provider ollama                 # GET {base}/models; clear error when the server is down
 ```
 
 Presets (base URLs + privacy + max_concurrent/rpd from `free-providers.md`; `(*)` unverified): groq `https://api.groq.com/openai/v1` zdr max2; cerebras `https://api.cerebras.ai/v1` zdr max2; openrouter `https://openrouter.ai/api/v1` train max1 rpd50; cloudflare `https://api.cloudflare.com/client/v4/accounts/{env:CF_ACCOUNT_ID}/ai/v1` retain max2 (AI Gateway `(*)`); gemini `https://generativelanguage.googleapis.com/v1beta/openai/` train max1; mistral `https://api.mistral.ai/v1` train max1; sambanova `https://api.sambanova.ai/v1` retain max1 rpd20. ag writes an opencode config fragment (`"apiKey": "{env:AG_KEY_<ID>}"`) merged into the scoped `OPENCODE_CONFIG` it already builds (never your global `~/.config/opencode/opencode.json`) and injects `AG_KEY_<ID>` into the child env only. Provider privacy feeds `models --rank` data + the work-guard; provider max_concurrent feeds ratelimit slots for `<provider>/*` models.

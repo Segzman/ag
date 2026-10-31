@@ -10264,9 +10264,8 @@ def _relay_remote_wake_dir():
 
 # ---- channels: shared room; @member mentions wake that agent, its reply is posted back (hand-off chain) ----
 # <state>/channels/NAME.jsonl (append-only {ts,from,text}) + NAME.json ({members}). Wake jobs carry
-# channel={name,left}: `left` = remaining auto-wake budget (--max-hops), decremented per hop down the chain.
-# ponytail: budget is per chain branch (a post mentioning k agents may fan out k wakes each with left-1);
-# ceiling: no cross-branch counter. Upgrade: shared counter file under flock.
+# channel={name,left}: `left` = remaining auto-wake budget (--max-hops); each wake costs 1 and the remainder is split
+# across the agents a post wakes, so a whole chain wakes at most --max-hops agents.
 CHAN_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 CHAN_MENTION = re.compile(r"(?<![\w@.])@([A-Za-z0-9][A-Za-z0-9_.-]*)")
 
@@ -10292,7 +10291,7 @@ def _chan_post(sdir, name, sender, text, left=8, ctx=20, wake=True):
     with open(_chan_paths(sdir, name)[0], "a", encoding="utf-8") as f: f.write(json.dumps({"ts": now_iso(), "from": sender, "text": text}) + "\n")
     out = {"woke": [], "ignored": [], "skipped": []}
     if not wake: return out
-    members = meta.get("members", []); seen = set()
+    members = meta.get("members", []); seen = set(); targets = []
     for m in CHAN_MENTION.findall(text):
         m = m.rstrip(".-")
         if m in seen or m == sender: continue
@@ -10300,12 +10299,18 @@ def _chan_post(sdir, name, sender, text, left=8, ctx=20, wake=True):
         if m not in members:
             if m != "user": out["ignored"].append(m)
             continue
-        if left <= 0: out["skipped"].append({"agent": m, "reason": "hop limit"}); continue
-        hist = "\n".join(f"[{r.get('from')}] {r.get('text')}" for r in _chan_read(sdir, name)[-max(1, ctx):])
+        targets.append(m)
+    # each wake costs 1; the rest of the budget is split across the woken agents, so --max-hops caps total wakes
+    out["skipped"] += [{"agent": m, "reason": "hop limit"} for m in targets[max(0, left):]]
+    targets = targets[:max(0, left)]
+    share, extra = divmod(left - len(targets), len(targets) or 1)
+    hist = "\n".join(f"[{r.get('from')}] {r.get('text')}" for r in _chan_read(sdir, name)[-max(1, ctx):])
+    for i, m in enumerate(targets):
+        sub = share + (1 if i < extra else 0)
         msg = (f"[channel {name}] {sender} mentioned you. Members: {', '.join(members)}. Last messages (oldest first):\n{hist}\n\n"
             f"Your reply is posted back to channel {name} automatically. Write @ + a member's name in it to hand off to that member "
-            f"(never yourself). Extra mid-turn message: `{ag_script_path()} --dir {sdir} channel post {name} \"...\" --as {m}`.")
-        r = launch_wake_chat(sdir, m, msg, trigger="channel", extra={"channel": {"name": name, "left": left - 1, "ctx": ctx}})
+            f"(never yourself). Extra mid-turn message: `{ag_script_path()} --dir {sdir} channel post {name} \"...\" --as {m} --max-hops {sub}`.")
+        r = launch_wake_chat(sdir, m, msg, trigger="channel", extra={"channel": {"name": name, "left": sub, "ctx": ctx}})
         if "error" in r: out["skipped"].append({"agent": m, "reason": r["error"]})
         else: out["woke"].append({"agent": m, "job": r.get("job")})
     return out

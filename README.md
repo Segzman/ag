@@ -389,7 +389,7 @@ ag channel log room [--tail N]            # --json on every subcommand
 - Shared room built on wakes. State: `<state>/channels/NAME.jsonl` (append-only `{ts,from,text}`) + `NAME.json` (`{members}`). `--as` defaults to `$AG_PARENT_AGENT` (set inside every turn), else `user`.
 - Each `@member` in a post (not the sender, deduped) triggers `wake member` with the channel name, the last `--context` messages and a note that its reply is posted back and it may `@mention` others. Unknown `@names` are ignored and listed under `ignored` in the JSON; `@user` is silent.
 - The wake job carries `channel`; when it finishes (`_wake_finish`), the reply is appended as `from=<agent>` (a failed wake appends `(wake failed: ...)`, no mentions). Mentions in that reply wake the next agents, so agents hand off. An agent never wakes itself.
-- Loop guard: `--max-hops N` (default 8) is the auto-wake budget handed down each chain (post -> wake -> reply -> wake ...); at 0 further mentions are reported under `skipped` (`hop limit`). Per branch, not a global counter: a post that fans out to k agents gives each its own remaining budget.
+- Loop guard: `--max-hops N` (default 8) caps the total wakes in a chain (post -> wake -> reply -> wake ...): each wake costs 1 and the rest is split across the agents a post wakes; mentions past the budget are reported under `skipped` (`hop limit`).
 - An agent may also post mid-turn: `ag --dir <state> channel post NAME "..." --as <self>` (its final reply is posted automatically, do not repeat it).
 
 ## Scheduled tasks

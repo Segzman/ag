@@ -97,9 +97,9 @@ class TChannelWake(unittest.TestCase):
 
     def test_handoff_chain(self):
         m, sd = mk("a", "b", "boss")
-        post(m, sd, "@a ask @b", "--max-hops", "2")
+        post(m, sd, "@a ask @b", "--max-hops", "4")
         order = drain(m, sd)
-        # gen 1: a,b woken by the user; their echo replies hand off to each other (gen 2); budget then spent
+        # --max-hops caps total wakes: gen 1 a,b (1 left each); their echo replies hand off to each other (gen 2); spent
         self.assertEqual(sorted(order), ["a", "a", "b", "b"])  # drain order follows job-id hashes
         froms = [r["from"] for r in log(m, sd)]
         self.assertEqual((froms[0], sorted(froms[1:])), ("user", ["a", "a", "b", "b"]))

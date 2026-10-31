@@ -134,18 +134,25 @@ class AgSetup(unittest.TestCase):
         rt = json.loads((self.cfg/"routing.json").read_text())
         self.assertEqual((rt["version"], rt["preset"]), (2, "cost-first"))
         self.assertEqual(rt.get("profiles", {}), {})  # sparse: defaults are inherited, not frozen into the file
-        for base in (self.home/".claude", self.home/".config"/"opencode", self.home/".codex"):
-            cli = (base/"skills"/"ag-cli"/"SKILL.md").read_text()
-            self.assertEqual(cli, f"---\nname: ag-cli\n---\nrun {Path(AG).resolve()} models (global) keep {{{{OTHER}}}}\n")
-            ags = (base/"skills"/"ag-agents"/"SKILL.md").read_text()
-            self.assertIn("| review — code review, verification | opus | claude / opus |" if base.name == ".claude"
-                else "| review — code review, verification | " + ("opencode / opencode/" if base.name == "opencode" else "codex / "), ags)
-            self.assertIn(f"Profile: {'claude' if base.name == '.claude' else base.name.lstrip('.')}.", ags)
-            self.assertNotIn("{{ROUTING}}", ags); self.assertNotIn("{{AG}}", ags)
+        sh = self.home/".agents"/"skills"
+        cli = (sh/"ag-cli"/"SKILL.md").read_text()
+        self.assertEqual(cli, f"---\nname: ag-cli\n---\nrun {Path(AG).resolve()} models (global) keep {{{{OTHER}}}}\n")
+        ags = (sh/"ag-agents"/"SKILL.md").read_text()
+        self.assertNotIn("{{ROUTING}}", ags); self.assertNotIn("{{AG}}", ags)
+        self.assertTrue((sh/"ag-agents"/"SKILL.md").is_file() and not (sh/"ag-agents").is_symlink())
+        for n in ("ag-cli", "ag-agents"):
+            self.assertEqual(os.readlink(self.home/".claude"/"skills"/n), str(sh/n))
+        for gone in (self.home/".config"/"opencode"/"skills", self.home/".codex"/"skills"): self.assertFalse(gone.exists())
+        self.assertIn("| review — code review, verification | opus | claude / opus |", (self.home/".claude"/"CLAUDE.md").read_text())
+        for base, fn, pat in ((".config/opencode", "AGENTS.md", "opencode / opencode/"), (".codex", "AGENTS.md", "codex / ")):
+            ins = (self.home/base/fn).read_text()
+            self.assertTrue(ins.startswith(START) and ins.endswith(f"{END}\n"))
+            self.assertIn("| review — code review, verification | " + pat, ins); self.assertIn("Skills: ag-cli, ag-agents.", ins)
+            self.assertIn(f"Profile: {base.split('/')[-1].lstrip('.')}.", ins)
         self.assertEqual(old_skill.read_text(), "old")
         self.assertTrue(any("using-ag" in n for n in d["notes"]))
         t1 = cm.read_text()
-        self.assertTrue(t1.startswith(f"# mine\nkeep me\n\n{START}\n## Model routing"), t1)
+        self.assertTrue(t1.startswith(f"# mine\nkeep me\n\n{START}\nag is installed at ") and "\n## Model routing" in t1, t1)
         self.assertTrue(t1.endswith(f"{END}\n"))
         a1 = agents_md.read_text()
         self.assertTrue(a1.startswith(f"head\n{START}\n## Model routing") and a1.endswith(f"{END}\ntail\n"))
@@ -179,8 +186,10 @@ class AgSetup(unittest.TestCase):
         rt = json.loads((self.proj/".agent"/"routing.json").read_text())
         self.assertEqual(rt["profiles"]["claude"]["jobs"]["mechanical"], {"claude": "sonnet", "ag": {"backend": "opencode", "model": "opencode/a"}})
         self.assertEqual(rt["profiles"]["claude"]["jobs"]["plan"]["claude"], "opus")
-        for sub in (".claude", ".opencode", ".agents"):
+        for sub in (".claude", ".agents"):
             self.assertIn("(project)", (self.proj/sub/"skills"/"ag-cli"/"SKILL.md").read_text())
+        self.assertTrue((self.proj/".claude"/"skills"/"ag-cli").is_symlink() and not (self.proj/".agents"/"skills"/"ag-cli").is_symlink())
+        self.assertFalse((self.proj/".opencode").exists())
         self.assertFalse((self.home/".claude").exists() or (self.cfg/"routing.json").exists())
         self.assertEqual(self.agj("route", "plan")["data"]["jobs"]["plan"]["source"]["claude"], "project")
         for bad in ("plan=opus", "nope=claude:opus", "debug=ag:bogus/x"):
@@ -192,6 +201,77 @@ class AgSetup(unittest.TestCase):
         self.assertTrue((self.cfg/"routing.json").exists())
         self.assertIn(START, (self.home/".claude"/"CLAUDE.md").read_text())
         self.assertFalse((self.home/".claude"/"skills").exists())
+
+    # ---- shared skills + instruction-file pointers ----
+    def test_shared_skills_references_links_and_stale(self):
+        (self.skills/"ag-agents"/"references").mkdir()
+        (self.skills/"ag-agents"/"references"/"r.md").write_text("ref {{AG}} {{SCOPE}}\n")
+        sh = self.home/".agents"/"skills"/"ag-agents"
+        sh.mkdir(parents=True); (sh/"old.md").write_text("stale")
+        self.agj("setup", "--yes", "--harness", "claude,amp")
+        self.assertEqual((sh/"references"/"r.md").read_text(), f"ref {Path(AG).resolve()} global\n")
+        self.assertFalse((sh/"old.md").exists())  # ag owns this dir: files the template no longer has go
+        for base in (self.home/".claude"/"skills", self.home/".config"/"agents"/"skills"):
+            self.assertEqual(os.readlink(base/"ag-agents"), str(sh))
+            self.assertTrue((base/"ag-agents"/"references"/"r.md").is_file())
+        d = self.agj("setup", "--yes", "--harness", "claude,amp", "--dry-run")["data"]
+        self.assertTrue(all(f["status"] == "unchanged" for f in d["files"]), d["files"])
+
+    def test_dry_run_shows_links_and_removals(self):
+        leg = self.home/".codex"/"skills"/"ag-cli"; leg.mkdir(parents=True); (leg/"SKILL.md").write_text("---\nname: ag-cli\n---\nold\n")
+        d = self.agj("setup", "--yes", "--harness", "claude,codex", "--dry-run")["data"]
+        ops = {(f.get("op"), f["path"]) for f in d["files"] if f.get("op")}
+        self.assertIn(("link", str(self.home/".claude"/"skills"/"ag-cli")), ops)
+        self.assertIn(("rmdir", str(leg)), ops)
+        self.assertTrue(leg.exists() and not (self.home/".claude"/"skills").exists())
+
+    def test_legacy_copies_removed_foreign_untouched(self):
+        oc, cx = self.home/".config"/"opencode"/"skills", self.home/".codex"/"skills"
+        for base in (oc, cx):
+            for n in ("ag-cli", "ag-agents"):
+                (base/n).mkdir(parents=True, exist_ok=True); (base/n/"SKILL.md").write_text(f"---\nname: {n}\n---\nold copy\n")
+        (cx/"ag-cli"/"extra.md").write_text("mine")           # not a plain ag copy
+        (oc/"other").mkdir(); (oc/"other"/"SKILL.md").write_text("---\nname: other\n---\n")
+        cl = self.home/".claude"/"skills"/"ag-cli"; cl.mkdir(parents=True); (cl/"SKILL.md").write_text("---\nname: ag-cli\n---\nprev ag copy\n")
+        cl2 = self.home/".claude"/"skills"/"ag-agents"; cl2.mkdir(); (cl2/"SKILL.md").write_text("---\nname: something-else\n---\n")
+        d = self.agj("setup", "--yes", "--harness", "claude,opencode,codex")["data"]
+        self.assertFalse((oc/"ag-cli").exists() or (oc/"ag-agents").exists() or (cx/"ag-agents").exists())
+        self.assertTrue((cx/"ag-cli"/"extra.md").exists() and (oc/"other"/"SKILL.md").exists())
+        self.assertTrue(any(str(cx/"ag-cli") in n for n in d["notes"]))
+        self.assertTrue(cl.is_symlink())                       # earlier ag copy replaced by the link
+        self.assertTrue(not cl2.is_symlink() and "something-else" in (cl2/"SKILL.md").read_text())
+        self.assertTrue(any(str(cl2) in n for n in d["notes"]))
+
+    def test_pointer_blocks_in_each_harness_file(self):
+        files = {".codex/AGENTS.md": "codex", ".config/opencode/AGENTS.md": "opencode", ".gemini/GEMINI.md": "gemini"}
+        for f in list(files)[:2]:
+            (self.home/f).parent.mkdir(parents=True, exist_ok=True); (self.home/f).write_text("# mine é\nkeep\n")
+        self.agj("setup", "--yes", "--harness", "codex,opencode,gemini,cursor")
+        after = {}
+        for f, prof in files.items():
+            t = (self.home/f).read_text(); after[f] = t
+            self.assertEqual((t.count(START), t.count(END)), (1, 1))
+            self.assertIn(f"ag is installed at {Path(AG).resolve()}", t); self.assertIn("`ag wake`", t); self.assertIn("Skills: ag-cli, ag-agents.", t)
+            self.assertIn(f"Profile: {'default' if prof == 'gemini' else prof}.", t)
+        for f in list(files)[:2]: self.assertTrue(after[f].startswith("# mine é\nkeep\n\n" + START))
+        self.assertFalse((self.home/".claude"/"CLAUDE.md").exists())
+        self.assertTrue((self.home/".agents"/"skills"/"ag-cli"/"SKILL.md").is_file() and not (self.home/".claude"/"skills").exists())
+        # text around the markers survives; re-run changes nothing
+        g = self.home/".gemini"/"GEMINI.md"; g.write_text("TOP\n" + after[".gemini/GEMINI.md"] + "BOTTOM\n"); before = g.read_text()
+        d = self.agj("setup", "--yes", "--harness", "codex,opencode,gemini,cursor")["data"]
+        self.assertTrue(all(f["status"] == "unchanged" for f in d["files"]), d["files"]); self.assertEqual(g.read_text(), before)
+
+    def test_unknown_harness_error_lists_all(self):
+        e = self.agj("setup", "--yes", "--harness", "nope", ok=False)["error"]
+        for h in ("gemini", "cursor", "amp", "copilot"): self.assertIn(h, e)
+
+    def test_project_scope_layout_and_legacy(self):
+        leg = self.proj/".opencode"/"skills"/"ag-cli"; leg.mkdir(parents=True); (leg/"SKILL.md").write_text("---\nname: ag-cli\n---\nold\n")
+        self.agj("setup", "--yes", "--scope", "project", "--harness", "claude,opencode,codex")
+        self.assertFalse(leg.exists())
+        self.assertTrue((self.proj/".agents"/"skills"/"ag-agents"/"SKILL.md").is_file())
+        self.assertEqual(os.readlink(self.proj/".claude"/"skills"/"ag-cli"), str(self.proj/".agents"/"skills"/"ag-cli"))
+        self.assertFalse((self.home/".agents").exists() or (self.home/".codex"/"AGENTS.md").exists())
 
 
 if __name__ == "__main__":

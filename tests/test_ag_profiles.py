@@ -85,9 +85,9 @@ class Profiles(unittest.TestCase):
 
     def test_skills_render_profile_of_each_harness(self):
         self.agj("setup", "--yes", "--scope", "global", "--harness", "claude,opencode,codex")
-        for base_, prof in ((".claude", "claude"), (".config/opencode", "opencode"), (".codex", "codex")):
-            t = (self.home/base_/"skills"/"ag-agents"/"SKILL.md").read_text()
-            self.assertIn(f"Profile: {prof}.", t)
+        for base_, fn, prof in ((".claude", "CLAUDE.md", "claude"), (".config/opencode", "AGENTS.md", "opencode"), (".codex", "AGENTS.md", "codex")):
+            t = (self.home/base_/fn).read_text()
+            if prof != "claude": self.assertIn(f"Profile: {prof}.", t)
             self.assertEqual("Claude subagent" in t, prof == "claude")
 
     def test_setup_profile_flag_edits_only_that_profile(self):

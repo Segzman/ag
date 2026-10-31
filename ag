@@ -15003,7 +15003,9 @@ ROUTING_PRESETS = {"cost-first": _ROUTE_COST,
     "quality-first": {"mechanical": _rj("sonnet", "claude", "sonnet"), "implement": _rj("opus", "claude", "opus"),
         **{j: _rj("fable", "claude", "fable") for j in ("review", "debug", "plan", "hardest")}}}
 ROUTE_FALLBACK = {"backend": "opencode", "model": OPENCODE_MODEL_DEFAULT}
-SETUP_HARNESSES = ("claude", "opencode", "codex")
+SETUP_HARNESSES = ("claude", "opencode", "codex", "gemini", "cursor", "amp", "copilot")
+ROUTE_HARNESSES = ("claude", "opencode", "codex")  # harnesses with their own routing profile; the rest only get links/pointers
+INSTR_FILES = {"claude": ".claude/CLAUDE.md", "codex": ".codex/AGENTS.md", "opencode": ".config/opencode/AGENTS.md", "gemini": ".gemini/GEMINI.md"}
 SKILL_NAMES = ("ag-cli", "ag-agents")
 OLD_SKILLS = ("using-ag", "ag-delegate")
 ROUTING_MARKERS = ("<!-- ag:routing:start -->", "<!-- ag:routing:end -->")
@@ -16698,17 +16700,25 @@ def render_skill(tpl, routing_md, scope):
     """Substitute {{AG}} {{ROUTING}} {{SCOPE}}; any other {{...}} stays. Pure."""
     return tpl.replace("{{AG}}", ag_script_path()).replace("{{SCOPE}}", scope).replace("{{ROUTING}}", routing_md)
 
-def skill_templates_dir(): return Path(os.environ.get("AG_SKILLS_DIR") or Path(ag_script_path()).parent/"skills")
+def skill_templates_dir():
+    """AG_SKILLS_DIR > skills/ beside the script (repo checkout) > ../share/ag/skills (install.sh layout)."""
+    if os.environ.get("AG_SKILLS_DIR"): return Path(os.environ["AG_SKILLS_DIR"])
+    d = Path(ag_script_path()).parent
+    return d/"skills" if (d/"skills").is_dir() else d.parent/"share"/"ag"/"skills"
 
-def harness_skills_dir(harness, scope, proj):
-    if scope == "global":
-        h = _ag_home()
-        return {"claude": h/".claude", "opencode": h/".config"/"opencode", "codex": h/".codex"}[harness]/"skills"
-    return Path(proj)/{"claude": ".claude", "opencode": ".opencode", "codex": ".agents"}[harness]/"skills"
+def shared_skills_dir(scope, proj):
+    """Real skill files live in ONE dir: ~/.agents/skills (project .agents/skills), read natively by opencode, Codex, Gemini, Cursor, Copilot, Amp-project."""
+    return (_ag_home() if scope == "global" else Path(proj))/".agents"/"skills"
+
+def skill_link_dirs(harns, scope, proj):
+    """Symlink dirs pointing at the shared skills: Claude (reads only .claude/skills; dedupes symlinks) and Amp (global ~/.config/agents/skills).
+    opencode/Cursor/Copilot also read ~/.claude/skills, so they may see a skill twice unless it is a symlink to the shared one (dedupe unverified there)."""
+    h = _ag_home() if scope == "global" else Path(proj)
+    return ([h/".claude"/"skills"] if "claude" in harns else []) + ([h/".config"/"agents"/"skills"] if "amp" in harns and scope == "global" else [])
 
 def detect_harnesses():
     h = _ag_home()
-    dirs = {"claude": h/".claude", "opencode": h/".config"/"opencode", "codex": h/".codex"}
+    dirs = {"claude": h/".claude", "opencode": h/".config"/"opencode", "codex": h/".codex", "gemini": h/".gemini", "cursor": h/".cursor", "amp": h/".config"/"amp", "copilot": h/".copilot"}
     return [x for x in SETUP_HARNESSES if shutil.which(x) or dirs[x].is_dir()]
 
 def parse_route_sets(items):
@@ -16742,7 +16752,7 @@ def parse_harness_list(v):
     if v in ("", "none"): return []
     hs = [x.strip() for x in v.split(",") if x.strip()]
     bad = [x for x in hs if x not in SETUP_HARNESSES]
-    if bad: raise ValueError(f"unknown harness {','.join(bad)} (claude,opencode,codex|all|none)")
+    if bad: raise ValueError(f"unknown harness {','.join(bad)} ({','.join(SETUP_HARNESSES)}|all|none)")
     return list(dict.fromkeys(hs))
 
 def _say(*x): print(*x, file=sys.stderr)
@@ -16762,7 +16772,7 @@ def route_check(harness, profile, proj=None):
     proj = Path(proj or project_root()); pdoc = _json_or_empty(routing_paths(proj)[1])
     done = bool((pdoc.get("project") or {}).get("answered"))
     hn = harness if harness != "none" else "your agent harness"
-    others = [h for h in SETUP_HARNESSES if h != harness]
+    others = [h for h in ROUTE_HARNESSES if h != harness]
     qs = []
     if not done:
         qs = [{"id": "use", "multi": False, "question": f"How should ag pick agents in this project when you're in {hn}?", "options": [
@@ -16773,7 +16783,7 @@ def route_check(harness, profile, proj=None):
                 "options": [{"value": h, "label": h} for h in others]}]
         qs.append({"id": "data", "multi": False, "question": "Data class for this project? (work = code stays on zero-retention models only)",
             "options": [{"value": "work", "label": "Work (only zero-retention models: space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)"}, {"value": "public", "label": "Public (any model, may train on your data)"}]})
-        be = harness if harness in SETUP_HARNESSES else "claude"
+        be = harness if harness in ROUTE_HARNESSES else "claude"
         cands = list(dict.fromkeys(m for m in (_pick(be, t, be == "opencode") for t in ("small", "balanced", "big")) if m)) or \
             ({"claude": ["haiku", "sonnet", "opus"], "opencode": [OPENCODE_MODEL_DEFAULT], "codex": ["default"]}[be])
         qs += [{"id": f"job.{j}", "when": {"use": "custom"}, "multi": False, "question": f"Model for {j} ({JOB_DESC[j]})?",
@@ -16885,7 +16895,7 @@ def setup_custom_jobs(st):
     """Jobs whose picks differ from the preset table (what applying a preset would overwrite). Pure."""
     p = _setup_base(st)
     return [j for j in JOB_KEYS if st["jobs"][j] != {"claude": p[j]["claude"], "ag": dict(p[j]["ag"])}]
-def setup_claude_md_on(st): return st["claude_md"] if st["claude_md"] is not None else "claude" in st["harnesses"]
+def setup_claude_md_on(st): return st["claude_md"] if st["claude_md"] is not None else any(h in INSTR_FILES for h in st["harnesses"])
 def setup_rows(st):
     """[(key, label)] for the mac hub / cli screen: 4 settings, then one row per job. Pure."""
     cm = "n/a (global scope only)" if st["scope"] != "global" else \
@@ -16904,6 +16914,30 @@ def setup_models_info(b):
     e = _models_read()["backends"].get(b) or {}
     src = "static" if b in MODELS_STATIC else f'fetched {_ago(e.get("fetched_at"))}'
     return f"{b} · {len(model_choices(b))} models · {src}" + (f' · error: {e["error"][:60]}' if e.get("error") else "")
+
+def ag_pointer(block):
+    """Instruction-file text: short pointer to ag, then the harness routing table. Pure."""
+    return (f"ag is installed at {ag_script_path()}: use it to delegate to other agents/models, run long or background work (`ag wake`),\n"
+        "drive interactive programs (`ag spawn`/`snap`/`send`), and pick a model per job (`ag route`).\n"
+        f"Skills: {', '.join(SKILL_NAMES)}.\n\n{block}")
+
+def _ag_owned_dir(d, name, rels):
+    """True iff dir d is a copy ag wrote: SKILL.md frontmatter `name:` matches and every file is one ag's template has."""
+    try:
+        m = re.search(r"\A---\n(.*?)\n---", (d/"SKILL.md").read_text(), re.S)
+        nm = re.search(r"^name:\s*(\S+)", m.group(1), re.M) if m else None
+        return bool(nm) and nm.group(1) == name and all(f.relative_to(d).as_posix() in rels for f in d.rglob("*") if f.is_file())
+    except (OSError, UnicodeDecodeError): return False
+
+def _apply_op(kind, p, tgt):
+    """Run one non-text plan op: link (symlink; copy if symlinks fail) | remove (file) | rmdir (tree)."""
+    if kind == "remove": p.unlink(missing_ok=True); return
+    if kind == "rmdir": shutil.rmtree(p, ignore_errors=True); return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.is_symlink(): p.unlink()
+    elif p.exists(): shutil.rmtree(p)
+    try: os.symlink(tgt, p, target_is_directory=True)
+    except OSError: shutil.copytree(tgt, p)
 
 def setup_targets(st):
     """Planned writes [(path, text, old, new|changed|unchanged)] + notes, skill_err, block, tdir. Reads only."""
@@ -16934,29 +16968,46 @@ def setup_targets(st):
     eff = ef("claude")
     block = routing_block(eff)
     writes = [(gp if scope == "global" else pp, json.dumps(doc, indent=2) + "\n")]
-    tdir, tpls, skill_err, notes = skill_templates_dir(), {}, "", []
+    tdir, tpls, skill_err, notes, ops = skill_templates_dir(), {}, "", [], []
     for n in SKILL_NAMES if harn else ():
         t = tdir/n/"SKILL.md"
-        try: tpls[n] = t.read_text()
-        except OSError: skill_err = f"skill template missing: {t}"; break
-    if not skill_err:
-        for h in harn:
-            sd = harness_skills_dir(h, scope, proj)
-            hp = profile_for(h)
-            writes += [(sd/n/"SKILL.md", render_skill(tpls[n], routing_block(ef(h), st["backends"], hp), scope)) for n in SKILL_NAMES]
-            notes += [f"left alone: old skill {sd/o} (remove by hand once ag-cli/ag-agents replace it)"
-                for o in OLD_SKILLS if (sd/o).exists()]
+        if not t.is_file(): skill_err = f"skill template missing: {t}"; break
+        try: tpls[n] = {f.relative_to(tdir/n).as_posix(): f.read_text() for f in sorted((tdir/n).rglob("*")) if f.is_file()}
+        except (OSError, UnicodeDecodeError) as e: skill_err = f"skill template unreadable: {tdir/n}: {e}"; break
+    if not skill_err and harn:
+        sd, h = shared_skills_dir(scope, proj), _ag_home() if scope == "global" else proj
+        for n in SKILL_NAMES:
+            writes += [(sd/n/rel, render_skill(txt, block, scope)) for rel, txt in tpls[n].items()]
+            ops += [("remove", f, None, "remove") for f in sorted((sd/n).rglob("*")) if f.is_file() and f.relative_to(sd/n).as_posix() not in tpls[n]]  # stale: ag owns this dir
+        for ld in skill_link_dirs(harn, scope, proj):
+            for n in SKILL_NAMES:
+                lp, tgt = ld/n, sd/n
+                if lp.is_symlink():
+                    if os.readlink(lp) == str(tgt): ops.append(("link", lp, tgt, "unchanged"))
+                    else: notes.append(f"left alone: {lp} is a symlink to {os.readlink(lp)} (not ag's)")
+                elif not lp.exists(): ops.append(("link", lp, tgt, "new"))
+                elif _ag_owned_dir(lp, n, tpls[n]): ops.append(("link", lp, tgt, "changed"))  # an earlier ag copy
+                else: notes.append(f"left alone: {lp} exists and was not written by ag (remove it so the symlink to {tgt} can replace it)")
+        for ld in ([h/".config"/"opencode"/"skills", h/".codex"/"skills"] if scope == "global" else [Path(proj)/".opencode"/"skills"]):
+            for n in SKILL_NAMES:  # legacy per-harness copies from older ag setup: opencode/Codex now read the shared dir
+                if (ld/n).is_dir() and not (ld/n).is_symlink():
+                    if _ag_owned_dir(ld/n, n, {"SKILL.md": ""}): ops.append(("rmdir", ld/n, None, "remove"))
+                    else: notes.append(f"left alone: old skill dir {ld/n} (not a plain ag copy; remove by hand)")
+        for d in dict.fromkeys([sd, *skill_link_dirs(harn, scope, proj)]):
+            notes += [f"left alone: old skill {d/o} (remove by hand once ag-cli/ag-agents replace it)" for o in OLD_SKILLS if (d/o).exists()]
     if setup_claude_md_on(st) and scope == "global":
-        cp, ap = _ag_home()/".claude"/"CLAUDE.md", _ag_home()/"AGENTS.md"
-        writes.append((cp, routing_md_insert(_read_or_empty(cp), block)))
+        ap = _ag_home()/"AGENTS.md"
+        for hn in dict.fromkeys([x for x in harn if x in INSTR_FILES] + (["claude"] if st["claude_md"] else [])):
+            ip = _ag_home()/INSTR_FILES[hn]
+            writes.append((ip, routing_md_insert(_read_or_empty(ip), ag_pointer(block if hn == "claude" else routing_block(ef(hn), None, profile_for(hn))))))
         t2 = routing_md_insert(_read_or_empty(ap), block, append=False)  # markers only, never append
         if t2 is not None: writes.append((ap, t2))
-    elif st["claude_md"] and scope == "project": notes.append("CLAUDE.md block is global-only; skipped for --scope project")
+    elif st["claude_md"] and scope == "project": notes.append("instruction-file blocks are global-only; skipped for --scope project")
     plan = []
     for p, txt in writes:
         old, ex = _read_or_empty(p), p.exists()
         plan.append((p, txt, old, "unchanged" if ex and old == txt else "changed" if ex else "new"))
-    return {"plan": plan, "notes": notes, "skill_err": skill_err, "block": block, "tdir": tdir}
+    return {"plan": plan, "ops": ops, "notes": notes, "skill_err": skill_err, "block": block, "tdir": tdir}
 
 def _setup_short(p, n=200):
     s, home = str(p), str(_ag_home())
@@ -16964,7 +17015,7 @@ def _setup_short(p, n=200):
     return s if len(s) <= n else G("…") + s[-max(1, n - 1):]
 def setup_summary_lines(st, t):
     return [f'scope={st["scope"]} preset={st["preset"]} harnesses={",".join(st["harnesses"]) or "none"}'] + \
-        [f"{s:9} {_setup_short(p)}" for p, _, _, s in t["plan"]] + t["notes"] + ([f'! {t["skill_err"]}'] if t["skill_err"] else [])
+        [f"{s:9} {_setup_short(p)}" for p, _, _, s in t["plan"]] + [f"{s:9} {_setup_short(p)}" + (f" -> {_setup_short(g)}" if g else "") for _, p, g, s in t.get("ops", [])] + t["notes"] + ([f'! {t["skill_err"]}'] if t["skill_err"] else [])
 
 def setup_ui_pick(want="", platform=None, env=None, tty=True):
     """Front-end: explicit --ui/AG_SETUP_UI wins (mac = web; cli needs a TTY, else plain);
@@ -17243,8 +17294,8 @@ def setup_web_plan(st, profs=None):
     """The web save plan = setup_targets (v2 + sparse profiles are built there; keeps project.answered + unknown keys). Reads."""
     return setup_targets(st)
 
-def setup_write_plan(plan, dry):
-    """Write (or diff) a setup_targets plan -> (files, text lines). Same output as do_setup's loop."""
+def setup_write_plan(plan, dry, ops=()):
+    """Write (or diff) a setup_targets plan (+ link/remove ops) -> (files, text lines). Same output as do_setup's loop."""
     files, out = [], []
     for p, txt, old, s in plan:
         rec = {"path": str(p), "status": s}
@@ -17256,6 +17307,12 @@ def setup_write_plan(plan, dry):
             if s != "unchanged": _put_file(p, txt)
             out.append(f"{'wrote' if s != 'unchanged' else 'unchanged'} {p}")
         files.append(rec)
+    for kind, p, tgt, s in ops:
+        files.append({"path": str(p), "status": s, "op": kind, **({"target": str(tgt)} if tgt else {})})
+        if s == "unchanged": out.append(f"unchanged {p}"); continue
+        desc = f"{p} -> {tgt}" if kind == "link" else str(p)
+        out.append(f"would {'link' if kind == 'link' else 'remove'} {desc} ({s})" if dry else f"{'linked' if kind == 'link' else 'removed'} {desc}")
+        if not dry: _apply_op(kind, p, tgt)
     return files, out
 
 def setup_web_serve(st0, dry=False, idle=None, announce=None):
@@ -17312,7 +17369,7 @@ def setup_web_serve(st0, dry=False, idle=None, announce=None):
                 errs, st, profs = setup_web_apply(st0, body)
                 if errs: return self._json(400, {"ok": False, "errors": errs})
                 try:
-                    t = setup_web_plan(st, profs); files, out = setup_write_plan(t["plan"], dry)
+                    t = setup_web_plan(st, profs); files, out = setup_write_plan(t["plan"], dry, t["ops"])
                 except OSError as e: return self._json(500, {"ok": False, "errors": [f"write failed: {e}"]})
                 notes = t["notes"] + ([t["skill_err"]] if t["skill_err"] else [])
                 state["result"] = {"saved": {"scope": st["scope"], "harnesses": st["harnesses"], "preset": st["preset"], "routing": st["jobs"], "profiles": profs,
@@ -17625,14 +17682,14 @@ def setup_apply_answers(st, ans, harness):
         if dc not in ("work", "public"): return f"bad answers.data {dc!r}: work|public"
         st["privacy"] = dc
     if use in ("cheap", "strong"):
-        for h in harn:
+        for h in [x for x in harn if x in ROUTE_HARNESSES]:
             tier = "small" if use == "cheap" else "big"
             if h == "claude": jobs = {j: _rj(a_, "claude", a_) for j in JOB_KEYS for a_ in ["haiku" if use == "cheap" else "fable" if j == "hardest" else "opus"]}
             else: jobs = {j: _rj("haiku" if use == "cheap" else "opus", h, _pick(h, tier, h == "opencode" and use == "cheap")
                 or (OPENCODE_MODEL_DEFAULT if h == "opencode" else "default")) for j in JOB_KEYS}
             st["pjobs"][h] = jobs
     elif use == "custom":
-        be, jobs = harness if harness in SETUP_HARNESSES else "claude", {}
+        be, jobs = harness if harness in ROUTE_HARNESSES else "claude", {}
         for j, v in (ans.get("jobs") or {}).items():
             if j not in JOB_KEYS: return f"bad answers.jobs key {j!r} ({','.join(JOB_KEYS)})"
             if isinstance(v, dict): jobs[j] = {k: v[k] for k in ("claude", "ag") if k in v}; continue
@@ -17672,7 +17729,7 @@ def do_setup(a):
     if scope not in ("global", "project"): return emit(a, "setup", error=f"bad scope {scope!r}: global|project")
     if harn is None:
         det = ",".join(detect_harnesses()) or "none"
-        try: harn = parse_harness_list(_ask("install skills for (claude,opencode,codex|all|none)", det) if ui == "plain" else det)
+        try: harn = parse_harness_list(_ask(f"install skills for ({','.join(SETUP_HARNESSES)}|all|none)", det) if ui == "plain" else det)
         except ValueError as e: return emit(a, "setup", error=str(e))
     if getattr(a, "profile", None) and a.profile not in ROUTE_PROFILES: return emit(a, "setup", error=f"bad profile {a.profile!r}: {'|'.join(ROUTE_PROFILES)}")
     st = setup_state_from(scope, a.preset, sets, harn, a.claude_md, bsets=bsets, profile=getattr(a, "profile", None))
@@ -17709,21 +17766,10 @@ def do_setup(a):
     if ui == "plain":
         _say(f"\nscope={scope} preset={preset} harnesses={','.join(harn) or 'none'}\n{block}\n")
         for p, _, _, s in plan: _say(f"  {s:9} {p}")
+        for _, p, g, s in t["ops"]: _say(f"  {s:9} {p}" + (f" -> {g}" if g else ""))
         if skill_err: _say(f"  ! {skill_err}")
         if _ask("write these files? (Y/n)", "y").lower()[:1] == "n": return emit(a, "setup", {"_text": "cancelled", "cancelled": True})
-    files, out = [], []
-    for p, txt, old, st_ in plan:
-        rec = {"path": str(p), "status": st_}
-        if a.dry_run:
-            if st_ != "unchanged":
-                rec["diff"] = "".join(difflib.unified_diff(old.splitlines(True), txt.splitlines(True),
-                    str(p) if st_ == "changed" else "/dev/null", str(p)))
-            out.append(f"would write {p} ({st_})" if st_ != "unchanged" else f"unchanged {p}")
-            if rec.get("diff"): out.append(rec["diff"].rstrip("\n"))
-        else:
-            if st_ != "unchanged": _put_file(p, txt)
-            out.append(f"{'wrote' if st_ != 'unchanged' else 'unchanged'} {p}")
-        files.append(rec)
+    files, out = setup_write_plan(plan, a.dry_run, t["ops"])
     out += notes
     data = {"scope": scope, "profile": st["profile"], "harnesses": harn, "preset": preset, "routing": jobs, "backends": st["backends"], "files": files,
         "dry_run": bool(a.dry_run), "notes": notes}
@@ -18524,7 +18570,7 @@ def build():
     bu=sub.add_parser("budget",help="spend/request budgets"); bus=bu.add_subparsers(dest="sub",required=True)
     bus.add_parser("show",help="limits + spent/used today")
     bset=bus.add_parser("set",help="set daily/monthly USD + provider rpd"); bset.add_argument("--daily",type=float,default=None,help="USD per UTC day"); bset.add_argument("--monthly",type=float,default=None,help="USD per UTC month"); bset.add_argument("--provider",default=None,help="provider id for --rpd"); bset.add_argument("--rpd",type=int,default=None,help="requests per UTC day for --provider")
-    st=sub.add_parser("setup",help="pick model routing, install ag skills, write CLAUDE.md routing block"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help="claude,opencode,codex | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] | backend.B.(enabled|model|mode|plan|effort)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
+    st=sub.add_parser("setup",help="pick model routing, install ag skills (shared ~/.agents/skills + links), write ag pointer blocks into harness instruction files"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help=",".join(SETUP_HARNESSES) + " | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] | backend.B.(enabled|model|mode|plan|effort)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
     lk = sub.add_parser("link", help="VM -> Mac view over outbound reverse SSH (docs/LINK.md)"); lks = lk.add_subparsers(dest="lsub", required=True)
     lki = lks.add_parser("init", help="write link.json + create the key + print the Mac authorized_keys line"); lki.add_argument("--to", required=True, help="USER@HOST"); lki.add_argument("--key", default=None, help="private key path (default ~/.ssh/ag_link, created when missing)"); lki.add_argument("--ports", default="auto", help="auto | 3000,8080"); lki.add_argument("--base", type=int, default=41000, help="mac port base"); lki.add_argument("--watch-port", dest="watch_port", type=int, default=7790, help="vm watch page port")
     lku = lks.add_parser("up", help="start the supervisor (ssh -R forwards + watch page; detached unless --foreground)"); lku.add_argument("--foreground", action="store_true"); lku.add_argument("--no-watch", dest="no_watch", action="store_true", help="no watch page / no watch forward")

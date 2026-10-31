@@ -25,6 +25,9 @@ REPO_AG = _REPO / "ag"
 
 def run_install(*args, home=None, extra_env=None, path=None):
     env = dict(os.environ)
+    # install.sh runs `ag setup` (writes under AG_HOME): never let a test touch the real home
+    env["AG_HOME"] = str(home) if home is not None else tempfile.mkdtemp(prefix="aginst-aghome-")
+    env["AG_AUTO_UPDATE"] = "0"
     if home is not None:
         env["HOME"] = str(home)
     if path is not None:
@@ -256,6 +259,27 @@ def test_old_python():
     print("ok test_old_python")
 
 
+def test_no_setup_flag_and_setup_run():
+    base = Path(tempfile.mkdtemp(prefix="aginst-"))
+    home = base / "home"
+    (home / ".codex").mkdir(parents=True)
+    p = run_install("--prefix", str(base / "p1"), "--no-setup", home=home)
+    assert p.returncode == 0, p.stderr
+    assert not (home / ".agents").exists() and not (home / ".codex" / "AGENTS.md").exists(), "--no-setup must not write skills/pointers"
+    assert "--no-setup" in run_install("--help").stdout
+    p = run_install("--prefix", str(base / "p2"), home=home, extra_env={"AG_CONFIG_HOME": str(base / "cfg")})
+    assert p.returncode == 0, p.stderr
+    assert (home / ".agents" / "skills" / "ag-cli" / "SKILL.md").is_file(), (p.stdout, p.stderr)
+    ptr = (home / ".codex" / "AGENTS.md").read_text()
+    assert "<!-- ag:routing:start -->" in ptr and "Skills: ag-cli, ag-agents." in ptr, ptr
+    assert (base / "p2" / "share" / "ag" / "skills" / "ag-cli" / "SKILL.md").is_file()
+    assert str(home / ".agents" / "skills") in p.stdout or "AGENTS.md" in p.stdout, p.stdout
+    # a failing setup only warns: install still succeeds
+    p = run_install("--prefix", str(base / "p3"), home=home, extra_env={"AG_SKILLS_DIR": str(base / "nope")})
+    assert p.returncode == 0 and (base / "p3" / "bin" / "ag").is_file(), p.stderr
+    print("ok test_no_setup_flag_and_setup_run")
+
+
 def test_installed_cli_help():
     base = Path(tempfile.mkdtemp(prefix="aginst-"))
     prefix = base / "p"
@@ -284,4 +308,5 @@ if __name__ == "__main__":
     test_missing_python()
     test_old_python()
     test_installed_cli_help()
+    test_no_setup_flag_and_setup_run()
     print("all install tests passed")

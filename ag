@@ -13510,6 +13510,7 @@ def provider_privacy(backend, model):
             if m == pid or m.startswith(pid + "/") or m.startswith("opencode/" + pid + "/") or m == "opencode/" + pid: cand.append(e)
         for e in cand:
             p = (e.get("privacy") or "").strip().lower()
+            if e.get("local") and re.search(r"[:-]cloud$", m): return "unknown"  # ollama *-cloud models run on ollama.com
             if p in ("zdr", "retain", "train", "unknown"): return p
     except Exception: pass
     return None
@@ -13642,7 +13643,8 @@ def do_providers(a):
         else: return emit(a, "providers", error=f"bad --key-ref {kr!r} (want keychain:NAME or ${{VAR}})", hint="never a literal secret")
         if len(kr) > 200: return emit(a, "providers", error="key-ref too long")
         npm = (getattr(a, "npm", None) or "").strip() or pre.get("npm") or "@ai-sdk/openai-compatible"
-        local = _loopback(base) or pid in LOCAL_PROVIDERS
+        # a custom localhost URL may be a proxy to a cloud API (LiteLLM etc.): only the presets, or --zdr on loopback, count as local
+        local = pid in LOCAL_PROVIDERS or (_loopback(base) and getattr(a, "zdr", False))
         priv = ((getattr(a, "privacy", None) or "").strip().lower() or ("zdr" if getattr(a, "zdr", False) or local else "") or pre.get("privacy") or ("retain" if kr else "unknown")).lower()
         if priv not in ("zdr", "retain", "train", "unknown"): return emit(a, "providers", error=f"bad --privacy {priv!r}: zdr|retain|train")
         try: mc = pre.get("max_concurrent") if getattr(a, "max_concurrent", None) is None else getattr(a, "max_concurrent", None)

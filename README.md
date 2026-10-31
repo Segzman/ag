@@ -140,8 +140,8 @@ ag providers add ID --base-url URL --key-ref keychain:NAME [--npm @ai-sdk/openai
 ag providers list | show ID | rm ID        # stored in $AG_CONFIG_HOME/providers.json (refs only, never secrets)
 ag providers add groq --key-ref keychain:NAME        # presets: groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova
 # local / any OpenAI-compatible server (/v1/chat/completions): built-in keyless presets ollama (localhost:11434/v1) + lmstudio (localhost:1234/v1), zero config:
-ag agents add l --backend api --model ollama/qwen3:8b     # loopback = zero-retention (ok for --data work), ledger cost 0
-ag providers add gw --base-url https://host/v1 --no-key [--zdr]   # custom URL: privacy "unknown" (refused for --data work) unless --zdr/--privacy; loopback URLs auto-zdr
+ag agents add l --backend api --model ollama/qwen3:8b     # presets = zero-retention (ok for --data work), ledger cost 0; ollama *-cloud models are not (run on ollama.com)
+ag providers add gw --base-url https://host/v1 --no-key [--zdr]   # custom URL: privacy "unknown" (refused for --data work) unless --zdr/--privacy; a localhost URL is not trusted on its own (may proxy a cloud API): add --zdr if it is really local
 ag models --backend api --provider ollama                 # GET {base}/models; clear error when the server is down
 ```
 

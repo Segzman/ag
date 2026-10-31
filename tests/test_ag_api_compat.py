@@ -84,6 +84,16 @@ class Compat(unittest.TestCase):
         self.ag("providers", "add", "gw", "--base-url", "https://gw.example.com/v1", "--no-key", "--zdr")
         self.assertEqual(self.ag("agents", "add", "w2", "--backend", "api", "--model", "gw/m", "--dir", str(self.td)).returncode, 0)
 
+    def test_localhost_proxy_and_ollama_cloud_not_trusted(self):
+        # a localhost URL may be a proxy (LiteLLM) to a cloud API; ollama *-cloud models run on ollama.com
+        d = json.loads(self.ag("--json", "providers", "add", "px", "--base-url", "http://localhost:4000/v1", "--no-key").stdout)["data"]
+        self.assertEqual(d["privacy"], "unknown"); self.assertNotIn("local", d)
+        self.assertNotEqual(self.ag("agents", "add", "w", "--backend", "api", "--model", "px/m", "--dir", str(self.td)).returncode, 0)
+        d = json.loads(self.ag("--json", "providers", "add", "px", "--base-url", "http://localhost:4000/v1", "--no-key", "--zdr").stdout)["data"]
+        self.assertEqual((d["privacy"], d.get("local")), ("zdr", True))
+        self.assertNotEqual(self.ag("agents", "add", "c", "--backend", "api", "--model", "ollama/gpt-oss:120b-cloud", "--dir", str(self.td)).returncode, 0)
+        self.assertEqual(self.ag("agents", "add", "l", "--backend", "api", "--model", "ollama/qwen3:8b", "--dir", str(self.td)).returncode, 0)
+
     def test_models_listing_and_down(self):
         self.ag("providers", "add", "ollama", "--base-url", self.base)
         d = json.loads(self.ag("--json", "models", "--backend", "api", "--provider", "ollama").stdout)["data"]

@@ -25,6 +25,7 @@ Pick the job type first, then use the routed model: Claude Code subagents take t
 {{AG}} --dir <state> agents set w --model ID | --backend B | --persona planner | --worktree
 {{AG}} --dir <state> agents rm w [--force] [--purge]
 {{AG}} --dir <state> agents reset w               # clear stored session ids; keep config and chat log
+{{AG}} --dir <state> agents create "a careful reviewer for X that never edits files" [--name N] [--using AGENT] [--yes] [--dry-run]   # model drafts name/job/mode/instructions, ag clamps + routes; no --yes = proposal + exact `agents add` command only
 {{AG}} --dir <state> agents fork src new [--backend B] [--model ID] [--effort E] [--worktree]   # clone config + history, fresh session; list shows `<- src`; refused while src busy
 {{AG}} --dir <state> harness use w codex [--budget N]   # switch backend; next turn replays old history bounded by N tokens (default 4000, AG_HANDOFF_BUDGET); harness current w shows it
 {{AG}} --dir <state> models --backend opencode   # valid model ids

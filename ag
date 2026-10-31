@@ -7146,6 +7146,77 @@ def do_agents_ps(a, sdir):
             for x in r["pids"]: L.append(f'  {x:>7} ppid={tb[x]["ppid"]} {tb[x]["comm"]}' if x in tb else f'  {x:>7} (gone)')
     return emit(a, "agents", {"_text": "\n".join(L)})
 
+CREATE_PROMPT = ("Turn this description into an ag agent proposal. Reply with ONLY one JSON object: "
+    '{"name": "short-kebab-name", "job": "<one of %s>", "mode": "<ro|edits|auto|full>", "system": "concise instructions, max 1200 chars", "worktree": false}. '
+    "job = the kind of work (review/debug/plan read-mostly; implement/mechanical write). mode ro = read-only, edits = may edit files, auto = autonomous; never full unless the description explicitly asks for full access. "
+    "worktree true only if it should work in an isolated checkout. Description: %s")
+
+def _first_json_obj(text):
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\{", text or ""):
+        try: o, _ = dec.raw_decode(text, m.start())
+        except ValueError: continue
+        if isinstance(o, dict): return o
+    return None
+
+def create_clamp(p, desc, taken, want=None):
+    """Validate/clamp a raw proposal dict. Returns (proposal, error)."""
+    job = p.get("job") if p.get("job") in JOB_KEYS else "implement"
+    mode = p.get("mode") if p.get("mode") in MODES else "ro"
+    if mode == "full" and not re.search(r"full[- ]access|unrestricted|full permissions|dangerously", desc, re.I): mode = "auto"
+    slug = lambda s: re.sub(r"[^A-Za-z0-9_.-]+", "-", str(s or "")).strip("-._")[:32].strip("-._")
+    if want:
+        name = slug(want)
+        if not name: return None, f"bad --name {want!r}: letters, digits, - _ ."
+        if name in taken: return None, f"exists: {name}"
+    else:
+        base = slug(p.get("name")) or slug(" ".join(desc.split()[:3])) or "agent"; name = base; n = 2
+        while name in taken: name = f"{base[:28]}-{n}"; n += 1
+    system = str(p.get("system") or "").strip()
+    if len(system) < 8: system = desc.strip()
+    return {"name": name, "job": job, "mode": mode, "system": system[:1200], "worktree": p.get("worktree") is True}, None
+
+def do_agents_create(a, sdir, rows):
+    desc = (a.description or "").strip()
+    if not desc: return emit(a, "agents", error="empty description", hint='ag agents create "a careful reviewer for X that never edits files"')
+    raw = os.environ.get("AG_CREATE_PROPOSAL_JSON")  # test-only: skip the model call
+    if raw is None:
+        using = getattr(a, "using", None); tmp = None
+        if using and not any(r["name"] == using for r in rows): return emit(a, "agents", error=f"no such agent: {using}", hint="ag agents list")
+        if not using:
+            try: ra = routing_now()[0]["plan"]["ag"]; tmp = f"_create{os.getpid()}"; using = tmp
+            except Exception: ra = None
+            if tmp: save_agents(sdir, rows + [{"name": tmp, "backend": ra["backend"], "model": ra["model"] or "default", "dir": ".", "role": "sub", "mode": "ro", "system": "", "instructions": []}])
+            else: using = next((r["name"] for r in rows if r.get("role") == "orchestrator"), "")
+            if not using: return emit(a, "agents", error="no agent to draft the proposal", hint="--using AGENT")
+        try: r = run_turn(sdir, using, CREATE_PROMPT % ("|".join(JOB_KEYS), desc))
+        finally:
+            if tmp:
+                save_agents(sdir, rows)
+                try: _clear_chat_session(sdir, tmp, purge=True)
+                except Exception: pass
+        if r.get("error") or r.get("exit"): return emit(a, "agents", error=f"proposal turn failed: {(r.get('error') or r.get('reply') or '')[:200]}", hint="--using AGENT")
+        raw = r.get("reply") or ""
+    obj = _first_json_obj(raw)
+    if obj is None: return emit(a, "agents", error="no JSON proposal in model reply", hint=raw[:200])
+    prop, err = create_clamp(obj, desc, {r["name"] for r in rows}, getattr(a, "name", None))
+    if err: return emit(a, "agents", error=err)
+    argv = ["agents", "add", prop["name"], "--job", prop["job"], "--mode", prop["mode"], "--system=" + prop["system"], "--dir", a.adir or "."] + (["--worktree"] if prop["worktree"] else [])
+    gl = ["--dir", a.dir] if getattr(a, "dir", None) else []
+    cmd = shlex.join(["ag"] + gl + argv)
+    try: rt = routing_now()[0][prop["job"]]["ag"]; prop["backend"], prop["model"] = rt["backend"], rt["model"] or "default"
+    except Exception: prop["backend"] = prop["model"] = "?"
+    created, out = False, ""
+    if getattr(a, "yes", False) and not getattr(a, "dry_run", False):
+        import io, contextlib
+        o, e = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e): rc = do_agents(build().parse_args(gl + argv))
+        if rc: return emit(a, "agents", {"proposal": prop, "command": cmd, "created": False}, error=(e.getvalue().strip() or "agents add failed"))
+        created, out = True, o.getvalue().strip()
+    txt = "\n".join([f"name:          {prop['name']}", f"backend/model: {prop['backend']}/{prop['model']}  (job {prop['job']})", f"mode:          {prop['mode']}", f"worktree:      {str(prop['worktree']).lower()}", "instructions:", "  " + prop["system"].replace("\n", "\n  "), "",
+        out if created else ("dry run: nothing created." if getattr(a, "dry_run", False) else "not created. Re-run with --yes, or run:") + "\n  " + cmd])
+    return emit(a, "agents", {"_text": txt, "proposal": prop, "command": cmd, "created": created})
+
 def do_agents(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     if a.sub=="ps": return do_agents_ps(a, sdir)
@@ -7186,6 +7257,7 @@ def do_agents(a):
         if getattr(a,"json",False): return emit(a,"agents",rep_)
         txt = "\n".join([f"set   {k}={v}" for k,v in sorted(rep_["set"].items())]+[f"unset {k}" for k in rep_["unset"]]+rep_["notes"]) or "(no env changes)"
         return emit(a,"agents",{"_text":txt})
+    if a.sub=="create": return do_agents_create(a, sdir, rows)
     if a.sub=="add":
         if any(r["name"]==a.name for r in rows):
             return emit(a,"agents",error=f"exists: {a.name}")
@@ -18115,6 +18187,7 @@ def build():
     ags.add_parser("list")
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
     aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model"); aga.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears -> AG_STALL_S/backend default)')
+    agc=ags.add_parser("create",help="draft an agent from one sentence (proposal; --yes creates)"); agc.add_argument("description"); agc.add_argument("--name",default=None); agc.add_argument("--dir",dest="adir",default="."); agc.add_argument("--using",default=None,help="agent that drafts the proposal (default: routing plan job, else first orchestrator)"); agc.add_argument("--yes",action="store_true",help="create the agent (default: show proposal + command only)"); agc.add_argument("--dry-run",dest="dry_run",action="store_true")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)"); agrm.add_argument("--purge",action="store_true",help="also remove chat log and metadata")
     agrs=ags.add_parser("reset",help="clear stored backend session ids; keep config and chat log"); agrs.add_argument("name")
     agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
@@ -18869,7 +18942,7 @@ def _lift_trailing_dir(argv, subs):
     si = next((i for i, t in enumerate(head) if t in subs), -1)
     if si < 0: return argv, None
     if head[si] == "notify": return argv, None  # notify --dir selects the notification inbox
-    if head[si] == "agents" and len(head) > si+1 and head[si+1] in ("add", "set"): return argv, None
+    if head[si] == "agents" and len(head) > si+1 and head[si+1] in ("add", "set", "create"): return argv, None
     if head[si] == "relay" and len(head) > si+1 and head[si+1] == "init": return argv, None  # relay init --dir = mailbox, not state
     out, j, d = head[:si+1], si+1, None
     while j < len(head):

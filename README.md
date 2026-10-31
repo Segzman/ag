@@ -251,6 +251,7 @@ ag agents add w --backend opencode --role sub [--model ID] [--data work|public] 
 ag agents set w --backend B --model ID --persona P --worktree      # refused while busy
 ag agents rm w [--force] [--purge]
 ag agents reset w                           # forget backend session ids; keep config + chat log
+ag agents create "a careful reviewer for the payments service that never edits files" [--name N] [--dir WORKDIR] [--using AGENT] [--yes] [--dry-run] [--json]   # a model drafts {name, job, mode, system, worktree}; ag clamps it (unknown job -> implement, mode full only if the text asks for full access/unrestricted, name sanitized + unique) and routes backend/model from the job; without --yes it only prints the proposal + the exact `agents add` command; --yes creates via `agents add` (instructions stored as --system); --json = {proposal, command, created}; drafter = --using, else the routing `plan` job (temporary headless turn), else the first orchestrator; AG_CREATE_PROPOSAL_JSON = test-only reply override
 ag agents fork src new [--backend B] [--model ID] [--effort E] [--worktree] [--base REF]   # clone config + chat history, fresh session; list shows `<- src`; refused while src busy
 ag harness use w codex [--model ID] [--budget N] ; ag harness current w     # switch backend; remembers one model + one session id per backend
 ```

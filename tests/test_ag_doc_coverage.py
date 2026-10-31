@@ -28,6 +28,21 @@ def _read(*p):
         return f.read()
 
 
+SKILLS = ("ag-cli", "ag-agents")
+
+
+def _skill_files(n):
+    base = os.path.join(ROOT, "skills", n)
+    out = []
+    for d, _, fs in os.walk(base):
+        out += [os.path.join(d, f) for f in fs if f.endswith(".md")]
+    return sorted(out)
+
+
+def _skill_text(n):
+    return "\n".join(_read(os.path.relpath(f, ROOT)) for f in _skill_files(n))
+
+
 def _subs(parser):
     for a in parser._actions:
         if isinstance(a, argparse._SubParsersAction):
@@ -65,7 +80,7 @@ class DocCoverage(unittest.TestCase):
     def setUpClass(cls):
         cls.cmds = _commands()
         cls.readme = _read("README.md")
-        cls.skills = [_read("skills", n, "SKILL.md") for n in ("ag-cli", "ag-agents")]
+        cls.skills = [_skill_text(n) for n in SKILLS]
 
     def test_every_command_in_readme(self):
         miss = ["ag " + " ".join(p) for p in self.cmds if not _covered(p, self.readme)]
@@ -90,7 +105,28 @@ class DocCoverage(unittest.TestCase):
         for n, s in zip(("ag-cli", "ag-agents"), self.skills):
             self.assertIn("{{AG}}", s, n)
             self.assertIn("{{SCOPE}}", s, n)
-        self.assertIn("{{ROUTING}}", self.skills[1])
+        for n in SKILLS:
+            self.assertNotIn("{{ROUTING}}", _skill_text(n), n)
+
+    def test_skill_frontmatter(self):
+        for n in SKILLS:
+            m = re.match(r"---\n(.*?)\n---\n", _read("skills", n, "SKILL.md"), re.S)
+            self.assertTrue(m, n + ": no frontmatter")
+            fm = dict(l.split(": ", 1) for l in m.group(1).splitlines() if ": " in l)
+            self.assertEqual(fm.get("name"), n)
+            self.assertRegex(fm["name"], r"^[a-z0-9-]+$")
+            d = fm.get("description", "")
+            self.assertTrue(d, n + ": empty description")
+            self.assertLessEqual(len(d), 1024, n)
+            self.assertNotRegex(d, r"[<>]", n)
+
+    def test_skill_size_and_references_linked(self):
+        for n in SKILLS:
+            body = _read("skills", n, "SKILL.md")
+            self.assertLessEqual(len(body.splitlines()), 130, n + " SKILL.md too long")
+            refdir = os.path.join(ROOT, "skills", n, "references")
+            for f in sorted(os.listdir(refdir)) if os.path.isdir(refdir) else []:
+                self.assertIn("references/" + f, body, n + ": unlinked " + f)
 
 
 if __name__ == "__main__":

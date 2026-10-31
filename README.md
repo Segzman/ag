@@ -216,7 +216,7 @@ Writes are atomic and printed; `--dry-run` writes nothing and prints a diff; not
 
 ## TUI
 
-`ag tui` (or `scripts/ag-tui.command`): composer-first, no insert mode — just type. Home lists projects grouped by agent workdir; `Enter` sends to the selected agent and opens its chat; `/` opens the slash popup; `Esc` selects (`q` quits). Mouse supported; keyboard has full parity. Needs a TTY, at least 40x16 (sidebar only at 110+ cols). `NO_COLOR=1`, `AG_ASCII=1` supported. `ag keys` prints the cheat-sheet; layout/design in [docs/UI_DESIGN.md](docs/UI_DESIGN.md), captures in `docs/ui-previews/`.
+`ag tui` (or `scripts/ag-tui.command`): composer-first, no insert mode — just type. Home lists projects grouped by agent workdir; `Enter` sends to the selected agent and opens its chat; `/` opens the slash popup; `Esc` selects (`q` quits). Mouse supported; keyboard has full parity. Needs a TTY, at least 40x16 (sidebar only at 110+ cols). `NO_COLOR=1`, `AG_ASCII=1` supported. `ag keys` prints the cheat-sheet; layout/design in [docs/UI_DESIGN.md](docs/UI_DESIGN.md), captures: `python3 scripts/make_ui_previews.py` (writes `docs/ui-previews/`, not tracked).
 
 | Key | Action |
 |---|---|

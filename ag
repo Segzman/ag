@@ -7192,7 +7192,7 @@ def do_agents_create(a, sdir, rows):
         try: r = run_turn(sdir, using, CREATE_PROMPT % ("|".join(JOB_KEYS), desc))
         finally:
             if tmp:
-                save_agents(sdir, rows)
+                save_agents(sdir, [r for r in load_agents(sdir) if r["name"] != tmp])  # re-read: the roster may change during the turn
                 try: _clear_chat_session(sdir, tmp, purge=True)
                 except Exception: pass
         if r.get("error") or r.get("exit"): return emit(a, "agents", error=f"proposal turn failed: {(r.get('error') or r.get('reply') or '')[:200]}", hint="--using AGENT")

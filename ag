@@ -8847,6 +8847,20 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         backend = a.get("backend","claude")
         model = _mo or a.get("model","default") or "default"
         if _rs and _rs.get("fb"): model = _rs["fb"]  # ratelimit fallback: this attempt runs on the fallback model
+        _fo = (_rs or {}).get("xb")  # usage-limit failover: (backend, model) on another backend
+        if not _fo and not _rs and not command and (_ulc := _ul_active(a, backend)):
+            _fo = _ul_pick(sdir, a, backend)
+            if _fo: _ul_note(sdir, name, f"[fallback] {backend} usage limit -> {_fo[0]}/{_fo[1]}", on_event, "usage_fallback", primary=backend, fallback=f"{_fo[0]}/{_fo[1]}")
+            else:
+                _release_agent_turn(_turn_lock); _turn_lock = None
+                _lm = _ulc.get("label") or f"{backend} usage limit"
+                _ul_note(sdir, name, f"[limit] {_lm}", on_event, "usage_limit", backend=backend)
+                try: _ms = load_chat_meta(sdir,name,agent=a).get("sid","")
+                except Exception: _ms = ""
+                return {"error":_lm,"exit":2,"sid":_ms,"reply":_lm,"usage_limit":True,"reset_at":datetime.fromtimestamp(float(_ulc["until"]),timezone.utc).isoformat()}
+        if _fo:
+            backend, model = _fo
+            a = {k: v for k, v in a.items() if k not in ("effort", "acp_cmd", "transport")}; a["backend"], a["model"] = backend, model
         workdir = os.path.abspath(a.get("dir",".") or ".")
         if command and backend != "opencode":
             _release_agent_turn(_turn_lock); _turn_lock = None
@@ -8879,7 +8893,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                 except Exception: _ms = ""
                 return {"error":_ave,"exit":2,"sid":_ms,"reply":_ave}
         except Exception: pass
-        if not _force and not _rs:
+        if not _force and (not _rs or _fo):
             try:
                 _berr, _bw = budget_check(backend, model)
                 if _berr:
@@ -8932,6 +8946,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             sid = sids.get(backend, "")
             if not sid and meta.get("backend", backend) == backend:
                 sid = meta.get("sid","")
+        if _fo: sid = ""  # other backend has no session: fresh + history replay (_rs hist or recent_history)
         prompt, sys_txt, prof_name = _turn_prompt(sdir, a_eff, backend, sid, text, command, _rs)
         try:
             argv = _turn_argv(sdir, a_eff, backend, model, workdir, sid, prompt, sys_txt, command, prof_name)
@@ -9066,9 +9081,11 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                 for kind,txt in parse_events(backend,line):
                     if kind=="meta":
                         if txt and not sid_new:
-                            sid_new=txt; meta["sid"]=txt; meta["backend"]=backend
-                            sids = meta.get("sids") or {}; sids[backend]=txt; meta["sids"]=sids
-                            save_chat_meta(sdir,name,meta)
+                            sid_new=txt
+                            if not _fo:  # failover turns stay session-less (roster + primary sids untouched)
+                                meta["sid"]=txt; meta["backend"]=backend
+                                sids = meta.get("sids") or {}; sids[backend]=txt; meta["sids"]=sids
+                                save_chat_meta(sdir,name,meta)
                     elif kind=="text":
                         if delta_only or _unknown_json: continue
                         if txt: chunks.append(txt)
@@ -9141,13 +9158,21 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if _intr: rc = 130; _event(sdir, "interrupted", name)
         full = "\n".join(c for c in chunks if c).strip()
         _erows = "\n".join(str(r.get("text","")) for r in buf.rows.values() if r.get("role")=="error")  # opencode reports provider errors as JSON events, not stderr
-        _nx = None if command else _retry_plan(sdir,name,backend,sid,rc,(err+"\n"+_erows).strip(),_timed_out["hit"] or _intr,bool(full) or any(r.get("role") not in ("user","error") for r in buf.rows.values()),_rs,_turn_lock,_t_guard,timeout_s,on_event)
+        _uli = usage_limit_scan(backend, err, _erows, full if len(full) < 1500 else "") if rc and not command and not _intr and not _timed_out["hit"] else None
+        if _uli:  # plan cap, not a 429: shared cooldown + log, never retry
+            _ul_record(a, backend, _uli)
+            _ul_note(sdir, name, f"[limit] {_uli['label']}", on_event, "usage_limit", backend=backend, reset_when=_uli["when"])
+            if not _fo and (_xf := _ul_pick(sdir, a, backend)):
+                _ul_note(sdir, name, f"[fallback] {backend} usage limit -> {_xf[0]}/{_xf[1]}", on_event, "usage_fallback", primary=backend, fallback=f"{_xf[0]}/{_xf[1]}")
+                buf.finalize()
+                return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs={"lock":_turn_lock,"t0":_t_guard,"n":0,"resumed":False,"ck":_ck,"xb":_xf,"hist":resume_replay_hist(sdir,name)},force=_force,stall_s=stall_s,model=_mo)
+        _nx = None if command or _uli else _retry_plan(sdir,name,backend,sid,rc,(err+"\n"+_erows).strip(),_timed_out["hit"] or _intr,bool(full) or any(r.get("role") not in ("user","error") for r in buf.rows.values()),_rs,_turn_lock,_t_guard,timeout_s,on_event)
         if _nx: _nx["ck"] = _ck
         if _nx and _force: _nx["force"] = True
         if _nx: return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs=_nx,force=_force,stall_s=stall_s,model=_mo)
         if rc != 0 and not _intr:
             # record failure even when prose already streamed; never fake ok.
-            _emsg = f"(exit {rc}) " + ((err.strip().splitlines()[-3:] or [""])[-1][:300] or "turn failed")
+            _emsg = f"(exit {rc}) " + (_uli["label"] if _uli else ((err.strip().splitlines()[-3:] or [""])[-1][:300] or "turn failed"))
             if _timed_out["hit"]: _emsg += " (raise --max-runtime or split the task)"
             buf.error(_emsg)
         buf.finalize()
@@ -9194,6 +9219,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             if not command: usage_log_turn(sdir, name, backend, model, _usage, rc)
         except Exception: pass
         if _intr: out["interrupted"] = True
+        if _uli: out.update(usage_limit=True, reset_at=datetime.fromtimestamp(_uli["until"], timezone.utc).isoformat(), error=_uli["label"])
         if _timed_out["hit"]:
             out["timed_out"] = True
             out["error"] = f"max-runtime {timeout_s:g}s exceeded (backend killed)"
@@ -9208,7 +9234,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                 if _a is not None and _a.pop("pending_handoff", None) is not None:
                     save_agents(sdir, _rows)
             except Exception: pass
-            try: _rl_clear_cooldown(_rl_key(backend, model))  # ratelimit hits reset after a success
+            try: _rl_clear_cooldown(_rl_key(backend, model)); _rl_clear_cooldown(_ul_key(a, backend))  # ratelimit hits reset after a success
             except Exception: pass
         return out
     finally:
@@ -9312,6 +9338,89 @@ def _retry_plan(sdir,name,backend,sid,rc,err,timed_out,got_output,rs,lock,t0,tim
         pass
     return None
 
+# ---- usage/spend limits: plan caps (claude "You've hit your ... limit", codex, gemini quota) ----
+# Not a 429: no auto-retry. Cooldown key <backend>/usage-limit[@sha1(claude_config_dir)[:8]] in the
+# ratelimit cooldown dir (until = parsed reset, else +1h; shows in `ag ratelimit`). Failover: agent
+# `fallback` entries BACKEND/MODEL | BACKEND:MODEL on another backend run the turn fresh with history replay.
+_USAGE_LIMIT_RE = re.compile(
+    r"hit your (?:[\w-]+ ){0,2}limit|usage limit|spend limit|[\w-]+-hour limit (?:reached|hit|exceeded)"
+    r"|resource_exhausted|quota exceeded|exceeded your (?:current )?quota", re.I)
+_UL_DEFAULT_S = 3600
+def _ul_reset(t, now=None):
+    """Reset time in text -> (epoch|None, 'HH:MM[ tz]'). 'resets 7:40pm (America/Toronto)', 'resets at 19:40', 'try again in 3h'. Pure."""
+    now = now or time.time()
+    m = re.search(r"(?:try again|retry|resets?|available again)\s+in\s+((?:\d+(?:\.\d+)?\s*[dhms]\w*[\s,]*(?:and\s+)?)+)", t, re.I)
+    if m:
+        s = sum(float(n) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[u.lower()] for n, u in re.findall(r"(\d+(?:\.\d+)?)\s*([dhms])", m.group(1), re.I))
+        if s > 0: return now + s, datetime.fromtimestamp(now + s).strftime("%H:%M")
+    m = re.search(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)?(?:\s*\(([A-Za-z_]+(?:/[A-Za-z_+-]+)*)\))?", t, re.I)
+    if m and (m.group(2) or m.group(3)):
+        h, mi, ap, tzn = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower(), m.group(4) or ""
+        if ap: h = h % 12 + (12 if ap == "pm" else 0)
+        if h > 23 or mi > 59: return None, ""
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tzn) if tzn else None
+        except Exception: tz, tzn = None, ""
+        dt = datetime.fromtimestamp(now, tz).replace(hour=h, minute=mi, second=0, microsecond=0)
+        if dt.timestamp() <= now:
+            from datetime import timedelta
+            dt += timedelta(days=1)
+        return dt.timestamp(), f"{h:02d}:{mi:02d}" + (f" {tzn}" if tzn else "")
+    return None, ""
+def usage_limit_scan(backend, *texts, now=None):
+    """First usage-limit hit in texts -> {until, when, label, msg} or None. Pure."""
+    now = now or time.time()
+    for t in texts:
+        t = _ANSI_RE.sub("", t or "")[-2000:]
+        m = _USAGE_LIMIT_RE.search(t)
+        if not m: continue
+        ep, when = _ul_reset(t[max(0, m.start() - 100):m.end() + 300], now)
+        if ep is None: ep, when = now + _UL_DEFAULT_S, ""
+        ls = t.rfind("\n", 0, m.start()) + 1; le = t.find("\n", m.end()); msg = t[ls:le if le >= 0 else None].strip()[:300]
+        return {"until": ep, "when": when, "msg": msg,
+                "label": f"{backend} usage limit (" + (f"resets {when}" if when else "reset time unknown; cooling 1h") + ")"}
+    return None
+def _ul_key(a, backend):
+    d = (a.get("claude_config_dir") or "").strip() if backend == "claude" else ""
+    return f"{backend}/usage-limit" + (f"@{hashlib.sha1(d.encode()).hexdigest()[:8]}" if d else "")
+def _ul_record(a, backend, info):
+    try:
+        p = _rl_cooldown_path(_ul_key(a, backend)); p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"until": info["until"], "hits": 1, "usage_limit": True, "label": info["label"], "msg": info["msg"]}))
+    except Exception: pass
+def _ul_active(a, backend):
+    """Cooldown record {until,label,msg} while this backend/account is limited, else None. Never raises."""
+    try:
+        d = json.loads(_rl_cooldown_path(_ul_key(a, backend)).read_text())
+        if d.get("usage_limit") and float(d.get("until") or 0) > time.time(): return d
+    except Exception: pass
+    return None
+def _fb_split(entry, backend):
+    """Fallback entry BACKEND/MODEL | BACKEND:MODEL on a different backend -> (backend, model), else None (same-backend model). Pure."""
+    m = re.match(r"^(claude|codex|gemini|opencode|cursor|echo)[/:](.*)$", (entry or "").strip())
+    if not m or m.group(1) == backend: return None
+    b, md = m.group(1), m.group(2).strip() or "default"
+    if b == "opencode" and md != "default" and "/" not in md: md = "opencode/" + md
+    return b, md
+def _ul_pick(sdir, a, backend):
+    """First cross-backend fallback not cooling and passing privacy + access. Never raises."""
+    try:
+        fbs = a.get("fallback") or []
+        for e in ([fbs] if isinstance(fbs, str) else fbs):
+            x = _fb_split(e, backend)
+            if not x or _ul_active(a, x[0]): continue
+            if privacy_error(x[0], x[1], agent_data(a)) or access_error(x[0], x[1], agent_data(a), sdir=sdir): continue
+            return x
+    except Exception: pass
+    return None
+def _ul_note(sdir, name, note, on_event, ev, **kw):
+    try: append_chat(sdir, name, "tool", note); _event(sdir, ev, name, **kw)
+    except Exception: pass
+    if on_event:
+        try: on_event(name, "tool", note)
+        except Exception: pass
+
 # ---- rate-limit manager: slots + stall watchdog + shared cooldown + fallback (one block) ----
 # Key = backend+model. Slots: fcntl.flock on $AG_CACHE_HOME/ratelimit/slots/<key>/<i>.lock,
 # default 4 for opencode free models, unlimited otherwise. Cooldown: .../cooldown/<key>.json
@@ -9404,7 +9513,7 @@ def _rl_read_cooldown(key):
         d = json.loads(_rl_cooldown_path(key).read_text())
         until = float(d.get("until") or 0); hits = int(d.get("hits") or 0)
         rem = until - time.time()
-        return {"until": until, "hits": hits, "remaining": rem if rem > 0 else 0}
+        return {"until": until, "hits": hits, "remaining": rem if rem > 0 else 0, "label": d.get("label") or ""}
     except Exception: return {"until": 0, "hits": 0, "remaining": 0}
 def _rl_write_cooldown(key, hits):
     try:
@@ -9541,7 +9650,7 @@ def _rl_pick_fallback(agent, backend, primary):
             s = (x or "").strip()
             if s and s not in out: out.append(s)
         for fb in out:
-            if fb == primary: continue
+            if fb == primary or _fb_split(fb, backend): continue
             try:
                 pf = globals().get("model_privacy")
                 if callable(pf) and (agent.get("data") or "work") != "public":
@@ -9613,6 +9722,7 @@ def do_ratelimit(a):
                 rem = float(d.get("until") or 0) - time.time()
                 if rem < 0: rem = 0
                 cooldowns[p.stem] = {"remaining": int(rem + 0.999), "hits": int(d.get("hits") or 0)}
+                if d.get("usage_limit"): cooldowns[p.stem].update(usage_limit=True, reset_at=datetime.fromtimestamp(float(d.get("until") or 0), timezone.utc).isoformat(), label=d.get("label") or "", msg=d.get("msg") or "")
             except Exception: continue
     except Exception: pass
     data = {"slots": slots, "cooldowns": cooldowns}
@@ -9624,7 +9734,7 @@ def do_ratelimit(a):
     else: lines.append("slots: idle")
     if cooldowns:
         for k, c in sorted(cooldowns.items()):
-            lines.append(f"cooldown {k}: {c['remaining']}s remaining (hits {c['hits']})")
+            lines.append(f"cooldown {k}: {c['remaining']}s remaining (hits {c['hits']})" if not c.get("usage_limit") else f"cooldown {k}: {c['remaining']}s remaining, {c['label']}: {c['msg']}")
     else: lines.append("cooldowns: none")
     return emit(a, "ratelimit", {**data, "_text": "\n".join(lines)})
 
@@ -10189,8 +10299,9 @@ def do_chat(a):
         _rcpt_done(_h, r)
         if "error" in r and not r.get("timed_out"):
             if notify_done: _notify_completion(a.name, "failed", error=r.get("error"))
-            if r.get("exit") == 2: emit(a,"chat",error=r["error"]); return 2
-            return emit(a,"chat",error=r["error"])
+            _uld = {k: r[k] for k in ("usage_limit","reset_at") if k in r} or None  # usage limit: machine-readable in --json
+            if r.get("exit") == 2: emit(a,"chat",_uld,error=r["error"]); return 2
+            return emit(a,"chat",_uld,error=r["error"])
         if vcmd and esc is None:  # turn ran (errors above already returned); run trusted verify in the agent workdir
             try: v = run_verify(sdir,a.name,vcmd,vtmo)
             except Exception as e: v = {"cmd":vcmd,"exit":1,"tail":f"verify error: {e}"}
@@ -18285,12 +18396,12 @@ def build():
     ag = sub.add_parser("agents",help="ag roster + backends"); ags=ag.add_subparsers(dest="sub",required=True)
     ags.add_parser("list")
     agps=ags.add_parser("ps",help="live process trees per agent"); agps.add_argument("--tree",action="store_true")
-    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model"); aga.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears -> AG_STALL_S/backend default)')
+    aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback when rate-limited: MODEL, or BACKEND/MODEL | BACKEND:MODEL to fail over to another backend on a usage limit (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model"); aga.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears -> AG_STALL_S/backend default)')
     agc=ags.add_parser("create",help="draft an agent from one sentence (proposal; --yes creates)"); agc.add_argument("description"); agc.add_argument("--name",default=None); agc.add_argument("--dir",dest="adir",default="."); agc.add_argument("--using",default=None,help="agent that drafts the proposal (default: routing plan job, else first orchestrator)"); agc.add_argument("--yes",action="store_true",help="create the agent (default: show proposal + command only)"); agc.add_argument("--dry-run",dest="dry_run",action="store_true")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)"); agrm.add_argument("--purge",action="store_true",help="also remove chat log and metadata")
     agrs=ags.add_parser("reset",help="clear stored backend session ids; keep config and chat log"); agrs.add_argument("name")
     agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback model when rate-limited (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)')
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback when rate-limited: MODEL, or BACKEND/MODEL | BACKEND:MODEL to fail over to another backend on a usage limit (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)')
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)

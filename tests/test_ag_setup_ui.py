@@ -132,7 +132,7 @@ class SetupUIs(unittest.TestCase):
         rt = json.loads((self.cfg/"routing.json").read_text())["profiles"]["claude"]["jobs"]
         self.assertEqual(rt["review"]["ag"], {"backend": "opencode", "model": "anthropic/c"})
         self.assertEqual(rt["debug"], {"claude": "haiku", "ag": {"backend": "claude", "model": "my/custom-1"}})
-        for d in (self.home/".claude", self.home/".config"/"opencode"):
+        for d in (self.home/".claude", self.home/".agents"):
             self.assertTrue((d/"skills"/"ag-cli"/"SKILL.md").exists(), d)
         self.assertIn("my/custom-1", (self.home/".claude"/"CLAUDE.md").read_text())
 

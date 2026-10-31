@@ -22,11 +22,23 @@ Variants:
 ```sh
 ./install.sh --prefix DIR     # installs to DIR/bin/ag
 ./install.sh --force          # replace an existing installed file
+./install.sh --no-setup       # copy ag only, skip the setup step below
 ```
 
-The installer copies only the single `ag` file. It does not use sudo,
-does not fetch anything from the network, does not set up backends,
-and does not edit shell rc files. Running from the checkout (`./ag`)
+The installer copies the single `ag` file (plus `skills/` to
+`<prefix>/share/ag/skills`, where the installed `ag` finds its templates),
+then runs `ag setup --scope global --yes` and prints what it wrote: the
+`ag-cli`/`ag-agents` skills as real files in `~/.agents/skills/` (read
+natively by opencode, Codex, Gemini, Cursor, Copilot), symlinks to them
+in `~/.claude/skills/` (and `~/.config/agents/skills/` for Amp), and a
+marker-wrapped pointer + routing block in `~/.claude/CLAUDE.md`,
+`~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`,
+`~/.gemini/GEMINI.md` for each harness it detects, plus
+`~/.config/ag/routing.json`. A failing setup only warns. Undo: delete
+`~/.agents/skills/ag-*`, the `~/.claude/skills/ag-*` links, and the text
+between `<!-- ag:routing:start -->` and `<!-- ag:routing:end -->`. It does
+not use sudo, does not fetch anything from the network, does not set up
+backends, and does not edit shell rc files. Running from the checkout (`./ag`)
 keeps working with or without installing.
 
 ## PATH
@@ -71,8 +83,7 @@ job reports done, so leave the temp dir to the OS.
 
 Coding-CLI backends (`claude`, `opencode`, `codex`, `gemini`, `cursor`)
 are optional: install and authenticate each one separately, then
-re-run `ag agents doctor`. Skills (`.claude/skills/`) and docs stay in
-the clone — a single-file install does not move them.
+re-run `ag agents doctor`. Docs stay in the clone.
 
 Note: when `opencode` is not on `PATH`, `ag` also looks in
 `~/.opencode/bin/opencode`, `~/.local/bin/opencode`,

@@ -1410,6 +1410,7 @@ SECRET_REDACTED = b"[secret input redacted]\n"
 SECRET_FRAME = (b"\x00AG-SECRET\x00", b"\x00AG-END\x00")
 SECRET_MAX = 400       # framed payload < PIPE_BUF (512): one atomic fifo write
 SECRET_QUIET_S = 0.3   # output must be idle this long before a prompt counts
+SECRET_SCRUB_S = 3.0   # window to redact an app-level echo of a just-sent secret
 SECRET_PROMPT_RE = re.compile(r"\b(password|passphrase|passcode|verification code|one[- ]time"
     r"|otp|2fa|pin|security code|token)\b[^\n]{0,40}[:?]\s*$", re.I)
 SECRET_BLOCKED_RE = re.compile(r"a terminal is required to read the password|sudo: a password "
@@ -1510,10 +1511,36 @@ def secret_write_pty(fd, data):
             try: termios.tcsetattr(fd, termios.TCSANOW, old)
             except Exception: pass
 
-def secret_feed(sp, fd, chunk):
+class SecretScrub:
+    """Output filter redacting the echo of a just-sent secret: apps that echo
+    themselves (readline input(), echo-on keyword prompts) bypass tty ECHO off.
+    Armed per secret (memory only); first match or SECRET_SCRUB_S disarms. A
+    tail that may start the secret is held back across reads (dropped on close)."""
+    MARK = b"[secret redacted]"
+    def __init__(self): self.pat, self.until, self.hold, self.lock = b"", 0.0, b"", threading.Lock()
+    def arm(self, val):
+        val = bytes(val).rstrip(b"\r\n")
+        with self.lock:
+            if val: self.pat, self.until = val, time.monotonic() + SECRET_SCRUB_S
+    def __call__(self, data=b""):
+        with self.lock:
+            data, self.hold = self.hold + data, b""
+            if self.pat and time.monotonic() > self.until: self.pat = b""
+            if not self.pat: return data
+            i = data.find(self.pat)
+            if i >= 0:
+                n, self.pat = len(self.pat), b""
+                return data[:i] + self.MARK + data[i+n:]
+            for k in range(min(len(self.pat) - 1, len(data)), 0, -1):
+                if self.pat.startswith(data[-k:]):
+                    self.hold = data[-k:]; return data[:-k]
+            return data
+
+def secret_feed(sp, fd, chunk, scrub=None):
     """fifo chunk -> PTY; framed secrets are echo-suppressed and redacted in input.log."""
     log = bytearray()
     for sec, part in secret_fifo_split(chunk):
+        if sec and scrub: scrub.arm(part)
         try: (secret_write_pty if sec else os.write)(fd, part)
         except OSError: pass
         log += SECRET_REDACTED if sec else part
@@ -1612,8 +1639,8 @@ def secret_env(sdir, env, enabled=True):
 class SecretWatch:
     """Daemon-side PTY prompt detector: debounced, one dialog at a time, and
     no re-pop for the same prompt until new output arrives."""
-    def __init__(self, sdir, sp, fd, enabled):
-        self.sdir, self.sp, self.fd, self.on = sdir, Path(sp), fd, enabled
+    def __init__(self, sdir, sp, fd, enabled, scrub=None):
+        self.sdir, self.sp, self.fd, self.on, self.scrub = sdir, Path(sp), fd, enabled, scrub
         self.tail, self.seq, self.seen, self.t, self.busy = b"", 0, 0, 0.0, False
     def output(self, data):
         self.tail = (self.tail + data)[-1024:]; self.seq += 1; self.t = time.monotonic()
@@ -1637,6 +1664,7 @@ class SecretWatch:
             outcome, val = secret_dialog((f"[{who}] " if who else "") + prompt)
             if outcome == "ok":
                 data = val.encode() + b"\r"; val = None
+                if self.scrub: self.scrub.arm(data)
                 secret_write_pty(self.fd, data); data = None
                 with open(self.sp/"input.log", "ab") as inf: inf.write(SECRET_REDACTED)
         except Exception: outcome = "error"
@@ -1812,6 +1840,9 @@ def secret_selfcheck():
     assert secret_fifo_split(b"a" + secret_frame(b"pw\r") + b"b") == [
         (False, b"a"), (True, b"pw\r"), (False, b"b")]
     assert secret_fifo_split(SECRET_FRAME[0] + b"x") == [(True, b"x")]  # fail closed
+    sc = SecretScrub(); sc.arm(b"pw12\r")
+    assert sc(b"OTP: p") == b"OTP: " and sc(b"w12\r\n") == SecretScrub.MARK + b"\r\n"
+    assert sc(b"pw12") == b"pw12" and SecretScrub()(b"x") == b"x"  # disarmed after one match
     assert sudo_args(["ls"]) == ["-A", "ls"] and sudo_args(["-u", "root", "id"])[0] == "-A"
     assert sudo_args(["-unobody", "id"])[0] == "-A" and sudo_args(["-v"]) == ["-A", "-v"]
     for keep in (["-S", "ls"], ["-n", "ls"], ["-A", "ls"], ["-nk"], ["-k"], ["-V"], [],
@@ -1860,7 +1891,8 @@ def daemon_main(sp):
             struct.pack("HHHH", st.get("rows",30), st.get("cols",100), 0, 0))
     except Exception: pass
     lastwz = 0
-    sw = SecretWatch(sp.parent.parent, sp, fd, st.get("secret_popup", True) and secret_enabled())
+    scrub = SecretScrub()
+    sw = SecretWatch(sp.parent.parent, sp, fd, st.get("secret_popup", True) and secret_enabled(), scrub)
     ff = os.open(fifo, os.O_RDONLY|os.O_NONBLOCK)
     code, drain = None, 0
     try:
@@ -1876,13 +1908,18 @@ def daemon_main(sp):
             if fd in r:
                 try: data = os.read(fd, 65536)
                 except OSError: data = b""
-                if data: logf.write(data); sw.output(data)
+                if data:
+                    data = scrub(data)
+                    if data: logf.write(data); sw.output(data)
                 else: eof = True
+            elif scrub.hold:
+                held = scrub()  # releases held bytes once the window expires
+                if held: logf.write(held); sw.output(held)
             if ff in r:
                 try: chunk = os.read(ff, 65536)
                 except OSError: chunk = b""
                 if chunk:
-                    secret_feed(sp, fd, chunk)
+                    secret_feed(sp, fd, chunk, scrub)
                 else:
                     os.close(ff); ff = os.open(fifo, os.O_RDONLY|os.O_NONBLOCK)
             try:

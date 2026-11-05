@@ -8655,6 +8655,193 @@ def parse_usage_acp(o):
             "cache_write": cw, "reasoning": _uint(x.get("thoughtTokens")), "final": True}
     return None
 
+# --- ACP server: `ag acp serve` makes ag an ACP *agent* (T3 Code / Zed launch it; client side is above) ---
+# sessionId "<agent>:<hex>" -> roster agent (map in acp_sessions.json; survives restarts for session/load).
+# session/prompt runs run_turn in a worker thread; timeline rows stream as session/update. Permissions are
+# answered by ag from the agent's mode (never asked of the client); client fs/terminal caps and mcpServers
+# are ignored. stdout carries JSON-RPC only (fd 1 is re-pointed at stderr for strays/children).
+ACP_MODES = {"default": "backend default permissions", "ro": "read-only", "edits": "edit files in the agent dir",
+    "auto": "edits + allowlisted shell", "full": "no restrictions"}
+_ACP_KINDS = (("think", ("think", "todo", "plan")), ("execute", ("bash", "shell", "exec", "command", "terminal", "run")),
+    ("edit", ("edit", "write", "patch", "replace", "create")), ("delete", ("delete", "remove", "rm")), ("move", ("move", "rename", "mv")),
+    ("read", ("read", "view", "cat", "open")), ("search", ("grep", "glob", "search", "find", "list", "ls")), ("fetch", ("fetch", "web", "http", "url")))
+
+def acp_tool_kind(name):
+    ts = [t for t in re.split(r"[^a-z]+", (name or "").lower()) if t]
+    return next((k for k, ws in _ACP_KINDS if any(t == w or t.startswith(w) or t.endswith(w) for t in ts for w in ws)), "other")
+
+def acp_prompt_text(blocks):
+    """ACP ContentBlock[] -> one message: text, embedded resource text, resource links. Images/audio dropped."""
+    out = []
+    for b in blocks if isinstance(blocks, list) else []:
+        if not isinstance(b, dict): continue
+        t, r = b.get("type"), b.get("resource")
+        if t == "text" and isinstance(b.get("text"), str): out.append(b["text"])
+        elif t == "resource" and isinstance(r, dict) and isinstance(r.get("text"), str): out.append(f'<context uri="{r.get("uri", "")}">\n{r["text"]}\n</context>')
+        elif t == "resource_link" and b.get("uri"): out.append(f'[{b.get("name") or b["uri"]}]({b["uri"]})')
+    return "\n\n".join(x for x in out if x)
+
+class AcpNoMethod(Exception): pass
+
+def acp_serve(sdir, fixed=None):
+    sdir = Path(os.path.abspath(sdir)); ensure_state(sdir)
+    wf = os.fdopen(os.dup(1), "wb"); os.dup2(2, 1); sys.stdout = sys.stderr
+    rf, wl, run = sys.stdin.buffer, threading.Lock(), {}
+    mp = sdir / "acp_sessions.json"
+    try: smap = json.loads(mp.read_text())
+    except Exception: smap = {}
+    smap = smap if isinstance(smap, dict) else {}
+    def send(o):
+        with wl:
+            try: wf.write((json.dumps(o) + "\n").encode()); wf.flush()
+            except Exception: pass
+    res = lambda i, r: send({"jsonrpc": "2.0", "id": i, "result": r})
+    err = lambda i, c, m: send({"jsonrpc": "2.0", "id": i, "error": {"code": c, "message": str(m)[:500]}})
+    upd = lambda sid, u: send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": u}})
+    chunk = lambda sid, t, k="agent_message_chunk": upd(sid, {"sessionUpdate": k, "content": {"type": "text", "text": t}})
+    roster = lambda: {x["name"]: x for x in load_agents(sdir)}
+    def remember(sid, n):
+        smap.pop(sid, None); smap[sid] = n
+        for k in list(smap)[:-500]: smap.pop(k)
+        try: mp.write_text(json.dumps(smap))
+        except Exception: pass
+    def agent_of(sid):
+        n = smap.get(sid) or (str(sid).rsplit(":", 1)[0] if ":" in str(sid or "") else "")
+        if n not in roster(): raise ValueError(f"unknown session {sid!r} (agent {n or '?'} not in roster)")
+        return n
+    def pick(cwd):
+        ags = roster()
+        if fixed:
+            if fixed not in ags: raise ValueError(f"no such agent: {fixed} (ag --dir {sdir} agents list)")
+            return fixed
+        rc = os.path.realpath(cwd) if isinstance(cwd, str) and cwd else ""
+        hits = [x for x in ags.values() if rc and os.path.realpath(os.path.abspath(x.get("dir") or ".")) == rc]
+        if not hits: raise ValueError(f"no ag agent works in {cwd or '(no cwd)'}: ag --dir {sdir} agents add NAME --backend claude --dir {cwd or '/abs/project'} (or acp serve --agent NAME)")
+        return next((x for x in hits if x.get("role") == "orchestrator"), hits[0])["name"]
+    def modes(n):
+        return {"currentModeId": roster().get(n, {}).get("mode") or "default",
+            "availableModes": [{"id": k, "name": k, "description": v} for k, v in ACP_MODES.items()]}
+    def cfg(n):
+        ags = roster(); a = ags.get(n, {}); be, m = a.get("backend", "claude"), a.get("model", "default") or "default"
+        sel = lambda i, nm, cur, opts, **kw: dict({"id": i, "name": nm, "type": "select", "currentValue": cur, "options": opts}, **kw)
+        out = [] if fixed else [sel("agent", "Agent", n, [{"value": k, "name": k, "description": f'{v.get("backend", "claude")}/{v.get("model", "default")}'} for k, v in ags.items()])]
+        return out + [sel("model", "Model", m, [{"value": x, "name": x} for x in list(dict.fromkeys([m] + model_choices(be)))[:200]], category="model")]
+    def cmds(sid):
+        upd(sid, {"sessionUpdate": "available_commands_update", "availableCommands": [dict({"name": c["cmd"], "description": c["desc"]},
+            **({"input": {"hint": "list | <name>"}} if c["cmd"] in ("model", "backend", "harness", "profile") else {}))
+            for c in SLASH_COMMANDS if c["cmd"] not in SLASH_UI_ONLY + ("handoff",)]})
+    def turn(i, sid, n, text, st):
+        def ev(_n, k, t):
+            if k != "timeline" or not isinstance(t, dict): return
+            ro, eid, tx = t.get("role"), t.get("event_id") or "", t.get("text") or ""
+            if ro in ("assistant", "reasoning"):
+                prev = st["seen"].get(eid)
+                if prev is not None and not (len(tx) > len(prev) and tx.startswith(prev)): return
+                d = tx[len(prev or ""):]
+                if not d: return
+                if prev is None and st["sent"].get(ro): d = "\n\n" + d
+                st["seen"][eid] = tx; st["sent"][ro] = True
+                chunk(sid, d, "agent_message_chunk" if ro == "assistant" else "agent_thought_chunk")
+            elif ro == "tool":
+                tid, s = f"ag-{eid}", {"completed": "completed", "failed": "failed"}.get(t.get("status"), "in_progress")
+                if t.get("tool_id"): st["tools"][t["tool_id"]] = tid
+                key = (tx[:200] or t.get("tool_name") or "tool", s)
+                if st["seen"].get(eid) == key: return
+                u = {"toolCallId": tid, "title": key[0], "status": s}
+                upd(sid, dict(u, sessionUpdate="tool_call_update") if eid in st["seen"] else dict(u, sessionUpdate="tool_call", kind=acp_tool_kind(t.get("tool_name"))))
+                st["seen"][eid] = key
+            elif ro == "toolout" and eid not in st["seen"]:
+                st["seen"][eid] = 1
+                tid, s = st["tools"].get(t.get("tool_id") or ""), "failed" if t.get("status") == "failed" else "completed"
+                c = [{"type": "content", "content": {"type": "text", "text": tx}}]
+                upd(sid, {"sessionUpdate": "tool_call_update", "toolCallId": tid, "status": s, "content": c} if tid else
+                    {"sessionUpdate": "tool_call", "toolCallId": f"ag-{eid}", "title": "output", "kind": "other", "status": s, "content": c})
+            elif ro == "error" and eid not in st["seen"] and tx.strip() and not st["cancel"]:
+                st["seen"][eid] = 1; st["err"] = True
+                chunk(sid, ("\n\n" if st["sent"].get("assistant") else "") + f"[error] {tx.strip()}")
+        try: r = run_turn(sdir, n, text, on_event=ev)
+        except Exception as e: r = {"error": f"{type(e).__name__}: {str(e)[:300]}"}
+        finally: run.pop(sid, None)
+        stop = "cancelled" if st["cancel"] or r.get("interrupted") else "end_turn" if r.get("slash") or (not r.get("error") and not r.get("exit")) else "refusal"
+        if stop != "cancelled" and not st["err"]:
+            if not st["sent"].get("assistant"): chunk(sid, r.get("reply") or (f'[error] {r["error"]}' if r.get("error") else ""))
+            elif stop == "refusal": chunk(sid, f'\n\n[error] {r.get("error") or r.get("reply") or "turn failed"}')
+        out, u = {"stopReason": stop}, r.get("usage") or {}
+        if u.get("in") or u.get("out"):
+            out["usage"] = {"inputTokens": u.get("in", 0), "outputTokens": u.get("out", 0), "totalTokens": u.get("in", 0) + u.get("out", 0),
+                **({"cachedReadTokens": u["cache_read"]} if u.get("cache_read") else {}), **({"thoughtTokens": u["reasoning"]} if u.get("reasoning") else {})}
+        res(i, out)
+    def cancel(sid):
+        st = run.get(sid)
+        if not st or st["cancel"]: return
+        st["cancel"] = True
+        def _stop():
+            try:
+                if agent_stop(sdir, st["agent"], hold=False).get("interrupted"): return
+                end = time.monotonic() + 10  # cancel raced the backend launch: keep interrupting until the turn ends
+                while sid in run and time.monotonic() < end and not agent_interrupt(sdir, st["agent"], 2): time.sleep(0.2)
+            except Exception as e: sys.stderr.write(f"[acp] cancel {st['agent']}: {e}\n")
+        threading.Thread(target=_stop, daemon=True).start()
+    def handle(m):
+        meth, i, p = m.get("method"), m.get("id"), m.get("params") if isinstance(m.get("params"), dict) else {}
+        if meth == "initialize":
+            pv = p.get("protocolVersion")
+            return res(i, {"protocolVersion": min(pv, 1) if isinstance(pv, int) and pv > 0 else 1, "agentInfo": {"name": "ag", "version": VERSION}, "authMethods": [],
+                "agentCapabilities": {"loadSession": True, "promptCapabilities": {"image": False, "audio": False, "embeddedContext": True}}})
+        if meth == "authenticate": return res(i, {})
+        if meth == "session/new":
+            n = pick(p.get("cwd")); sid = f"{n}:{os.urandom(6).hex()}"; remember(sid, n)
+            res(i, {"sessionId": sid, "modes": modes(n), "configOptions": cfg(n)}); return cmds(sid)
+        if meth == "session/cancel": return cancel(p.get("sessionId"))
+        if meth not in ("session/load", "session/set_mode", "session/set_config_option", "session/prompt"): raise AcpNoMethod(meth)
+        sid = p.get("sessionId"); n = agent_of(sid)
+        if meth == "session/load":
+            for r in load_chat_log(sdir, n):
+                if r.get("role") in ("user", "agent") and r.get("text"): chunk(sid, r["text"], "user_message_chunk" if r["role"] == "user" else "agent_message_chunk")
+            res(i, {"modes": modes(n), "configOptions": cfg(n)}); return cmds(sid)
+        if meth == "session/set_mode":
+            mid = p.get("modeId")
+            if mid not in ACP_MODES: raise ValueError(f"bad modeId {mid!r}: {'|'.join(ACP_MODES)}")
+            ok, msg = update_agent_settings(sdir, n, {"mode": "" if mid == "default" else mid})
+            if not ok: return err(i, -32603, msg)
+            upd(sid, {"sessionUpdate": "current_mode_update", "currentModeId": mid}); return res(i, {})
+        if meth == "session/set_config_option":
+            cid, v = p.get("configId"), p.get("value")
+            if cid == "agent" and not fixed:
+                if v not in roster(): raise ValueError(f"no such agent: {v}")
+                remember(sid, v); upd(sid, {"sessionUpdate": "current_mode_update", "currentModeId": modes(v)["currentModeId"]})
+                return res(i, {"configOptions": cfg(v)})
+            if cid != "model" or not isinstance(v, str) or not v.strip(): raise ValueError(f"unknown config option {cid!r} (agent|model)")
+            ok, msg = update_agent_settings(sdir, n, {"model": v.strip()[:120]})
+            return res(i, {"configOptions": cfg(n)}) if ok else err(i, -32603, msg)
+        text = acp_prompt_text(p.get("prompt"))
+        if not text.strip(): raise ValueError("empty prompt (ag takes text/resource blocks)")
+        if sid in run: return err(i, -32603, f"a prompt is already running in session {sid}")
+        st = run[sid] = {"agent": n, "cancel": False, "err": False, "seen": {}, "sent": {}, "tools": {}}
+        st["t"] = threading.Thread(target=turn, args=(i, sid, n, text, st), daemon=True); st["t"].start()
+    def dispatch(m):
+        try: handle(m)
+        except AcpNoMethod: err(m["id"], -32601, f"method not found: {m.get('method')}") if "id" in m else None
+        except ValueError as e: err(m["id"], -32602, e) if "id" in m else None
+        except Exception as e: err(m["id"], -32603, f"{type(e).__name__}: {e}") if "id" in m else sys.stderr.write(f"[acp] {e}\n")
+    while True:
+        l = rf.readline(ACP_MAX_MSG + 1)
+        if not l: break
+        if len(l) > ACP_MAX_MSG and not l.endswith(b"\n"):
+            while l and not l.endswith(b"\n"): l = rf.readline(ACP_MAX_MSG)
+            err(None, -32600, "message > 4MB dropped"); continue
+        if not l.strip(): continue
+        try: m = json.loads(l)
+        except Exception: err(None, -32700, "parse error"); continue
+        if isinstance(m, dict) and isinstance(m.get("method"), str): dispatch(m)  # responses: ag never asks the client
+    ts = [st["t"] for st in list(run.values())]
+    for sid in list(run): cancel(sid)  # stdin EOF: stop running turns, let them answer, exit
+    for t in ts: t.join(15)
+    return 0
+
+def do_acp(a):
+    return acp_serve(state_dir(a.dir), getattr(a, "agent", None))
+
 def _acp_selfcheck(td):
     assert acp_check("claude", "acp", "") and acp_check("acp", "", "") and not acp_check("gemini", "acp", "")
     assert acp_on({"transport": "acp"}, "gemini") and not acp_on({"transport": "acp"}, "gemini", "cmd") and not acp_on({}, "gemini")
@@ -8673,6 +8860,8 @@ def _acp_selfcheck(td):
     assert parse_timeline("gemini", L({"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hi"}}})) == [{"op": "assistant_delta", "seg": "acp:2", "delta": "hi"}]
     assert parse_events("opencode", json.dumps({"ag_acp": "session", "sessionId": "s1"})) == [("meta", "s1")]
     assert parse_usage("acp", json.dumps({"ag_acp": "done", "usage": {"inputTokens": 5, "outputTokens": 2, "cachedReadTokens": 3}}))["in"] == 8
+    assert [acp_tool_kind(x) for x in ("Bash", "MultiEdit", "read_file", "TodoWrite", "webfetch", "mcp__x")] == ["execute", "edit", "read", "think", "fetch", "other"]
+    assert acp_prompt_text([{"type": "text", "text": "a"}, {"type": "image", "data": "x"}, {"type": "resource_link", "uri": "file:///f", "name": "f"}]) == "a\n\n[f](file:///f)"
 
 # --- run_turn seams: each turn feature edits ONE helper ---
 def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
@@ -18541,6 +18730,8 @@ def build():
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50);     ws.add_argument("--wait",default=None,nargs="+",help="block until one or more wake jobs finish (exit 0 ok, 1 failed, 124 timeout)"); ws.add_argument("--wait-group",dest="wait_group",default=None,help="block until all jobs of cohort GROUP finish (same exit codes)"); ws.add_argument("--timeout",type=int,default=30);  ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3)
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
     sub.add_parser("_acp",help=argparse.SUPPRESS).add_argument("spec")
+    acs=sub.add_parser("acp",help="Agent Client Protocol server: ag as an ACP agent for T3 Code/Zed (stdio JSON-RPC)").add_subparsers(dest="sub",required=True)
+    acs.add_parser("serve",help="speak ACP on stdin/stdout; session cwd picks the roster agent").add_argument("--agent",default=None,help="pin every session to this roster agent (default: agent whose --dir == session cwd)")
     hosts=sub.add_parser("hosts",help="outbound SSH host and project mappings"); hsub=hosts.add_subparsers(dest="hostsub",required=True)
     hsub.add_parser("list")
     ha=hsub.add_parser("add"); ha.add_argument("host"); ha.add_argument("--ssh-json",required=True); ha.add_argument("--remote-ag",required=True); ha.add_argument("--remote-state",required=True); ha.add_argument("--remote-project",required=True); ha.add_argument("--local-project",required=True)
@@ -18983,7 +19174,7 @@ UPDATE_RAW_PINNED = "https://raw.githubusercontent.com/Segzman/ag/{sha}/ag"
 UPDATE_API_URL = f"https://api.github.com/repos/Segzman/ag/commits/{UPDATE_BRANCH}"
 UPDATE_EVERY_S = 86400
 UPDATE_NET_TIMEOUT_S = 15
-UPDATE_SKIP = {"schedule", "relay", "push", "_daemon", "_wake_run", "_acp", "_sudo", "askpass", "ui", "selfcheck", "update", "tui", "attach", "shell"}
+UPDATE_SKIP = {"schedule", "relay", "push", "_daemon", "_wake_run", "_acp", "acp", "_sudo", "askpass", "ui", "selfcheck", "update", "tui", "attach", "shell"}
 
 def _ag_conf_path():
     return Path(os.environ.get("AG_CONFIG_HOME") or Path.home()/".config/ag")/"config.json"
@@ -19270,7 +19461,7 @@ def main(argv=None):
         "handoff":do_handoff,"hosts":do_hosts,"sync":do_sync,
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,"providers":do_providers,
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
-        "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"_sudo":do__sudo,"update":do_update,
+        "_wake_run":do__wake_run,"_acp":do__acp,"acp":do_acp,"askpass":do_askpass,"ui":do_ui,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"channel":do_channel,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
         "access":do_access,"usage":do_usage,"budget":do_budget,"link":do_link}[a.subcmd]
     maybe_auto_update(a.subcmd)

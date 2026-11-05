@@ -48,7 +48,7 @@ First ag delegation in a project: run `{{AG}} route --check --json`. If `configu
 - `references/delegation.md` - delegate table, `chat send|log`, `delegate`, timeouts, verify/escalate, idempotency, notify, slash text.
 - `references/crosscheck.md` - second opinions, suggested ZDR pairs, benchmarks, openrouter.
 - `references/wakes-cohorts.md` - `wake`, `wakes` wait/cancel/reap, cohorts, queue/stop/steer.
-- `references/roster-permissions.md` - `agents add|set|create|fork|rm|reset`, caps/modes, effort, stall, per-agent env/keys, ACP, roles, `harness use`.
+- `references/roster-permissions.md` - `agents add|set|create|fork|rm|reset`, caps/modes, effort, stall, per-agent env/keys, ACP (client + `acp serve` for T3 Code), roles, `harness use`.
 - `references/channels.md` - `channel create|post|log|list|rm`, hop caps.
 - `references/reliability-limits.md` - retries, rate limits, usage-limit detection, `--fallback`, `ratelimit`, reap.
 - `references/schedule-relay.md` - `schedule add` flags (`--tz`), relay mailbox, remote schedules, one-shot cloud wake.

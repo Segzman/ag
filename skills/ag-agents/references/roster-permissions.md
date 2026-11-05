@@ -4,7 +4,7 @@
 - Roster and backends
 - Caps and permission modes
 - Per-agent env and keys
-- ACP transport
+- ACP transport (+ `acp serve`)
 - Roles
 
 ## Roster and backends
@@ -73,6 +73,14 @@ Custom/local: `providers add ID --base-url URL --no-key [--zdr]`; list models: `
 ```
 
 Pre-prompt failure -> `[acp] fallback to cli: <reason>` and one CLI rerun. Permissions answered from agent mode. `AG_ACP=0` disables. Verified: opencode; cursor/gemini need login.
+
+ag as an ACP agent (server side, for T3 Code / Zed; the client launches it, never run it from agent context):
+
+```sh
+{{AG}} --dir /abs/state acp serve [--agent NAME]   # T3: Executable /abs/ag, Args ["--dir","/abs/state","acp","serve"]
+```
+
+Session cwd picks the roster agent whose `--dir` matches (else error naming `agents add`); `--agent` pins one. Prompts run as normal turns (queue, modes, chat log); modes `default|ro|edits|auto|full` and config options `agent`/`model` write the roster; `session/cancel` = non-holding stop; `session/load` replays the chat log. `mcpServers` and client fs/terminal ignored.
 
 ## Roles
 

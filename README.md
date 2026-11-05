@@ -291,6 +291,14 @@ Opt-in per agent: `ag agents add|set W --transport acp|cli` (gemini/cursor/openc
 - Timeout / `ag stop`: `session/cancel`, ≤1.5s grace, then the agent's process group is killed. Runs in a private `_acp` bridge process so run_turn's guard, queue pid, retry and usage paths apply unchanged.
 - Verified 2026-10-08: opencode 1.18.31 full round-trip (new, load replay, set_config_option, tools, usage); cursor `agent acp` and gemini 0.45.2 `--acp` initialize fine but `session/new` returns `-32000` here (cursor logged out; gemini personal OAuth retired).
 
+### Using ag from T3 Code (`ag acp serve`)
+
+`ag --dir /abs/state acp serve [--agent NAME]` is the other side: ag *is* the ACP agent (JSON-RPC 2.0, newline-delimited on stdin/stdout; logs on stderr) and every prompt runs as a normal turn on a roster agent (queue, modes, checkpoints, usage, chat log all apply). In T3 Code: Settings > Providers > add an ACP provider instance, local command: Executable `/abs/path/to/ag`, Args `["--dir","/abs/state","acp","serve"]` (optionally `"--agent","NAME"`), no shell. Zed's `agent_servers` takes the same command/args.
+- `session/new {cwd}`: `--agent` if given, else the roster agent whose `--dir` realpaths to `cwd` (orchestrator first; relative dirs resolve against the server's cwd), else a `-32602` error naming `ag agents add NAME --dir CWD`. sessionId = `<agent>:<hex>` (map in `.agent/acp_sessions.json`). Returns `modes` (`default` = backend default, `ro|edits|auto|full`) and `configOptions` (`agent` roster select, omitted with `--agent`; `model`), then `available_commands_update` (ag slash commands: model/backend/harness/profile/approve/help).
+- `session/prompt`: text + embedded resource text + resource links become one message (images/audio dropped); streams `agent_message_chunk`/`agent_thought_chunk`/`tool_call`/`tool_call_update` from the turn timeline; `stopReason` `end_turn`, `cancelled`, or `refusal` on a failed turn (error also sent as text); `usage` when the backend reports it. `/cmd` prompts run ag slash commands. One prompt per session at a time.
+- `session/cancel` = non-holding `ag stop` (queue not held). `session/load` replays the agent's chat log (user/agent rows). `session/set_mode` / `session/set_config_option` write the roster like `agents set --mode` / `/model` (refused while the agent is busy). stdin EOF stops running turns and exits. Unknown methods `-32601`.
+- Limits: `mcpServers` are ignored (use profiles); permissions are answered by ag from the agent mode, never asked of the client; client `fs`/`terminal` capabilities are unused (the backend touches files itself); no auth methods.
+
 ## Routing
 
 Pick a **job type**, then use the routed model. Fixed keys: `mechanical` (scripts, rote edits, boilerplate, lookups), `implement` (clear spec), `review` (review, verification), `debug` (failing tests, root cause), `plan` (design, architecture), `hardest` (ambiguous, high-stakes, security).
@@ -592,7 +600,7 @@ System-prompt presets per agent: `ag roles list|show|add|set|rm|reset NAME`. Bui
 - Daemon `kill -9`: sessions go `stale` (`exit=-1`); the pending wake fires once on the next reconcile (exactly-once via `wake.claimed`).
 - While a turn runs its agent's guard is held: other turns on that agent queue (FIFO within priority, steer first); backend/profile/model switches refuse. Interrupted turns (`stop`/`steer`) are never retried.
 - Scheduler needs the global tick installed (`schedule install --write` or cron); with no tick, nothing fires. Local wall clock, 60s minimum, no sub-minute or cron-expression schedules.
-- ACP is opt-in and experimental: only opencode is verified end to end; cursor/gemini need a working login; `fs/*` and `terminal/*` client requests are refused.
+- ACP is opt-in and experimental: only opencode is verified end to end; cursor/gemini need a working login; `fs/*` and `terminal/*` client requests are refused. `acp serve` ignores client `mcpServers` and fs/terminal capabilities.
 - Auto-update is fast-forward only and never touches a dirty or ahead checkout; copy installs replace the single file from `master`.
 - Message cap 4000 chars (truncated). `wake/jobs` is never pruned by `forget`.
 - POSIX only (`spawn`/workers need the pty daemon; TUI needs curses). Secret popup is macOS only.

@@ -1076,7 +1076,9 @@ def do__wake_run(a):
                 raise RuntimeError("wake already finished or cancelled")
             cur["status"] = "running"
             cur["pid"] = os.getpid()
-            cur["running_at"] = cur["guard_acquired_at"] = now_iso()
+            # ms precision: --timeout ages from this; second-truncated stamps
+            # overstate age by up to 1s and falsely stall short timeouts.
+            cur["running_at"] = cur["guard_acquired_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             cur.pop("wait_reason", None)
             _wake_write_job(sdir, cur)
         finally:

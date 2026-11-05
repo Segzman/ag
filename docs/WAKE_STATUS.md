@@ -24,7 +24,8 @@ them from `queued`, so no permanent queued leftover is possible.
 
 ## Stall rule
 
-`--timeout` ages `running` jobs from `running_at` only. Queued jobs never
+`--timeout` ages `running` jobs from `running_at` only (millisecond
+precision, so a short timeout is not tripped by second truncation). Queued jobs never
 report `stalled` and never emit `wake_stall`, however long they wait for
 the guard. Dead workers (missing/dead session incl. stale daemons) still
 fail closed with `worker gone` regardless of state.

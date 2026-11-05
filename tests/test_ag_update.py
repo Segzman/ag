@@ -44,6 +44,13 @@ class UpdateTest(unittest.TestCase):
         st, detail = self.ag.self_update(src)
         self.assertEqual(st, "skipped"); self.assertIn("diverged", detail)
 
+    def test_clone_without_git_on_path_is_skipped(self):
+        src = self.clone / "ag"; self.push("v2\n"); old = os.environ["PATH"]
+        os.environ["PATH"] = str(self.td / "nopath")
+        try: st, detail = self.ag.self_update(src)
+        finally: os.environ["PATH"] = old
+        self.assertEqual(st, "skipped", detail); self.assertEqual(src.read_text(), "v1\n")
+
     def test_toggle_and_daily_stamp(self):
         r = subprocess.run([sys.executable, str(AG), "update", "--auto", "off"], capture_output=True, text=True, env=os.environ)
         self.assertEqual(r.returncode, 0, r.stderr)

@@ -19206,6 +19206,7 @@ def do_sync(a):
 # tree is clean, on a branch tracking a remote, and not ahead. Copy installs:
 # one cheap `git ls-remote` sha check, then download that pinned sha from raw
 # (never a moving master), py_compile it, atomic replace, record the sha.
+# A clone whose git can't run (missing from PATH) is skipped, never overwritten.
 # Off: `ag update --auto off` or AG_AUTO_UPDATE=0. Takes effect on the next
 # invocation, never mid-command. The daily stamp also gates the inline check
 # `schedule tick` runs, so a tick-only node (the VM) still updates.
@@ -19306,6 +19307,7 @@ def self_update(src=None):
     g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True, timeout=UPDATE_NET_TIMEOUT_S)
     try: in_git = g("rev-parse", "--is-inside-work-tree").stdout.strip() == "true"
     except Exception: in_git = False
+    if not in_git and (repo / ".git").exists(): return "skipped", f"git checkout but git not runnable ({repo})"  # never clobber a clone
     if in_git:
         if g("rev-parse", "--abbrev-ref", "@{u}").returncode: return "skipped", "branch has no upstream"
         if g("status", "--porcelain", "-uno").stdout.strip(): return "skipped", "local changes in " + str(repo)

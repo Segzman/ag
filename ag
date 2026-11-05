@@ -8862,6 +8862,18 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             backend, model = _fo
             a = {k: v for k, v in a.items() if k not in ("effort", "acp_cmd", "transport")}; a["backend"], a["model"] = backend, model
         workdir = os.path.abspath(a.get("dir",".") or ".")
+        if not os.path.isdir(workdir):  # before auth probes/compaction: nothing may run the backend
+            _release_agent_turn(_turn_lock); _turn_lock = None
+            _wde = _describe_backend_launch(None, workdir, name, None)
+            try: append_chat(sdir,name,"error",_wde)
+            except Exception: pass
+            if on_event:
+                try: on_event(name,"tool",_wde); on_event(name,"exit","127")
+                except Exception: pass
+            _event(sdir,"chat",name,exit=127)
+            try: _ms = load_chat_meta(sdir,name,agent=a).get("sid","")
+            except Exception: _ms = ""
+            return {"sid":_ms,"exit":127,"reply":_wde}
         if command and backend != "opencode":
             _release_agent_turn(_turn_lock); _turn_lock = None
             return {"error":f"--command is opencode-only (agent {name} runs {backend})"}

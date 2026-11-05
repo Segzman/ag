@@ -326,9 +326,12 @@ def _shell_cmd(tokens):
 
 def _daemon_alive(dp):
     if not dp: return False
-    try: os.kill(dp, 0); return True
+    try: os.kill(dp, 0)
     except ProcessLookupError: return False
     except PermissionError: return True
+    except Exception: return True
+    # kill(0) succeeds on zombies: a killed daemon (reparented to an init that reaps lazily, e.g. container pid 1) is dead
+    try: return open(f"/proc/{dp}/stat").read().rpartition(")")[2].split()[0] not in ("Z", "X")
     except Exception: return True
 
 def _reconcile_stale(sdir, sp, st, *, grace_s=2.0):

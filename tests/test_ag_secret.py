@@ -148,7 +148,8 @@ class SecretTest(unittest.TestCase):
             self.assertIn("retry", seen[0][1])
             ev = (self.state / "events.jsonl").read_text()
             self.assertEqual(ev.count('"secret_needed"'), 1)
-            env = m.secret_env(self.state, {"PATH": "/bin", "GIT_ASKPASS": "/mine"})
+            # secret_enabled() reads the env being wired (real callers pass a copy of os.environ); off-macOS it needs AG_ASKPASS_CMD there
+            env = m.secret_env(self.state, {"PATH": "/bin", "GIT_ASKPASS": "/mine", "AG_ASKPASS_CMD": "true"})
             self.assertEqual(env["GIT_ASKPASS"], "/mine")
             self.assertTrue(env["SUDO_ASKPASS"].endswith("/bin/ag-askpass"))
             self.assertEqual(env["SSH_ASKPASS_REQUIRE"], "force")

@@ -34,9 +34,10 @@ Run `{{AG}} route` for the effective job -> model table of the calling harness; 
 {{AG}} --dir <state> wait <id> --timeout 30       # only blocking cmd; always bound it
 {{AG}} --dir <state> kill [--force] <id>
 {{AG}} --dir <state> sessions | status | events --limit 20
+{{AG}} --dir <state> events --follow [--agent A] [--type T1,T2] [--exit-on-match --timeout S]
 ```
 
-`spawn` returns instantly; poll with `snap` (offset comes from prior output). `spawn --name N --cwd D --env K=V --on-exit CMD`. Daemon `kill -9` -> session `stale` (`exit=-1`); its pending wake fires once on next reconcile (`sessions`/`snap`/`wait`/`kill`). `forget <id>` wipes logs (auth traces). `spawn --wake` = follow-up when session ends: see `ag-agents`.
+`spawn` returns instantly; poll with `snap` (offset comes from prior output). `spawn --name N --cwd D --env K=V --on-exit CMD`. Daemon `kill -9` -> session `stale` (`exit=-1`); its pending wake fires once on next reconcile (`sessions`/`snap`/`wait`/`kill`). `forget <id>` wipes logs (auth traces). `spawn --wake` = follow-up when session ends: see `ag-agents`. `events --follow` tails new lines (0.5 s poll) and terminal wake-job changes (`wake_done`/`wake_fail`/`wake_cancel`); `--exit-on-match` exits 0 on the first match, `--timeout S` exits 124 if none; `--json` = one event object per line.
 
 ## run, approvals, audit
 

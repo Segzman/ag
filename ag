@@ -10968,6 +10968,7 @@ def _relay_node_name():
     except Exception: return "node"
     return re.sub(r"[^a-z0-9-]", "", (socket.gethostname() or "").split(".")[0].lower())[:24] or "node"
 RELAY_ADMIN_OPS = ("update", "notify-dir", "status")
+RELAY_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
 
 def relay_cfg():
     """$AG_CONFIG_HOME/relay.json with ~-expanded paths, or None (missing/corrupt/incomplete)."""
@@ -11484,6 +11485,148 @@ def _relay_status(cfg):
             "status": m.get("status"), "due": m.get("due")})
     return monitored
 
+# ---- relay names: one private mailbox per local session (no wire change) ----
+def _relay_names_path(): return ag_cache_home() / "relay" / "names.json"
+def _relay_names():
+    d = _json_or_empty(_relay_names_path())
+    names = d.get("names") if isinstance(d.get("names"), dict) else {}
+    cursors = d.get("cursors") if isinstance(d.get("cursors"), dict) else {}
+    return {"names": {k: v for k, v in names.items() if isinstance(v, dict)},
+        "cursors": {k: v for k, v in cursors.items() if isinstance(v, list)}}
+def _relay_names_save(d):
+    _put_file(_relay_names_path(), json.dumps(d, indent=1))
+def _relay_session(a):
+    return str(getattr(a, "session", None) or os.environ.get("AG_RELAY_SESSION") or "").strip()
+def _relay_name_for_session(st, sess):
+    return next((n for n in sorted(st["names"]) if str((st["names"][n] or {}).get("session") or "") == sess), None)
+def _relay_ensure_echo_agent(sdir, name):
+    ensure_state(sdir)
+    rows = load_agents(sdir)
+    if not any(r.get("name") == name for r in rows):
+        save_agents(sdir, rows + [{"name": name, "backend": "echo", "model": "default", "dir": ".", "role": "sub"}])
+def _relay_agent_claimed(agent, names):
+    return agent in names or (agent.startswith("chat-") and agent[5:] in names)
+def _relay_inbox_messages(cfg):
+    inbox = relay_root(cfg) / "schedules" / cfg["node"]
+    out = []
+    if not inbox.is_dir(): return out
+    for f in sorted(inbox.glob("*.json")):
+        m = _relay_jload(f)
+        if isinstance(m, dict) and m.get("id") is not None and "message" in m: out.append(m)
+    return out
+def _relay_inbox_select(st, name, msgs):
+    ent = st["names"].get(name) or {}
+    default, claimed_at = bool(ent.get("default")), int(ent.get("claimed_at") or 0)
+    seen = {str(x) for x in (st["cursors"].get(name) or [])}
+    picked, unaddressed = [], []
+    for m in msgs:
+        agent = str(m.get("agent") or "")
+        owned = _relay_agent_claimed(agent, st["names"])
+        if not owned: unaddressed.append(m)
+        addressed = agent == name or agent == "chat-" + name
+        defaulted = default and not owned and int(m.get("at_epoch") or 0) >= claimed_at
+        if (addressed or defaulted) and str(m.get("id")) not in seen: picked.append(m)
+    return picked, unaddressed
+def _relay_inbox_text(name, msgs):
+    lines = [f'relay inbox {name}: {len(msgs)} new message' + ("" if len(msgs) == 1 else "s")]
+    lines += [f'- [{m.get("agent") or "?"}] {m.get("id")}: {" ".join(str(m.get("message") or "").split())[:600]}' for m in msgs]
+    lines.append('reply: ag relay say "<text>"')
+    return "\n".join(lines)
+def _do_relay_names(a, cfg):
+    def err(m, h=None): return emit(a, "relay", error=m, hint=h) or 1
+    st = _relay_names()
+    if a.nsub == "list":
+        if getattr(a, "json", False): return emit(a, "relay", st["names"])
+        L = [f'{n:20} {(str(v.get("session") or "-"))[:24]:24} {"default" if v.get("default") else "-":7} {_sched_ts(v.get("claimed_at"))}' for n, v in sorted(st["names"].items())]
+        return emit(a, "relay", {"_text": "\n".join(["NAME                 SESSION                  DEFAULT CLAIMED", *L] if L else ["(no relay names)"])})
+    if a.nsub == "claim":
+        name, sess = (getattr(a, "name", None) or "").strip(), _relay_session(a)
+        if not RELAY_NAME_RE.fullmatch(name): return err(f"bad relay name {name!r}", "lowercase letters, digits and dashes; 2-40 chars")
+        cur = st["names"].get(name)
+        held = str((cur or {}).get("session") or "")
+        if held and held != sess and not getattr(a, "force", False):
+            return err(f"relay name {name} is held by another session", f"ag relay name claim {name} --force")
+        same = cur is not None and held == sess
+        for other in [n for n, v in st["names"].items() if n != name and str(v.get("session") or "") == sess]:
+            st["names"].pop(other, None); st["cursors"].pop(other, None)
+        if getattr(a, "default", False):
+            for v in st["names"].values(): v["default"] = False
+        claimed_at = int((cur or {}).get("claimed_at") or 0) if same else int(time.time())
+        default = bool(getattr(a, "default", False)) or bool(same and cur.get("default"))
+        entry = {"session": sess, "claimed_at": claimed_at or int(time.time()), "default": default}
+        st["names"][name] = entry
+        _relay_names_save(st)
+        _relay_ensure_echo_agent(state_dir(a.dir), name)
+        txt = f'relay name {name} claimed' + (" (default)" if default else "") + (f" for session {sess}" if sess else "")
+        return emit(a, "relay", {"_text": txt, "name": name, **entry})
+    if a.nsub == "release":
+        name, sess = (getattr(a, "name", None) or "").strip(), _relay_session(a)
+        if not name:
+            name = _relay_name_for_session(st, sess)
+            if not name: return err("no relay name for this session", "ag relay name release NAME | ag relay name list")
+        if name not in st["names"]: return err(f"no such relay name: {name}")
+        st["names"].pop(name, None); st["cursors"].pop(name, None)
+        _relay_names_save(st)
+        return emit(a, "relay", {"_text": f"relay name {name} released", "name": name})
+    return err("relay name: claim | release | list")
+def _do_relay_inbox(a, cfg):
+    st = _relay_names()
+    name = (getattr(a, "name", None) or "").strip() or _relay_name_for_session(st, _relay_session(a))
+    hook, as_json = getattr(a, "hook", None) == "claude-inject", bool(getattr(a, "json", False))
+    msgs = _relay_inbox_messages(cfg)
+    if not name:
+        unaddressed = [m for m in msgs if not _relay_agent_claimed(str(m.get("agent") or ""), st["names"])]
+        if not unaddressed or hook or any(v.get("default") for v in st["names"].values()): return 0
+        hint = f'{len(unaddressed)} unaddressed relay message' + ("" if len(unaddressed) == 1 else "s") + '; claim a name: ag relay name claim NAME --default'
+        if as_json: return emit(a, "relay", {"_text": hint, "unaddressed": len(unaddressed)})
+        print(hint)
+        return 0
+    picked, _ = _relay_inbox_select(st, name, msgs)
+    if not picked:
+        if as_json and not hook: print(json.dumps({"ok": True, "cmd": "relay", "data": []}))
+        return 0
+    txt = _relay_inbox_text(name, picked)
+    if hook: print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": txt}}))
+    elif as_json: emit(a, "relay", picked)
+    else: emit(a, "relay", {"_text": txt})
+    if not getattr(a, "peek", False):
+        st["cursors"][name] = list(dict.fromkeys([str(x) for x in (st["cursors"].get(name) or [])] + [str(m.get("id")) for m in picked]))[-500:]
+        _relay_names_save(st)
+    return 0
+def _do_relay_say(a, cfg):
+    def err(m, h=None): return emit(a, "relay", error=m, hint=h) or 1
+    st = _relay_names()
+    name = (getattr(a, "name", None) or "").strip() or _relay_name_for_session(st, _relay_session(a))
+    if not name: return err("no relay name for this session", "ag relay name claim NAME | ag relay say --name NAME ...")
+    msg = " ".join(getattr(a, "message", None) or []).strip()
+    if not msg: return err("empty message", 'ag relay say "text"')
+    peer = (getattr(a, "peer", None) or "").strip()
+    if not peer:
+        peers = sorted(f.stem for f in (relay_root(cfg) / "nodes").glob("*.json") if f.stem != cfg["node"])
+        if len(peers) != 1:
+            return err("cannot pick a peer: " + (f"peers {', '.join(peers)}" if peers else "no peer heartbeats seen"), 'ag relay say "text" --peer NODE')
+        peer = peers[0]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", peer): return err(f"bad --peer {peer!r}")
+    if peer == cfg["node"]: return err("--peer must name a different relay node")
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    row = next((r for r in load_agents(sdir) if r.get("name") == name), None)
+    if row is None: return err(f"no such agent: {name}", f"ag relay name claim {name}")
+    text = f"[from {name}] {msg}"
+    rid = "w-" + hashlib.sha1(f'{cfg["node"]}\0{peer}\0{name}\0{time.time()}\0{os.getpid()}\0{text}'.encode()).hexdigest()[:12]
+    srow = {"id": rid, "on": peer, "agent": name, "message": text, "once": True, "at_epoch": int(time.time()),
+        "enabled": True, "max_runtime_s": 0, "job": None, "notify_done": True}
+    spec = {k: row.get(k) for k in ("backend", "model", "effort", "mode", "data", "stall_s")}
+    try:
+        relay_publish_schedule(cfg, srow, spec)
+        rp = _relay_remote_wake_dir() / f"{rid}.json"; rp.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(rp, json.dumps({"id": rid, "agent": name, "target": peer, "message": text,
+            "state": str(sdir.resolve()), "ts": now_iso(), "status": f"remote@{peer}"}, indent=1))
+    except Exception as e: return err(f"relay publish failed: {str(e)[:180]}")
+    summary = relay_sync(cfg)
+    data = {"name": name, "peer": peer, "id": rid, "status": f"remote@{peer}",
+        **({"relay_error": summary["error"]} if summary.get("error") else {})}
+    return emit(a, "relay", {"_text": f"say sent -> {peer} as {name} (id {rid})", **data})
+
 def do_relay(a):
     cmd = "relay"
     def err(m, h=None): return emit(a, cmd, error=m, hint=h) or 1
@@ -11564,7 +11707,10 @@ def do_relay(a):
         txt = f'admin {op} -> {target} queued (id {rec["id"]})'
         if hit: txt = f'admin {op} -> {target}: {hit.get("status") or "-"} {hit.get("detail") or ""}'.strip()
         return emit(a, cmd, {"_text": txt, **data}, error=out.get("error"))
-    return err("relay: init | sync | status | results | admin")
+    if a.rsub == "name": return _do_relay_names(a, cfg)
+    if a.rsub == "inbox": return _do_relay_inbox(a, cfg)
+    if a.rsub == "say": return _do_relay_say(a, cfg)
+    return err("relay: init | sync | status | results | admin | name | inbox | say")
 
 def orch_snapshot(sdir):
     ensure_state(sdir)
@@ -18537,6 +18683,12 @@ def build():
     rys.add_parser("status",help="this node + peers, schedules in flight, recent results")
     ryr=rys.add_parser("results",help="ingested remote results, newest first"); ryr.add_argument("--id",default=None,help="filter by schedule id"); ryr.add_argument("--limit",type=int,default=20); ryr.add_argument("--last",action="store_true",help="print only the newest result's reply text")
     rya=rys.add_parser("admin",help="run a relay admin op on another node (update | notify-dir PATH | status)"); rya.add_argument("node"); rya.add_argument("op"); rya.add_argument("arg",nargs="?",default=None); rya.add_argument("--wait",type=float,default=0,help="poll sync every 10s up to S seconds for the result")
+    ryn=rys.add_parser("name",help="claim/release/list a relay name; one private mailbox per local session"); ryns=ryn.add_subparsers(dest="nsub",required=True)
+    rync=ryns.add_parser("claim",help="claim NAME for this session; creates a local echo agent NAME"); rync.add_argument("name"); rync.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)"); rync.add_argument("--default",action="store_true",help="also receive unaddressed messages (at most one default)"); rync.add_argument("--force",action="store_true",help="take the name even when another session holds it")
+    rynr=ryns.add_parser("release",help="release NAME (default: this session's claim)"); rynr.add_argument("name",nargs="?",default=None); rynr.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)")
+    ryns.add_parser("list",help="relay names, their sessions, default owner and claim time")
+    rin=rys.add_parser("inbox",help="unseen messages addressed to a relay name (NAME or chat-NAME)"); rin.add_argument("--name",default=None,help="relay name (default: this session's claim)"); rin.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)"); rin.add_argument("--peek",action="store_true",help="print unseen messages without advancing the cursor"); rin.add_argument("--hook",choices=["claude-inject"],default=None,help="print a Claude Code UserPromptSubmit hook JSON object (nothing when empty)")
+    rsay=rys.add_parser("say",help="send a message to a peer as a relay name (wake NAME --on PEER --notify-done)"); rsay.add_argument("message",nargs="+"); rsay.add_argument("--name",default=None,help="relay name (default: this session's claim)"); rsay.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)"); rsay.add_argument("--peer",default=None,metavar="NODE",help="peer node (default: the single other node under nodes/)")
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50);     ws.add_argument("--wait",default=None,nargs="+",help="block until one or more wake jobs finish (exit 0 ok, 1 failed, 124 timeout)"); ws.add_argument("--wait-group",dest="wait_group",default=None,help="block until all jobs of cohort GROUP finish (same exit codes)"); ws.add_argument("--timeout",type=int,default=30);  ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3)
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")

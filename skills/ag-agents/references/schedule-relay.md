@@ -24,8 +24,14 @@ Schedules made here can run on another machine (even one accepting no inbound co
 {{AG}} --dir <state> relay sync | status        # heartbeat write on init; sync = pull, materialise/report, ingest, push
 {{AG}} --dir <state> relay results [--id ID] [--limit N] [--last]
 {{AG}} --dir <state> relay admin NODE update|notify-dir PATH|status [--wait S]
+{{AG}} --dir <state> relay name claim NAME [--session ID] [--default] [--force]  # private mailbox per session
+{{AG}} --dir <state> relay name release [NAME] [--session ID] | name list
+{{AG}} --dir <state> relay inbox [--name NAME | --session ID] [--peek] [--hook claude-inject]
+{{AG}} --dir <state> relay say "text" [--name NAME | --session ID] [--peer NODE]
 {{AG}} push [GIT_PUSH_ARGS…]            # git push; signal every relay peer to update; sync
 ```
+
+Relay names keep local sessions from sharing a mailbox: `relay name claim coop --session ID` stores the claim in `~/.cache/ag/relay/names.json` and creates a local echo agent `coop`, so `wake coop --on PEER` works. Inbound messages addressed to `coop` or `chat-coop` go to that name; `--default` also takes messages whose agent matches no claimed name (at most one default, only from its `claimed_at` onward). One session holds one name; claiming another releases the old one, and another session's name needs `--force`. `relay inbox` prints unseen messages (per-name cursor, `--peek` leaves it, `--hook claude-inject` emits a Claude Code `UserPromptSubmit` hook object), and `relay say "text"` is `wake NAME --on PEER --notify-done "[from NAME] text"` with `--peer` defaulting to the single other node under `nodes/`.
 
 Mailbox layout: `nodes/<node>.json` heartbeats, `schedules/<target>/<origin>--<id>.json`, `results/<origin>/<target>--<id>--<due>.json`, `admin/<target>/<origin>--<id>.json` - each node writes only its own files, so rebases never conflict. Admin ops (`update`, `notify-dir PATH`, `status`) run once on the target; `relay.json` `admin_ops` limits them (default all three, `[]` disables). Target materialises inbound schedules into its `--state` (rows `<origin>--<id>`, agents `relay-<origin>-<name>`, workdirs `<workdir>/<origin>`; `agents add` guards and `--max-mode` clamp apply). Results land back in the origin row's state dir `relay/results/` and `relay results --last` prints the newest reply. Prompts and replies live in the mailbox - use a private repo and give the VM credentials. `status` alerts on a peer's differing `ag_commit` or silence > 2x its shortest schedule interval (or 1h). `--dir` on `init` is the mailbox, not the state dir. Dir transport nodes must be synced by their own means (ag does no copy).
 

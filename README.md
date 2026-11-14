@@ -537,6 +537,11 @@ ag --dir <state> relay sync                  # pull, process inbound schedules, 
 ag --dir <state> relay status                # this node + every peer: last seen, ag commit, backends; sync-state alerts
 ag --dir <state> relay results [--id ID] [--limit N] [--last]   # ingested replies, newest first; --last = newest reply text
 ag --dir <state> relay admin NODE update|notify-dir PATH|status [--wait S]
+ag --dir <state> relay name claim NAME [--session ID] [--default] [--force]   # private mailbox per session
+ag --dir <state> relay name release [NAME] [--session ID]
+ag --dir <state> relay name list
+ag --dir <state> relay inbox [--name NAME | --session ID] [--peek] [--hook claude-inject]
+ag --dir <state> relay say "text" [--name NAME | --session ID] [--peer NODE]
 ag push [GIT_PUSH_ARGS…]                     # git push; signal every relay peer to update; sync
 ```
 
@@ -545,6 +550,7 @@ Admin ops travel as `admin/<target>/<origin>--<id>.json` and run once on the tar
 - Mailbox layout: `nodes/<node>.json` (heartbeat: version, ag commit, usable backends, last seen, `schedules_in`, `results_pending`), `schedules/<target>/<origin>--<id>.json` (written by the origin), `results/<origin>/<target>--<id>--<due>.json` (written by the target). Each node only ever writes its own files, so git rebases never conflict. Data note: prompts and replies are stored in that repo — use a private one; the VM needs git credentials for it.
 - On a target, inbound schedules materialise into `--state DIR` (`schedules.json` row ids `<origin>--<id>`, agents `relay-<origin>-<agent>`, workdirs `<workdir>/<origin>`); the normal `agents add` guards apply (a refused model parks the row `last_status: error`, no crash) and the target clamps a published mode to its `--max-mode` (default `edits`). Rows materialise exactly as published: disabled mail rows stay disabled, all counters are preserved, and rows whose mail disappears are removed on the next sync.
 - On the origin, finished runs land in the row's state dir as `relay/results/` (reply kept up to 20000 chars) and `relay results` lists them; the mailbox result files are cleaned after 7 days by the origin itself. `relay status` flags a peer whose `ag_commit` differs from ours or unseen for > 2x its shortest schedule interval (or 1h).
+- Relay names give each local session (Claude Code, Codex, ...) a private mailbox: `relay name claim NAME --session ID` writes `~/.cache/ag/relay/names.json`, creates a local echo agent `NAME`, and addresses messages to `NAME` or `chat-NAME`. `--default` also receives unaddressed messages (at most one default, and only messages at/after its `claimed_at`); claiming a new name releases the session's old one. `relay inbox` prints unseen messages and advances that name's cursor (`--peek` does not; `--hook claude-inject` prints a `UserPromptSubmit` hook object), and `relay say "text"` is `wake NAME --on PEER --notify-done "[from NAME] text"` with `--peer` defaulting to the single other node under `nodes/`.
 
 ## Link (VM -> Mac live view)
 

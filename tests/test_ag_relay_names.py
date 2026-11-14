@@ -36,6 +36,15 @@ class Names(Env):
         a = next(x for x in self.agents(self.o) if x["name"] == "coop")
         self.assertEqual(a["backend"], "echo")
 
+    def test_concurrent_claims_all_survive(self):
+        self.init(self.o)
+        import subprocess, sys
+        ps = [subprocess.Popen([sys.executable, _sup.AG, "--dir", str(self.o["state"]), "relay", "name", "claim",
+                                f"n{i}", "--session", f"s{i}"], env=self.o["env"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) for i in range(8)]
+        for p in ps: self.assertEqual(p.wait(timeout=60), 0)
+        self.assertEqual(sorted(self.names(self.o)["names"]), sorted(f"n{i}" for i in range(8)))
+
     def test_one_name_per_session_and_release(self):
         self.init(self.o)
         self.j(self.o, "relay", "name", "claim", "coop", "--session", "s1")

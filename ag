@@ -11656,6 +11656,14 @@ def _relay_names():
         "cursors": {k: v for k, v in cursors.items() if isinstance(v, list)}}
 def _relay_names_save(d):
     _put_file(_relay_names_path(), json.dumps(d, indent=1))
+def _relay_names_lock():
+    """Blocking lock for names.json read-modify-write (POSIX flock); two sessions claim/read at once."""
+    if os.name != "posix": return None
+    import fcntl
+    _relay_names_path().parent.mkdir(parents=True, exist_ok=True)
+    f = open(str(_relay_names_path()) + ".lock", "a+b")
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    return f
 def _relay_session(a):
     return str(getattr(a, "session", None) or os.environ.get("AG_RELAY_SESSION") or "").strip()
 def _relay_name_for_session(st, sess):
@@ -11695,6 +11703,10 @@ def _relay_inbox_text(name, msgs):
     return "\n".join(lines)
 def _do_relay_names(a, cfg):
     def err(m, h=None): return emit(a, "relay", error=m, hint=h) or 1
+    lk = _relay_names_lock() if a.nsub in ("claim", "release") else None
+    try: return _do_relay_names_locked(a, cfg, err)
+    finally: _ctx_unlock(lk)
+def _do_relay_names_locked(a, cfg, err):
     st = _relay_names()
     if a.nsub == "list":
         if getattr(a, "json", False): return emit(a, "relay", st["names"])
@@ -11751,8 +11763,12 @@ def _do_relay_inbox(a, cfg):
     elif as_json: emit(a, "relay", picked)
     else: emit(a, "relay", {"_text": txt})
     if not getattr(a, "peek", False):
-        st["cursors"][name] = list(dict.fromkeys([str(x) for x in (st["cursors"].get(name) or [])] + [str(m.get("id")) for m in picked]))[-500:]
-        _relay_names_save(st)
+        lk = _relay_names_lock()
+        try:
+            st = _relay_names()  # re-read under the lock: another session may have claimed/acked meanwhile
+            st["cursors"][name] = list(dict.fromkeys([str(x) for x in (st["cursors"].get(name) or [])] + [str(m.get("id")) for m in picked]))[-500:]
+            _relay_names_save(st)
+        finally: _ctx_unlock(lk)
     return 0
 def _do_relay_say(a, cfg):
     def err(m, h=None): return emit(a, "relay", error=m, hint=h) or 1

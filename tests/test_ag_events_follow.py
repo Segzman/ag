@@ -4,16 +4,27 @@
 Run: python3 tests/test_ag_events_follow.py
 Target: live repo ag (override with AG_EVENTS_BIN).
 """
+import importlib.machinery
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 
 AG = os.environ.get("AG_EVENTS_BIN", str(Path(__file__).resolve().parent.parent / "ag"))
 assert os.path.exists(AG), f"ag missing: {AG}"
+
+
+def _load_ag(name):
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader(name, AG)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
 
 
 def _cmd(td, *args):
@@ -101,3 +112,27 @@ def test_events_filters_apply_without_follow():
             "--limit", "10"), capture_output=True, text=True, timeout=20)
         assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
         assert p.stdout.strip() == "t3 wake_done", p.stdout
+
+
+def test_unchanged_wake_job_not_reparsed():
+    ag = _load_ag("agev_reparse")
+    with tempfile.TemporaryDirectory(prefix="agev-") as td:
+        sdir = Path(td)
+        ag.ensure_state(sdir)
+        jobs = sdir / "wake" / "jobs"
+        jobs.mkdir(parents=True)
+        (jobs / "j1.json").write_text(json.dumps(
+            {"id": "j1", "agent": "w", "status": "queued"}))
+        (sdir / "events.jsonl").touch()
+        a = types.SimpleNamespace(type=None, session=None, agent=None,
+            timeout=1.1, json=True, exit_on_match=False, follow=True, dir=str(sdir))
+        calls = []
+        real = ag.json.loads
+        def counting(*args, **kw):
+            calls.append(args[0])
+            return real(*args, **kw)
+        ag.json.loads = counting
+        try: rc = ag._follow_events(a, sdir)
+        finally: ag.json.loads = real
+        assert rc == 124, rc
+        assert len(calls) == 1, calls

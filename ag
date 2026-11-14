@@ -2172,8 +2172,13 @@ def _follow_events(a, sdir):
     except OSError: pos, ino = 0, None
     buf = b""
     jobs_dir = _wake_dirs(sdir)[1]
-    wake_state, seen_wake = {}, set()
+    wake_state, seen_wake, job_sig = {}, set(), {}
+    try: jobs_mtime = jobs_dir.stat().st_mtime_ns
+    except OSError: jobs_mtime = None
     for p in jobs_dir.glob("*.json"):
+        try: st = p.stat()
+        except OSError: continue
+        job_sig[p] = (st.st_mtime_ns, st.st_size, st.st_ino)
         try: j = json.loads(p.read_text())
         except Exception: continue
         wake_state[j.get("id") or p.stem] = _wake_terminal(j)
@@ -2208,7 +2213,22 @@ def _follow_events(a, sdir):
                 pos, buf, ino = 0, b"", None
             except OSError:
                 pass
-            for p in sorted(jobs_dir.glob("*.json")):
+            try: dm = jobs_dir.stat().st_mtime_ns
+            except OSError: dm = None
+            if dm != jobs_mtime:
+                jobs_mtime = dm
+                try: paths = sorted(jobs_dir.glob("*.json"))
+                except OSError: paths = []
+                for gone in set(job_sig) - set(paths): job_sig.pop(gone, None)
+            else:
+                paths = sorted(job_sig)
+            for p in paths:
+                try: st = p.stat()
+                except OSError:
+                    job_sig.pop(p, None); continue
+                sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+                if job_sig.get(p) == sig: continue
+                job_sig[p] = sig
                 try: j = json.loads(p.read_text())
                 except Exception: continue
                 jid = j.get("id") or p.stem

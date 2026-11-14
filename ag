@@ -405,6 +405,28 @@ def _wake_job_path(sdir, jid):
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", jid)[:64]
     return jobs / f"{safe}.json"
 
+def _wake_reply_path(sdir, jid):
+    _, jobs, _ = _wake_dirs(sdir)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", jid)[:64]
+    return jobs / f"{safe}.reply.md"
+
+def _wake_write_reply(sdir, jid, text):
+    p = _wake_reply_path(sdir, jid)
+    t = p.with_suffix(".tmp")
+    t.write_text(text)
+    t.rename(p)
+    return p
+
+def _wake_full_reply(sdir, job):
+    """Full reply body from the job's sidecar file (reply_full), else ""."""
+    p = str((job or {}).get("reply_full") or "")
+    if not p: return ""
+    try:
+        rp = Path(p)
+        if rp.parent != _wake_reply_path(sdir, str((job or {}).get("id", ""))).parent: return ""
+        return rp.read_text()
+    except Exception: return ""
+
 def _wake_read_job(sdir, jid):
     try: return json.loads(_wake_job_path(sdir, jid).read_text())
     except Exception: return {}
@@ -726,7 +748,12 @@ def _wake_finish(sdir, jid, status, reply="", error="", exit_code=0,
         cur["ended_at"] = now_iso()
         if status == "done":
             cur["backend_exit"] = 0
-            cur["reply"] = str(reply or "")[:500]
+            full = str(reply or "")
+            cur["reply"] = full[:500]
+            cur.pop("reply_full", None)
+            if len(full) > 500:  # full body lives beside the job; previews stay short
+                try: cur["reply_full"] = str(_wake_write_reply(sdir, jid, full))
+                except Exception: pass
         else:
             cur["error"] = str(error or "")[:200]
             cur["backend_exit"] = exit_code
@@ -1237,6 +1264,7 @@ def do_wakes(a):
     rows.sort(key=lambda j: j.get("ts", ""))
     rows = rows[-(a.limit or 50):]
     if getattr(a, "json", False):
+        rows = [{**j, **({"reply": t} if (t := _wake_full_reply(sdir, j)) else {})} for j in rows]
         return emit(a, "wakes", {"wakes": rows})
     txt = "\n".join(
         f'{j.get("id","")} {j.get("status",""):8} {j.get("agent",""):10} '
@@ -1293,7 +1321,9 @@ def do_wakes_wait(a, sdir):
                 if st:
                     sess_running, sess_exit = st.get("running"), st.get("exit")
             except Exception: pass
+        full = _wake_full_reply(sdir, cur)
         data = {**cur, "sess_running": sess_running, "sess_exit": sess_exit}
+        if full: data["reply"] = full
         rc = 1 if cur.get("status") == "failed" else 0
         if getattr(a, "json", False):
             emit(a, "wakes", data)
@@ -1334,6 +1364,8 @@ def do_wakes_wait(a, sdir):
                 try: j = _wake_read_job(sdir, jid) or {}
                 except Exception: j = {}
                 if not j: j = {"id": jid, "status": "missing"}
+            t = _wake_full_reply(sdir, j)
+            if t: j = {**j, "reply": t}
             jobs.append(j)
         emit(a, "wakes", {"jobs": jobs, "pending": sorted(unfinished), "timed_out": timed_out})
         return rc
@@ -11159,12 +11191,15 @@ def _relay_materialize(cfg, root, now, out, errs):
     finally: ll.close()
 
 def _relay_reply(sdir, r, j):
-    """Latest full agent reply since the job started, else the short one saved on the job."""
+    """Latest full agent reply since the job started, else the job's stored
+    full body (reply_full sidecar), else the short preview saved on the job."""
     since, until = str(j.get("ts") or ""), str(j.get("ended_at") or "")
     try: log = [x for x in load_chat_log(sdir, r["agent"])
         if x.get("role") == "agent" and since <= str(x.get("ts") or "") and (not until or str(x.get("ts") or "") <= until)]
     except Exception: log = []
     if log: return str(log[-1].get("text") or "")
+    full = _wake_full_reply(sdir, j)
+    if full: return full
     return str(j.get("reply") or j.get("error") or "")
 
 def _relay_error_tail(sdir, r, j):

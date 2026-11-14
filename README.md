@@ -80,8 +80,12 @@ ag wait <id> --timeout 30         # only blocking command; bound it
 ag attach <id>                    # full terminal (TTY; Ctrl-] detaches)
 ag kill [--force] <id>
 ag sessions | status | events --limit 20
+ag events [--session S] [--agent A] [--type T1,T2] [--limit N]
+ag events --follow [--agent A] [--type T1,T2] [--exit-on-match] [--timeout S]
 ag forget <id>                    # wipe logs (auth traces)
 ```
+
+`ag events` reads `events.jsonl`; `--follow` tails new lines (0.5 s poll) and also emits terminal wake-job changes (`wake_done`, `wake_fail`, `wake_cancel` with `status` `done|failed|cancelled`). `--exit-on-match` exits `0` after the first matching event; with `--timeout S` it exits `124` if none arrives. `--json` streams one event object per line.
 
 ## run, approvals, rtk
 

@@ -2122,17 +2122,143 @@ def do_wait(a):
         return emit(a,"wait",{**data,"_text":f'exit=-1 (stale daemon gone)\n'+data["tail"]})
     return emit(a,"wait",{**data,"_text":f'exit={cur.get("exit")}\n'+data["tail"]})
 
+def _event_types(spec):
+    return {t.strip() for t in (spec or "").split(",") if t.strip()}
+
+def _event_match(r, session=None, agent=None, types=None):
+    if session and not ((r.get("session") or "")==session
+            or (r.get("session") or "").startswith(session)): return False
+    if agent and (r.get("agent") or "")!=agent: return False
+    if types and (r.get("type") or "") not in types: return False
+    return True
+
+def _event_text(r):
+    return (f'{r.get("ts","")} {r.get("type")} {r.get("session") or ""} '
+        f'{r.get("cmd",r.get("exit",r.get("bytes","")))}')
+
+def _wake_terminal(job):
+    st = job.get("status")
+    if st=="done": return "done"
+    if st=="cancelled": return "cancelled"
+    if st=="failed": return "cancelled" if job.get("cancelled") else "failed"
+    return None
+
+def _wake_state_event(job, state):
+    r = {"ts":now_iso(),
+        "type":{"done":"wake_done","failed":"wake_fail","cancelled":"wake_cancel"}[state],
+        "session":job.get("trigger"),"agent":job.get("agent"),"job":job.get("id"),
+        "status":state,"exit":job.get("backend_exit",job.get("exit"))}
+    if state=="cancelled": r["cancelled"] = True
+    if job.get("stalled"): r["stalled"] = True
+    return r
+
+def _event_wake_key(r):
+    if r.get("type") not in ("wake_done","wake_fail","wake_cancel") or not r.get("job"):
+        return None
+    state = ("done" if r.get("type")=="wake_done" else "cancelled"
+        if r.get("type")=="wake_cancel" or r.get("cancelled")
+        or r.get("reason")=="cancelled" or r.get("status")=="cancelled" else "failed")
+    return (r.get("job"), state)
+
+def _follow_events(a, sdir):
+    """Tail events.jsonl + terminal wake-job changes. 0.5s poll, no inotify."""
+    path = sdir/"events.jsonl"
+    types = _event_types(getattr(a,"type",None))
+    session, agent = getattr(a,"session",None), getattr(a,"agent",None)
+    try: budget = max(0.0, float(getattr(a,"timeout",None) or 0))
+    except Exception: budget = 0.0
+    t0 = time.time()
+    try: st = path.stat(); pos, ino = st.st_size, st.st_ino
+    except OSError: pos, ino = 0, None
+    buf = b""
+    jobs_dir = _wake_dirs(sdir)[1]
+    wake_state, seen_wake, job_sig = {}, set(), {}
+    try: jobs_mtime = jobs_dir.stat().st_mtime_ns
+    except OSError: jobs_mtime = None
+    for p in jobs_dir.glob("*.json"):
+        try: st = p.stat()
+        except OSError: continue
+        job_sig[p] = (st.st_mtime_ns, st.st_size, st.st_ino)
+        try: j = json.loads(p.read_text())
+        except Exception: continue
+        wake_state[j.get("id") or p.stem] = _wake_terminal(j)
+    def show(r):
+        if not _event_match(r, session, agent, types): return False
+        print(json.dumps(r) if getattr(a,"json",False) else _event_text(r), flush=True)
+        return True
+    try:
+        while True:
+            try:
+                st = path.stat()
+                if st.st_size < pos or (ino is not None and st.st_ino != ino):
+                    pos, buf, ino = 0, b"", st.st_ino
+            except OSError:
+                pass
+            try:
+                with open(path,"rb") as f:
+                    f.seek(pos); data = f.read()
+                if data:
+                    pos += len(data); buf += data
+                    chunks = buf.split(b"\n"); buf = chunks.pop()
+                    for raw in chunks:
+                        if not raw.strip(): continue
+                        try: r = json.loads(raw.decode("utf-8","replace"))
+                        except Exception: continue
+                        key = _event_wake_key(r)
+                        if key and key in seen_wake: continue
+                        if show(r):
+                            if key: seen_wake.add(key)
+                            if getattr(a,"exit_on_match",False): return 0
+            except FileNotFoundError:
+                pos, buf, ino = 0, b"", None
+            except OSError:
+                pass
+            try: dm = jobs_dir.stat().st_mtime_ns
+            except OSError: dm = None
+            if dm != jobs_mtime:
+                jobs_mtime = dm
+                try: paths = sorted(jobs_dir.glob("*.json"))
+                except OSError: paths = []
+                for gone in set(job_sig) - set(paths): job_sig.pop(gone, None)
+            else:
+                paths = sorted(job_sig)
+            for p in paths:
+                try: st = p.stat()
+                except OSError:
+                    job_sig.pop(p, None); continue
+                sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+                if job_sig.get(p) == sig: continue
+                job_sig[p] = sig
+                try: j = json.loads(p.read_text())
+                except Exception: continue
+                jid = j.get("id") or p.stem
+                state, prev = _wake_terminal(j), wake_state.get(jid)
+                if jid in wake_state and state==prev: continue
+                wake_state[jid] = state
+                if not state: continue
+                key = (jid, state)
+                if key in seen_wake: continue
+                if show(_wake_state_event(j, state)):
+                    seen_wake.add(key)
+                    if getattr(a,"exit_on_match",False): return 0
+            if budget and time.time()-t0 >= budget: return 124
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 130
+
 def do_events(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
+    if getattr(a,"follow",False): return _follow_events(a, sdir)
     try: rows = [json.loads(l) for l in (sdir/"events.jsonl").read_text().splitlines() if l.strip()]
     except Exception: rows = []
-    if a.session:
-        rows = [r for r in rows if (r.get("session") or "")==a.session
-            or (r.get("session") or "").startswith(a.session)]
+    rows = [r for r in rows if _event_match(r, a.session,
+        getattr(a,"agent",None), _event_types(getattr(a,"type",None)))]
     rows = rows[-(a.limit or 20):]
+    if getattr(a,"exit_on_match",False):
+        if not rows: return 1
+        rows = rows[:1]
     if getattr(a,"json",False): return emit(a,"events",{"events":rows})
-    txt = "\n".join(f'{r.get("ts","")} {r.get("type")} {r.get("session") or ""} '
-        f'{r.get("cmd",r.get("exit",r.get("bytes","")))}' for r in rows) or "(none)"
+    txt = "\n".join(_event_text(r) for r in rows) or "(none)"
     return emit(a,"events",{"_text":txt})
 
 def do_daemon(a):
@@ -18589,6 +18715,11 @@ def build():
     k = sub.add_parser("kill",help="kill session"); k.add_argument("sess"); k.add_argument("--force",action="store_true")
     w8 = sub.add_parser("wait",help="block until session exits (opt-in only)"); w8.add_argument("sess"); w8.add_argument("--timeout",type=int,default=30)
     ev = sub.add_parser("events",help="pings: spawn/send/exit feed"); ev.add_argument("--limit",type=int,default=20); ev.add_argument("--session",default=None)
+    ev.add_argument("--follow",action="store_true",help="tail events.jsonl, printing new events (and terminal wake-job changes) as they land; 0.5s poll")
+    ev.add_argument("--agent",default=None,help="only events for this agent (wake jobs)")
+    ev.add_argument("--type",dest="type",default=None,metavar="T1,T2",help="only these event types, comma-separated (e.g. wake_done,wake_fail)")
+    ev.add_argument("--exit-on-match",dest="exit_on_match",action="store_true",help="exit 0 after printing the first matching event (with --follow)")
+    ev.add_argument("--timeout",type=float,default=None,help="stop waiting after S seconds with exit 124 (with --follow; 0 = none)")
     dm = sub.add_parser("_daemon",help=argparse.SUPPRESS); dm.add_argument("sp")
     h = sub.add_parser("harness",help="select agent backends and share harness configuration"); hs=h.add_subparsers(dest="sub",required=True)
     huse=hs.add_parser("use",help="switch an agent backend, remembering its model"); huse.add_argument("agent"); huse.add_argument("backend"); huse.add_argument("--model",default=None); huse.add_argument("--budget",default=None,help="handoff replay budget in tokens for the next turn (default 4000, AG_HANDOFF_BUDGET overrides)")

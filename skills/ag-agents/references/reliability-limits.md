@@ -23,7 +23,7 @@ Failover:
 {{AG}} --dir <state> agents set w --fallback codex/default      # or BACKEND:MODEL
 ```
 
-`--fallback BACKEND/MODEL` (or `BACKEND:MODEL`, other backend, e.g. `codex/default`) fails the turn over to that backend with recent history replayed (`[fallback] claude usage limit -> codex/default`); privacy/access/budget re-checked; roster unchanged, primary retried after reset.
+`--fallback BACKEND/MODEL` (or `BACKEND:MODEL`, other backend, e.g. `codex/default`) fails the turn over to that backend with recent history replayed (`[fallback] claude usage limit -> codex/default`); privacy/access/budget re-checked; roster unchanged, primary retried after reset. A wake that ends on a usage limit with a parsed reset and no fallback is `parked` (job `resume_at`, options kept), not failed; the global `schedule tick` relaunches it once after the reset (old job `resumed_as`, new `parked_from`). `wakes --cancel` cancels a parked job; `wake --no-park` disables parking.
 
 ## Stall watchdog
 

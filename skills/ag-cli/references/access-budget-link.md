@@ -14,6 +14,15 @@
 
 `access` = `routing.json` allow/deny globs over `backend/model` + `provider/*` (deny wins; per-`--data work|public`). Ledger `$AG_CACHE_HOME/usage.jsonl`. `budget` refuses turns (exit 2) unless `--force`; 80% warns `[budget]`.
 
+## Policy compiler
+
+```sh
+{{AG}} policy check --file ag-policy.json                       # validate schema; nonzero exit on bad key/value
+{{AG}} policy render --file ag-policy.json [--target claude|codex|all] [--out DIR] [--dry-run]
+```
+
+Policy JSON: `{version:1, permission_floor:"ro|edits|auto", allowed_models:[], denied_models:[], mcp_allow:[], secret_read_ban:[globs], network:"on|off"}`. `render` prints to stdout without `--out`, writes `managed-settings.json` (Claude) and/or `requirements.toml` (Codex) with `--out`, and `--dry-run` prints a unified diff against existing files without writing. Floor reuses `_mode_rank` (Claude `defaultMode`, Codex `approval_policy`+`sandbox_mode`); secret globs -> Claude `Read(...)` deny rules; vendor field names are as of 2026-11 and must be re-checked per release.
+
 ## Link (VM -> Mac)
 
 VM shows its sites + long jobs on the Mac over outbound reverse SSH (docs/LINK.md). Mac needs only sshd + the printed restricted `authorized_keys` line (`link mac-key PUBKEY_FILE` prints it, never writes).

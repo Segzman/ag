@@ -519,6 +519,36 @@ ag handoff w [--spawn|--exec]    # native backend TUI argv + profile env; --exec
 
 Same scope inherits the prior `HANDOFF.md`; sibling scopes are isolated. Native TUI gets no auto-inject. Handoff argv never carries auto-approve flags; `claude`/`cursor` keep `--resume SID`, others launch bare. Multi-host snapshots: [Multi-host](#multi-host).
 
+## Policy compiler
+
+Compile one `ag-policy.json` into backend-native policy files. Renderers are pure functions (validated dict in, text out), so output is deterministic and testable.
+
+```sh
+ag policy check --file ag-policy.json                                   # validate; nonzero exit + clear message on bad keys/values
+ag policy render --file ag-policy.json [--target claude|codex|all]      # print to stdout
+ag policy render --file ag-policy.json --target all --out DIR           # write managed-settings.json + requirements.toml
+ag policy render --file ag-policy.json --target all --out DIR --dry-run # unified diff, writes nothing
+```
+
+Schema (`version` required, the rest optional; defaults shown):
+
+```json
+{"version": 1,
+ "permission_floor": "edits",
+ "allowed_models": [], "denied_models": [],
+ "mcp_allow": [],
+ "secret_read_ban": ["~/.ssh/**", "**/.env"],
+ "network": "on"}
+```
+
+- `permission_floor` reuses the dispatch-mode rank (`_mode_rank`): `ro` < `edits` < `auto`. Claude Code gets `permissions.defaultMode` `plan`/`acceptEdits`/`bypassPermissions`; Codex gets `approval_policy` + `sandbox_mode` `on-request`/`read-only`, `on-request`/`workspace-write`, `never`/`workspace-write`.
+- `secret_read_ban` globs become Claude `Read(...)` deny rules. Codex has no equivalent field: they are emitted as comments (the sandbox is the real boundary).
+- `mcp_allow` becomes Claude `enabledMcpjsonServers` + `allowedMcpServers`; Codex lists it as a comment (MCP servers live in `config.toml`).
+- `allowed_models` becomes Claude `availableModels`; `denied_models` has no native field and is emitted as a comment.
+- `network: off` adds Claude `WebFetch`/`WebSearch` deny rules and sets Codex `sandbox_workspace_write.network_access = false`.
+
+Vendor note: field names follow the Claude Code and Codex docs **as of 2026-11**; they are not a stable API. Re-check each vendor release before relying on the rendered file, and treat `--dry-run` diffs as the review surface.
+
 ## Multi-host
 
 Outbound-SSH snapshot handoff, no automatic failover (full runbook: [docs/MULTI_HOST.md](docs/MULTI_HOST.md)):

@@ -1,0 +1,10 @@
+usage: ag policy render [-h] [--file PFILE] [--target {claude,codex,all}]
+                        [--out OUT] [--dry-run]
+
+options:
+  -h, --help            show this help message and exit
+  --file PFILE          policy JSON (default ag-policy.json)
+  --target {claude,codex,all}
+                        backend policy file to render
+  --out OUT             output directory (default: print to stdout)
+  --dry-run             print a unified diff against existing files; write nothing

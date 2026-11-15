@@ -79,6 +79,6 @@ ag pops a native masked macOS dialog and types the value into the program; the m
 - `references/models-privacy.md` - `ag models` flags/ranking/openrouter, data-privacy rule + zdr/retain/train table.
 - `references/setup-update.md` - `ag setup` flags and UIs, `ag update`, `ag push`.
 - `references/schedule-relay-tick.md` - global schedule tick install, relay tick/admin, `ratelimit`.
-- `references/access-budget-link.md` - `access`, `usage`, `budget`, VM -> Mac `link`.
+- `references/access-budget-link.md` - `access`, `usage`, `budget`, `policy`, VM -> Mac `link`.
 
 Deeper: `README.md`, `docs/INSTALL.md` in the ag repo.

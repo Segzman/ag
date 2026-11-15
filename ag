@@ -18714,6 +18714,147 @@ def do_link(a):
     return {"init": _link_init, "up": _link_up, "down": _link_down, "status": _link_status_cmd,
         "serve": _link_serve, "run": _link_run, "mac-key": _link_mac_key}[a.lsub](a)
 
+# --- ag-policy compiler (v0) -------------------------------------------------
+# One policy JSON -> backend-native policy files. Renderers are pure
+# (validated dict in -> text out); only do_policy touches the filesystem.
+# Field names follow vendor docs as of 2026-11; re-check them each release.
+POLICY_KEYS = ("version", "permission_floor", "allowed_models", "denied_models", "mcp_allow", "secret_read_ban", "network")
+POLICY_FLOORS = ("ro", "edits", "auto")
+POLICY_FILES = {"claude": "managed-settings.json", "codex": "requirements.toml"}
+POLICY_NOTE = "ag policy v0: field names follow vendor docs as of 2026-11; re-check them against each release."
+POLICY_CLAUDE_MODE = {0: "plan", 1: "acceptEdits", 2: "bypassPermissions"}
+POLICY_CODEX_SANDBOX = {0: ("on-request", "read-only"), 1: ("on-request", "workspace-write"), 2: ("never", "workspace-write")}
+
+def _policy_list(value, name, errs, pattern=None):
+    """Pure: clean string array (deduped) or errors appended to errs."""
+    if not isinstance(value, list):
+        errs.append(f"{name} must be an array of strings"); return []
+    out, seen = [], set()
+    for i, raw in enumerate(value):
+        if not isinstance(raw, str) or not raw.strip():
+            errs.append(f"{name}[{i}] must be a non-empty string"); continue
+        s = raw.strip()
+        if any(c in s for c in "\r\n"):
+            errs.append(f"{name}[{i}] must be one line"); continue
+        if pattern and not re.fullmatch(pattern, s):
+            errs.append(f"{name}[{i}] has a bad value {s!r}"); continue
+        if s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
+def policy_validate(doc):
+    """Pure: (clean policy with defaults, [errors]). Unknown keys and bad values are rejected."""
+    if not isinstance(doc, dict): return {}, ["policy must be a JSON object"]
+    errs = []
+    unknown = sorted(set(doc) - set(POLICY_KEYS))
+    if unknown: errs.append("unknown key(s): " + ", ".join(unknown))
+    ver = doc.get("version")
+    if isinstance(ver, bool) or ver != 1: errs.append(f"version must be 1 (got {ver!r})")
+    floor = doc.get("permission_floor", "edits")
+    if floor not in POLICY_FLOORS: errs.append(f"permission_floor must be ro|edits|auto (got {floor!r})")
+    network = doc.get("network", "on")
+    if network not in ("on", "off"): errs.append(f"network must be on|off (got {network!r})")
+    allow = _policy_list(doc.get("allowed_models", []), "allowed_models", errs)
+    deny = _policy_list(doc.get("denied_models", []), "denied_models", errs)
+    mcp = _policy_list(doc.get("mcp_allow", []), "mcp_allow", errs, r"[A-Za-z0-9_.-]+")
+    secrets = _policy_list(doc.get("secret_read_ban", []), "secret_read_ban", errs)
+    for m in sorted(set(allow) & set(deny)): errs.append(f"model {m!r} is both allowed and denied")
+    clean = {"version": 1,
+        "permission_floor": floor if floor in POLICY_FLOORS else "edits",
+        "allowed_models": allow, "denied_models": deny, "mcp_allow": mcp,
+        "secret_read_ban": secrets,
+        "network": network if network in ("on", "off") else "on"}
+    return clean, errs
+
+def claude_policy_render(p):
+    """Pure: policy dict -> Claude Code managed-settings.json text."""
+    rank = _mode_rank(p.get("permission_floor") or "edits")
+    deny = [f"Read({g})" for g in p.get("secret_read_ban") or []]
+    if (p.get("network") or "on") == "off": deny += ["WebFetch", "WebSearch"]
+    out = {"permissions": {"defaultMode": POLICY_CLAUDE_MODE.get(rank, "acceptEdits")}}
+    if deny: out["permissions"]["deny"] = deny
+    if p.get("mcp_allow"):
+        out["enabledMcpjsonServers"] = list(p["mcp_allow"])
+        out["allowedMcpServers"] = list(p["mcp_allow"])
+    if p.get("allowed_models"): out["availableModels"] = list(p["allowed_models"])
+    notes = [POLICY_NOTE]
+    if p.get("denied_models"): notes.append("denied_models (no native field): " + ", ".join(p["denied_models"]))
+    out["_agPolicyNotes"] = notes
+    return json.dumps(out, indent=2) + "\n"
+
+def _policy_toml_str(s):
+    return json.dumps(s, ensure_ascii=True)  # JSON string == valid TOML basic string here
+
+def codex_policy_render(p):
+    """Pure: policy dict -> Codex requirements.toml text."""
+    rank = _mode_rank(p.get("permission_floor") or "edits")
+    approval, sandbox = POLICY_CODEX_SANDBOX.get(rank, POLICY_CODEX_SANDBOX[1])
+    lines = [f"# {POLICY_NOTE}",
+        f"approval_policy = {_policy_toml_str(approval)}",
+        f"sandbox_mode = {_policy_toml_str(sandbox)}"]
+    if p.get("allowed_models"): lines.append("allowed_models = [" + ", ".join(_policy_toml_str(m) for m in p["allowed_models"]) + "]")
+    if p.get("denied_models"): lines.append("denied_models = [" + ", ".join(_policy_toml_str(m) for m in p["denied_models"]) + "]")
+    if p.get("mcp_allow"): lines.append("# mcp_allow (Codex MCP servers live in config.toml, not requirements.toml): " + ", ".join(p["mcp_allow"]))
+    if p.get("secret_read_ban"): lines.append("# secret_read_ban (no requirements.toml field; rely on sandbox_mode): " + ", ".join(p["secret_read_ban"]))
+    lines += ["", "[sandbox_workspace_write]", f"network_access = {'false' if (p.get('network') or 'on') == 'off' else 'true'}"]
+    return "\n".join(lines) + "\n"
+
+def policy_render(p, target):
+    """Pure: validated policy dict -> (filename, text) for one target."""
+    if target == "claude": return POLICY_FILES[target], claude_policy_render(p)
+    if target == "codex": return POLICY_FILES[target], codex_policy_render(p)
+    raise ValueError(f"unknown policy target: {target}")
+
+def policy_diff(old, new, name):
+    """Pure: unified diff old -> new ('' when identical)."""
+    if old == new: return ""
+    return "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
+        fromfile=f"a/{name}", tofile=f"b/{name}"))
+
+def do_policy(a):
+    sub = getattr(a, "polsub", None) or ""
+    if sub not in ("render", "check"):
+        return emit(a, "policy", error="no policy subcommand", hint="render|check")
+    fp = Path(getattr(a, "pfile", None) or "ag-policy.json").expanduser()
+    try: doc = json.loads(fp.read_text())
+    except FileNotFoundError: return emit(a, "policy", error=f"no policy file: {fp}")
+    except Exception as e: return emit(a, "policy", error=f"cannot read {fp}: {e}")
+    policy, errs = policy_validate(doc)
+    if errs:
+        return emit(a, "policy", error="invalid policy: " + "; ".join(errs),
+            hint="schema: version permission_floor allowed_models denied_models mcp_allow secret_read_ban network")
+    if sub == "check":
+        txt = (f"policy ok: {fp} (version={policy['version']} floor={policy['permission_floor']} "
+            f"network={policy['network']} allow={len(policy['allowed_models'])} deny={len(policy['denied_models'])} "
+            f"mcp={len(policy['mcp_allow'])} secret_bans={len(policy['secret_read_ban'])})")
+        return emit(a, "policy", dict(policy, file=str(fp), _text=txt))
+    target = getattr(a, "target", None) or "all"
+    targets = ["claude", "codex"] if target == "all" else [target]
+    rendered = {t: policy_render(policy, t) for t in targets}
+    out = getattr(a, "out", None) or ""
+    if getattr(a, "dry_run", False):
+        base = Path(out).expanduser() if out else Path(".")
+        diffs = {}
+        for t in targets:
+            name, text = rendered[t]
+            p = base/name
+            try: old = p.read_text() if p.exists() else ""
+            except Exception as e: return emit(a, "policy", error=f"cannot read {p}: {e}")
+            diffs[str(p)] = policy_diff(old, text, p.name) or f"no changes: {p}"
+        return emit(a, "policy", {"_text": "\n".join(diffs.values()), "diffs": diffs, "dry_run": True})
+    if out:
+        base = Path(out).expanduser(); base.mkdir(parents=True, exist_ok=True)
+        written = []
+        for t in targets:
+            name, text = rendered[t]; p = base/name
+            _atomic_write(p, text); written.append(str(p))
+        return emit(a, "policy", {"_text": "wrote " + ", ".join(written), "files": written})
+    if len(targets) == 1:
+        text = rendered[targets[0]][1]
+    else:
+        text = "\n".join(f"# --- {t} -> {rendered[t][0]} ---\n{rendered[t][1]}" for t in targets)
+    return emit(a, "policy", {"_text": text.rstrip("\n"), "targets": targets})
+
 def build():
     p = argparse.ArgumentParser(prog="ag", description="CLI helper for autonomous agents")
     p.add_argument("--dir", default=None, help="state dir (default ./.agent)")
@@ -18904,6 +19045,14 @@ def build():
     bu=sub.add_parser("budget",help="spend/request budgets"); bus=bu.add_subparsers(dest="sub",required=True)
     bus.add_parser("show",help="limits + spent/used today")
     bset=bus.add_parser("set",help="set daily/monthly USD + provider rpd"); bset.add_argument("--daily",type=float,default=None,help="USD per UTC day"); bset.add_argument("--monthly",type=float,default=None,help="USD per UTC month"); bset.add_argument("--provider",default=None,help="provider id for --rpd"); bset.add_argument("--rpd",type=int,default=None,help="requests per UTC day for --provider")
+    po=sub.add_parser("policy",help="compile an ag-policy.json into backend policy files"); pos=po.add_subparsers(dest="polsub",required=False)
+    por=pos.add_parser("render",help="render Claude Code managed settings / Codex requirements")
+    por.add_argument("--file",dest="pfile",default="ag-policy.json",help="policy JSON (default ag-policy.json)")
+    por.add_argument("--target",default="all",choices=["claude","codex","all"],help="backend policy file to render")
+    por.add_argument("--out",default=None,help="output directory (default: print to stdout)")
+    por.add_argument("--dry-run",dest="dry_run",action="store_true",help="print a unified diff against existing files; write nothing")
+    poc=pos.add_parser("check",help="validate a policy file")
+    poc.add_argument("--file",dest="pfile",default="ag-policy.json",help="policy JSON (default ag-policy.json)")
     st=sub.add_parser("setup",help="pick model routing, install ag skills (shared ~/.agents/skills + links), write ag pointer blocks into harness instruction files"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help=",".join(SETUP_HARNESSES) + " | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] | backend.B.(enabled|model|mode|plan|effort)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
     lk = sub.add_parser("link", help="VM -> Mac view over outbound reverse SSH (docs/LINK.md)"); lks = lk.add_subparsers(dest="lsub", required=True)
     lki = lks.add_parser("init", help="write link.json + create the key + print the Mac authorized_keys line"); lki.add_argument("--to", required=True, help="USER@HOST"); lki.add_argument("--key", default=None, help="private key path (default ~/.ssh/ag_link, created when missing)"); lki.add_argument("--ports", default="auto", help="auto | 3000,8080"); lki.add_argument("--base", type=int, default=41000, help="mac port base"); lki.add_argument("--watch-port", dest="watch_port", type=int, default=7790, help="vm watch page port")
@@ -19606,7 +19755,7 @@ def main(argv=None):
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"channel":do_channel,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
-        "access":do_access,"usage":do_usage,"budget":do_budget,"link":do_link}[a.subcmd]
+        "access":do_access,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)
 

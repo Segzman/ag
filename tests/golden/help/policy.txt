@@ -1,0 +1,9 @@
+usage: ag policy [-h] {render,check} ...
+
+positional arguments:
+  {render,check}
+    render      render Claude Code managed settings / Codex requirements
+    check       validate a policy file
+
+options:
+  -h, --help  show this help message and exit

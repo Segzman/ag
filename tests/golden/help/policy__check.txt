@@ -1,0 +1,5 @@
+usage: ag policy check [-h] [--file PFILE]
+
+options:
+  -h, --help    show this help message and exit
+  --file PFILE  policy JSON (default ag-policy.json)

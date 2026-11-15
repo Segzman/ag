@@ -76,6 +76,12 @@ OR_RANK_URL
 OR_SITE_URL
 OR_UA
 PAIR_ROLES
+POLICY_CLAUDE_MODE
+POLICY_CODEX_SANDBOX
+POLICY_FILES
+POLICY_FLOORS
+POLICY_KEYS
+POLICY_NOTE
 PRIVACY_TRAIN
 PRIVACY_ZDR
 PRIVACY_ZDR_HINT
@@ -432,6 +438,8 @@ _parse_opencode
 _parse_opencode_verbose
 _pick
 _pid_alive
+_policy_list
+_policy_toml_str
 _prepare_tracked
 _proj_of
 _providers_path
@@ -732,8 +740,10 @@ ckpt_revert
 ckpt_snapshot
 ckpt_turns
 classify_turn_failure
+claude_policy_render
 clear_agent_sid
 cmd_hash
+codex_policy_render
 compact_advanced_rows
 compact_apply_edit
 compact_apply_onoff
@@ -840,6 +850,7 @@ do_models
 do_note
 do_notes
 do_notify
+do_policy
 do_providers
 do_push
 do_queue
@@ -981,6 +992,9 @@ parse_timeline_generic
 parse_timeline_opencode
 parse_usage
 parse_usage_acp
+policy_diff
+policy_render
+policy_validate
 preflight_auth
 privacy_default
 privacy_error

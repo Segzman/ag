@@ -594,7 +594,7 @@ System-prompt presets per agent: `ag roles list|show|add|set|rm|reset NAME`. Bui
 
 ## Tests and golden snapshots
 
-`python3 tests/test_golden_snapshots.py` checks `tests/golden/`: `--help` for every (sub)command (`help/`), the top-level namespace (`namespace.txt`) and read-only `--json` output on a temp state dir (`json/`), all byte-identical after scrubbing temp paths and timestamps. Run `python3 tools/golden_update.py` only when a help, namespace or JSON change is intended, then commit the regenerated snapshots with that change.
+`python3 tests/test_golden_snapshots.py` checks `tests/golden/`: `--help` for every (sub)command (`help/`), the top-level namespace (`namespace.txt`) and read-only `--json` output on a temp state dir (`json/`), help compared word-for-word (line wrapping varies by Python version), JSON byte-identical after scrubbing temp paths and timestamps. Run `python3 tools/golden_update.py` only when a help, namespace or JSON change is intended, then commit the regenerated snapshots with that change.
 
 ## Docs
 

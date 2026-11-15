@@ -42,7 +42,8 @@ class Needs(Env):
         n = dict(self.o); n["env"] = dict(self.o["env"], AG_PARENT_AGENT="worker-1", AG_NOTIFY_DIR=str(self.td / "inbox"))
         p = self.ui(n, "ask", "Deploy tag?", "--timeout", "1", ok=False)
         self.assertEqual(p.returncode, 2)
-        self.assertIn("queued", p.stdout)
+        self.assertEqual(p.stdout, "")                     # stdout contract unchanged (cancel/timeout = empty)
+        self.assertIn("queued", p.stderr)
         r = self.rows(n)[-1]
         self.assertEqual(r["status"], "open"); self.assertEqual(r["kind"], "ask")
         self.assertEqual(r["agent"], "worker-1"); self.assertEqual(r["question"], "Deploy tag?")
@@ -74,7 +75,8 @@ class Needs(Env):
         n = dict(self.o); n["env"] = dict(self.o["env"], AG_NOTIFY_DIR=str(self.td / "inbox"))
         p = self.ui(n, "confirm", "Deploy?", "--timeout", "1", ok=False)
         self.assertEqual(p.returncode, 2)
-        self.assertIn("yes|no", p.stdout)
+        self.assertEqual(p.stdout.strip(), "timeout")      # confirm still prints exactly 'timeout'
+        self.assertIn("yes|no", p.stderr)
         r = self.rows(n)[-1]
         self.assertEqual(r["kind"], "confirm"); self.assertEqual(r["options"], ["Yes", "No"])
         self.run_ag(n, "needs", "answer", r["id"], "yes")

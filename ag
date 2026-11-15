@@ -1930,24 +1930,23 @@ def do_ui(a):
         if st == "error": return _ui_fail(a, 1, "dialog failed")
         ans = ("yes" if out == a.yes else "no") if st == "ok" else "timeout" if st == "timeout" else "no"
         _ui_event(a, k, "timeout" if st == "timeout" else "answered" if st == "ok" else "cancelled")
+        nid = None  # a cancel is an answer: only timeouts (or --queue) enter the needs queue
         if st == "timeout" or getattr(a, "queue", False):
             nid = _needs_enqueue(a, sdir, k, "answered" if st == "ok" else "open", ans if st == "ok" else None)
-            if st != "ok":
-                emit(a, "ui", {"_text": f"timeout — queued {nid}; answer with: ag needs answer {nid} yes|no",
-                    "outcome": "timeout", "needs_id": nid})
-                return 2
-        emit(a, "ui", {"_text": ans, "answer": ans})
+            if st == "timeout": print(f"queued {nid}; answer with: ag needs answer {nid} yes|no", file=sys.stderr)
+        emit(a, "ui", {"_text": ans, "answer": ans, **({"needs_id": nid} if nid else {})})
         return {"yes": 0, "no": 1}.get(ans, 2)
     if k == "choose": st, out = ui_run("choose", [a.question, a.title, "1" if a.multi else "0", *a.options], a.timeout)
     else: st, out = ui_run("ask", [a.question, a.default, a.title, a.timeout], a.timeout)
     if st == "error": return _ui_fail(a, 1, "dialog failed")
     _ui_event(a, k, UI_OUTCOME[st])
-    if st != "ok" or getattr(a, "queue", False):
+    nid = None  # stdout contract unchanged; the queue hint goes to stderr
+    if st == "timeout" or getattr(a, "queue", False):
         nid = _needs_enqueue(a, sdir, k, "answered" if st == "ok" else "open", out if st == "ok" else None)
-        if st != "ok":
-            emit(a, "ui", {"_text": f"{UI_OUTCOME[st]} — queued {nid}; answer with: ag needs answer {nid} VALUE",
-                "outcome": UI_OUTCOME[st], "needs_id": nid})
-            return 2
+        if st == "timeout": print(f"queued {nid}; answer with: ag needs answer {nid} VALUE", file=sys.stderr)
+    if st != "ok":
+        if getattr(a, "json", False): emit(a, "ui", {"outcome": UI_OUTCOME[st], **({"needs_id": nid} if nid else {})})
+        return 2
     if k == "choose":
         vals = out.split("\n")
         emit(a, "ui", {"_text": out, "choices": vals})

@@ -1,9 +1,12 @@
-usage: ag relay inbox [-h] [--name NAME] [--session SESSION] [--peek] [--hook {claude-inject}]
+usage: ag relay inbox [-h] [--name NAME] [--session SESSION] [--peek] [--all] [--since HOURS]
+                      [--hook {claude-inject}]
 
 options:
   -h, --help            show this help message and exit
   --name NAME           relay name (default: this session's claim)
   --session SESSION     session id (default $AG_RELAY_SESSION)
   --peek                print unseen messages without advancing the cursor
+  --all                 include already-seen messages from the relay inbox log
+  --since HOURS         only messages at/after N hours ago
   --hook {claude-inject}
                         print a Claude Code UserPromptSubmit hook JSON object (nothing when empty)

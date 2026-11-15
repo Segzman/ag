@@ -11591,6 +11591,7 @@ def relay_sync(cfg, now=None):
         if _relay_pull(cfg, out, errs):
             root = relay_root(cfg)
             _relay_materialize(cfg, root, now, out, errs)
+            _relay_inbox_log(cfg, root, now, errs)
             _relay_report(cfg, root, now, out, errs)
             _relay_admin(cfg, root, now, out, errs)
             _relay_ingest(cfg, root, now, out, errs)
@@ -11683,7 +11684,7 @@ def _relay_inbox_messages(cfg):
         m = _relay_jload(f)
         if isinstance(m, dict) and m.get("id") is not None and "message" in m: out.append(m)
     return out
-def _relay_inbox_select(st, name, msgs):
+def _relay_inbox_select(st, name, msgs, all_=False):
     ent = st["names"].get(name) or {}
     default, claimed_at = bool(ent.get("default")), int(ent.get("claimed_at") or 0)
     seen = {str(x) for x in (st["cursors"].get(name) or [])}
@@ -11694,13 +11695,72 @@ def _relay_inbox_select(st, name, msgs):
         if not owned: unaddressed.append(m)
         addressed = agent == name or agent == "chat-" + name
         defaulted = default and not owned and int(m.get("at_epoch") or 0) >= claimed_at
-        if (addressed or defaulted) and str(m.get("id")) not in seen: picked.append(m)
+        if (addressed or defaulted) and (all_ or str(m.get("id")) not in seen): picked.append(m)
     return picked, unaddressed
 def _relay_inbox_text(name, msgs):
     lines = [f'relay inbox {name}: {len(msgs)} new message' + ("" if len(msgs) == 1 else "s")]
     lines += [f'- [{m.get("agent") or "?"}] {m.get("id")}: {" ".join(str(m.get("message") or "").split())[:600]}' for m in msgs]
     lines.append('reply: ag relay say "<text>"')
     return "\n".join(lines)
+def _relay_inbox_log_dir(): return ag_cache_home() / "relay" / "inbox"
+def _relay_inbox_log_bucket(m):
+    """Bucket file stem: the addressed relay name (chat-NAME counts as NAME), else _unaddressed."""
+    b = str(m.get("agent") or "")
+    if b.startswith("chat-") and RELAY_NAME_RE.fullmatch(b[5:]): b = b[5:]
+    return b if RELAY_NAME_RE.fullmatch(b) else "_unaddressed"
+def _relay_inbox_log_file(f):
+    rows = []
+    try: lines = f.read_text().splitlines()
+    except OSError: return rows
+    for l in lines:
+        try:
+            r = json.loads(l)
+            if isinstance(r, dict): rows.append(r)
+        except ValueError: pass
+    return rows
+def _relay_inbox_log_append(m, now):
+    """Append one inbound message to relay/inbox/<name|_unaddressed>.jsonl once (dedupe by id),
+    dropping the oldest rows past 5000 so the log stays bounded."""
+    d = _relay_inbox_log_dir(); d.mkdir(parents=True, exist_ok=True)
+    f = d / (_relay_inbox_log_bucket(m) + ".jsonl")
+    rows = _relay_inbox_log_file(f)
+    if any(str(r.get("id")) == str(m.get("id")) for r in rows): return
+    rows.append({"id": m.get("id"), "origin": m.get("origin"), "agent": m.get("agent"),
+        "message": str(m.get("message") or "")[:20000], "at_epoch": int(m.get("at_epoch") or now), "seen": False})
+    if len(rows) > 5000: rows = rows[-5000:]
+    _atomic_write(f, "\n".join(json.dumps(r) for r in rows) + ("\n" if rows else ""))
+def _relay_inbox_log_rows(st, name=None):
+    """Log rows the inbox may consider: this name's bucket plus every bucket no claimed name owns."""
+    d = _relay_inbox_log_dir()
+    out = []
+    if not d.is_dir(): return out
+    for f in sorted(d.glob("*.jsonl")):
+        if f.stem in st["names"] and f.stem != name: continue
+        out += [r for r in _relay_inbox_log_file(f) if r.get("id") is not None]
+    return out
+def _relay_inbox_log_mark(ids):
+    """Mark log rows whose id is in ids as seen (the cursor advanced past them)."""
+    d = _relay_inbox_log_dir()
+    if not d.is_dir() or not ids: return
+    for f in sorted(d.glob("*.jsonl")):
+        rows, dirty = _relay_inbox_log_file(f), False
+        for r in rows:
+            if not r.get("seen") and str(r.get("id")) in ids: r["seen"] = True; dirty = True
+        if dirty: _atomic_write(f, "\n".join(json.dumps(r) for r in rows) + "\n")
+def _relay_inbox_log(cfg, root, now, errs):
+    """Persist each inbound message once at sync time: pending files vanish once they run, so a
+    session that misses the window would never see the message. Appends under the names lock."""
+    inbox = root / "schedules" / cfg["node"]
+    files = sorted(inbox.glob("*.json")) if inbox.is_dir() else []
+    if not files: return
+    lk = _relay_names_lock()
+    try:
+        for f in files:
+            m = _relay_jload(f)
+            if isinstance(m, dict) and m.get("id") is not None and "message" in m:
+                try: _relay_inbox_log_append(m, now)
+                except OSError as e: errs.append(f"inbox log: {e}")
+    finally: _ctx_unlock(lk)
 def _do_relay_names(a, cfg):
     def err(m, h=None): return emit(a, "relay", error=m, hint=h) or 1
     lk = _relay_names_lock() if a.nsub in ("claim", "release") else None
@@ -11747,6 +11807,14 @@ def _do_relay_inbox(a, cfg):
     name = (getattr(a, "name", None) or "").strip() or _relay_name_for_session(st, _relay_session(a))
     hook, as_json = getattr(a, "hook", None) == "claude-inject", bool(getattr(a, "json", False))
     msgs = _relay_inbox_messages(cfg)
+    have = {str(m.get("id")) for m in msgs}
+    cur = {str(x) for x in (st["cursors"].get(name) or [])} if name else set()
+    inc_seen, since = bool(getattr(a, "all", False)), getattr(a, "since", None)
+    rows = [r for r in _relay_inbox_log_rows(st, name) if inc_seen or (not r.get("seen") and str(r.get("id")) not in cur)]
+    msgs += [r for r in rows if str(r.get("id")) not in have]
+    if since is not None:
+        cutoff = time.time() - max(0.0, float(since)) * 3600
+        msgs = [m for m in msgs if int(m.get("at_epoch") or 0) >= cutoff]
     if not name:
         unaddressed = [m for m in msgs if not _relay_agent_claimed(str(m.get("agent") or ""), st["names"])]
         if not unaddressed or hook or any(v.get("default") for v in st["names"].values()): return 0
@@ -11754,7 +11822,7 @@ def _do_relay_inbox(a, cfg):
         if as_json: return emit(a, "relay", {"_text": hint, "unaddressed": len(unaddressed)})
         print(hint)
         return 0
-    picked, _ = _relay_inbox_select(st, name, msgs)
+    picked, _ = _relay_inbox_select(st, name, msgs, inc_seen)
     if not picked:
         if as_json and not hook: print(json.dumps({"ok": True, "cmd": "relay", "data": []}))
         return 0
@@ -11768,6 +11836,7 @@ def _do_relay_inbox(a, cfg):
             st = _relay_names()  # re-read under the lock: another session may have claimed/acked meanwhile
             st["cursors"][name] = list(dict.fromkeys([str(x) for x in (st["cursors"].get(name) or [])] + [str(m.get("id")) for m in picked]))[-500:]
             _relay_names_save(st)
+            _relay_inbox_log_mark({str(m.get("id")) for m in picked})
         finally: _ctx_unlock(lk)
     return 0
 def _do_relay_say(a, cfg):
@@ -18869,7 +18938,7 @@ def build():
     rync=ryns.add_parser("claim",help="claim NAME for this session; creates a local echo agent NAME"); rync.add_argument("name"); rync.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)"); rync.add_argument("--default",action="store_true",help="also receive unaddressed messages (at most one default)"); rync.add_argument("--force",action="store_true",help="take the name even when another session holds it")
     rynr=ryns.add_parser("release",help="release NAME (default: this session's claim)"); rynr.add_argument("name",nargs="?",default=None); rynr.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)")
     ryns.add_parser("list",help="relay names, their sessions, default owner and claim time")
-    rin=rys.add_parser("inbox",help="unseen messages addressed to a relay name (NAME or chat-NAME)"); rin.add_argument("--name",default=None,help="relay name (default: this session's claim)"); rin.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)"); rin.add_argument("--peek",action="store_true",help="print unseen messages without advancing the cursor"); rin.add_argument("--hook",choices=["claude-inject"],default=None,help="print a Claude Code UserPromptSubmit hook JSON object (nothing when empty)")
+    rin=rys.add_parser("inbox",help="unseen messages addressed to a relay name (NAME or chat-NAME)"); rin.add_argument("--name",default=None,help="relay name (default: this session's claim)"); rin.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)"); rin.add_argument("--peek",action="store_true",help="print unseen messages without advancing the cursor"); rin.add_argument("--all",action="store_true",help="include already-seen messages from the relay inbox log"); rin.add_argument("--since",type=float,default=None,metavar="HOURS",help="only messages at/after N hours ago"); rin.add_argument("--hook",choices=["claude-inject"],default=None,help="print a Claude Code UserPromptSubmit hook JSON object (nothing when empty)")
     rsay=rys.add_parser("say",help="send a message to a peer as a relay name (wake NAME --on PEER --notify-done)"); rsay.add_argument("message",nargs="+"); rsay.add_argument("--name",default=None,help="relay name (default: this session's claim)"); rsay.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)"); rsay.add_argument("--peer",default=None,metavar="NODE",help="peer node (default: the single other node under nodes/)")
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50);     ws.add_argument("--wait",default=None,nargs="+",help="block until one or more wake jobs finish (exit 0 ok, 1 failed, 124 timeout)"); ws.add_argument("--wait-group",dest="wait_group",default=None,help="block until all jobs of cohort GROUP finish (same exit codes)"); ws.add_argument("--timeout",type=int,default=30);  ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3)

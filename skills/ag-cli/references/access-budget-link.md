@@ -21,7 +21,7 @@
 {{AG}} policy render --file ag-policy.json [--target claude|codex|all] [--out DIR] [--dry-run]
 ```
 
-Policy JSON: `{version:1, permission_floor:"ro|edits|auto", allowed_models:[], denied_models:[], mcp_allow:[], secret_read_ban:[globs], network:"on|off"}`. `render` prints to stdout without `--out`, writes `managed-settings.json` (Claude) and/or `requirements.toml` (Codex) with `--out`, and `--dry-run` prints a unified diff against existing files without writing. Floor reuses `_mode_rank` (Claude `defaultMode`, Codex `approval_policy`+`sandbox_mode`); secret globs -> Claude `Read(...)` deny rules; vendor field names are as of 2026-11 and must be re-checked per release.
+Policy JSON: `{version:1, permission_floor:"ro|edits|auto", allowed_models:[], denied_models:[], mcp_allow:[], mcp_identity:{}, secret_read_ban:[globs], network:"on|off"}`. `render` prints to stdout without `--out`, writes `managed-settings.json` (Claude), `requirements.toml` (Codex constraints) and `codex-config.toml` (Codex defaults) with `--out`; `--dry-run` prints a unified diff without writing. Claude gets `deniedModels`, `allowedMcpServers` objects and `sandbox` when network is off; Codex `mcp_identity` fills `[mcp_servers.<name>] identity`. Vendor field names are as of 2026-11; re-check each release.
 
 ## Link (VM -> Mac)
 

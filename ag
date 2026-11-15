@@ -18966,12 +18966,14 @@ def do_link(a):
 # One policy JSON -> backend-native policy files. Renderers are pure
 # (validated dict in -> text out); only do_policy touches the filesystem.
 # Field names follow vendor docs as of 2026-11; re-check them each release.
-POLICY_KEYS = ("version", "permission_floor", "allowed_models", "denied_models", "mcp_allow", "secret_read_ban", "network")
+POLICY_KEYS = ("version", "permission_floor", "allowed_models", "denied_models", "mcp_allow", "mcp_identity", "secret_read_ban", "network")
 POLICY_FLOORS = ("ro", "edits", "auto")
-POLICY_FILES = {"claude": "managed-settings.json", "codex": "requirements.toml"}
+POLICY_FILES = {"claude": "managed-settings.json", "codex": "requirements.toml", "codex-config": "codex-config.toml"}
 POLICY_NOTE = "ag policy v0: field names follow vendor docs as of 2026-11; re-check them against each release."
 POLICY_CLAUDE_MODE = {0: "plan", 1: "acceptEdits", 2: "bypassPermissions"}
-POLICY_CODEX_SANDBOX = {0: ("on-request", "read-only"), 1: ("on-request", "workspace-write"), 2: ("never", "workspace-write")}
+# requirements.toml constrains user values (lists); codex-config.toml sets the default (scalars)
+POLICY_CODEX_ALLOW = {0: (["on-request"], ["read-only"]), 1: (["on-request"], ["read-only", "workspace-write"]), 2: (["never"], ["workspace-write"])}
+POLICY_CODEX_DEFAULT = {0: ("on-request", "read-only"), 1: ("on-request", "workspace-write"), 2: ("never", "workspace-write")}
 
 def _policy_list(value, name, errs, pattern=None):
     """Pure: clean string array (deduped) or errors appended to errs."""
@@ -19004,54 +19006,80 @@ def policy_validate(doc):
     if network not in ("on", "off"): errs.append(f"network must be on|off (got {network!r})")
     allow = _policy_list(doc.get("allowed_models", []), "allowed_models", errs)
     deny = _policy_list(doc.get("denied_models", []), "denied_models", errs)
-    mcp = _policy_list(doc.get("mcp_allow", []), "mcp_allow", errs, r"[A-Za-z0-9_.-]+")
+    mcp = _policy_list(doc.get("mcp_allow", []), "mcp_allow", errs, r"[A-Za-z0-9_-]+")  # Claude serverName charset
+    ident = doc.get("mcp_identity", {})
+    if not isinstance(ident, dict): errs.append("mcp_identity must be an object: server -> {command} or {url}"); ident = {}
+    for name, spec in ident.items():
+        if name not in mcp: errs.append(f"mcp_identity.{name} has no mcp_allow entry")
+        elif not (isinstance(spec, dict) and len(spec) == 1 and set(spec) <= {"command", "url"}
+                and isinstance(next(iter(spec.values())), str) and next(iter(spec.values())).strip()):
+            errs.append(f"mcp_identity.{name} must be {{command}} or {{url}} with a non-empty string")
     secrets = _policy_list(doc.get("secret_read_ban", []), "secret_read_ban", errs)
     for m in sorted(set(allow) & set(deny)): errs.append(f"model {m!r} is both allowed and denied")
     clean = {"version": 1,
         "permission_floor": floor if floor in POLICY_FLOORS else "edits",
         "allowed_models": allow, "denied_models": deny, "mcp_allow": mcp,
+        "mcp_identity": {k: v for k, v in ident.items() if k in mcp and isinstance(v, dict)},
         "secret_read_ban": secrets,
         "network": network if network in ("on", "off") else "on"}
     return clean, errs
 
 def claude_policy_render(p):
-    """Pure: policy dict -> Claude Code managed-settings.json text."""
+    """Pure: policy dict -> Claude Code managed-settings.json text (only documented keys)."""
     rank = _mode_rank(p.get("permission_floor") or "edits")
-    deny = [f"Read({g})" for g in p.get("secret_read_ban") or []]
-    if (p.get("network") or "on") == "off": deny += ["WebFetch", "WebSearch"]
-    out = {"permissions": {"defaultMode": POLICY_CLAUDE_MODE.get(rank, "acceptEdits")}}
-    if deny: out["permissions"]["deny"] = deny
+    off = (p.get("network") or "on") == "off"
+    deny = [f"Read({'//' + g if g.startswith('**/') else g})" for g in p.get("secret_read_ban") or []]  # //** = any depth
+    if off: deny += ["WebFetch", "WebSearch"]
+    perms = {"defaultMode": POLICY_CLAUDE_MODE.get(rank, "acceptEdits")}
+    if rank < 2 or off:  # bypass/auto would sidestep the floor and the network block
+        perms.update(disableBypassPermissionsMode="disable", disableAutoMode="disable")
+    if deny: perms["deny"] = deny
+    out = {"permissions": perms}
+    if off: out["sandbox"] = {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+        "network": {"allowedDomains": []}}
     if p.get("mcp_allow"):
+        out["allowManagedMcpServersOnly"] = True
+        out["allowedMcpServers"] = [{"serverName": n} for n in p["mcp_allow"]]
         out["enabledMcpjsonServers"] = list(p["mcp_allow"])
-        out["allowedMcpServers"] = list(p["mcp_allow"])
     if p.get("allowed_models"): out["availableModels"] = list(p["allowed_models"])
-    notes = [POLICY_NOTE]
-    if p.get("denied_models"): notes.append("denied_models (no native field): " + ", ".join(p["denied_models"]))
-    out["_agPolicyNotes"] = notes
+    if p.get("denied_models"): out["deniedModels"] = list(p["denied_models"])
     return json.dumps(out, indent=2) + "\n"
 
 def _policy_toml_str(s):
     return json.dumps(s, ensure_ascii=True)  # JSON string == valid TOML basic string here
 
+def _policy_toml_list(xs):
+    return "[" + ", ".join(_policy_toml_str(x) for x in xs) + "]"
+
 def codex_policy_render(p):
-    """Pure: policy dict -> Codex requirements.toml text."""
-    rank = _mode_rank(p.get("permission_floor") or "edits")
-    approval, sandbox = POLICY_CODEX_SANDBOX.get(rank, POLICY_CODEX_SANDBOX[1])
+    """Pure: policy dict -> Codex requirements.toml (admin constraints: lists, not defaults)."""
+    approval, sandbox = POLICY_CODEX_ALLOW.get(_mode_rank(p.get("permission_floor") or "edits"), POLICY_CODEX_ALLOW[1])
     lines = [f"# {POLICY_NOTE}",
-        f"approval_policy = {_policy_toml_str(approval)}",
-        f"sandbox_mode = {_policy_toml_str(sandbox)}"]
-    if p.get("allowed_models"): lines.append("allowed_models = [" + ", ".join(_policy_toml_str(m) for m in p["allowed_models"]) + "]")
-    if p.get("denied_models"): lines.append("denied_models = [" + ", ".join(_policy_toml_str(m) for m in p["denied_models"]) + "]")
-    if p.get("mcp_allow"): lines.append("# mcp_allow (Codex MCP servers live in config.toml, not requirements.toml): " + ", ".join(p["mcp_allow"]))
-    if p.get("secret_read_ban"): lines.append("# secret_read_ban (no requirements.toml field; rely on sandbox_mode): " + ", ".join(p["secret_read_ban"]))
-    lines += ["", "[sandbox_workspace_write]", f"network_access = {'false' if (p.get('network') or 'on') == 'off' else 'true'}"]
+        f"allowed_approval_policies = {_policy_toml_list(approval)}",
+        f"allowed_sandbox_modes = {_policy_toml_list(sandbox)}"]
+    for n in p.get("mcp_allow") or []:
+        ident = (p.get("mcp_identity") or {}).get(n)
+        lines += ["", f"[mcp_servers.{n}]",
+            f"identity = {{ {next(iter(ident))} = {_policy_toml_str(next(iter(ident.values())))} }}" if ident
+            else "# identity missing: set mcp_identity (command or url) or Codex cannot match this server"]
+    if p.get("secret_read_ban"):
+        lines += ["", "[permissions.filesystem]", f"deny_read = {_policy_toml_list(p['secret_read_ban'])}"]
     return "\n".join(lines) + "\n"
+
+def codex_config_render(p):
+    """Pure: policy dict -> Codex config.toml defaults (user-editable; not enforcement)."""
+    approval, sandbox = POLICY_CODEX_DEFAULT.get(_mode_rank(p.get("permission_floor") or "edits"), POLICY_CODEX_DEFAULT[1])
+    return "\n".join([f"# {POLICY_NOTE}",
+        f"approval_policy = {_policy_toml_str(approval)}",
+        f"sandbox_mode = {_policy_toml_str(sandbox)}",
+        "", "[sandbox_workspace_write]",
+        f"network_access = {'false' if (p.get('network') or 'on') == 'off' else 'true'}"]) + "\n"
 
 def policy_render(p, target):
     """Pure: validated policy dict -> (filename, text) for one target."""
-    if target == "claude": return POLICY_FILES[target], claude_policy_render(p)
-    if target == "codex": return POLICY_FILES[target], codex_policy_render(p)
-    raise ValueError(f"unknown policy target: {target}")
+    fns = {"claude": claude_policy_render, "codex": codex_policy_render, "codex-config": codex_config_render}
+    if target not in fns: raise ValueError(f"unknown policy target: {target}")
+    return POLICY_FILES[target], fns[target](p)
 
 def policy_diff(old, new, name):
     """Pure: unified diff old -> new ('' when identical)."""
@@ -19070,14 +19098,14 @@ def do_policy(a):
     policy, errs = policy_validate(doc)
     if errs:
         return emit(a, "policy", error="invalid policy: " + "; ".join(errs),
-            hint="schema: version permission_floor allowed_models denied_models mcp_allow secret_read_ban network")
+            hint="schema: version permission_floor allowed_models denied_models mcp_allow mcp_identity secret_read_ban network")
     if sub == "check":
         txt = (f"policy ok: {fp} (version={policy['version']} floor={policy['permission_floor']} "
             f"network={policy['network']} allow={len(policy['allowed_models'])} deny={len(policy['denied_models'])} "
             f"mcp={len(policy['mcp_allow'])} secret_bans={len(policy['secret_read_ban'])})")
         return emit(a, "policy", dict(policy, file=str(fp), _text=txt))
     target = getattr(a, "target", None) or "all"
-    targets = ["claude", "codex"] if target == "all" else [target]
+    targets = list(POLICY_FILES) if target == "all" else [target]
     rendered = {t: policy_render(policy, t) for t in targets}
     out = getattr(a, "out", None) or ""
     if getattr(a, "dry_run", False):
@@ -19305,7 +19333,7 @@ def build():
     po=sub.add_parser("policy",help="compile an ag-policy.json into backend policy files"); pos=po.add_subparsers(dest="polsub",required=False)
     por=pos.add_parser("render",help="render Claude Code managed settings / Codex requirements")
     por.add_argument("--file",dest="pfile",default="ag-policy.json",help="policy JSON (default ag-policy.json)")
-    por.add_argument("--target",default="all",choices=["claude","codex","all"],help="backend policy file to render")
+    por.add_argument("--target",default="all",choices=list(POLICY_FILES)+["all"],help="backend policy file to render")
     por.add_argument("--out",default=None,help="output directory (default: print to stdout)")
     por.add_argument("--dry-run",dest="dry_run",action="store_true",help="print a unified diff against existing files; write nothing")
     poc=pos.add_parser("check",help="validate a policy file")

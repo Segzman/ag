@@ -541,7 +541,7 @@ Compile one `ag-policy.json` into backend-native policy files. Renderers are pur
 ```sh
 ag policy check --file ag-policy.json                                   # validate; nonzero exit + clear message on bad keys/values
 ag policy render --file ag-policy.json [--target claude|codex|all]      # print to stdout
-ag policy render --file ag-policy.json --target all --out DIR           # write managed-settings.json + requirements.toml
+ag policy render --file ag-policy.json --target all --out DIR           # write managed-settings.json + requirements.toml + codex-config.toml
 ag policy render --file ag-policy.json --target all --out DIR --dry-run # unified diff, writes nothing
 ```
 
@@ -551,16 +551,17 @@ Schema (`version` required, the rest optional; defaults shown):
 {"version": 1,
  "permission_floor": "edits",
  "allowed_models": [], "denied_models": [],
- "mcp_allow": [],
+ "mcp_allow": [], "mcp_identity": {},
  "secret_read_ban": ["~/.ssh/**", "**/.env"],
  "network": "on"}
 ```
 
-- `permission_floor` reuses the dispatch-mode rank (`_mode_rank`): `ro` < `edits` < `auto`. Claude Code gets `permissions.defaultMode` `plan`/`acceptEdits`/`bypassPermissions`; Codex gets `approval_policy` + `sandbox_mode` `on-request`/`read-only`, `on-request`/`workspace-write`, `never`/`workspace-write`.
-- `secret_read_ban` globs become Claude `Read(...)` deny rules. Codex has no equivalent field: they are emitted as comments (the sandbox is the real boundary).
-- `mcp_allow` becomes Claude `enabledMcpjsonServers` + `allowedMcpServers`; Codex lists it as a comment (MCP servers live in `config.toml`).
-- `allowed_models` becomes Claude `availableModels`; `denied_models` has no native field and is emitted as a comment.
-- `network: off` adds Claude `WebFetch`/`WebSearch` deny rules and sets Codex `sandbox_workspace_write.network_access = false`.
+- `permission_floor` reuses the dispatch-mode rank (`_mode_rank`): `ro` < `edits` < `auto`. Claude Code gets `permissions.defaultMode` `plan`/`acceptEdits`/`bypassPermissions`, plus `disableBypassPermissionsMode` and `disableAutoMode` set to `"disable"` for `ro`/`edits` so users cannot switch out of the floor. Codex `requirements.toml` gets list constraints (`allowed_approval_policies`, `allowed_sandbox_modes`); the scalar defaults (`approval_policy`, `sandbox_mode`, `network_access`) go to `codex-config.toml`, which is user-editable and not enforced.
+- `secret_read_ban` globs become Claude `permissions.deny` `Read(...)` rules (`**/` globs become `//**/` so they match at any depth) and Codex `[permissions.filesystem] deny_read`.
+- `mcp_allow` becomes Claude `allowedMcpServers` as `{"serverName": ...}` objects with `allowManagedMcpServersOnly: true`, plus `enabledMcpjsonServers`. Codex gets one `[mcp_servers.<name>]` table per server; its `identity` comes from the optional `mcp_identity` map (`{"command": ...}` or `{"url": ...}`), and a comment flags a missing identity.
+- `allowed_models` becomes Claude `availableModels`; `denied_models` becomes Claude `deniedModels` (managed scope). Codex has no model key, so models are not rendered for Codex.
+- `network: off` adds Claude `WebFetch`/`WebSearch` deny rules and a `sandbox` block (`enabled`, `failIfUnavailable`, empty `allowedDomains`), and sets Codex `[sandbox_workspace_write] network_access = false` in `codex-config.toml`.
+- Rendered files carry no notes key; render output is pure vendor-documented keys only.
 
 Vendor note: field names follow the Claude Code and Codex docs **as of 2026-11**; they are not a stable API. Re-check each vendor release before relying on the rendered file, and treat `--dry-run` diffs as the review surface.
 

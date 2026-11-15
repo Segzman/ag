@@ -23,34 +23,45 @@ SAMPLE = {
 CLAUDE_GOLDEN = """{
   "permissions": {
     "defaultMode": "acceptEdits",
+    "disableBypassPermissionsMode": "disable",
+    "disableAutoMode": "disable",
     "deny": [
       "Read(~/.ssh/**)",
-      "Read(**/.env)"
+      "Read(//**/.env)"
     ]
   },
-  "enabledMcpjsonServers": [
-    "github"
-  ],
+  "allowManagedMcpServersOnly": true,
   "allowedMcpServers": [
+    {
+      "serverName": "github"
+    }
+  ],
+  "enabledMcpjsonServers": [
     "github"
   ],
   "availableModels": [
     "claude-sonnet-4-5"
   ],
-  "_agPolicyNotes": [
-    "ag policy v0: field names follow vendor docs as of 2026-11; re-check them against each release.",
-    "denied_models (no native field): gpt-5"
+  "deniedModels": [
+    "gpt-5"
   ]
 }
 """
 
 CODEX_GOLDEN = """# ag policy v0: field names follow vendor docs as of 2026-11; re-check them against each release.
+allowed_approval_policies = ["on-request"]
+allowed_sandbox_modes = ["read-only", "workspace-write"]
+
+[mcp_servers.github]
+# identity missing: set mcp_identity (command or url) or Codex cannot match this server
+
+[permissions.filesystem]
+deny_read = ["~/.ssh/**", "**/.env"]
+"""
+
+CODEX_CONFIG_GOLDEN = """# ag policy v0: field names follow vendor docs as of 2026-11; re-check them against each release.
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
-allowed_models = ["claude-sonnet-4-5"]
-denied_models = ["gpt-5"]
-# mcp_allow (Codex MCP servers live in config.toml, not requirements.toml): github
-# secret_read_ban (no requirements.toml field; rely on sandbox_mode): ~/.ssh/**, **/.env
 
 [sandbox_workspace_write]
 network_access = true
@@ -90,14 +101,18 @@ class Policy(unittest.TestCase):
         rc, out, err = self.run_do(ns(pfile=str(p), target="codex"))
         self.assertEqual((rc, err), (0, ""))
         self.assertEqual(out, CODEX_GOLDEN)
+        rc, out, err = self.run_do(ns(pfile=str(p), target="codex-config"))
+        self.assertEqual((rc, err, out), (0, "", CODEX_CONFIG_GOLDEN))
 
     def test_renderers_pure_and_targeted(self):
         clean, errs = ag.policy_validate(SAMPLE)
         self.assertEqual(errs, [])
         self.assertEqual(ag.claude_policy_render(clean), CLAUDE_GOLDEN)
         self.assertEqual(ag.codex_policy_render(clean), CODEX_GOLDEN)
+        self.assertEqual(ag.codex_config_render(clean), CODEX_CONFIG_GOLDEN)
         self.assertEqual(ag.policy_render(clean, "claude"), ("managed-settings.json", CLAUDE_GOLDEN))
         self.assertEqual(ag.policy_render(clean, "codex"), ("requirements.toml", CODEX_GOLDEN))
+        self.assertEqual(ag.policy_render(clean, "codex-config"), ("codex-config.toml", CODEX_CONFIG_GOLDEN))
         with self.assertRaises(ValueError):
             ag.policy_render(clean, "gemini")
 
@@ -108,27 +123,30 @@ class Policy(unittest.TestCase):
             self.assertEqual(errs, [])
             ranks[floor] = ag._mode_rank(floor)
             self.assertEqual(ag.POLICY_CLAUDE_MODE[ranks[floor]], {"ro": "plan", "edits": "acceptEdits", "auto": "bypassPermissions"}[floor])
-            approval, sandbox = ag.POLICY_CODEX_SANDBOX[ranks[floor]]
+            approval, sandbox = ag.POLICY_CODEX_DEFAULT[ranks[floor]]
             self.assertEqual((approval, sandbox), {
                 "ro": ("on-request", "read-only"),
                 "edits": ("on-request", "workspace-write"),
                 "auto": ("never", "workspace-write")}[floor])
+            self.assertEqual(ag.POLICY_CODEX_ALLOW[ranks[floor]][0], {"ro": ["on-request"], "edits": ["on-request"], "auto": ["never"]}[floor])
         self.assertEqual([ranks[f] for f in ("ro", "edits", "auto")], [0, 1, 2])
 
     def test_network_off_adds_fetch_denies(self):
         clean, errs = ag.policy_validate({"version": 1, "secret_read_ban": ["**/.env"], "network": "off"})
         self.assertEqual(errs, [])
         doc = json.loads(ag.claude_policy_render(clean))
-        self.assertIn("Read(**/.env)", doc["permissions"]["deny"])
+        self.assertIn("Read(//**/.env)", doc["permissions"]["deny"])
         self.assertIn("WebFetch", doc["permissions"]["deny"])
         self.assertIn("WebSearch", doc["permissions"]["deny"])
-        self.assertIn("network_access = false", ag.codex_policy_render(clean))
+        self.assertEqual(doc["sandbox"]["network"], {"allowedDomains": []})
+        self.assertTrue(doc["sandbox"]["failIfUnavailable"])
+        self.assertIn("network_access = false", ag.codex_config_render(clean))
 
     def test_defaults(self):
         clean, errs = ag.policy_validate({"version": 1})
         self.assertEqual(errs, [])
         self.assertEqual(clean, {"version": 1, "permission_floor": "edits", "allowed_models": [],
-            "denied_models": [], "mcp_allow": [], "secret_read_ban": [], "network": "on"})
+            "denied_models": [], "mcp_allow": [], "mcp_identity": {}, "secret_read_ban": [], "network": "on"})
 
     def test_validator_unknown_keys_and_bad_values(self):
         self.assertIn("policy must be a JSON object", self.errs([])[0])
@@ -148,6 +166,19 @@ class Policy(unittest.TestCase):
             for e in self.errs({"version": 1, "mcp_allow": ["bad name"]})))
         self.assertTrue(any("both allowed and denied" in e
             for e in self.errs({"version": 1, "allowed_models": ["m"], "denied_models": ["m"]})))
+
+    def test_mcp_names_and_identity(self):
+        self.assertTrue(any("mcp_allow[0] has a bad value" in e
+            for e in self.errs({"version": 1, "mcp_allow": ["a.b"]})))  # serverName charset is [A-Za-z0-9_-]
+        clean, errs = ag.policy_validate({"version": 1, "mcp_allow": ["gh"], "mcp_identity": {"gh": {"command": "npx"}}})
+        self.assertEqual((errs, clean["mcp_identity"]), ([], {"gh": {"command": "npx"}}))
+        self.assertIn('identity = { command = "npx" }', ag.codex_policy_render(clean))
+        self.assertTrue(any("has no mcp_allow entry" in e
+            for e in self.errs({"version": 1, "mcp_identity": {"gh": {"url": "https://x"}}})))
+        self.assertTrue(any("must be {command} or {url}" in e
+            for e in self.errs({"version": 1, "mcp_allow": ["gh"], "mcp_identity": {"gh": {"url": "u", "command": "c"}}})))
+        self.assertTrue(any("mcp_identity must be an object" in e
+            for e in self.errs({"version": 1, "mcp_identity": []})))
 
     def test_duplicates_are_deduped(self):
         clean, errs = ag.policy_validate({"version": 1, "allowed_models": ["m", "m"], "mcp_allow": ["x", "x"]})
@@ -177,6 +208,7 @@ class Policy(unittest.TestCase):
         self.assertIn("wrote", out)
         self.assertEqual((outdir / "managed-settings.json").read_text(), CLAUDE_GOLDEN)
         self.assertEqual((outdir / "requirements.toml").read_text(), CODEX_GOLDEN)
+        self.assertEqual((outdir / "codex-config.toml").read_text(), CODEX_CONFIG_GOLDEN)
 
         # unchanged policy -> no diff, files untouched
         rc, out, err = self.run_do(ns(pfile=str(p), out=str(outdir), dry_run=True))
@@ -190,8 +222,8 @@ class Policy(unittest.TestCase):
         self.assertEqual((rc, err), (0, ""))
         self.assertIn("--- a/", out)
         self.assertIn("+++ b/", out)
-        self.assertIn("network_access = false", out)
         self.assertIn('"WebFetch"', out)
+        self.assertIn('"sandbox"', out)
         self.assertEqual((outdir / "requirements.toml").read_text(), before)
 
     def test_policy_diff_pure(self):

@@ -78,7 +78,8 @@ OR_SITE_URL
 OR_UA
 PAIR_ROLES
 POLICY_CLAUDE_MODE
-POLICY_CODEX_SANDBOX
+POLICY_CODEX_ALLOW
+POLICY_CODEX_DEFAULT
 POLICY_FILES
 POLICY_FLOORS
 POLICY_KEYS
@@ -446,6 +447,7 @@ _parse_opencode_verbose
 _pick
 _pid_alive
 _policy_list
+_policy_toml_list
 _policy_toml_str
 _prepare_tracked
 _proj_of
@@ -760,6 +762,7 @@ classify_turn_failure
 claude_policy_render
 clear_agent_sid
 cmd_hash
+codex_config_render
 codex_policy_render
 compact_advanced_rows
 compact_apply_edit

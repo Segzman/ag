@@ -7,7 +7,7 @@ All commands accept --json for machine-readable output:
   {"ok": true, "cmd": "run", "data": {...}}
   {"ok": false, "cmd": "run", "error": "...", "hint": "..."}
 """
-import argparse, difflib, fnmatch, hashlib, json, os, re, shlex, shutil, subprocess, sys, threading, time
+import argparse, base64, difflib, fnmatch, hashlib, json, os, re, shlex, shutil, signal, socket, struct, subprocess, sys, threading, time, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1976,6 +1976,279 @@ def do_needs(a):
         hit["status"] = "closed"; hit["done_ts"] = now_iso()
     _needs_save(sdir, rows)
     return emit(a, "needs", {"_text": f"{a.id} {k}", "need": hit})
+
+# ---- ag browser: per-agent isolated Chrome over CDP (stdlib RFC 6455 client, no deps) ----
+class BrowserError(Exception):
+    def __init__(self, msg, hint=None): super().__init__(msg); self.hint = hint
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_BR_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # localhost only; ignore http_proxy
+
+def ws_accept(key): return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+
+def _ws_xor(data, key):
+    return (int.from_bytes(data, "big") ^ int.from_bytes((key * (len(data) // 4 + 1))[:len(data)], "big")).to_bytes(len(data), "big")
+
+def ws_frame(payload, opcode=0x1, mask=True):
+    """One final frame. Clients must mask (RFC 6455 5.3)."""
+    data = payload.encode() if isinstance(payload, str) else bytes(payload)
+    n, m = len(data), (0x80 if mask else 0)
+    if n < 126: head = bytes([0x80 | opcode, m | n])
+    elif n < 65536: head = bytes([0x80 | opcode, m | 126]) + struct.pack(">H", n)
+    else: head = bytes([0x80 | opcode, m | 127]) + struct.pack(">Q", n)
+    if not mask: return head + data
+    key = os.urandom(4)
+    return head + key + _ws_xor(data, key)
+
+def ws_parse(buf):
+    """(fin, opcode, payload, used) for the frame at buf[0:], or None if incomplete. Masked or not."""
+    if len(buf) < 2: return None
+    n, pos = buf[1] & 0x7F, 2
+    if n == 126:
+        if len(buf) < 4: return None
+        n, pos = struct.unpack(">H", bytes(buf[2:4]))[0], 4
+    elif n == 127:
+        if len(buf) < 10: return None
+        n, pos = struct.unpack(">Q", bytes(buf[2:10]))[0], 10
+    key = None
+    if buf[1] & 0x80:
+        if len(buf) < pos + 4: return None
+        key, pos = bytes(buf[pos:pos + 4]), pos + 4
+    if len(buf) < pos + n: return None
+    payload = bytes(buf[pos:pos + n])
+    return bool(buf[0] & 0x80), buf[0] & 0x0F, _ws_xor(payload, key) if key else payload, pos + n
+
+class WS:
+    def __init__(self, url, timeout=30):
+        u = urllib.parse.urlsplit(url); port = u.port or 80
+        self.sock = socket.create_connection((u.hostname, port), timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {u.hostname}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk: raise BrowserError("websocket handshake: connection closed")
+            buf += chunk
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        hdr = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:])}
+        if lines[0].split()[1:2] != ["101"] or hdr.get("sec-websocket-accept") != ws_accept(key):
+            raise BrowserError(f"websocket handshake failed: {lines[0]}")
+        self.buf = bytearray(rest)
+
+    def _fill(self):
+        data = self.sock.recv(65536)
+        if not data: raise BrowserError("websocket closed")
+        self.buf += data
+
+    def send(self, text): self.sock.sendall(ws_frame(text))
+
+    def recv(self):
+        parts = []
+        while True:
+            r = ws_parse(self.buf)
+            if r is None: self._fill(); continue
+            fin, op, payload, used = r
+            del self.buf[:used]
+            if op == 0x8: raise BrowserError("websocket closed by peer")
+            if op == 0x9: self.sock.sendall(ws_frame(payload, 0xA)); continue
+            if op == 0xA: continue
+            parts.append(payload)  # text (0x1) or continuation (0x0)
+            if fin: return b"".join(parts).decode()
+
+    def close(self):
+        try: self.sock.sendall(ws_frame(b"", 0x8))
+        except OSError: pass
+        self.sock.close()
+
+class Cdp:
+    def __init__(self, url): self.ws, self.n, self.events = WS(url), 0, []
+
+    def call(self, method, **params):
+        self.n += 1; mid = self.n
+        self.ws.send(json.dumps({"id": mid, "method": method, "params": params}))
+        while True:
+            msg = json.loads(self.ws.recv())
+            if msg.get("id") == mid:
+                if "error" in msg: raise BrowserError(f"{method}: {msg['error'].get('message', 'error')}")
+                return msg.get("result", {})
+            if "method" in msg: self.events.append(msg)
+
+    def wait_event(self, name, timeout=10):
+        hit = next((e["params"] for e in self.events if e["method"] == name), None)
+        self.ws.sock.settimeout(timeout)
+        try:
+            while hit is None:
+                msg = json.loads(self.ws.recv())
+                if msg.get("method") == name: hit = msg["params"]
+        except socket.timeout: raise BrowserError(f"timed out waiting for {name}")
+        return hit
+
+    def close(self): self.ws.close()
+
+def _br_dir(a): return state_dir(a.dir) / "browser"
+def _br_reg(a): return _json_or_empty(_br_dir(a) / "registry.json")
+def _br_save(a, reg): _put_file(_br_dir(a) / "registry.json", json.dumps(reg, indent=1))
+
+def _br_http(port, path, method="GET"):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+    with _BR_HTTP.open(req, timeout=5) as r: return json.loads(r.read())
+
+def _br_alive(port):
+    if not port: return False
+    try: _br_http(port, "/json/version"); return True
+    except (OSError, ValueError): return False
+
+def _br_chrome(path=None):
+    names = [path] if path else (["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"] if sys.platform == "darwin"
+        else ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"])
+    for n in names:
+        if os.path.isfile(n): return n
+        if shutil.which(n): return shutil.which(n)
+    return None
+
+def _br_launch(a, reg):
+    chrome = _br_chrome(a.chrome)
+    if not chrome: raise BrowserError("Chrome not found", hint="install Google Chrome/chromium or pass --chrome PATH")
+    profile = _br_dir(a) / a.name
+    profile.mkdir(parents=True, exist_ok=True)
+    (profile / "DevToolsActivePort").unlink(missing_ok=True)
+    args = [chrome, "--headless=new"] if not a.headed else [chrome]
+    args += [f"--user-data-dir={profile}", "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check", "about:blank"]
+    proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.time() + 30
+    while True:
+        try: port = int((profile / "DevToolsActivePort").read_text().split()[0])
+        except (OSError, ValueError, IndexError): port = None
+        if port and _br_alive(port): break
+        if proc.poll() is not None: raise BrowserError(f"Chrome exited with {proc.returncode}", hint="another Chrome may hold this profile")
+        if time.time() > deadline: raise BrowserError("Chrome did not open DevTools within 30s")
+        time.sleep(0.2)
+    reg[a.name] = {"pid": proc.pid, "port": port, "headed": bool(a.headed)}
+    _br_save(a, reg)
+    return port
+
+def _br_connect(port):
+    pages = [t for t in _br_http(port, "/json/list") if t.get("type") == "page"]
+    if not pages: pages = [_br_http(port, "/json/new?about:blank", "PUT")]
+    c = Cdp(pages[0]["webSocketDebuggerUrl"])
+    for d in ("Page", "DOM", "Accessibility"): c.call(f"{d}.enable")
+    return c
+
+def _br_running(a):
+    cur = _br_reg(a).get(a.name)
+    if not cur or not _br_alive(cur.get("port")): raise BrowserError(f"browser {a.name!r} is not running", hint=f"ag browser open {a.name} URL")
+    return cur["port"]
+
+def _br_eval(c, js):
+    r = c.call("Runtime.evaluate", expression=js, returnByValue=True, awaitPromise=True)
+    if "exceptionDetails" in r:
+        d = r["exceptionDetails"]
+        raise BrowserError("eval: " + (d.get("exception", {}).get("description") or d.get("text", "exception")).splitlines()[0])
+    return r.get("result", {}).get("value")
+
+def _br_ready(c, timeout=30):
+    deadline = time.time() + timeout
+    while _br_eval(c, "document.readyState") != "complete":
+        if time.time() > deadline: raise BrowserError("page did not finish loading")
+        time.sleep(0.2)
+
+def _br_locate(c, css=None, role=None, aname=None):
+    """backendNodeId of the first element matching a CSS selector, or of the first AX node with role + accessible name."""
+    root = c.call("DOM.getDocument", depth=0)["root"]
+    if css:
+        nid = c.call("DOM.querySelector", nodeId=root["nodeId"], selector=css)["nodeId"]
+        if not nid: raise BrowserError(f"no element matches {css!r}")
+        return c.call("DOM.describeNode", nodeId=nid)["node"]["backendNodeId"]
+    nodes = c.call("Accessibility.queryAXTree", backendNodeId=root["backendNodeId"], role=role, accessibleName=aname)["nodes"]
+    hit = next((n["backendDOMNodeId"] for n in nodes if n.get("backendDOMNodeId")), None)
+    if hit is None: raise BrowserError(f"no element role={role} name={aname!r}", hint="check the name with: ag browser snap NAME --text")
+    return hit
+
+def _br_press(c, backend):
+    c.call("DOM.scrollIntoViewIfNeeded", backendNodeId=backend)
+    q = c.call("DOM.getBoxModel", backendNodeId=backend)["model"]["content"]
+    x, y = (q[0] + q[2] + q[4] + q[6]) / 4, (q[1] + q[3] + q[5] + q[7]) / 4
+    for t in ("mousePressed", "mouseReleased"): c.call("Input.dispatchMouseEvent", type=t, x=x, y=y, button="left", clickCount=1)
+    return x, y
+
+def _br_out(a, data, text): return emit(a, "browser", data) if getattr(a, "json", False) else emit(a, "browser", {"_text": text})
+
+def _br_open(a):
+    reg = _br_reg(a); cur = reg.get(a.name)
+    if cur and _br_alive(cur.get("port")):
+        if bool(a.headed) != cur.get("headed"): raise BrowserError(f"{a.name!r} already running {'headed' if cur.get('headed') else 'headless'}", hint=f"ag browser close {a.name} first")
+    else: _br_launch(a, reg)
+    c = _br_connect(reg[a.name]["port"])
+    r = c.call("Page.navigate", url=a.url)
+    if r.get("errorText"): raise BrowserError(f"navigate: {r['errorText']}")
+    _br_ready(c)
+    url = _br_eval(c, "location.href"); c.close()
+    return _br_out(a, {"name": a.name, "url": url, "headed": reg[a.name]["headed"]}, f"{a.name} {url}")
+
+def _br_eval_cmd(a):
+    c = _br_connect(_br_running(a)); v = _br_eval(c, a.js); c.close()
+    return _br_out(a, {"value": v}, v if isinstance(v, str) else json.dumps(v))
+
+def _br_click(a):
+    if a.css and (a.role or a.aname): raise BrowserError("use --css or --role/--name, not both")
+    if not a.css and not (a.role and a.aname): raise BrowserError("click needs --css SEL or --role R --name TEXT")
+    c = _br_connect(_br_running(a))
+    x, y = _br_press(c, _br_locate(c, a.css, a.role, a.aname)); c.close()
+    return _br_out(a, {"clicked": True, "x": x, "y": y}, "clicked")
+
+def _br_type(a):
+    c = _br_connect(_br_running(a)); c.call("Input.insertText", text=a.text); c.close()
+    return _br_out(a, {"typed": len(a.text)}, "typed")
+
+def _br_upload(a):
+    path = os.path.abspath(a.file)
+    if not os.path.isfile(path): raise BrowserError(f"no such file: {a.file}")
+    c = _br_connect(_br_running(a))
+    c.call("Page.setInterceptFileChooserDialog", enabled=True)
+    backend = _br_locate(c, css=a.css)
+    node = c.call("DOM.describeNode", backendNodeId=backend)["node"]
+    attrs = node.get("attributes", [])
+    if not (node.get("localName") == "input" and dict(zip(attrs[::2], attrs[1::2])).get("type") == "file"):
+        _br_press(c, backend)  # a button that opens a native chooser: the intercepted chooser names the input
+        backend = c.wait_event("Page.fileChooserOpened")["backendNodeId"]
+    c.call("DOM.setFileInputFiles", files=[path], backendNodeId=backend); c.close()
+    return _br_out(a, {"uploaded": os.path.basename(path)}, f"uploaded {os.path.basename(path)}")
+
+def _br_snap(a):
+    c = _br_connect(_br_running(a))
+    data = _br_eval(c, "({url: location.href, title: document.title})")
+    if a.text: data["text"] = (_br_eval(c, "document.body ? document.body.innerText : ''") or "")[:MAX_OUT]
+    if a.png: Path(a.png).write_bytes(base64.b64decode(c.call("Page.captureScreenshot", format="png")["data"])); data["png"] = a.png
+    c.close()
+    text = data["text"] if a.text else f"wrote {a.png}" if a.png else f"{data['url']} {data['title']}"
+    return _br_out(a, data, text)
+
+def _br_list(a):
+    rows = {n: {"pid": r.get("pid"), "headed": r.get("headed"), "alive": _br_alive(r.get("port"))} for n, r in sorted(_br_reg(a).items())}
+    return _br_out(a, rows, "\n".join(f"{n} alive={r['alive']} headed={r['headed']}" for n, r in rows.items()) or "no browsers")
+
+def _br_close(a):
+    reg = _br_reg(a); cur = reg.pop(a.name, None)
+    if cur is None: raise BrowserError(f"no browser {a.name!r}")
+    try: os.kill(cur["pid"], signal.SIGTERM)
+    except OSError: pass
+    for _ in range(50):
+        if not _br_alive(cur.get("port")): break
+        time.sleep(0.1)
+    _br_save(a, reg)  # profile stays: the next open for NAME reuses cookies and logins
+    return _br_out(a, {"closed": a.name}, f"closed {a.name}")
+
+def do_browser(a):
+    name = getattr(a, "name", "")
+    if name and not re.fullmatch(r"[\w.-]+", name): return emit(a, "browser", error=f"bad name {name!r}", hint="letters, digits, . _ - only")
+    fns = {"open": _br_open, "eval": _br_eval_cmd, "click": _br_click, "type": _br_type, "upload": _br_upload,
+        "snap": _br_snap, "list": _br_list, "close": _br_close}
+    try: return fns[a.browser_cmd](a)
+    except BrowserError as e: return emit(a, "browser", error=str(e), hint=e.hint)
+    except (OSError, ValueError) as e: return emit(a, "browser", error=str(e))
 
 def do__sudo(a):
     """PATH shim target: exec the real sudo, adding -A so it uses askpass."""
@@ -19158,6 +19431,15 @@ def build():
             u.add_argument("--queue", action="store_true", help="also record this request in needs.jsonl (open until answered; timeout always queues)")
             u.add_argument("--needs-id", dest="needs_id", default="", metavar="ID", help="return the recorded answer for this need instead of popping a dialog (re-check after a timeout)")
             u.add_argument("--agent", default="", help="agent the queued need is attributed to (default $AG_PARENT_AGENT)")
+    br = sub.add_parser("browser", help="per-agent isolated Chrome over CDP (open|eval|click|type|upload|snap|list|close)"); brs = br.add_subparsers(dest="browser_cmd", required=True)
+    b = brs.add_parser("open", help="start (or reuse) NAME's Chrome and navigate to URL"); b.add_argument("name"); b.add_argument("url"); b.add_argument("--headed", action="store_true", help="show the window (default headless)"); b.add_argument("--chrome", default=None, metavar="PATH", help="Chrome binary (default: Google Chrome, google-chrome, chromium)")
+    b = brs.add_parser("eval", help="evaluate JS in NAME's page; prints the value"); b.add_argument("name"); b.add_argument("js")
+    b = brs.add_parser("click", help="trusted mouse click on --css SEL, or --role R --name TEXT"); b.add_argument("name"); b.add_argument("--css", default=None); b.add_argument("--role", default=None); b.add_argument("--name", dest="aname", default=None, metavar="TEXT")
+    b = brs.add_parser("type", help="insert TEXT into the focused element (click it first)"); b.add_argument("name"); b.add_argument("text")
+    b = brs.add_parser("upload", help="set FILE on --css input[type=file]; a button that opens a native chooser is clicked and the chooser answered"); b.add_argument("name"); b.add_argument("--css", required=True); b.add_argument("file")
+    b = brs.add_parser("snap", help="page URL and title; --text adds innerText; --png FILE writes a screenshot"); b.add_argument("name"); b.add_argument("--png", default=None, metavar="FILE"); b.add_argument("--text", action="store_true")
+    brs.add_parser("list", help="browsers in the registry and whether each answers")
+    b = brs.add_parser("close", help="stop NAME's Chrome (profile kept)"); b.add_argument("name")
     su = sub.add_parser("_sudo",help=argparse.SUPPRESS); su.add_argument("args",nargs=argparse.REMAINDER)
     sn = sub.add_parser("snap",help="snapshot live output (many readers OK)"); sn.add_argument("sess"); sn.add_argument("--lines",type=int,default=40); sn.add_argument("--since",type=int,default=None,help="byte offset from prior snap"); sn.add_argument("--clean",action="store_true",help="strip ANSI codes")
     sub.add_parser("sessions",help="list sessions")
@@ -20010,7 +20292,7 @@ def main(argv=None):
         "handoff":do_handoff,"hosts":do_hosts,"sync":do_sync,
         "tui":do_tui,"attach":do_attach,"forget":do_forget,"keys":do_keys,"providers":do_providers,
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
-        "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"_sudo":do__sudo,"update":do_update,
+        "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"browser":do_browser,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"channel":do_channel,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
         "access":do_access,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link}[a.subcmd]
     maybe_auto_update(a.subcmd)

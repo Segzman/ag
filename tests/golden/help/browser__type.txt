@@ -1,0 +1,8 @@
+usage: ag browser type [-h] name text
+
+positional arguments:
+  name
+  text
+
+options:
+  -h, --help  show this help message and exit

@@ -1,0 +1,10 @@
+usage: ag browser open [-h] [--headed] [--chrome PATH] name url
+
+positional arguments:
+  name
+  url
+
+options:
+  -h, --help     show this help message and exit
+  --headed       show the window (default headless)
+  --chrome PATH  Chrome binary (default: Google Chrome, google-chrome, chromium)

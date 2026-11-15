@@ -41,6 +41,7 @@ Single-file Python CLI, stdlib only, POSIX. Binary: `{{AG}}`. Delegating to othe
 - `references/pty-sessions.md` - snap offsets, stale daemon sessions, `forget`, `spawn --wake`, events details.
 - `references/run-approvals.md` - dangerous-run blocking, approval lifetime, rtk compaction, small file ops.
 - `references/secrets-ui.md` - secret prompts, askpass, `ui` dialogs, `notify` inbox.
+- `references/browser.md` - `browser` open/eval/click/type/upload/snap: per-agent Chrome over CDP.
 - `references/keys-providers.md` - Keychain `keys`, `providers`, `api` backend, ollama/lmstudio.
 - `references/models-privacy.md` - `ag models` flags/ranking/openrouter, data-privacy rule + zdr/retain/train table.
 - `references/setup-update.md` - `ag setup` flags and UIs, `ag update`, `ag push`.

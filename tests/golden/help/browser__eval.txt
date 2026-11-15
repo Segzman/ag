@@ -1,0 +1,8 @@
+usage: ag browser eval [-h] name js
+
+positional arguments:
+  name
+  js
+
+options:
+  -h, --help  show this help message and exit

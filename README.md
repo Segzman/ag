@@ -10,7 +10,7 @@ State lives in `./.agent/` (override: `--dir`, `$AGENT_CLI_DIR`). Every command 
 ## Contents
 
 - [Quickstart](#quickstart) · [Capability matrix](#capability-matrix)
-- [Part 1 — CLI](#part-1--cli): [Install and updates](#install) · [State dir](#state-dir) · [Sessions](#sessions-pty) · [run / approvals / rtk](#run-approvals-rtk) · [Secrets](#secrets) · [Talk to the user](#talk-to-the-user-ag-ui) · [Notes / todos](#notes-and-todos) · [Models](#models) · [Setup](#setup) · [TUI](#tui)
+- [Part 1 — CLI](#part-1--cli): [Install and updates](#install) · [State dir](#state-dir) · [Sessions](#sessions-pty) · [run / approvals / rtk](#run-approvals-rtk) · [Secrets](#secrets) · [Talk to the user](#talk-to-the-user-ag-ui) · [Browser](#browser-ag-browser) · [Notes / todos](#notes-and-todos) · [Models](#models) · [Setup](#setup) · [TUI](#tui)
 - [Part 2 — Agents](#part-2--agents): [Roster and env](#roster-and-backends) · [Capabilities / modes](#capabilities-and-permission-modes) · [ACP](#acp-transport) · [Routing](#routing) · [Delegation / wake](#delegation-and-wake) · [Cohorts](#delegated-completion-cohorts) · [Queue / stop / steer](#queue-stop-steer) · [Scheduled tasks](#scheduled-tasks) · [Reliability](#reliability) · [Reap / ps](#reap-lost-wakes-process-view) · [Isolation](#isolation-worktree-per-agent) · [Checkpoints](#checkpoints) · [Usage](#usage) · [Context](#context-and-handoff) · [Multi-host](#multi-host) · [Harness profiles](#harness-profiles) · [Roles](#roles)
 - [Docs](#docs) · [Limitations](#limitations-honest)
 
@@ -145,6 +145,26 @@ ag needs done ID                                    # close an item
 - On timeout the call still exits 2 but prints the queued id: `timeout — queued <id>; answer with: ag needs answer <id> VALUE`. Answered dialogs recorded via `--queue` keep their answer too.
 - `ag ui ask|choose|confirm ... --needs-id ID` returns the recorded answer immediately (exit 0) once one exists, so an agent can re-check after the user catches up.
 - While items are open, a single "N things need you" notification goes to the notify inbox at most once per 10 minutes.
+
+## Browser (`ag browser`)
+
+Per-agent isolated Chrome driven over the DevTools Protocol. Each NAME gets its own profile under `<state>/browser/NAME/` (cookies and logins persist across `open`), headless unless `--headed`.
+
+```sh
+ag browser open NAME URL [--headed] [--chrome PATH]        # start or reuse NAME's Chrome, navigate
+ag browser eval NAME JS                                    # evaluate JS in the page; prints the value
+ag browser click NAME --role R --name TEXT | --css SEL     # trusted mouse click at the element center
+ag browser type NAME TEXT                                  # Input.insertText into the focused element
+ag browser upload NAME --css SEL FILE                     # <input type=file>; a button that opens a native chooser is clicked and answered
+ag browser snap NAME [--png FILE] [--text]                 # URL and title; --text adds innerText; --png writes a screenshot
+ag browser list                                            # registry: alive, headed
+ag browser close NAME                                      # stop NAME's Chrome; profile kept
+```
+
+- Chrome: `/Applications/Google Chrome.app` on macOS, else `google-chrome`/`chromium` on PATH; `--chrome PATH` overrides. POSIX only, stdlib only (a minimal WebSocket client talks CDP directly).
+- `click` resolves the target by CSS or by accessibility role and name, then dispatches press/release at its center. `type` inserts into whatever has focus, so click the field first.
+- `eval` and `snap` never read cookies; `eval` runs whatever JS you pass. Output is JSON with `--json`.
+- Exit 1 with `error:` on a missing browser, unknown element, or no Chrome (hint: `--chrome PATH`).
 
 ## Keys and providers
 

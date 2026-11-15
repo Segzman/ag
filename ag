@@ -12430,6 +12430,7 @@ def _do_relay_say(a, cfg):
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", peer): return err(f"bad --peer {peer!r}")
     if peer == cfg["node"]: return err("--peer must name a different relay node")
     sdir = state_dir(a.dir); ensure_state(sdir)
+    if name in st["names"]: _relay_ensure_echo_agent(sdir, name)  # claim's echo agent lives in the cwd-relative state dir
     row = next((r for r in load_agents(sdir) if r.get("name") == name), None)
     if row is None: return err(f"no such agent: {name}", f"ag relay name claim {name}")
     text = f"[from {name}] {msg}"

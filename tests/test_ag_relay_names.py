@@ -146,6 +146,16 @@ class Names(Env):
         p = self.run_ag(self.o, "relay", "say", "x", "--name", "coop", "--peer", "mac", ok=False)
         self.assertIn("different relay node", p.stdout + p.stderr)
 
+    def test_say_recreates_echo_agent_from_another_state_dir(self):
+        # claim and say may run from different cwds (cwd-relative state dir): say must not fail "no such agent"
+        self.init(self.t); self.init(self.o)
+        self.j(self.o, "relay", "name", "claim", "coop", "--session", "s1")
+        af = Path(self.o["state"]) / "agents.json"
+        af.write_text(json.dumps([r for r in json.loads(af.read_text()) if r.get("name") != "coop"]))
+        p, d = self.j(self.o, "relay", "say", "still here", "--session", "s1")
+        self.assertEqual(d["data"]["peer"], "muse")
+        self.assertIn("coop", [r.get("name") for r in json.loads(af.read_text())])
+
 
 if __name__ == "__main__":
     import unittest

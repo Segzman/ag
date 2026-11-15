@@ -221,6 +221,7 @@ _LINK_DIRS
 _LINK_PAGE
 _LINK_RESCAN_S
 _MD_FIELDS
+_MODEL_CATALOG_MAX_AGE_S
 _OR_DROPS
 _OR_PARTS
 _OR_POLICY_RE
@@ -309,6 +310,7 @@ _br_type
 _br_upload
 _budget_path
 _cached_remote
+_catalog_fresh
 _cell_clusters
 _chan_meta
 _chan_paths
@@ -464,6 +466,7 @@ _notify_set_dir
 _notify_target_dir
 _notify_write
 _opencode_bin
+_opencode_error_message
 _opencode_variants_fetch
 _or_date
 _or_fetch_all
@@ -1028,6 +1031,7 @@ merge_agent_env
 mode_env
 mode_flags
 mode_warning
+model_check
 model_choices
 model_default_variant
 model_privacy

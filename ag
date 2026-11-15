@@ -1059,6 +1059,10 @@ def do__wake_run(a):
     message = job.get("message", "")
 
     def _mark_failed(reason, code=1, fields=None):
+        # the worker runs in a tracked pty session: print the failure so `ag snap`
+        # shows the cause instead of "(no output yet)" when the backend dies.
+        try: print(f"[wake {jid}] failed: {reason} (backend exit {code})", flush=True)
+        except Exception: pass
         try: _wake_finish(sdir, jid, "failed", error=reason, exit_code=code, fields=fields)
         except Exception: pass
 
@@ -1145,8 +1149,7 @@ def do__wake_run(a):
         _wvf = {"verify": r["verify"]}
     _we = {"backend_stderr": str(r.get("stderr") or "")[-8000:]} if r.get("stderr") else {}
     if r.get("timed_out"):
-        _wake_finish(sdir, jid, "failed", error=r.get("error", "max-runtime exceeded"),
-            exit_code=124, fields={"timed_out": True, **_wvf, **_we})
+        _mark_failed(r.get("error", "max-runtime exceeded"), 124, fields={"timed_out": True, **_wvf, **_we})
         return 1
     _wp = None if job.get("no_park") else _usage_park_epoch(r)
     if _wp:  # plan cap with a parsed reset: park for the scheduler tick, not a failure
@@ -1156,15 +1159,16 @@ def do__wake_run(a):
             fields={"usage_limit": True, "resume_at": _wp, "usage_reset_at": r.get("reset_at"), **_wvf, **_we})
         return 0
     if "error" in r:
-        _mark_failed(r["error"], r.get("exit", 1) if isinstance(r.get("exit"), int) else 1, fields=_wvf or None)
+        # carry backend_stderr too: error-dict failures (preflight, usage-limit)
+        # previously dropped it, so the job held no backend error text at all.
+        _mark_failed(r["error"], r.get("exit", 1) if isinstance(r.get("exit"), int) else 1, fields={**_wvf, **_we} if (_wvf or _we) else None)
         return 1
     if r.get("interrupted"):
-        _wake_finish(sdir, jid, "failed", error="interrupted", exit_code=130, fields={"interrupted": True, **_wvf, **_we}); return 1
+        _mark_failed("interrupted", 130, fields={"interrupted": True, **_wvf, **_we}); return 1
     code = r.get("exit", 0)
     if code != 0:
         excerpt = " ".join(str(r.get("reply") or "").split())[:160]
-        _wake_finish(sdir, jid, "failed", error=f"backend exit {code}" + (f": {excerpt}" if excerpt else ""),
-            exit_code=code, fields={**_wvf, **_we} or None)
+        _mark_failed(f"backend exit {code}" + (f": {excerpt}" if excerpt else ""), code, fields={**_wvf, **_we} or None)
         return 1
     _wake_finish(sdir, jid, "done", reply=r.get("reply", ""), fields=_wvf or None)
     return 0
@@ -1339,7 +1343,9 @@ def do_wakes(a):
         f'{str(j.get("session") or "-"):7} trig={j.get("trigger") or "-"} '
         f'exit={j.get("backend_exit", j.get("exit", "-"))} '
         + (f'resume={_sched_ts(int(j["resume_at"]))} ' if j.get("status") == "parked" and j.get("resume_at") else "")
-        + f'{(j.get("message","") or "")[:60]}' for j in rows) or "(none)"
+        + f'{(j.get("message","") or "")[:60]}'
+        + (f' error={(j.get("error") or "")[:120]}' if j.get("status") == "failed" and j.get("error") else "")
+        for j in rows) or "(none)"
     return emit(a, "wakes", {"_text": txt})
 
 def do_wakes_wait(a, sdir):
@@ -5633,6 +5639,23 @@ def _parse_claude(line):
         return [("done",f'{o.get("subtype","")} cost=${o.get("total_cost_usd") or 0:.3f}')]
     return []
 
+def _opencode_error_message(err):
+    """Provider message out of an opencode {"type":"error","error":...} event.
+    Shapes seen: {"data":{"message":...,"ref":...}} (retired model, free-tier 403),
+    {"message":...}, or a plain string. Pure; unparseable -> "" (caller falls back)."""
+    if isinstance(err, str):
+        return err.strip()[:500]
+    if not isinstance(err, dict):
+        return ""
+    data = err.get("data") if isinstance(err.get("data"), dict) else {}
+    msg = (data.get("message") or err.get("message") or err.get("name") or "").strip()
+    if not msg:
+        return ""
+    ref = data.get("ref")
+    if isinstance(ref, str) and ref.strip():
+        msg = f"{msg} (ref {ref.strip()})"
+    return msg[:500]
+
 def _parse_opencode(line):
     try: o = json.loads(line)
     except Exception: return [("text",line[:500])] if line.strip() else []
@@ -5646,6 +5669,15 @@ def _parse_opencode(line):
         evs.append(("tool",f'{p.get("tool","tool")} {title}'))
         if st.get("output"): evs.append(("toolout",tl_bound(str(st["output"]),600)[0]))
     elif t=="step_finish" and p.get("reason")=="stop": evs.append(("done","stop"))
+    # NOTE: no t=="error" branch here on purpose. An error event must NOT
+    # become a ("text", ...) chunk: run_turn treats any chunk text as reply
+    # output (full), and classify_turn_failure refuses to retry once output
+    # exists -- so surfacing the error as text silently disables transient
+    # retries, ratelimit cooldown/fallback, and resume recovery. The error
+    # still surfaces: parse_timeline_opencode records it as an error op
+    # (see _opencode_error_message), and run_turn's failure assembly uses
+    # _fail_text (stderr, else timeline error rows) for _emsg, the reply
+    # fallback, and out["stderr"].
     return evs
 
 def _parse_codex(line):
@@ -5878,8 +5910,9 @@ def parse_timeline_opencode(line):
                 "text": txt, "is_error": True})
             ops.append({"op": "error", "text": txt[:500]})
     elif t == "error":
-        err = o.get("error")
-        ops.append({"op": "error", "text": str(err)[:500] if err else "provider error"})
+        # extract the provider message; str(dict) would persist a Python repr
+        # ("{'name': ...}") that no error matcher or human reads well.
+        ops.append({"op": "error", "text": _opencode_error_message(o.get("error")) or "provider error"})
     return ops
 
 def _tl_claude_blocks(blocks, key=None):
@@ -7546,6 +7579,54 @@ def preflight_auth(backend):
     try: r = providers_snapshot([backend]).get(backend) or {}
     except Exception: return None
     return f'not logged in to {backend}: {AUTH_HINT[backend]}' if r.get("auth") == "no" else None
+
+_MODEL_CATALOG_MAX_AGE_S = 7 * 86400
+
+def _catalog_fresh(backend):
+    """(is_fresh, fetched_at_iso) for the backend's models cache. Never raises."""
+    try:
+        mc = _models_read()
+        bk = (mc.get("backends") or {}).get(backend) or {}
+        ts = (bk.get("fetched_at") or mc.get("fetched_at") or "").strip()
+        if not ts:
+            return False, ""
+        age = _age_s(ts)
+        return (age != float("inf") and age <= _MODEL_CATALOG_MAX_AGE_S), ts
+    except Exception:
+        return False, ""
+
+def model_check(backend, model):
+    """Error string if the agent's explicit model is absent from a freshly-refreshed backend catalog, else None.
+    opencode only: its free-tier catalog churns (models retire without notice), and a model missing from a
+    fresh catalog would die at the provider with an opaque error, so fail fast here instead of launching.
+    Unknown/stale catalog = proceed (never block on missing data); 'default' models always pass; no model is
+    ever substituted -- the caller must pick a listed one. Opt out: AG_MODEL_CHECK=0. Never raises."""
+    if backend != "opencode":
+        return None
+    if os.environ.get("AG_MODEL_CHECK", "1") == "0":
+        return None
+    try:
+        m = eff_model(backend, model)
+    except Exception:
+        return None
+    if not m:
+        return None
+    try:
+        choices = model_choices(backend)
+    except Exception:
+        return None
+    if m in choices:
+        return None
+    try:
+        fresh, ts = _catalog_fresh(backend)
+    except Exception:
+        return None
+    if not fresh:
+        return None
+    n = len(((_models_read().get("backends") or {}).get(backend) or {}).get("models") or [])
+    return (f"model {m} is not in the opencode catalog (refreshed {_ago(ts)}; {n} models) -- "
+            f"it may be retired: run `ag models --refresh` to re-check, pick a listed model, "
+            f"or set AG_MODEL_CHECK=0 to skip this check")
 
 # Receipts: --request-id K makes wake/delegate/chat send idempotent.
 def _rcpt(a, sdir, cmd, agent, payload):
@@ -9517,6 +9598,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if _ceil == "plan": a_eff["plan"] = True
         elif _ceil: a_eff["mode"] = _ceil
         if not _rs and (_pe := preflight_auth(backend)): _release_agent_turn(_turn_lock); _turn_lock = None; return {"error":_pe}
+        if not _rs and (_me := model_check(backend, model)): _release_agent_turn(_turn_lock); _turn_lock = None; return {"error":_me}
         meta = load_chat_meta(sdir,name,agent=a)
         sids = meta.get("sids") or {}
         sid = sids.get(backend, "")
@@ -9762,6 +9844,10 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if _intr: rc = 130; _event(sdir, "interrupted", name)
         full = "\n".join(c for c in chunks if c).strip()
         _erows = "\n".join(str(r.get("text","")) for r in buf.rows.values() if r.get("role")=="error")  # opencode reports provider errors as JSON events, not stderr
+        # failure text prefers process stderr, then timeline error rows: a backend
+        # that dies with empty stderr (opencode JSON error events) must still
+        # report its real error instead of "(exit 1) turn failed" / "(failed)".
+        _fail_text = (err.strip() or _erows.strip())
         _uli = usage_limit_scan(backend, err, _erows, full if len(full) < 1500 else "") if rc and not command and not _intr and not _timed_out["hit"] else None
         if _uli:  # plan cap, not a 429: shared cooldown + log, never retry
             _ul_record(a, backend, _uli)
@@ -9776,7 +9862,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if _nx: return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs=_nx,force=_force,stall_s=stall_s,model=_mo)
         if rc != 0 and not _intr:
             # record failure even when prose already streamed; never fake ok.
-            _emsg = f"(exit {rc}) " + (_uli["label"] if _uli else ((err.strip().splitlines()[-3:] or [""])[-1][:300] or "turn failed"))
+            _emsg = f"(exit {rc}) " + (_uli["label"] if _uli else ((_fail_text.splitlines()[-3:] or [""])[-1][:300] or "turn failed"))
             if _timed_out["hit"]: _emsg += " (raise --max-runtime or split the task)"
             buf.error(_emsg)
         buf.finalize()
@@ -9789,7 +9875,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             _segs = [t for t in buf.seg_texts("a") if (t or "").strip()]
             if _segs: full = "\n\n".join(_segs).strip()
         if not full and rc!=0 and not _intr:
-            full = (err.strip().splitlines()[-3:] or ["(failed)"])[-1][:500]
+            full = (_fail_text.splitlines()[-3:] or ["(failed)"])[-1][:500]
             full = f"(exit {rc}) {full}"
         full = full or ("(interrupted)" if _intr else "(no output)")
         extra = {"timeline_summary": True} if buf.had_assistant else None
@@ -9812,7 +9898,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         _event(sdir,"chat",name,exit=rc)
         if on_event: on_event(name,"exit",str(rc))
         out = {"sid":sid_new or sid,"exit":rc,"reply":full}
-        if rc != 0 and (err or "").strip(): out["stderr"] = err[-8000:]
+        if rc != 0 and _fail_text: out["stderr"] = _fail_text[-8000:]  # stderr tail, else provider error text (see _fail_text)
         _ck_sum = ckpt_end(sdir, name, _ck, on_event)
         if _ck_sum: out["checkpoint"] = _ck_sum
         if _usage:

@@ -1,0 +1,13 @@
+usage: ag sync pull [-h] [--watch WATCH] [--timeout TIMEOUT] [--file FILE] [--message MESSAGE]
+                    host agent
+
+positional arguments:
+  host
+  agent
+
+options:
+  -h, --help         show this help message and exit
+  --watch WATCH
+  --timeout TIMEOUT
+  --file FILE
+  --message MESSAGE

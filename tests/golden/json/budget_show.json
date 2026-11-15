@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "cmd": "budget",
+  "data": {
+    "daily": null,
+    "monthly": null,
+    "providers": {},
+    "rpd": {},
+    "spent_today": 0,
+    "spent_month": 0,
+    "provider_today": {}
+  }
+}

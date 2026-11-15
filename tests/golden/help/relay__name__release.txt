@@ -1,0 +1,8 @@
+usage: ag relay name release [-h] [--session SESSION] [name]
+
+positional arguments:
+  name
+
+options:
+  -h, --help         show this help message and exit
+  --session SESSION  session id (default $AG_RELAY_SESSION)

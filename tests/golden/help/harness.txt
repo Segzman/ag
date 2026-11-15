@@ -1,0 +1,10 @@
+usage: ag harness [-h] {use,current,show,export,import,link,profile} ...
+
+positional arguments:
+  {use,current,show,export,import,link,profile}
+    use                 switch an agent backend, remembering its model
+    current             show an agent's backend, model and persona
+    profile             named harness profiles (opt-in, shared across agents)
+
+options:
+  -h, --help            show this help message and exit

@@ -1,0 +1,8 @@
+usage: ag schedule install [-h] [--write] [--cron] [--systemd] [--interval INTERVAL]
+
+options:
+  -h, --help           show this help message and exit
+  --write
+  --cron
+  --systemd            print or install systemd user service + timer
+  --interval INTERVAL

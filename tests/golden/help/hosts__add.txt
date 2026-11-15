@@ -1,0 +1,14 @@
+usage: ag hosts add [-h] --ssh-json SSH_JSON --remote-ag REMOTE_AG --remote-state REMOTE_STATE
+                    --remote-project REMOTE_PROJECT --local-project LOCAL_PROJECT
+                    host
+
+positional arguments:
+  host
+
+options:
+  -h, --help            show this help message and exit
+  --ssh-json SSH_JSON
+  --remote-ag REMOTE_AG
+  --remote-state REMOTE_STATE
+  --remote-project REMOTE_PROJECT
+  --local-project LOCAL_PROJECT

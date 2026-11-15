@@ -1,0 +1,7 @@
+usage: ag _acp [-h] spec
+
+positional arguments:
+  spec
+
+options:
+  -h, --help  show this help message and exit

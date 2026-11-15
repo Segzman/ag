@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "cmd": "usage",
+  "data": {
+    "total": {
+      "requests": 0,
+      "in": 0,
+      "out": 0,
+      "cache": 0,
+      "cost": 0,
+      "turns": 0
+    },
+    "by": null,
+    "groups": {},
+    "since": null,
+    "rpd": {},
+    "provider_today": {}
+  }
+}

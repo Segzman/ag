@@ -1,0 +1,7 @@
+usage: ag harness profile show [-h] [pname]
+
+positional arguments:
+  pname
+
+options:
+  -h, --help  show this help message and exit

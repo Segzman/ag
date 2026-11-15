@@ -1,0 +1,19 @@
+usage: ag models [-h] [--backend {claude,opencode,codex,cursor,gemini,openrouter,api}]
+                 [--provider PROVIDER] [--refresh] [--rank] [--tier {small,balanced,big}] [--free]
+                 [--sort {intel,coding,speed,popular}] [--auto {on,off}] [--status] [--zdr]
+
+options:
+  -h, --help            show this help message and exit
+  --backend {claude,opencode,codex,cursor,gemini,openrouter,api}
+  --provider PROVIDER   with --backend api: list GET {base}/models of this provider
+                        (ollama|lmstudio|custom)
+  --refresh             re-fetch now
+  --rank                rank by Artificial Analysis intelligence/coding/agentic score, speed, tier
+                        (openrouter.ai/rankings + models.dev)
+  --tier {small,balanced,big}
+  --free                free models only
+  --sort {intel,coding,speed,popular}
+                        rank order (implies --rank)
+  --auto {on,off}       toggle background catalog refresh (config.json catalog_auto)
+  --status              last fetch per catalog source + auto state
+  --zdr                 zero-retention models only (data privacy)

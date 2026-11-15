@@ -1,0 +1,7 @@
+usage: ag link mac-key [-h] pubkey
+
+positional arguments:
+  pubkey
+
+options:
+  -h, --help  show this help message and exit

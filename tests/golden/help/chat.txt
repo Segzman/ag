@@ -1,0 +1,12 @@
+usage: ag chat [-h] {send,steer,usage,log,diff,revert,checkpoints} ...
+
+positional arguments:
+  {send,steer,usage,log,diff,revert,checkpoints}
+    steer               interrupt the running turn, run this next (priority 0, same session)
+    usage               last-turn + total provider token usage
+    diff                patch of one turn's changes (git checkpoints)
+    revert              restore workdir to before turn N (default latest)
+    checkpoints         list checkpointed turns
+
+options:
+  -h, --help            show this help message and exit

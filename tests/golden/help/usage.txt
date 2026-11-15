@@ -1,0 +1,7 @@
+usage: ag usage [-h] [--by {provider,model,agent,project,day}] [--since SINCE]
+
+options:
+  -h, --help            show this help message and exit
+  --by {provider,model,agent,project,day}
+                        group breakdown
+  --since SINCE         1d|7d|30d (default: all)

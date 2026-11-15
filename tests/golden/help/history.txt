@@ -1,0 +1,5 @@
+usage: ag history [-h] [--limit LIMIT]
+
+options:
+  -h, --help     show this help message and exit
+  --limit LIMIT

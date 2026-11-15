@@ -1,0 +1,39 @@
+usage: ag wake [-h] [--notify NOTIFY] [--notify-done] [--parent PARENT] [--group GROUP]
+               [--quiet QUIET] [--job {mechanical,implement,review,debug,plan,hardest}]
+               [--on-done ON_DONE] [--timeout TIMEOUT] [--max-runtime MAX_RUNTIME]
+               [--stall-s STALL_S] [--request-id REQUEST_ID] [--force] [--verify CMD]
+               [--escalate MODEL[,MODEL...]] [--verify-timeout S] [--on NODE]
+               agent [message ...]
+
+positional arguments:
+  agent
+  message
+
+options:
+  -h, --help            show this help message and exit
+  --notify NOTIFY
+  --notify-done         write a notification when the wake finishes
+  --parent PARENT       auto-wake PARENT when its cohort finishes
+  --group GROUP
+  --quiet QUIET         deliver partial cohort results after S seconds
+  --job {mechanical,implement,review,debug,plan,hardest}
+                        record job type in the wake job
+  --on-done ON_DONE
+  --timeout TIMEOUT
+  --max-runtime MAX_RUNTIME
+                        hard backend runtime limit in seconds (0=unlimited); starts after guard
+                        acquired
+  --stall-s STALL_S     stall watchdog seconds for this turn (0 = off; default:
+                        agent/AG_STALL_S/backend default)
+  --request-id REQUEST_ID
+                        idempotency key: replay returns the original job (replayed:true)
+  --force               bypass budget limits once (logged)
+  --verify CMD          after the wake turn, the worker runs trusted CMD via sh -c in the agent
+                        workdir and records {cmd,exit,tail} in the wake job + [verify] row in the
+                        chat log (never from the agent's reply)
+  --escalate MODEL[,MODEL...]
+                        needs --verify: on failed verify/turn, the worker retries the same session
+                        on each next model (one-turn override, roster unchanged); job gains
+                        escalation[]
+  --verify-timeout S    verify command timeout in seconds (default 600)
+  --on NODE             run once on a relay node

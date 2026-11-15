@@ -1,0 +1,24 @@
+usage: ag setup [-h] [--scope {global,project}] [--harness HARNESS]
+                [--preset {cost-first,balanced,quality-first}] [--set SET] [--claude-md]
+                [--no-claude-md] [--profile {claude,opencode,codex,default}] [--answers JSON]
+                [--yes] [--dry-run] [--ui {web,mac,cli,plain}]
+
+options:
+  -h, --help            show this help message and exit
+  --scope {global,project}
+  --harness HARNESS     claude,opencode,codex,gemini,cursor,amp,copilot | all | none (default:
+                        detected)
+  --preset {cost-first,balanced,quality-first}
+  --set SET             JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] |
+                        backend.B.(enabled|model|mode|plan|effort)=V (repeatable)
+  --claude-md
+  --no-claude-md
+  --profile {claude,opencode,codex,default}
+                        profile whose jobs to edit (default: detected harness)
+  --answers JSON        apply `route --check` answers non-interactively (project scope): marks the
+                        project configured, writes overrides + project skills
+  --yes                 no prompts; defaults for unset flags
+  --dry-run             write nothing, print diffs
+  --ui {web,mac,cli,plain}
+                        interactive front-end: web (local browser form; default on a desktop) |
+                        mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI

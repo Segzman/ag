@@ -1,0 +1,9 @@
+usage: ag roles add [-h] [--system SYSTEM] [--file FILE] name
+
+positional arguments:
+  name
+
+options:
+  -h, --help       show this help message and exit
+  --system SYSTEM
+  --file FILE

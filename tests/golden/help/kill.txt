@@ -1,0 +1,8 @@
+usage: ag kill [-h] [--force] sess
+
+positional arguments:
+  sess
+
+options:
+  -h, --help  show this help message and exit
+  --force

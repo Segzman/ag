@@ -1,0 +1,10 @@
+usage: ag grep [-h] [--path PATH] [--include INCLUDE] [--max MAX] pattern
+
+positional arguments:
+  pattern
+
+options:
+  -h, --help         show this help message and exit
+  --path PATH
+  --include INCLUDE
+  --max MAX

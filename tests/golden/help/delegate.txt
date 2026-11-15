@@ -1,0 +1,26 @@
+usage: ag delegate [-h] [--job {mechanical,implement,review,debug,plan,hardest}] [--notify-done]
+                   [--parent PARENT] [--group GROUP] [--quiet QUIET] [--timeout TIMEOUT]
+                   [--verify CMD] [--verify-timeout S] [--request-id REQUEST_ID] [--force]
+                   agent [text ...]
+
+positional arguments:
+  agent
+  text
+
+options:
+  -h, --help            show this help message and exit
+  --job {mechanical,implement,review,debug,plan,hardest}
+                        record job type in events
+  --notify-done         write a notification when the turn finishes
+  --parent PARENT       run as background wake; auto-wake PARENT when its cohort finishes
+  --group GROUP
+  --quiet QUIET         deliver partial cohort results after S seconds
+  --timeout TIMEOUT     hard backend runtime limit in seconds (0=unlimited, default 1800); starts
+                        after guard acquired, lock wait excluded
+  --verify CMD          after the turn (or in the background wake job), run trusted CMD via sh -c
+                        in the agent workdir and record {cmd,exit,tail} (never from the agent's
+                        reply)
+  --verify-timeout S    verify command timeout in seconds (default 600)
+  --request-id REQUEST_ID
+                        idempotency key: replay returns the original result
+  --force               bypass budget limits once (logged)

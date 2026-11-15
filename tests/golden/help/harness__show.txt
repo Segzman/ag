@@ -1,0 +1,5 @@
+usage: ag harness show [-h] [--home HOME]
+
+options:
+  -h, --help   show this help message and exit
+  --home HOME

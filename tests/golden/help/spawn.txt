@@ -1,0 +1,23 @@
+usage: ag spawn [-h] [--name NAME] [--cols COLS] [--rows ROWS] [--cwd CWD] [--env ENV]
+                [--on-exit ON_EXIT] [--wake WAKE] [--wake-message WAKE_MESSAGE]
+                [--wake-notify WAKE_NOTIFY] [--wake-on-done WAKE_ON_DONE]
+                [--wake-timeout WAKE_TIMEOUT] [--no-secret-popup]
+                ...
+
+positional arguments:
+  cmd
+
+options:
+  -h, --help            show this help message and exit
+  --name NAME
+  --cols COLS
+  --rows ROWS
+  --cwd CWD
+  --env ENV
+  --on-exit ON_EXIT
+  --wake WAKE
+  --wake-message WAKE_MESSAGE
+  --wake-notify WAKE_NOTIFY
+  --wake-on-done WAKE_ON_DONE
+  --wake-timeout WAKE_TIMEOUT
+  --no-secret-popup     no secret dialog / askpass wiring

@@ -1,0 +1,12 @@
+usage: ag run [-h] [--timeout TIMEOUT] [--cwd CWD] [--env ENV] [--force] [--raw] ...
+
+positional arguments:
+  cmd
+
+options:
+  -h, --help         show this help message and exit
+  --timeout TIMEOUT
+  --cwd CWD
+  --env ENV
+  --force
+  --raw              skip rtk output compaction

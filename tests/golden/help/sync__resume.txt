@@ -1,0 +1,20 @@
+usage: ag sync resume [-h] --name NAME --project PROJECT [--source-stopped] [--run]
+                      [--timeout TIMEOUT] [--max-runtime MAX_RUNTIME]
+                      [--backend {claude,opencode,gemini,codex,cursor,echo}] [--model MODEL]
+                      snapshot
+
+positional arguments:
+  snapshot
+
+options:
+  -h, --help            show this help message and exit
+  --name NAME
+  --project PROJECT
+  --source-stopped
+  --run
+  --timeout TIMEOUT
+  --max-runtime MAX_RUNTIME
+                        hard runtime limit for --run backend turn in seconds (0=unlimited); budget
+                        starts at guard acquisition
+  --backend {claude,opencode,gemini,codex,cursor,echo}
+  --model MODEL

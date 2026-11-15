@@ -1,0 +1,12 @@
+usage: ag ui choose [-h] [--multi] [--title TITLE] [--timeout TIMEOUT]
+                    question options [options ...]
+
+positional arguments:
+  question
+  options
+
+options:
+  -h, --help         show this help message and exit
+  --multi
+  --title TITLE
+  --timeout TIMEOUT  seconds before giving up

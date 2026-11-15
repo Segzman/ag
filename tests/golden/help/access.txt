@@ -1,0 +1,11 @@
+usage: ag access [-h] {show,allow,deny,rm} ...
+
+positional arguments:
+  {show,allow,deny,rm}
+    show                show effective access policy
+    allow               allow a backend/model glob
+    deny                deny a backend/model glob (deny wins)
+    rm                  remove a glob from allow+deny
+
+options:
+  -h, --help            show this help message and exit

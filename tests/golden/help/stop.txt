@@ -1,0 +1,8 @@
+usage: ag stop [-h] [--cascade] agent
+
+positional arguments:
+  agent
+
+options:
+  -h, --help  show this help message and exit
+  --cascade   also stop agents whose jobs record parent == agent

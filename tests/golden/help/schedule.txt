@@ -1,0 +1,7 @@
+usage: ag schedule [-h] {add,list,rm,pause,resume,run,tick,install} ...
+
+positional arguments:
+  {add,list,rm,pause,resume,run,tick,install}
+
+options:
+  -h, --help            show this help message and exit

@@ -1,0 +1,9 @@
+usage: ag agents rm [-h] [--force] [--purge] name
+
+positional arguments:
+  name
+
+options:
+  -h, --help  show this help message and exit
+  --force     remove a dirty worktree (branch is kept)
+  --purge     also remove chat log and metadata

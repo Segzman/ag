@@ -1,0 +1,9 @@
+usage: ag harness profile set [-h] [--profile PROFILE] [--none] agent
+
+positional arguments:
+  agent
+
+options:
+  -h, --help         show this help message and exit
+  --profile PROFILE
+  --none

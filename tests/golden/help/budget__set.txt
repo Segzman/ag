@@ -1,0 +1,8 @@
+usage: ag budget set [-h] [--daily DAILY] [--monthly MONTHLY] [--provider PROVIDER] [--rpd RPD]
+
+options:
+  -h, --help           show this help message and exit
+  --daily DAILY        USD per UTC day
+  --monthly MONTHLY    USD per UTC month
+  --provider PROVIDER  provider id for --rpd
+  --rpd RPD            requests per UTC day for --provider

@@ -1,0 +1,8 @@
+usage: ag channel create [-h] [--agents AGENTS] name
+
+positional arguments:
+  name
+
+options:
+  -h, --help       show this help message and exit
+  --agents AGENTS  comma-separated members

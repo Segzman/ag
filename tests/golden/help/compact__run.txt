@@ -1,0 +1,8 @@
+usage: ag compact run [-h] [--force] cpname
+
+positional arguments:
+  cpname
+
+options:
+  -h, --help  show this help message and exit
+  --force

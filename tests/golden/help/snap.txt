@@ -1,0 +1,10 @@
+usage: ag snap [-h] [--lines LINES] [--since SINCE] [--clean] sess
+
+positional arguments:
+  sess
+
+options:
+  -h, --help     show this help message and exit
+  --lines LINES
+  --since SINCE  byte offset from prior snap
+  --clean        strip ANSI codes

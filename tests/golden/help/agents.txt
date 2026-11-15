@@ -1,0 +1,14 @@
+usage: ag agents [-h] {list,ps,add,create,rm,reset,fork,set,doctor,env,caps} ...
+
+positional arguments:
+  {list,ps,add,create,rm,reset,fork,set,doctor,env,caps}
+    ps                  live process trees per agent
+    create              draft an agent from one sentence (proposal; --yes creates)
+    reset               clear stored backend session ids; keep config and chat log
+    fork                clone config + chat history with fresh session (lineage:
+                        forked_from/forked_at/fork_turn)
+    env                 effective per-agent env diff vs os.environ (secrets redacted)
+    caps                backend capability table + mode enforcement
+
+options:
+  -h, --help            show this help message and exit

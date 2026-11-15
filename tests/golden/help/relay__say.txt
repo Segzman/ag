@@ -1,0 +1,10 @@
+usage: ag relay say [-h] [--name NAME] [--session SESSION] [--peer NODE] message [message ...]
+
+positional arguments:
+  message
+
+options:
+  -h, --help         show this help message and exit
+  --name NAME        relay name (default: this session's claim)
+  --session SESSION  session id (default $AG_RELAY_SESSION)
+  --peer NODE        peer node (default: the single other node under nodes/)

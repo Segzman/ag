@@ -1,0 +1,11 @@
+usage: ag link init [-h] --to TO [--key KEY] [--ports PORTS] [--base BASE]
+                    [--watch-port WATCH_PORT]
+
+options:
+  -h, --help            show this help message and exit
+  --to TO               USER@HOST
+  --key KEY             private key path (default ~/.ssh/ag_link, created when missing)
+  --ports PORTS         auto | 3000,8080
+  --base BASE           mac port base
+  --watch-port WATCH_PORT
+                        vm watch page port

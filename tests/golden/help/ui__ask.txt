@@ -1,0 +1,15 @@
+usage: ag ui ask [-h] [--default DEFAULT] [--secret] [--to-env TO_ENV] [--stdout] [--title TITLE]
+                 [--timeout TIMEOUT]
+                 question
+
+positional arguments:
+  question
+
+options:
+  -h, --help         show this help message and exit
+  --default DEFAULT
+  --secret
+  --to-env TO_ENV
+  --stdout
+  --title TITLE
+  --timeout TIMEOUT  seconds before giving up

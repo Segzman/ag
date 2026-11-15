@@ -1,0 +1,5 @@
+usage: ag agents ps [-h] [--tree]
+
+options:
+  -h, --help  show this help message and exit
+  --tree

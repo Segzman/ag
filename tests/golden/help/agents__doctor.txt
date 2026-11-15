@@ -1,0 +1,5 @@
+usage: ag agents doctor [-h] [--refresh]
+
+options:
+  -h, --help  show this help message and exit
+  --refresh   ignore the 60s probe cache

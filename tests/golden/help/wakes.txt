@@ -1,0 +1,21 @@
+usage: ag wakes [-h] [--agent AGENT] [--limit LIMIT] [--wait WAIT [WAIT ...]]
+                [--wait-group WAIT_GROUP] [--timeout TIMEOUT] [--cancel CANCEL] [--group GROUP]
+                [--stop] [--reap] [--dry-run] [--include-running] [--max-attempts MAX_ATTEMPTS]
+
+options:
+  -h, --help            show this help message and exit
+  --agent AGENT
+  --limit LIMIT
+  --wait WAIT [WAIT ...]
+                        block until one or more wake jobs finish (exit 0 ok, 1 failed, 124
+                        timeout)
+  --wait-group WAIT_GROUP
+                        block until all jobs of cohort GROUP finish (same exit codes)
+  --timeout TIMEOUT
+  --cancel CANCEL       cancel one wake job (incompatible with --wait)
+  --group GROUP         show cohort
+  --stop                with --group: disposition=stopped (never deliver)
+  --reap                relaunch jobs lost to a dead worker
+  --dry-run
+  --include-running     also reap jobs lost mid-turn
+  --max-attempts MAX_ATTEMPTS

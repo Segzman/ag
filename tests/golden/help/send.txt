@@ -1,0 +1,11 @@
+usage: ag send [-h] [--key KEY] [--no-enter] [--secret] sess [text ...]
+
+positional arguments:
+  sess
+  text
+
+options:
+  -h, --help  show this help message and exit
+  --key KEY   enter|tab|up|down|left|right|esc|ctrl-c|ctrl-d
+  --no-enter
+  --secret    value from a secure dialog; never logged

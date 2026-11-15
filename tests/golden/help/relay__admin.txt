@@ -1,0 +1,10 @@
+usage: ag relay admin [-h] [--wait WAIT] node op [arg]
+
+positional arguments:
+  node
+  op
+  arg
+
+options:
+  -h, --help   show this help message and exit
+  --wait WAIT  poll sync every 10s up to S seconds for the result

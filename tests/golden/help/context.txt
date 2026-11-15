@@ -1,0 +1,11 @@
+usage: ag context [-h] {init,assign,show,checkpoint} ...
+
+positional arguments:
+  {init,assign,show,checkpoint}
+    init                non-destructive scaffold of context state
+    assign              assign agent to project scope + brief
+    show                assembled context + sources/warnings
+    checkpoint          curated summary -> per-agent + shared scope handoff
+
+options:
+  -h, --help            show this help message and exit

@@ -1,0 +1,7 @@
+usage: ag push [-h] ...
+
+positional arguments:
+  push_args   git push arguments (e.g. origin master)
+
+options:
+  -h, --help  show this help message and exit

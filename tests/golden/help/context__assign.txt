@@ -1,0 +1,17 @@
+usage: ag context assign [-h] [--scope SCOPE] [--project-root PROJECT_ROOT] [--task TASK]
+                         [--acceptance ACCEPTANCE] [--file CFILE] [--brief BRIEF]
+                         [--brief-file BRIEF_FILE]
+                         cname
+
+positional arguments:
+  cname
+
+options:
+  -h, --help            show this help message and exit
+  --scope SCOPE
+  --project-root PROJECT_ROOT
+  --task TASK
+  --acceptance ACCEPTANCE
+  --file CFILE
+  --brief BRIEF
+  --brief-file BRIEF_FILE

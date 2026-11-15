@@ -1,0 +1,8 @@
+usage: ag schedule tick [-h] [--all] [--now NOW] [--reap] [--dry-run]
+
+options:
+  -h, --help  show this help message and exit
+  --all
+  --now NOW   ISO time (tests)
+  --reap
+  --dry-run

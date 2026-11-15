@@ -1,0 +1,7 @@
+usage: ag harness current [-h] agent
+
+positional arguments:
+  agent
+
+options:
+  -h, --help  show this help message and exit

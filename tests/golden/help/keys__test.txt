@@ -1,0 +1,8 @@
+usage: ag keys test [-h] [--provider PROVIDER] key_name
+
+positional arguments:
+  key_name             account name
+
+options:
+  -h, --help           show this help message and exit
+  --provider PROVIDER  provider id from providers registry

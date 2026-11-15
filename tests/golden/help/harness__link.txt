@@ -1,0 +1,6 @@
+usage: ag harness link [-h] [--to TO] [--home HOME]
+
+options:
+  -h, --help   show this help message and exit
+  --to TO
+  --home HOME

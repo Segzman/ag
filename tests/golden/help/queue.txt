@@ -1,0 +1,10 @@
+usage: ag queue [-h] [--cancel ID] [--hold] [--release] agent
+
+positional arguments:
+  agent
+
+options:
+  -h, --help   show this help message and exit
+  --cancel ID
+  --hold
+  --release

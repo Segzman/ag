@@ -592,6 +592,10 @@ System-prompt presets per agent: `ag roles list|show|add|set|rm|reset NAME`. Bui
 
 ---
 
+## Tests and golden snapshots
+
+`python3 tests/test_golden_snapshots.py` checks `tests/golden/`: `--help` for every (sub)command (`help/`), the top-level namespace (`namespace.txt`) and read-only `--json` output on a temp state dir (`json/`), all byte-identical after scrubbing temp paths and timestamps. Run `python3 tools/golden_update.py` only when a help, namespace or JSON change is intended, then commit the regenerated snapshots with that change.
+
 ## Docs
 
 [INSTALL](docs/INSTALL.md) · [HARNESS_ROLES](docs/HARNESS_ROLES.md) · [AGENT_CONTEXT](docs/AGENT_CONTEXT.md) · [AUTO_COMPACTION](docs/AUTO_COMPACTION.md) · [WAKE_CONTROL](docs/WAKE_CONTROL.md) · [WAKE_STATE](docs/WAKE_STATE.md) · [WAKE_STATUS](docs/WAKE_STATUS.md) · [STREAMING](docs/STREAMING.md) · [MULTI_HOST](docs/MULTI_HOST.md) · [UI_DESIGN](docs/UI_DESIGN.md) · [MUSE_FEEDBACK](docs/MUSE_FEEDBACK.md) · [RELAY](docs/RELAY.md) · [LINK](docs/LINK.md)

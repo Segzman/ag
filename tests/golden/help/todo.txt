@@ -1,0 +1,7 @@
+usage: ag todo [-h] {add,list,done,clear} ...
+
+positional arguments:
+  {add,list,done,clear}
+
+options:
+  -h, --help            show this help message and exit

@@ -1,0 +1,8 @@
+usage: ag roles [-h] {list,add,set,show,rm,reset} ...
+
+positional arguments:
+  {list,add,set,show,rm,reset}
+    reset               restore one built-in role's original prompt
+
+options:
+  -h, --help            show this help message and exit

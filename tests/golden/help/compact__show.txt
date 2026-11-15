@@ -1,0 +1,7 @@
+usage: ag compact show [-h] [cpname]
+
+positional arguments:
+  cpname
+
+options:
+  -h, --help  show this help message and exit

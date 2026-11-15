@@ -1,0 +1,7 @@
+usage: ag context show [-h] cname
+
+positional arguments:
+  cname
+
+options:
+  -h, --help  show this help message and exit

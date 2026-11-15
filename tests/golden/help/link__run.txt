@@ -1,0 +1,8 @@
+usage: ag link run [-h] [--name NAME] ...
+
+positional arguments:
+  cmd
+
+options:
+  -h, --help   show this help message and exit
+  --name NAME

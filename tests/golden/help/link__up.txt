@@ -1,0 +1,6 @@
+usage: ag link up [-h] [--foreground] [--no-watch]
+
+options:
+  -h, --help    show this help message and exit
+  --foreground
+  --no-watch    no watch page / no watch forward

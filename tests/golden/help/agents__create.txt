@@ -1,0 +1,14 @@
+usage: ag agents create [-h] [--name NAME] [--dir ADIR] [--using USING] [--yes] [--dry-run]
+                        description
+
+positional arguments:
+  description
+
+options:
+  -h, --help     show this help message and exit
+  --name NAME
+  --dir ADIR
+  --using USING  agent that drafts the proposal (default: routing plan job, else first
+                 orchestrator)
+  --yes          create the agent (default: show proposal + command only)
+  --dry-run

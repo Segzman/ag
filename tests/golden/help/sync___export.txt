@@ -1,0 +1,10 @@
+usage: ag sync _export [-h] --project PROJECT [--file FILE] [--message MESSAGE] agent
+
+positional arguments:
+  agent
+
+options:
+  -h, --help         show this help message and exit
+  --project PROJECT
+  --file FILE
+  --message MESSAGE

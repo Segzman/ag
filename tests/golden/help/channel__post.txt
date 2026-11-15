@@ -1,0 +1,12 @@
+usage: ag channel post [-h] [--as AS_] [--max-hops MAX_HOPS] [--context CONTEXT]
+                       name text [text ...]
+
+positional arguments:
+  name
+  text
+
+options:
+  -h, --help           show this help message and exit
+  --as AS_             sender: agent | user (default $AG_PARENT_AGENT, else user)
+  --max-hops MAX_HOPS  auto-wake budget down the hand-off chain
+  --context CONTEXT    last N messages given to woken agents

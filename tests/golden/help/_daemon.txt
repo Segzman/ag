@@ -1,0 +1,7 @@
+usage: ag _daemon [-h] sp
+
+positional arguments:
+  sp
+
+options:
+  -h, --help  show this help message and exit

@@ -1,0 +1,26 @@
+{
+  "ok": true,
+  "cmd": "agents",
+  "data": {
+    "agents": [
+      {
+        "name": "claude",
+        "backend": "claude",
+        "model": "default",
+        "dir": ".",
+        "role": "orchestrator",
+        "queue": 0,
+        "queue_held": false
+      },
+      {
+        "name": "oc",
+        "backend": "opencode",
+        "model": "default",
+        "dir": ".",
+        "role": "sub",
+        "queue": 0,
+        "queue_held": false
+      }
+    ]
+  }
+}

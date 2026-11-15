@@ -1,0 +1,22 @@
+usage: ag harness profile add [-h] [--instructions INSTRUCTIONS] [--skills SKILLS] [--mcp MCP]
+                              [--memory MEMORY] [--opencode-config OPENCODE_CONFIG]
+                              [--codex-config CODEX_CONFIG] [--claude-settings CLAUDE_SETTINGS]
+                              [--notes PNOTES] [--env K=V] [--env-unset K] [--force]
+                              pname
+
+positional arguments:
+  pname
+
+options:
+  -h, --help            show this help message and exit
+  --instructions INSTRUCTIONS
+  --skills SKILLS
+  --mcp MCP
+  --memory MEMORY
+  --opencode-config OPENCODE_CONFIG
+  --codex-config CODEX_CONFIG
+  --claude-settings CLAUDE_SETTINGS
+  --notes PNOTES
+  --env K=V
+  --env-unset K
+  --force

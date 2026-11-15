@@ -1,0 +1,21 @@
+usage: ag providers add [-h] [--base-url BASE_URL] [--key-ref KEY_REF] [--no-key] [--zdr]
+                        [--npm NPM] [--privacy {zdr,retain,train,unknown}]
+                        [--max-concurrent MAX_CONCURRENT] [--rpd RPD] [--model MODELS]
+                        pid
+
+positional arguments:
+  pid                   provider id
+
+options:
+  -h, --help            show this help message and exit
+  --base-url BASE_URL   OpenAI-compat base URL
+  --key-ref KEY_REF     keychain:NAME or ${VAR} (never a literal secret)
+  --no-key              keyless server (no Authorization header)
+  --zdr                 mark zero-retention (same as --privacy zdr)
+  --npm NPM             AI-SDK package (default @ai-sdk/openai-compatible)
+  --privacy {zdr,retain,train,unknown}
+                        data class
+  --max-concurrent MAX_CONCURRENT
+                        ratelimit slots for <provider>/*
+  --rpd RPD             known free-tier requests/day
+  --model MODELS        model id (repeatable)

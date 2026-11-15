@@ -1,0 +1,7 @@
+usage: ag forget [-h] sess
+
+positional arguments:
+  sess
+
+options:
+  -h, --help  show this help message and exit

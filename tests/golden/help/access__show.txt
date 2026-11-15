@@ -1,0 +1,7 @@
+usage: ag access show [-h] [--scope {global,project}] [--data {work,public}]
+
+options:
+  -h, --help            show this help message and exit
+  --scope {global,project}
+                        show one file (default: effective)
+  --data {work,public}  data class (default: both)

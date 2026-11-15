@@ -1,0 +1,10 @@
+usage: ag notify [-h] [--dir NOTIFY_DIR] [--set-dir DIR] [title] [body ...]
+
+positional arguments:
+  title
+  body
+
+options:
+  -h, --help        show this help message and exit
+  --dir NOTIFY_DIR  notification inbox directory (overrides AG_NOTIFY_DIR/config)
+  --set-dir DIR     save the default notification inbox in notify.json

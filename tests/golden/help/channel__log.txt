@@ -1,0 +1,8 @@
+usage: ag channel log [-h] [--tail TAIL] name
+
+positional arguments:
+  name
+
+options:
+  -h, --help   show this help message and exit
+  --tail TAIL

@@ -1,0 +1,7 @@
+usage: ag hosts [-h] {list,add,check} ...
+
+positional arguments:
+  {list,add,check}
+
+options:
+  -h, --help        show this help message and exit

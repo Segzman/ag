@@ -1,0 +1,9 @@
+usage: ag context checkpoint [-h] [--file CPT_FILE] cname [ctext ...]
+
+positional arguments:
+  cname
+  ctext
+
+options:
+  -h, --help       show this help message and exit
+  --file CPT_FILE

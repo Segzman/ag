@@ -1,0 +1,12 @@
+usage: ag route [-h] [--profile {claude,opencode,codex,default}] [--json] [--check]
+                [{mechanical,implement,review,debug,plan,hardest}]
+
+positional arguments:
+  {mechanical,implement,review,debug,plan,hardest}
+
+options:
+  -h, --help            show this help message and exit
+  --profile {claude,opencode,codex,default}
+                        profile to show (default: detected harness)
+  --json
+  --check               per-project setup check: configured? + questions to ask the user

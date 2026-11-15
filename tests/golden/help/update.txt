@@ -1,0 +1,6 @@
+usage: ag update [-h] [--auto {on,off}] [--status]
+
+options:
+  -h, --help       show this help message and exit
+  --auto {on,off}  toggle the daily background auto-update
+  --status

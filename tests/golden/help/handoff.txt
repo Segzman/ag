@@ -1,0 +1,10 @@
+usage: ag handoff [-h] [--spawn] [--exec] agent [backend]
+
+positional arguments:
+  agent
+  backend
+
+options:
+  -h, --help  show this help message and exit
+  --spawn     start tracked pty session, print id + attach
+  --exec      exec native TUI now (TTY only)

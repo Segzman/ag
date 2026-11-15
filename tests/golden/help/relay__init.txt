@@ -1,0 +1,12 @@
+usage: ag relay init [-h] [--git GIT_URL] [--dir RELAY_DIR] [--node NODE] [--state STATE]
+                     [--workdir WORKDIR] [--max-mode {ro,edits,auto,full}]
+
+options:
+  -h, --help            show this help message and exit
+  --git GIT_URL         private repo URL (a bare/local git path works too)
+  --dir RELAY_DIR       folder used directly as the mailbox (sync it yourself)
+  --node NODE           this machine's name (default: short hostname, [a-z0-9-])
+  --state STATE         ag state dir where inbound schedules materialise (default ~/.agent-relay)
+  --workdir WORKDIR     parent of per-origin agent workdirs (default ~/ag-relay-work)
+  --max-mode {ro,edits,auto,full}
+                        highest --mode a target accepts from the mailbox (default edits)

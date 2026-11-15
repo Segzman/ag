@@ -1,0 +1,5 @@
+usage: ag todo clear [-h] [--done-only]
+
+options:
+  -h, --help   show this help message and exit
+  --done-only

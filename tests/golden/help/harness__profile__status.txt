@@ -1,0 +1,4 @@
+usage: ag harness profile status [-h]
+
+options:
+  -h, --help  show this help message and exit

@@ -1,0 +1,10 @@
+usage: ag relay name [-h] {claim,release,list} ...
+
+positional arguments:
+  {claim,release,list}
+    claim               claim NAME for this session; creates a local echo agent NAME
+    release             release NAME (default: this session's claim)
+    list                relay names, their sessions, default owner and claim time
+
+options:
+  -h, --help            show this help message and exit

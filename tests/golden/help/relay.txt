@@ -1,0 +1,17 @@
+usage: ag relay [-h] {init,sync,status,results,admin,name,inbox,say} ...
+
+positional arguments:
+  {init,sync,status,results,admin,name,inbox,say}
+    init                write relay.json; clone for --git; first heartbeat
+    sync                pull mailbox, materialise/report inbound schedules, ingest results,
+                        heartbeat, push
+    status              this node + peers, schedules in flight, recent results
+    results             ingested remote results, newest first
+    admin               run a relay admin op on another node (update | notify-dir PATH | status)
+    name                claim/release/list a relay name; one private mailbox per local session
+    inbox               unseen messages addressed to a relay name (NAME or chat-NAME)
+    say                 send a message to a peer as a relay name (wake NAME --on PEER --notify-
+                        done)
+
+options:
+  -h, --help            show this help message and exit

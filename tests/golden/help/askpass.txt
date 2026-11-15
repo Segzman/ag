@@ -1,0 +1,7 @@
+usage: ag askpass [-h] ...
+
+positional arguments:
+  prompt
+
+options:
+  -h, --help  show this help message and exit

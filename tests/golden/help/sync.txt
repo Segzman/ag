@@ -1,0 +1,8 @@
+usage: ag sync [-h] {list,pull,_export,_probe,resume} ...
+
+positional arguments:
+  {list,pull,_export,_probe,resume}
+    _probe              ==SUPPRESS==
+
+options:
+  -h, --help            show this help message and exit

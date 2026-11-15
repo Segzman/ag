@@ -1,0 +1,122 @@
+{
+  "ok": true,
+  "cmd": "route",
+  "data": {
+    "harness": "claude",
+    "via": "process",
+    "profile": "claude",
+    "jobs": {
+      "mechanical": {
+        "claude": "haiku",
+        "ag": {
+          "backend": "claude",
+          "model": "haiku"
+        },
+        "source": {
+          "claude": "preset-default",
+          "ag": "preset-default"
+        }
+      },
+      "implement": {
+        "claude": "sonnet",
+        "ag": {
+          "backend": "claude",
+          "model": "sonnet"
+        },
+        "source": {
+          "claude": "preset-default",
+          "ag": "preset-default"
+        }
+      },
+      "review": {
+        "claude": "opus",
+        "ag": {
+          "backend": "claude",
+          "model": "opus"
+        },
+        "source": {
+          "claude": "preset-default",
+          "ag": "preset-default"
+        }
+      },
+      "debug": {
+        "claude": "opus",
+        "ag": {
+          "backend": "claude",
+          "model": "opus"
+        },
+        "source": {
+          "claude": "preset-default",
+          "ag": "preset-default"
+        }
+      },
+      "plan": {
+        "claude": "opus",
+        "ag": {
+          "backend": "claude",
+          "model": "opus"
+        },
+        "source": {
+          "claude": "preset-default",
+          "ag": "preset-default"
+        }
+      },
+      "hardest": {
+        "claude": "fable",
+        "ag": {
+          "backend": "claude",
+          "model": "fable"
+        },
+        "source": {
+          "claude": "preset-default",
+          "ag": "preset-default"
+        }
+      }
+    },
+    "backends": {
+      "claude": {
+        "enabled": true,
+        "model": "",
+        "mode": "",
+        "plan": false,
+        "effort": "",
+        "source": "default"
+      },
+      "opencode": {
+        "enabled": true,
+        "model": "",
+        "mode": "",
+        "plan": false,
+        "effort": "",
+        "source": "default"
+      },
+      "codex": {
+        "enabled": true,
+        "model": "",
+        "mode": "",
+        "plan": false,
+        "effort": "",
+        "source": "default"
+      },
+      "gemini": {
+        "enabled": true,
+        "model": "",
+        "mode": "",
+        "plan": false,
+        "effort": "",
+        "source": "default"
+      },
+      "cursor": {
+        "enabled": true,
+        "model": "",
+        "mode": "",
+        "plan": false,
+        "effort": "",
+        "source": "default"
+      }
+    },
+    "warnings": [],
+    "global": "<TMP>/home/cfg/routing.json",
+    "project": "<TMP>/home/.agent/routing.json"
+  }
+}

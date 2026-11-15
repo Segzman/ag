@@ -1,0 +1,7 @@
+usage: ag agents caps [-h] [backend]
+
+positional arguments:
+  backend
+
+options:
+  -h, --help  show this help message and exit

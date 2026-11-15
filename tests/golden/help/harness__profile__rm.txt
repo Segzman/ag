@@ -1,0 +1,8 @@
+usage: ag harness profile rm [-h] [--force] pname
+
+positional arguments:
+  pname
+
+options:
+  -h, --help  show this help message and exit
+  --force

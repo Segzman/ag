@@ -1,0 +1,7 @@
+usage: ag relay results [-h] [--id ID] [--limit LIMIT] [--last]
+
+options:
+  -h, --help     show this help message and exit
+  --id ID        filter by schedule id
+  --limit LIMIT
+  --last         print only the newest result's reply text

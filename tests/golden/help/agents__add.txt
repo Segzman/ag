@@ -1,0 +1,57 @@
+usage: ag agents add [-h] [--backend {claude,opencode,gemini,codex,cursor,echo,acp,api}]
+                     [--model MODEL] [--job {mechanical,implement,review,debug,plan,hardest}]
+                     [--profile {claude,opencode,codex,default}] [--dir ADIR]
+                     [--role {orchestrator,sub}] [--persona PERSONA] [--system SYSTEM]
+                     [--instructions INSTRUCTIONS] [--worktree] [--base BASE]
+                     [--mode {ro,edits,auto,full}] [--allow-cmd PATTERN] [--plan] [--env K=V]
+                     [--env-unset K] [--env-clear] [--claude-config-dir CLAUDE_CONFIG_DIR]
+                     [--subscription-only {on,off}] [--transport {acp,cli}] [--acp-cmd ACP_CMD]
+                     [--effort EFFORT] [--fallback FALLBACK] [--data {work,public}]
+                     [--stall-s STALL_S]
+                     name
+
+positional arguments:
+  name
+
+options:
+  -h, --help            show this help message and exit
+  --backend {claude,opencode,gemini,codex,cursor,echo,acp,api}
+  --model MODEL
+  --job {mechanical,implement,review,debug,plan,hardest}
+                        take backend/model from job routing (ag route) when --backend is omitted
+  --profile {claude,opencode,codex,default}
+                        routing profile for --job (default: detected harness)
+  --dir ADIR
+  --role {orchestrator,sub}
+  --persona PERSONA     behavior preset from roles
+  --system SYSTEM       inline custom system prompt (overrides persona)
+  --instructions INSTRUCTIONS
+                        explicit .md guidance file (repeatable, project-relative)
+  --worktree            isolated git worktree + branch ag/<name> (--dir must be in a git repo)
+  --base BASE           base ref for --worktree (default HEAD)
+  --mode {ro,edits,auto,full}
+                        permission mode (default: backend default)
+  --allow-cmd PATTERN   extra edits-mode shell allowlist prefix, opencode + claude (repeatable; ""
+                        clears)
+  --plan                plan (read-only) mode
+  --env K=V             child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir
+                        prepends)
+  --env-unset K         remove var from child env (repeatable)
+  --env-clear           drop all per-agent env
+  --claude-config-dir CLAUDE_CONFIG_DIR
+                        CLAUDE_CONFIG_DIR for this agent (second account); clears claude session
+                        on change
+  --subscription-only {on,off}
+                        strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use
+                        subscription login
+  --transport {acp,cli}
+                        acp: speak Agent Client Protocol (gemini/cursor/opencode)
+  --acp-cmd ACP_CMD     ACP agent command for --backend acp
+  --effort EFFORT       reasoning effort, checked per model (highest|lowest resolve; "" clears):
+                        claude --effort, opencode --variant, codex model_reasoning_effort
+  --fallback FALLBACK   fallback when rate-limited: MODEL, or BACKEND/MODEL | BACKEND:MODEL to
+                        fail over to another backend on a usage limit (repeatable, "" clears)
+  --data {work,public}  data class: work = zero-retention models only (default from routing.json
+                        privacy.default), public = any model
+  --stall-s STALL_S     stall watchdog seconds for this agent (0 = off; "" clears ->
+                        AG_STALL_S/backend default)

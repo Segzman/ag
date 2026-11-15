@@ -1,0 +1,7 @@
+usage: ag harness profile [-h] {list,status,show,validate,add,rm,set} ...
+
+positional arguments:
+  {list,status,show,validate,add,rm,set}
+
+options:
+  -h, --help            show this help message and exit

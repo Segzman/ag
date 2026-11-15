@@ -1,0 +1,10 @@
+usage: ag compact [-h] {config,show,run} ...
+
+positional arguments:
+  {config,show,run}
+    config           role defaults / per-agent override
+    show             effective settings + stats
+    run              manual compaction now
+
+options:
+  -h, --help         show this help message and exit

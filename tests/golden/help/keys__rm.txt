@@ -1,0 +1,7 @@
+usage: ag keys rm [-h] key_name
+
+positional arguments:
+  key_name    account name
+
+options:
+  -h, --help  show this help message and exit

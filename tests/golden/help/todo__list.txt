@@ -1,0 +1,5 @@
+usage: ag todo list [-h] [--all]
+
+options:
+  -h, --help  show this help message and exit
+  --all

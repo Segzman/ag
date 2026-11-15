@@ -1,0 +1,8 @@
+usage: ag harness export [-h] [--home HOME] [file]
+
+positional arguments:
+  file
+
+options:
+  -h, --help   show this help message and exit
+  --home HOME

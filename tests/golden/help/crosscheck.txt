@@ -1,0 +1,15 @@
+usage: ag crosscheck [-h] [--more AGENT [AGENT ...]] [--judge AGENT] [--timeout TIMEOUT] [--force]
+                     aname bname [task ...]
+
+positional arguments:
+  aname                 first agent
+  bname                 second agent
+  task                  self-contained task both agents answer
+
+options:
+  -h, --help            show this help message and exit
+  --more AGENT [AGENT ...]
+                        extra agent (repeatable or space-separated)
+  --judge AGENT         third agent asked which answer is right and why (one turn)
+  --timeout TIMEOUT     per-agent backend budget in seconds (0=unlimited, default 1800)
+  --force               bypass budget limits once (logged)

@@ -1,0 +1,11 @@
+usage: ag harness use [-h] [--model MODEL] [--budget BUDGET] agent backend
+
+positional arguments:
+  agent
+  backend
+
+options:
+  -h, --help       show this help message and exit
+  --model MODEL
+  --budget BUDGET  handoff replay budget in tokens for the next turn (default 4000,
+                   AG_HANDOFF_BUDGET overrides)

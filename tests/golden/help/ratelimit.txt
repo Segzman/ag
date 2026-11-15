@@ -1,0 +1,8 @@
+usage: ag ratelimit [-h] [op] [key]
+
+positional arguments:
+  op          clear
+  key         cooldown key backend/model (clear one)
+
+options:
+  -h, --help  show this help message and exit

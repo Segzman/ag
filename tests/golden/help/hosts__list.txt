@@ -1,0 +1,4 @@
+usage: ag hosts list [-h]
+
+options:
+  -h, --help  show this help message and exit

@@ -1,0 +1,9 @@
+usage: ag read [-h] [--offset OFFSET] [--limit LIMIT] path
+
+positional arguments:
+  path
+
+options:
+  -h, --help       show this help message and exit
+  --offset OFFSET
+  --limit LIMIT

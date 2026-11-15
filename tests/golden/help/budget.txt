@@ -1,0 +1,9 @@
+usage: ag budget [-h] {show,set} ...
+
+positional arguments:
+  {show,set}
+    show      limits + spent/used today
+    set       set daily/monthly USD + provider rpd
+
+options:
+  -h, --help  show this help message and exit

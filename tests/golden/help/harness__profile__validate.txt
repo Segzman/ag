@@ -1,0 +1,7 @@
+usage: ag harness profile validate [-h] pname
+
+positional arguments:
+  pname
+
+options:
+  -h, --help  show this help message and exit

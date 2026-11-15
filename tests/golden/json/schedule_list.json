@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "cmd": "schedule",
+  "data": {
+    "_text": "id             agent      spec                           next_due         last_due         status               runs miss skip\ntick: never ran (ag schedule install)",
+    "schedules": [],
+    "tick_age_s": null
+  }
+}

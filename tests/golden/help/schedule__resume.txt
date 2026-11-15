@@ -1,0 +1,7 @@
+usage: ag schedule resume [-h] id
+
+positional arguments:
+  id
+
+options:
+  -h, --help  show this help message and exit

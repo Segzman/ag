@@ -1,0 +1,10 @@
+usage: ag edit [-h] [--old OLD] [--new NEW] [--replace-all] path
+
+positional arguments:
+  path
+
+options:
+  -h, --help     show this help message and exit
+  --old OLD
+  --new NEW
+  --replace-all

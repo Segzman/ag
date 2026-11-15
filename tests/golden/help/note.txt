@@ -1,0 +1,8 @@
+usage: ag note [-h] [--tag TAG] [text ...]
+
+positional arguments:
+  text
+
+options:
+  -h, --help  show this help message and exit
+  --tag TAG

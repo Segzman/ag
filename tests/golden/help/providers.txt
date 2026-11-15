@@ -1,0 +1,13 @@
+usage: ag providers [-h] {list,add,rm,show} ...
+
+positional arguments:
+  {list,add,rm,show}
+    list              list providers
+    add               add/update a provider (presets:
+                      groq|cerebras|openrouter|cloudflare|gemini|mistral|sambanova; built-in
+                      keyless local: ollama|lmstudio)
+    rm                remove a provider
+    show              show one provider
+
+options:
+  -h, --help          show this help message and exit

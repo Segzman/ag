@@ -1,0 +1,11 @@
+usage: ag keys [-h] {list,set,rm,test} ...
+
+positional arguments:
+  {list,set,rm,test}
+    list              list key names + created/updated (never values)
+    set               store a key in the macOS Keychain (service ag)
+    rm                delete a key
+    test              cheap authenticated GET to the provider /models (never prints the key)
+
+options:
+  -h, --help          show this help message and exit

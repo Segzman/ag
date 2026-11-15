@@ -1,0 +1,18 @@
+usage: ag agents fork [-h] [--backend {claude,opencode,gemini,codex,cursor,echo,acp,api}]
+                      [--model MODEL] [--effort EFFORT] [--worktree] [--base BASE]
+                      [--acp-cmd ACP_CMD]
+                      src new
+
+positional arguments:
+  src                   agent to copy
+  new                   new agent name
+
+options:
+  -h, --help            show this help message and exit
+  --backend {claude,opencode,gemini,codex,cursor,echo,acp,api}
+  --model MODEL
+  --effort EFFORT       reasoning effort override (claude --effort, opencode --variant, codex
+                        model_reasoning_effort)
+  --worktree            new agent gets its own git worktree + branch ag/<new>
+  --base BASE           base ref for --worktree (default HEAD)
+  --acp-cmd ACP_CMD

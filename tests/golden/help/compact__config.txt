@@ -1,0 +1,15 @@
+usage: ag compact config [-h] [--role {orchestrator,sub}] [--agent CPAGENT] [--enable] [--disable]
+                         [--max-turns CPMAX] [--tokens CPTOKENS] [--keep CPKEEP]
+                         [--timeout CPTIMEOUT] [--clear]
+
+options:
+  -h, --help            show this help message and exit
+  --role {orchestrator,sub}
+  --agent CPAGENT
+  --enable
+  --disable
+  --max-turns CPMAX
+  --tokens CPTOKENS
+  --keep CPKEEP
+  --timeout CPTIMEOUT
+  --clear

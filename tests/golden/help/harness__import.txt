@@ -1,0 +1,13 @@
+usage: ag harness import [-h] [--home HOME] [--home-to HOME_TO] [--project-to PROJECT_TO]
+                         [--force]
+                         file
+
+positional arguments:
+  file
+
+options:
+  -h, --help            show this help message and exit
+  --home HOME
+  --home-to HOME_TO
+  --project-to PROJECT_TO
+  --force

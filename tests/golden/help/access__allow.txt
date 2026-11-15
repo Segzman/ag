@@ -1,0 +1,9 @@
+usage: ag access allow [-h] [--scope {global,project}] [--data {work,public}] glob
+
+positional arguments:
+  glob                  glob like opencode/* or provider/*
+
+options:
+  -h, --help            show this help message and exit
+  --scope {global,project}
+  --data {work,public}  per-data policy (default: base)

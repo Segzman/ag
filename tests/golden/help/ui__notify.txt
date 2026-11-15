@@ -1,0 +1,9 @@
+usage: ag ui notify [-h] [--sound] [--title TITLE] msg
+
+positional arguments:
+  msg
+
+options:
+  -h, --help     show this help message and exit
+  --sound
+  --title TITLE

@@ -1,0 +1,10 @@
+usage: ag chat steer [-h] [--timeout TIMEOUT] [--force] name [text ...]
+
+positional arguments:
+  name
+  text
+
+options:
+  -h, --help         show this help message and exit
+  --timeout TIMEOUT
+  --force            bypass budget limits once (logged)

@@ -1,0 +1,8 @@
+usage: ag wait [-h] [--timeout TIMEOUT] sess
+
+positional arguments:
+  sess
+
+options:
+  -h, --help         show this help message and exit
+  --timeout TIMEOUT

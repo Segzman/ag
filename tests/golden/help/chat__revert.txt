@@ -1,0 +1,8 @@
+usage: ag chat revert [-h] [--turn TURN] name
+
+positional arguments:
+  name
+
+options:
+  -h, --help   show this help message and exit
+  --turn TURN

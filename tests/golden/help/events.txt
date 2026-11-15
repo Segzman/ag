@@ -1,0 +1,13 @@
+usage: ag events [-h] [--limit LIMIT] [--session SESSION] [--follow] [--agent AGENT]
+                 [--type T1,T2] [--exit-on-match] [--timeout TIMEOUT]
+
+options:
+  -h, --help         show this help message and exit
+  --limit LIMIT
+  --session SESSION
+  --follow           tail events.jsonl, printing new events (and terminal wake-job changes) as
+                     they land; 0.5s poll
+  --agent AGENT      only events for this agent (wake jobs)
+  --type T1,T2       only these event types, comma-separated (e.g. wake_done,wake_fail)
+  --exit-on-match    exit 0 after printing the first matching event (with --follow)
+  --timeout TIMEOUT  stop waiting after S seconds with exit 124 (with --follow; 0 = none)

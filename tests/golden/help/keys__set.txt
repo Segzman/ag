@@ -1,0 +1,8 @@
+usage: ag keys set [-h] [--from-env VAR] key_name
+
+positional arguments:
+  key_name        account name
+
+options:
+  -h, --help      show this help message and exit
+  --from-env VAR  read value from env var instead of a secure dialog

@@ -1,0 +1,11 @@
+usage: ag chat log [-h] [--limit LIMIT] [--tail TAIL] [--last] [--no-tools] name
+
+positional arguments:
+  name
+
+options:
+  -h, --help     show this help message and exit
+  --limit LIMIT
+  --tail TAIL    show last N rows (overrides --limit)
+  --last         print only the final agent reply of the last turn (raw text)
+  --no-tools     hide tool/toolout/diff/reasoning rows

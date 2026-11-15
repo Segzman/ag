@@ -1,0 +1,11 @@
+usage: ag ui confirm [-h] [--yes YES] [--no NO] [--title TITLE] [--timeout TIMEOUT] question
+
+positional arguments:
+  question
+
+options:
+  -h, --help         show this help message and exit
+  --yes YES
+  --no NO
+  --title TITLE
+  --timeout TIMEOUT  seconds before giving up

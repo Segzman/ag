@@ -1,0 +1,6 @@
+usage: ag notes [-h] [--limit LIMIT] [--grep GREP]
+
+options:
+  -h, --help     show this help message and exit
+  --limit LIMIT
+  --grep GREP

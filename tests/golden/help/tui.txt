@@ -1,0 +1,5 @@
+usage: ag tui [-h] [--theme THEME]
+
+options:
+  -h, --help     show this help message and exit
+  --theme THEME

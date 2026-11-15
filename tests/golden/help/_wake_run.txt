@@ -1,0 +1,7 @@
+usage: ag _wake_run [-h] jid
+
+positional arguments:
+  jid
+
+options:
+  -h, --help  show this help message and exit

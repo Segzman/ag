@@ -1,0 +1,9 @@
+usage: ag write [-h] [--text TEXT] [--mkdir] path
+
+positional arguments:
+  path
+
+options:
+  -h, --help   show this help message and exit
+  --text TEXT
+  --mkdir

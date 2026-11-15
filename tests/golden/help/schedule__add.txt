@@ -1,0 +1,27 @@
+usage: ag schedule add [-h] [--every EVERY] [--at AT] [--tz TZ] [--days DAYS]
+                       [--max-runtime MAX_RUNTIME] [--notify NOTIFY] [--notify-done]
+                       [--on-done ON_DONE]
+                       [--job {mechanical,implement,review,debug,plan,hardest}]
+                       [--overlap {skip,queue}] [--catch-up] [--disabled] [--id ID] [--on NODE]
+                       agent message [message ...]
+
+positional arguments:
+  agent
+  message
+
+options:
+  -h, --help            show this help message and exit
+  --every EVERY         15m | 2h | 1d (>=60s)
+  --at AT               HH:MM local
+  --tz TZ               zone for --at: IANA (America/Toronto) or +HH:MM
+  --days DAYS           mon-fri | mon,wed,fri | daily | weekends (with --at)
+  --max-runtime MAX_RUNTIME
+  --notify NOTIFY
+  --notify-done         write a notification after each run
+  --on-done ON_DONE
+  --job {mechanical,implement,review,debug,plan,hardest}
+  --overlap {skip,queue}
+  --catch-up            fixed-time: fire even if >10min late
+  --disabled
+  --id ID
+  --on NODE             run schedule on another relay node

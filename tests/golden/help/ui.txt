@@ -1,0 +1,11 @@
+usage: ag ui [-h] {notify,confirm,choose,ask} ...
+
+positional arguments:
+  {notify,confirm,choose,ask}
+    notify              macOS notification (no focus change)
+    confirm             yes/no dialog; prints yes|no|timeout, exit 0/1/2
+    choose              pick from a list; exit 2 on cancel/timeout
+    ask                 text dialog; --secret hides the answer (never printed unless --stdout)
+
+options:
+  -h, --help            show this help message and exit

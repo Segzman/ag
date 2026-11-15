@@ -1,0 +1,7 @@
+usage: ag _sudo [-h] ...
+
+positional arguments:
+  args
+
+options:
+  -h, --help  show this help message and exit

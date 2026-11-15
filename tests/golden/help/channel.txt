@@ -1,0 +1,7 @@
+usage: ag channel [-h] {create,list,rm,post,log} ...
+
+positional arguments:
+  {create,list,rm,post,log}
+
+options:
+  -h, --help            show this help message and exit

@@ -1,0 +1,15 @@
+usage: ag link [-h] {init,up,down,status,serve,run,mac-key} ...
+
+positional arguments:
+  {init,up,down,status,serve,run,mac-key}
+    init                write link.json + create the key + print the Mac authorized_keys line
+    up                  start the supervisor (ssh -R forwards + watch page; detached unless
+                        --foreground)
+    down                stop supervisor + ssh
+    status              supervisor state + pid alive
+    serve               run the watch page server (foreground)
+    run                 spawn a command + print the watch url
+    mac-key             print (never write) the restricted authorized_keys line for a pubkey file
+
+options:
+  -h, --help            show this help message and exit

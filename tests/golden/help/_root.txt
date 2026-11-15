@@ -1,0 +1,79 @@
+usage: ag [-h] [--dir DIR] [--json] [--version]
+          {run,read,write,edit,ls,grep,note,notify,notes,todo,history,approvals,approve,spawn,send,askpass,ui,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,route,ratelimit,access,usage,budget,setup,link} ...
+
+CLI helper for autonomous agents
+
+positional arguments:
+  {run,read,write,edit,ls,grep,note,notify,notes,todo,history,approvals,approve,spawn,send,askpass,ui,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,route,ratelimit,access,usage,budget,setup,link}
+    run                 run shell cmd, logged
+    read                read file numbered
+    write               write file (arg or stdin)
+    edit                exact-string replace
+    ls                  glob files
+    grep                regex search
+    note                append memory
+    notify              write a notification to the configured inbox
+    notes               list memory
+    todo                task list
+    history             run log
+    approvals           list approval requests
+    approve             approve blocked cmd
+    spawn               spawn live pty session, returns instantly
+    send                send keystrokes to session
+    askpass             secure macOS secret dialog (askpass protocol)
+    ui                  native macOS notifications/dialogs to reach the user
+                        (notify|confirm|choose|ask)
+    _sudo               ==SUPPRESS==
+    snap                snapshot live output (many readers OK)
+    sessions            list sessions
+    kill                kill session
+    wait                block until session exits (opt-in only)
+    events              pings: spawn/send/exit feed
+    _daemon             ==SUPPRESS==
+    harness             select agent backends and share harness configuration
+    agents              ag roster + backends
+    roles               behavior presets (system prompts) for agents
+    chat                talk to an agent headless
+    queue               per-agent turn queue: list/cancel/hold/release
+    stop                hold queue, cancel waiters + wakes, interrupt running turn
+    handoff             native interactive TUI argv + profile env (no global writes)
+    status              orchestration overview
+    tui                 interactive orchestration console
+    attach              jump into a live session terminal (Ctrl-] detaches)
+    forget              wipe a session's logs (auth traces)
+    keys                Keychain keys (set/list/rm/test); bare `ag keys` = control cheat-sheet
+    providers           opencode-compatible provider registry (refs only, no secrets)
+    delegate            orchestrator assigns harness-linked task to a sub
+    crosscheck          same task to 2+ agents in parallel, compare answers
+    context             scoped guidance + persistent memory
+    compact             bounded history summarization
+    wake                wake a registered agent in background
+    channel             shared room: @agent mentions wake members, replies post back
+    schedule            recurring wakes (one global launchd/cron tick)
+    relay               run schedules made here on another machine (mailbox: git repo | synced
+                        folder)
+    receipts            idempotency receipts (--request-id)
+    wakes               list wake jobs (queued/running/done/failed)
+    _wake_run           ==SUPPRESS==
+    _acp                ==SUPPRESS==
+    hosts               outbound SSH host and project mappings
+    sync                portable task snapshots; no automatic failover
+    shell               interactive REPL
+    selfcheck           run built-in checks
+    update              update ag from GitHub (fast-forward only)
+    push                git push, then signal relay peers to update and sync
+    models              live model lists per backend (cached 24h)
+    route               effective job-type model routing
+    ratelimit           rate-limit slots + cooldowns (opencode free-tier)
+    access              allow/deny backend/model globs (routing.json access)
+    usage               token/cost/request totals from the usage ledger
+    budget              spend/request budgets
+    setup               pick model routing, install ag skills (shared ~/.agents/skills + links),
+                        write ag pointer blocks into harness instruction files
+    link                VM -> Mac view over outbound reverse SSH (docs/LINK.md)
+
+options:
+  -h, --help            show this help message and exit
+  --dir DIR             state dir (default ./.agent)
+  --json                machine-readable JSON output
+  --version

@@ -1,0 +1,7 @@
+usage: ag receipts [-h] {gc} ...
+
+positional arguments:
+  {gc}
+
+options:
+  -h, --help  show this help message and exit

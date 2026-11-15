@@ -1,0 +1,8 @@
+usage: ag hosts check [-h] [--timeout TIMEOUT] host
+
+positional arguments:
+  host
+
+options:
+  -h, --help         show this help message and exit
+  --timeout TIMEOUT

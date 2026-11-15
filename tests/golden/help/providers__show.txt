@@ -1,0 +1,7 @@
+usage: ag providers show [-h] pid
+
+positional arguments:
+  pid         provider id
+
+options:
+  -h, --help  show this help message and exit

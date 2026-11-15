@@ -1,0 +1,8 @@
+usage: ag ls [-h] [--root ROOT] [pattern]
+
+positional arguments:
+  pattern
+
+options:
+  -h, --help   show this help message and exit
+  --root ROOT

@@ -147,6 +147,7 @@ SyncTransportError
 THEMES
 THEME_256
 THEME_8
+TICK_MAX_S
 TIER_BIG
 TIER_ORDER
 TIER_SMALL
@@ -192,6 +193,7 @@ _BOOL
 _BR_HTTP
 _CAP_BASE
 _CC
+_CHILD_PGIDS
 _CKPT_IDENT
 _CLAUDE_PM
 _CODEX
@@ -516,6 +518,7 @@ _relay_backends
 _relay_cmd
 _relay_commit
 _relay_ensure_echo_agent
+_relay_env
 _relay_epoch
 _relay_error_tail
 _relay_errs_join
@@ -586,12 +589,15 @@ _run_probe
 _say
 _sched_at
 _sched_atfork
+_sched_backend
 _sched_days
 _sched_every
 _sched_fire
 _sched_flock
+_sched_installed
 _sched_load
 _sched_local_tz
+_sched_loop_start
 _sched_next
 _sched_plist
 _sched_reg_get
@@ -601,6 +607,7 @@ _sched_save
 _sched_spec
 _sched_step
 _sched_systemd_units
+_sched_tick_cmd
 _sched_tick_dir
 _sched_ts
 _sched_tz
@@ -645,6 +652,9 @@ _sync_source_agent
 _sync_validate
 _sync_write
 _systemd_quote
+_tick_mark
+_tick_path
+_tick_read
 _ticket_name
 _tier_of
 _tl_claude_blocks

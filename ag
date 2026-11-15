@@ -11382,14 +11382,63 @@ def _sched_systemd_units(interval):
         "[Install]", "WantedBy=timers.target", ""]
     return "\n".join(service), "\n".join(timer)
 
+TICK_MAX_S = 600  # hard deadline for one global tick (AG_TICK_MAX_S); a hung tick would block every later one
+
+def _tick_path(): return ag_config_home() / "tick.json"
+def _tick_read():
+    try: return json.loads(_tick_path().read_text())
+    except Exception: return {}
+def _tick_mark(**kw):
+    """Global tick heartbeat (harness-agnostic health: `ag schedule health`)."""
+    try: _tick_path().parent.mkdir(parents=True, exist_ok=True); _atomic_write(_tick_path(), json.dumps({**_tick_read(), **kw}))
+    except Exception: pass
+
+def _sched_backend():
+    """launchd on macOS; systemd user timer when a user manager answers; else cron; else a detached loop."""
+    if sys.platform == "darwin": return "launchd"
+    sc = shutil.which("systemctl")
+    if sc and subprocess.run([sc, "--user", "show-environment"], capture_output=True).returncode == 0: return "systemd"
+    return "cron" if shutil.which("crontab") else "loop"
+
+def _sched_installed(backend):
+    if backend == "launchd":
+        lc = shutil.which("launchctl")
+        return bool(lc) and subprocess.run([lc, "print", f"gui/{os.getuid()}/{SCHED_LABEL}"], capture_output=True).returncode == 0
+    if backend == "systemd":
+        sc = shutil.which("systemctl")
+        return bool(sc) and subprocess.run([sc, "--user", "is-active", "ag-tick.timer"], capture_output=True, text=True).stdout.strip() == "active"
+    if backend == "cron":
+        ct = shutil.which("crontab")
+        return bool(ct) and "schedule tick --all" in subprocess.run([ct, "-l"], capture_output=True, text=True).stdout
+    pid = _tick_read().get("loop_pid")
+    return bool(pid) and _pid_alive(pid)
+
+def _sched_tick_cmd(): return [sys.executable, ag_script_path(), "schedule", "tick", "--all", "--reap"]
+
+def _sched_loop_start(iv):
+    """No launchd/systemd/cron (containers, cloud agent VMs): a detached loop, one fresh tick process per interval."""
+    log = ag_cache_home() / "schedule-tick.log"; log.parent.mkdir(parents=True, exist_ok=True)
+    code = (f"import subprocess,time\nwhile True:\n    subprocess.run({_sched_tick_cmd()!r}, stdout=open({str(log)!r},'a'), stderr=subprocess.STDOUT)\n"
+            f"    time.sleep({int(iv)})\n")
+    p = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    _tick_mark(loop_pid=p.pid, interval=int(iv)); return p.pid
+
 def do_schedule(a):
     sub = a.ssub; sdir = state_dir(a.dir); cmd = "schedule"
     def err(m, h=None): return emit(a, cmd, error=m, hint=h) or 1
     if sub == "install":
         iv = int(a.interval)
         if iv < 10: return err("--interval must be >= 10")
-        if a.cron and a.systemd: return err("choose one of --cron / --systemd")
-        if a.systemd:
+        picked = [b for b in ("launchd", "systemd", "cron", "loop") if getattr(a, b, False)]
+        if len(picked) > 1: return err("choose one of --launchd / --systemd / --cron / --loop")
+        backend = picked[0] if picked else _sched_backend()
+        if backend == "loop":
+            if not a.write: return emit(a, cmd, {"_text": "no launchd/systemd/cron here: `ag schedule install --write` starts a detached tick loop", "backend": "loop"})
+            old_pid = _tick_read().get("loop_pid")
+            if old_pid and _pid_alive(old_pid): return emit(a, cmd, {"_text": f"tick loop already running (pid {old_pid})", "backend": "loop", "pid": old_pid})
+            pid = _sched_loop_start(iv)
+            return emit(a, cmd, {"_text": f"started detached tick loop pid {pid}, every {iv}s (no system scheduler found)", "backend": "loop", "pid": pid})
+        if backend == "systemd":
             service, timer = _sched_systemd_units(iv)
             path = _ag_home() / ".config" / "systemd" / "user"
             if not a.write:
@@ -11409,9 +11458,17 @@ def do_schedule(a):
             p = subprocess.run([systemctl, "--user", "enable", "--now", "ag-tick.timer"], capture_output=True, text=True)
             if p.returncode: return err(f"systemctl enable failed: {(p.stderr or p.stdout).strip()[:180]}", f"units written to {path}")
             return emit(a, cmd, {"_text": f"installed and enabled {path}/ag-tick.timer", "path": str(path), "enabled": True})
-        if a.cron:
+        if backend == "cron":
             line = f"{'*' if iv <= 60 else '*/' + str(max(1, iv // 60))} * * * * {shlex.quote(sys.executable)} {shlex.quote(ag_script_path())} schedule tick --all --reap >> {shlex.quote(str(ag_cache_home() / 'schedule-tick.log'))} 2>&1"
-            return emit(a, cmd, {"_text": line, "cron": line})
+            if not a.write: return emit(a, cmd, {"_text": line + "\n# install: ag schedule install --cron --write", "cron": line})
+            ct = shutil.which("crontab")
+            if not ct: return err("crontab not found", "ag schedule install --write picks a detached loop when no scheduler exists")
+            cur = subprocess.run([ct, "-l"], capture_output=True, text=True).stdout.splitlines()
+            keep = [l for l in cur if "schedule tick --all" not in l]  # replace any earlier ag tick line
+            p = subprocess.run([ct, "-"], input="\n".join(keep + [line]) + "\n", capture_output=True, text=True)
+            if p.returncode: return err(f"crontab write failed: {(p.stderr or p.stdout).strip()[:180]}")
+            ag_cache_home().mkdir(parents=True, exist_ok=True)
+            return emit(a, cmd, {"_text": f"installed cron tick: {line}", "cron": line, "installed": True})
         import plistlib
         pl = _sched_plist(iv); path = _ag_home() / "Library" / "LaunchAgents" / f"{SCHED_LABEL}.plist"
         uid = os.getuid(); boot = f"launchctl bootstrap gui/{uid} {shlex.quote(str(path))}"
@@ -11431,6 +11488,17 @@ def do_schedule(a):
     if sub == "tick":
         try: now = datetime.fromisoformat(a.now).astimezone().timestamp() if a.now else time.time()
         except ValueError: return err(f"bad --now {a.now!r}: need ISO time")
+        glob_tick = a.all and not a.dry_run and not a.now
+        if glob_tick:
+            tmax = int(os.environ.get("AG_TICK_MAX_S") or TICK_MAX_S)
+            def _deadline(*_):
+                for g in list(_CHILD_PGIDS):
+                    try: os.killpg(g, signal.SIGKILL)
+                    except OSError: pass
+                _tick_mark(pid=None, last_end=time.time(), ok=False, error=f"tick exceeded {tmax}s; killed")
+                os._exit(124)
+            if hasattr(signal, "SIGALRM"): signal.signal(signal.SIGALRM, _deadline); signal.alarm(tmax)
+            _tick_mark(pid=os.getpid(), started=time.time())
         upd = _update_check_inline()  # daily stamp; tick-driven nodes still update
         cfg = None; relay_errors = []
         if a.all:
@@ -11454,7 +11522,43 @@ def do_schedule(a):
         if relay_errors:
             data["relay_error"] = "; ".join(relay_errors)[:500]
             data["_text"] += "\nrelay error: " + data["relay_error"]
+        if glob_tick:
+            if hasattr(signal, "SIGALRM"): signal.alarm(0)
+            _tick_mark(pid=None, last_end=time.time(), ok=not relay_errors and not any(r.get("error") for r in res),
+                error=data.get("relay_error") or next((r["error"] for r in res if r.get("error")), None))
         return emit(a, cmd, data)
+    if sub == "health":
+        st = _tick_read(); now = time.time(); iv = int(a.interval); tmax = int(os.environ.get("AG_TICK_MAX_S") or TICK_MAX_S)
+        backend = _sched_backend(); installed = _sched_installed(backend)
+        last = st.get("last_end")
+        age = now - last if last else None
+        pid = st.get("pid"); run_s = now - st.get("started", now) if pid and _pid_alive(pid) else None
+        probs = []
+        if not installed: probs.append(f"no {backend} tick installed")
+        if run_s is not None and run_s > tmax: probs.append(f"tick pid {pid} hung for {int(run_s)}s")
+        if age is None or age > 3 * iv: probs.append("tick never finished" if age is None else f"last tick finished {int(age)}s ago")
+        fixed = []
+        if a.fix and probs:
+            if run_s is not None and run_s > tmax:
+                try: os.kill(pid, signal.SIGKILL); fixed.append(f"killed hung tick {pid}")
+                except OSError: pass
+            if not installed or backend != "launchd":  # launchd reinstall also unsticks a wedged job; others only when missing
+                flag = [f"--{backend}"]
+                p = subprocess.run([sys.executable, ag_script_path(), "schedule", "install", "--write", "--interval", str(iv), *flag], capture_output=True, text=True)
+                fixed.append(f"install {backend}: " + ("ok" if p.returncode == 0 else (p.stderr or p.stdout).strip()[:120]))
+            if backend == "launchd" and installed:
+                p = subprocess.run([sys.executable, ag_script_path(), "schedule", "install", "--write", "--launchd", "--interval", str(iv)], capture_output=True, text=True)
+                fixed.append("reloaded launchd job" if p.returncode == 0 else (p.stderr or p.stdout).strip()[:120])
+            subprocess.Popen(_sched_tick_cmd(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            fixed.append("started one tick now")
+        warn = st.get("error") if st.get("ok") is False else None
+        txt = [f"tick: {backend} {'installed' if installed else 'NOT installed'}; last finished " + (f"{int(age)}s ago" if age is not None else "never")
+               + (f"; running {int(run_s)}s" if run_s is not None else "")]
+        txt += [f"problem: {x}" for x in probs] + ([f"last tick error: {warn}"] if warn else []) + [f"fixed: {x}" for x in fixed]
+        if probs and not a.fix: txt.append("fix: ag schedule health --fix")
+        emit(a, cmd, {"_text": "\n".join(txt), "backend": backend, "installed": installed, "last_tick_age_s": age, "running_s": run_s,
+            "problems": probs, "fixed": fixed, "last_error": warn, "healthy": not probs})
+        return 0 if not probs or fixed else 1
     ensure_state(sdir)
     if sub == "add":
         try:
@@ -11564,11 +11668,30 @@ def do_schedule(a):
 # (written by the target) -- so concurrent rebases never conflict. Part 2 wires
 # `schedule add AGENT ... --on NODE` (local row stores on/sdir/agent_spec).
 
+_CHILD_PGIDS = set()  # live relay subprocess groups; the tick deadline kills them
+
+def _relay_env():
+    """git never prompts, and gives up on a dead link instead of hanging (stalled pull = no more ticks)."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env.setdefault("GIT_HTTP_LOW_SPEED_LIMIT", "1000"); env.setdefault("GIT_HTTP_LOW_SPEED_TIME", "30")
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=2")
+    return env
+
 def _relay_cmd(args, timeout=120):
-    """[exit, stderr+stdout tail]. Never raises."""
-    try: p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError) as e: return 1, f"{type(e).__name__}: {e}"[:200]
-    return p.returncode, ((p.stderr or "") + (p.stdout or "")).strip()
+    """[exit, stderr+stdout tail]. Never raises. Own process group: on timeout the whole group dies
+    (subprocess.run's timeout alone leaves git-remote-https/ssh holding the pipes, so the call never returns)."""
+    try: p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_relay_env(), start_new_session=True)
+    except OSError as e: return 1, f"{type(e).__name__}: {e}"[:200]
+    _CHILD_PGIDS.add(p.pid)
+    try: out, errs = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try: os.killpg(p.pid, signal.SIGKILL)
+        except OSError: pass
+        try: p.communicate(timeout=5)
+        except subprocess.SubprocessError: pass
+        return 124, f"timeout after {timeout}s: {' '.join(map(str, args[:4]))}"[:200]
+    finally: _CHILD_PGIDS.discard(p.pid)
+    return p.returncode, ((errs or "") + (out or "")).strip()
 def _relay_git(args, timeout=180):
     """None on exit 0, else the git error tail. Never raises."""
     rc, out = _relay_cmd(args, timeout)
@@ -19874,7 +19997,8 @@ def build():
     scl=scs.add_parser("list"); scl.add_argument("--all",action="store_true",help="every registered state dir")
     for v_ in ("rm","pause","resume","run"): scs.add_parser(v_).add_argument("id")
     sct=scs.add_parser("tick"); sct.add_argument("--all",action="store_true"); sct.add_argument("--now",default=None,help="ISO time (tests)"); sct.add_argument("--reap",action="store_true"); sct.add_argument("--dry-run",dest="dry_run",action="store_true")
-    sci=scs.add_parser("install"); sci.add_argument("--write",action="store_true"); sci.add_argument("--cron",action="store_true"); sci.add_argument("--systemd",action="store_true",help="print or install systemd user service + timer"); sci.add_argument("--interval",type=int,default=60)
+    sch=scs.add_parser("health",help="is the global tick alive (any harness can run this; exit 1 = stale)"); sch.add_argument("--fix",action="store_true",help="kill a hung tick, (re)install the scheduler, run one tick now"); sch.add_argument("--interval",type=int,default=60)
+    sci=scs.add_parser("install"); sci.add_argument("--write",action="store_true"); sci.add_argument("--cron",action="store_true"); sci.add_argument("--launchd",action="store_true",help="macOS LaunchAgent (default on macOS)"); sci.add_argument("--loop",action="store_true",help="detached tick loop (default when no launchd/systemd/cron)"); sci.add_argument("--systemd",action="store_true",help="print or install systemd user service + timer"); sci.add_argument("--interval",type=int,default=60)
     ry_=sub.add_parser("relay",help="run schedules made here on another machine (mailbox: git repo | synced folder)"); rys=ry_.add_subparsers(dest="rsub",required=True)
     ryi=rys.add_parser("init",help="write relay.json; clone for --git; first heartbeat"); ryi.add_argument("--git",dest="git_url",default=None,help="private repo URL (a bare/local git path works too)"); ryi.add_argument("--dir",dest="relay_dir",default=None,help="folder used directly as the mailbox (sync it yourself)"); ryi.add_argument("--node",default=None,help="this machine's name (default: short hostname, [a-z0-9-])"); ryi.add_argument("--state",default=None,help="ag state dir where inbound schedules materialise (default ~/.agent-relay)"); ryi.add_argument("--workdir",default=None,help="parent of per-origin agent workdirs (default ~/ag-relay-work)"); ryi.add_argument("--max-mode",dest="max_mode",default=None,choices=MODES,help="highest --mode a target accepts from the mailbox (default edits)")
     rys.add_parser("sync",help="pull mailbox, materialise/report inbound schedules, ingest results, heartbeat, push")

@@ -1,0 +1,6 @@
+usage: ag schedule health [-h] [--fix] [--interval INTERVAL]
+
+options:
+  -h, --help           show this help message and exit
+  --fix                kill a hung tick, (re)install the scheduler, run one tick now
+  --interval INTERVAL

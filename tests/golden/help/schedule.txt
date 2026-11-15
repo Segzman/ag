@@ -1,7 +1,8 @@
-usage: ag schedule [-h] {add,list,rm,pause,resume,run,tick,install} ...
+usage: ag schedule [-h] {add,list,rm,pause,resume,run,tick,health,install} ...
 
 positional arguments:
-  {add,list,rm,pause,resume,run,tick,install}
+  {add,list,rm,pause,resume,run,tick,health,install}
+    health              is the global tick alive (any harness can run this; exit 1 = stale)
 
 options:
   -h, --help            show this help message and exit

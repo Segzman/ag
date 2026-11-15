@@ -1,8 +1,11 @@
-usage: ag schedule install [-h] [--write] [--cron] [--systemd] [--interval INTERVAL]
+usage: ag schedule install [-h] [--write] [--cron] [--launchd] [--loop] [--systemd]
+                           [--interval INTERVAL]
 
 options:
   -h, --help           show this help message and exit
   --write
   --cron
+  --launchd            macOS LaunchAgent (default on macOS)
+  --loop               detached tick loop (default when no launchd/systemd/cron)
   --systemd            print or install systemd user service + timer
   --interval INTERVAL

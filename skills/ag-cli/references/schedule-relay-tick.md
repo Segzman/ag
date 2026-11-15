@@ -10,8 +10,12 @@ Scheduled wakes (`schedule add`) are in `ag-agents`. One global job drives all s
 {{AG}} schedule install --cron          # print crontab line instead
 {{AG}} schedule install --systemd       # print user service + timer (Linux)
 {{AG}} schedule install --systemd --write  # write units + enable timer
+{{AG}} schedule install --write         # auto backend: launchd (macOS) | systemd user timer | cron | --loop (no scheduler)
 {{AG}} schedule tick --all --reap       # what the job runs every 60s; --dry-run, --now ISO
+{{AG}} schedule health [--fix]          # exit 1 = tick missing/stale/hung; --fix kills, reinstalls, ticks now
 ```
+
+Use `schedule health` (not a harness-specific guard) to monitor the tick from any agent or cron; `--fix` repairs it. Each global tick has a hard deadline (`AG_TICK_MAX_S`, default 600s) and relay git calls die as a process group on timeout, so a stuck `git pull` cannot wedge the scheduler. Heartbeat: `$AG_CONFIG_HOME/tick.json`.
 
 Registry `$AG_CONFIG_HOME/schedule-dirs.json`. Every tick also relaunches `parked` usage-limit wake jobs whose `resume_at` passed, once (old job `resumed_as`, new `parked_from`; `--dry-run` reports `would-resume`). Concurrent ticks are lock-safe; corrupt `schedules.json` refuses the tick. The systemd service is `Type=oneshot` with `KillMode=process`, so a stopped tick does not kill the wake workers it launched; it passes HOME, PATH, and present proxy variables.
 

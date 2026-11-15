@@ -181,14 +181,14 @@ class Cli(Env):
         self.assertEqual(json.loads(p.stdout)["data"]["dirs"][0]["dir"], str(self.sd.resolve())); self.assertEqual(self.wakes(), 1)
 
     def test_install_plist_and_write(self):
-        p, o = self.j("schedule", "install"); self.assertEqual(p.returncode, 0)
+        p, o = self.j("schedule", "install", "--launchd"); self.assertEqual(p.returncode, 0)
         pl = o["data"]["plist"]; self.assertEqual(pl["Label"], "org.ag.schedule"); self.assertEqual(pl["StartInterval"], 60)
         self.assertEqual(pl["ProgramArguments"][2:], ["schedule", "tick", "--all", "--reap"])
         self.assertFalse((self.home / "Library").exists())
         self.assertIn("schedule tick --all --reap", self.run_ag("schedule", "install", "--cron").stdout)
         log = self.td / "lc.log"; fake = self.bin / "launchctl"
         fake.write_text(f"#!/bin/sh\necho \"$@\" >> {log}\n[ \"$1\" = print ] && exit 0\nexit 0\n"); fake.chmod(0o755)
-        p, o = self.j("schedule", "install", "--write"); self.assertEqual(p.returncode, 0, p.stderr)
+        p, o = self.j("schedule", "install", "--write", "--launchd"); self.assertEqual(p.returncode, 0, p.stderr)
         path = self.home / "Library" / "LaunchAgents" / "org.ag.schedule.plist"
         self.assertEqual(plistlib.loads(path.read_bytes())["Label"], "org.ag.schedule")
         calls = log.read_text().splitlines(); self.assertTrue(calls[1].startswith("bootout")); self.assertTrue(calls[2].startswith("bootstrap"))

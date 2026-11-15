@@ -1,0 +1,16 @@
+usage: ag browser [-h] {open,eval,click,type,upload,snap,list,close} ...
+
+positional arguments:
+  {open,eval,click,type,upload,snap,list,close}
+    open                start (or reuse) NAME's Chrome and navigate to URL
+    eval                evaluate JS in NAME's page; prints the value
+    click               trusted mouse click on --css SEL, or --role R --name TEXT
+    type                insert TEXT into the focused element (click it first)
+    upload              set FILE on --css input[type=file]; a button that opens a native chooser
+                        is clicked and the chooser answered
+    snap                page URL and title; --text adds innerText; --png FILE writes a screenshot
+    list                browsers in the registry and whether each answers
+    close               stop NAME's Chrome (profile kept)
+
+options:
+  -h, --help            show this help message and exit

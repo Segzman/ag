@@ -1,0 +1,10 @@
+usage: ag browser click [-h] [--css CSS] [--role ROLE] [--name TEXT] name
+
+positional arguments:
+  name
+
+options:
+  -h, --help   show this help message and exit
+  --css CSS
+  --role ROLE
+  --name TEXT

@@ -75,6 +75,7 @@ ag pops a native masked macOS dialog and types the value into the program; the m
 ## References (load only when needed)
 
 - `references/secrets-ui.md` - secret prompts, askpass, `ui` dialogs, `notify` inbox.
+- `references/browser.md` - `browser` open/eval/click/type/upload/snap: per-agent Chrome over CDP.
 - `references/keys-providers.md` - Keychain `keys`, `providers`, `api` backend, ollama/lmstudio.
 - `references/models-privacy.md` - `ag models` flags/ranking/openrouter, data-privacy rule + zdr/retain/train table.
 - `references/setup-update.md` - `ag setup` flags and UIs, `ag update`, `ag push`.

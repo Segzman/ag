@@ -1,0 +1,9 @@
+usage: ag browser upload [-h] --css CSS name file
+
+positional arguments:
+  name
+  file
+
+options:
+  -h, --help  show this help message and exit
+  --css CSS

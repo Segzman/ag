@@ -1,5 +1,4 @@
-usage: ag policy render [-h] [--file PFILE] [--target {claude,codex,all}]
-                        [--out OUT] [--dry-run]
+usage: ag policy render [-h] [--file PFILE] [--target {claude,codex,all}] [--out OUT] [--dry-run]
 
 options:
   -h, --help            show this help message and exit

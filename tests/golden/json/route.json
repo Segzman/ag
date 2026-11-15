@@ -3,7 +3,7 @@
   "cmd": "route",
   "data": {
     "harness": "claude",
-    "via": "process",
+    "via": "override",
     "profile": "claude",
     "jobs": {
       "mechanical": {

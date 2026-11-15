@@ -47,7 +47,8 @@ def _command_paths(parser, prefix=()):
 def _env(home):
     return dict(PATH="/usr/bin:/bin", LANG="C.UTF-8", COLUMNS="100", AG_AUTO_UPDATE="0", HOME=home,
                 XDG_CONFIG_HOME=home + "/.config", XDG_CACHE_HOME=home + "/.cache", XDG_DATA_HOME=home + "/.local/share",
-                AG_HOME=home, AG_CONFIG_HOME=home + "/cfg", AG_CACHE_HOME=home + "/cache")
+                AG_HOME=home, AG_CONFIG_HOME=home + "/cfg", AG_CACHE_HOME=home + "/cache",
+                AG_HARNESS="claude")  # route output depends on the detected harness; pin it
 
 
 PY = shutil.which("python3") or sys.executable  # the python3 `ag` runs under

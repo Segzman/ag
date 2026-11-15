@@ -4,6 +4,7 @@
 Baseline for the refactor: snapshots live in tests/golden/. Regenerate with tools/golden_update.py only
 when a change to help text, namespace or JSON is intended. Stdlib, hermetic env, temp state dirs.
 """
+import shutil
 import argparse, concurrent.futures as cf, difflib, importlib.machinery, importlib.util, json, os, re, subprocess, sys, tempfile, types, unittest
 from pathlib import Path
 
@@ -49,8 +50,11 @@ def _env(home):
                 AG_HOME=home, AG_CONFIG_HOME=home + "/cfg", AG_CACHE_HOME=home + "/cache")
 
 
+PY = shutil.which("python3") or sys.executable  # the python3 `ag` runs under
+
+
 def _run(args, env, cwd):
-    p = subprocess.run([sys.executable, AG, *args], cwd=cwd, env=env, capture_output=True, text=True,
+    p = subprocess.run([PY, AG, *args], cwd=cwd, env=env, capture_output=True, text=True,
                        encoding="utf-8", stdin=subprocess.DEVNULL, timeout=40)
     if p.returncode:
         raise RuntimeError("ag %s rc=%d\n%s%s" % (" ".join(args), p.returncode, p.stdout, p.stderr))
@@ -133,13 +137,15 @@ class GoldenSnapshots(unittest.TestCase):
         if set(want) != set(got):
             self.fail("%s: snapshot file set differs; missing %s, unexpected %s (run tools/golden_update.py if intended)"
                       % (prefix, sorted(set(want) - set(got)), sorted(set(got) - set(want))))
+        # help text: compare words, not line wrapping (argparse wraps differently per Python version)
+        norm = (lambda b: b" ".join(b.split())) if prefix == "help/" else (lambda b: b)
         for k in sorted(want):
-            if want[k] != got[k]:
+            if norm(want[k]) != norm(got[k]):
                 diff = "".join(difflib.unified_diff(want[k].decode("utf-8").splitlines(True), got[k].decode("utf-8").splitlines(True),
                                                     "golden/" + k, "fresh/" + k))
                 self.fail("%s differs from golden (run tools/golden_update.py if intended):\n%s" % (k, diff))
 
-    def test_help_identical(self):
+    def test_help_identical(self):  # wording/options, wrap-insensitive
         self._same("help/")
 
     def test_json_identical(self):

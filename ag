@@ -12077,7 +12077,7 @@ def _relay_status(cfg):
         alerts = []
         if not p: alerts.append("no heartbeat seen yet")
         else:
-            if (m_c := p.get("ag_commit")) and ours and m_c != ours: alerts.append(f"commit differs ({m_c} vs {ours})")
+            if (m_c := p.get("ag_commit")) and ours and not (m_c.startswith(ours) or ours.startswith(m_c)): alerts.append(f"commit differs ({m_c} vs {ours})")  # prefix match: full vs short hash
             if (age := now - p.get("last_seen", 0)) > max(2 * iv, 3600): alerts.append(f"unseen for {_relay_ago(age)}")
         monitored["peers"].append({"node": p.get("node") or f.stem, "commit": p.get("ag_commit"),
             "backends": p.get("backends"), "last_seen": p.get("last_seen"), "interval_s": iv,

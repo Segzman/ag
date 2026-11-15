@@ -18,10 +18,11 @@
 
 ```sh
 {{AG}} policy check --file ag-policy.json                       # validate schema; nonzero exit on bad key/value
-{{AG}} policy render --file ag-policy.json [--target claude|codex|all] [--out DIR] [--dry-run]
+{{AG}} policy targets [--file ag-policy.json] [--json]          # coverage: target x field -> native/approx/none (+ notes for this policy)
+{{AG}} policy render --file ag-policy.json [--target NAME|all] [--out DIR] [--dry-run]
 ```
 
-Policy JSON: `{version:1, permission_floor:"ro|edits|auto", allowed_models:[], denied_models:[], mcp_allow:[], secret_read_ban:[globs], network:"on|off"}`. `render` prints to stdout without `--out`, writes `managed-settings.json` (Claude) and/or `requirements.toml` (Codex) with `--out`, and `--dry-run` prints a unified diff against existing files without writing. Floor reuses `_mode_rank` (Claude `defaultMode`, Codex `approval_policy`+`sandbox_mode`); secret globs -> Claude `Read(...)` deny rules; vendor field names are as of 2026-11 and must be re-checked per release.
+Policy JSON: `{version:1, permission_floor:"ro|edits|auto", allowed_models:[], denied_models:[], mcp_allow:[], mcp_identity:{}, secret_read_ban:[globs], network:"on|off"}`. `--target` takes any name from `policy targets` (claude, codex, codex-config, gemini, gemini-policy, qwen, cursor, copilot, amp, goose, aider, aider-ignore, cline, roo, roo-modes, kilo, continue, windsurf, crush, augment, factory, grok, kiro, zed, opencode) or `all`. `--out DIR` writes `DIR/<target>/<file>`; `--dry-run` prints a unified diff without writing. Before relying on a file, check `policy targets`: `none` = not rendered for that agent, `approx` = partial. Vendor field names are as of 2026-11; re-check each release.
 
 ## Link (VM -> Mac)
 

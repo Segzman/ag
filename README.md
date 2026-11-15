@@ -556,12 +556,13 @@ Same scope inherits the prior `HANDOFF.md`; sibling scopes are isolated. Native 
 
 ## Policy compiler
 
-Compile one `ag-policy.json` into backend-native policy files. Renderers are pure functions (validated dict in, text out), so output is deterministic and testable.
+Compile one `ag-policy.json` into backend-native policy files. Renderers are pure functions (validated dict in, `(path, text)` out), so output is deterministic and testable. `--target` takes any target name below or `all`.
 
 ```sh
 ag policy check --file ag-policy.json                                   # validate; nonzero exit + clear message on bad keys/values
-ag policy render --file ag-policy.json [--target claude|codex|all]      # print to stdout
-ag policy render --file ag-policy.json --target all --out DIR           # write managed-settings.json + requirements.toml
+ag policy targets [--file ag-policy.json] [--json]                      # coverage matrix (target x field); --file adds notes for fields this policy sets
+ag policy render --file ag-policy.json [--target NAME|all]              # print to stdout
+ag policy render --file ag-policy.json --target all --out DIR           # write DIR/<target>/<file> for every target
 ag policy render --file ag-policy.json --target all --out DIR --dry-run # unified diff, writes nothing
 ```
 
@@ -571,18 +572,52 @@ Schema (`version` required, the rest optional; defaults shown):
 {"version": 1,
  "permission_floor": "edits",
  "allowed_models": [], "denied_models": [],
- "mcp_allow": [],
+ "mcp_allow": [], "mcp_identity": {},
  "secret_read_ban": ["~/.ssh/**", "**/.env"],
  "network": "on"}
 ```
 
-- `permission_floor` reuses the dispatch-mode rank (`_mode_rank`): `ro` < `edits` < `auto`. Claude Code gets `permissions.defaultMode` `plan`/`acceptEdits`/`bypassPermissions`; Codex gets `approval_policy` + `sandbox_mode` `on-request`/`read-only`, `on-request`/`workspace-write`, `never`/`workspace-write`.
-- `secret_read_ban` globs become Claude `Read(...)` deny rules. Codex has no equivalent field: they are emitted as comments (the sandbox is the real boundary).
-- `mcp_allow` becomes Claude `enabledMcpjsonServers` + `allowedMcpServers`; Codex lists it as a comment (MCP servers live in `config.toml`).
-- `allowed_models` becomes Claude `availableModels`; `denied_models` has no native field and is emitted as a comment.
-- `network: off` adds Claude `WebFetch`/`WebSearch` deny rules and sets Codex `sandbox_workspace_write.network_access = false`.
+`mcp_identity` maps an `mcp_allow` name to `{"command": ...}` or `{"url": ...}`; Codex needs it for `[mcp_servers.<name>] identity`.
 
-Vendor note: field names follow the Claude Code and Codex docs **as of 2026-11**; they are not a stable API. Re-check each vendor release before relying on the rendered file, and treat `--dry-run` diffs as the review surface.
+Coverage (`native` = the target's file enforces the field with a documented key; `approx` = a weaker or shared mechanism, or a partial rendering; `none` = not rendered for that target, so an admin console or another file may still enforce it). Doc URLs per target are in `ag policy targets --json` (`doc`):
+
+| target | file | floor | secret reads | MCP allow | models allow | models deny | network off | scope |
+|---|---|---|---|---|---|---|---|---|
+| `claude` | `managed-settings.json` | native | approx | native | native | native | approx | managed: /Library/Application Support/ClaudeCode/ (macOS), /etc/claude-code/ (Linux) |
+| `codex` | `requirements.toml` | native | native | native | none | none | none | admin: /etc/codex/requirements.toml (macOS MDM com.openai.codex) |
+| `codex-config` | `codex-config.toml` | approx | none | none | none | none | approx | user: ~/.codex/config.toml (defaults, not enforced) |
+| `gemini` | `settings.json` | none | none | none | approx | none | native | user: ~/.gemini/settings.json; system: /etc/gemini-cli/settings.json |
+| `gemini-policy` | `ag.toml` | native | approx | approx | none | none | none | user: ~/.gemini/policies/; admin: /Library/Application Support/GeminiCli/policies/ |
+| `qwen` | `settings.json` | approx | native | native | approx | none | approx | user: ~/.qwen/settings.json; system settings layer |
+| `cursor` | `cli-config.json` | approx | native | none | approx | none | native | user: ~/.cursor/cli-config.json; MCP and models via team dashboard/MDM |
+| `copilot` | `managed-settings.json` | approx | native | native | approx | none | approx | managed: /Library/Application Support/GitHubCopilot/managed-settings.json |
+| `amp` | `settings.json` | none | none | none | none | none | approx | user: ~/.config/amp/settings.json |
+| `goose` | `config.yaml` | approx | none | none | approx | none | none | user: ~/.config/goose/config.yaml |
+| `aider` | `.aider.conf.yml` | none | none | none | approx | none | none | user: ~/.aider.conf.yml; repo .aider.conf.yml |
+| `aider-ignore` | `.aiderignore` | none | approx | none | none | none | none | repo root: .aiderignore |
+| `cline` | `.clineignore` | none | approx | none | none | none | none | workspace root: .clineignore |
+| `roo` | `.rooignore` | none | approx | none | none | none | none | workspace root: .rooignore |
+| `roo-modes` | `.roomodes` | native | none | none | none | none | none | project: .roomodes (custom mode) |
+| `kilo` | `kilo.json` | native | approx | none | approx | none | approx | user: ~/.config/kilo/kilo.json; managed: /Library/Application Support/kilo/kilo.json |
+| `continue` | `permissions.yaml` | native | native | none | none | none | none | user: ~/.continue/permissions.yaml |
+| `windsurf` | `.devinignore` | none | approx | none | none | none | none | workspace root: .devinignore |
+| `crush` | `crush.json` | approx | none | none | none | none | none | project: crush.json; user: ~/.config/crush/crush.json |
+| `augment` | `settings.json` | native | none | none | approx | none | none | user: ~/.augment/settings.json |
+| `factory` | `.factory/settings.json` | none | native | none | native | native | native | project: .factory/settings.json; managed: /Library/Application Support/Factory/settings.json |
+| `grok` | `config.toml` | approx | native | none | native | native | approx | user: ~/.grok/config.toml; pins: /etc/grok/requirements.toml |
+| `kiro` | `managed-settings.json` | approx | approx | approx | none | none | approx | managed: /Library/Application Support/Kiro/managed-settings.json |
+| `zed` | `settings.json` | native | approx | none | none | none | approx | user: ~/.config/zed/settings.json; project .zed/settings.json |
+| `opencode` | `opencode.json` | native | native | approx | approx | none | none | user: ~/.config/opencode/opencode.json; project opencode.json |
+
+Per-target details:
+
+- **Claude Code** (`managed-settings.json`): `permissions.defaultMode` `plan`/`acceptEdits`/`bypassPermissions`, plus `disableBypassPermissionsMode` and `disableAutoMode` set to `"disable"` for `ro`/`edits`. `secret_read_ban` becomes `Read(...)` deny rules (`**/` becomes `//**/`, which matches at any depth). `mcp_allow` becomes `allowedMcpServers` as `{"serverName": ...}` objects plus `allowManagedMcpServersOnly: true`. `denied_models` becomes `deniedModels`. `network: off` adds `WebFetch`/`WebSearch` denies and a `sandbox` block. Bash `curl` is not blocked by these denies, so network stays `approx`.
+- **Codex** (`requirements.toml`): admin constraints as lists (`allowed_approval_policies`, `allowed_sandbox_modes`), `[permissions.filesystem] deny_read` for secrets, and `[mcp_servers.<name>] identity` from `mcp_identity`. No model key is rendered for Codex, and the `network_proxy` requirement is not rendered because its nesting is unverified.
+- **Codex defaults** (`codex-config.toml`): `approval_policy`, `sandbox_mode`, `[sandbox_workspace_write] network_access`. These are user defaults, not enforcement.
+- **Others**: one file per agent (Gemini `settings.json` + `ag.toml` policy rules, Qwen, Cursor, Copilot, Amp, Goose, Aider + `.aiderignore`, Cline/Roo/Windsurf ignore files, Roo `.roomodes` custom mode, Kilo, Continue, Crush, Augment, Factory, Grok, Kiro, Zed, OpenCode). Ignore files and regex rules are `approx` because they cover file tools only, not shell commands.
+- **Not rendered**: agent-side MCP server definitions (ag only has names), provider API keys, and admin-console settings (Cursor, Windsurf, Amp model/MCP registries). Verify approximations with `ag policy targets` before relying on them.
+
+Vendor note: field names follow the vendor docs **as of 2026-11**; they are not a stable API. Re-check each vendor release before relying on a rendered file, and treat `--dry-run` diffs as the review surface.
 
 ## Multi-host
 

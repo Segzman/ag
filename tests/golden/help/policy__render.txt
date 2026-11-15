@@ -1,9 +1,11 @@
-usage: ag policy render [-h] [--file PFILE] [--target {claude,codex,all}] [--out OUT] [--dry-run]
+usage: ag policy render [-h] [--file PFILE]
+                        [--target {claude,codex,codex-config,gemini,gemini-policy,qwen,cursor,copilot,amp,goose,aider,aider-ignore,cline,roo,roo-modes,kilo,continue,windsurf,crush,augment,factory,grok,kiro,zed,opencode,all}]
+                        [--out OUT] [--dry-run]
 
 options:
   -h, --help            show this help message and exit
   --file PFILE          policy JSON (default ag-policy.json)
-  --target {claude,codex,all}
-                        backend policy file to render
+  --target {claude,codex,codex-config,gemini,gemini-policy,qwen,cursor,copilot,amp,goose,aider,aider-ignore,cline,roo,roo-modes,kilo,continue,windsurf,crush,augment,factory,grok,kiro,zed,opencode,all}
+                        backend policy file to render (ag policy targets lists them)
   --out OUT             output directory (default: print to stdout)
   --dry-run             print a unified diff against existing files; write nothing

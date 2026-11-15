@@ -9572,7 +9572,8 @@ _RESUME_MISSING_RE = re.compile(
 _TRANSIENT_RE = re.compile(
     r"overloaded|\b529\b|\b503\b|service unavailable"
     r"|econnreset|stream (?:closed|ended|disconnected)|connection reset"
-    r"|free tier can only be used from within opencode", re.I)  # 5xx/network only; 429/rate-limit lives in _RATELIMIT_RE
+    r"|free tier can only be used from within opencode"
+    r"|database is locked|sqlite_busy", re.I)  # 5xx/network + parallel opencode runs racing on its SQLite db; 429 lives in _RATELIMIT_RE
 _RATELIMIT_RE = re.compile(
     r"\b429\b|rate.?limit|too many requests|endpoint is unavailable|stalled", re.I)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")

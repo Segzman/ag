@@ -117,5 +117,15 @@ class RetryE2E(unittest.TestCase):
         self.assertEqual(len(self.calls()), 1)
 
 
+
+class Classify(unittest.TestCase):
+    def test_sqlite_lock_is_transient(self):
+        # 2026-11-14: parallel opencode agents failed instantly with "database is locked" (shared SQLite db)
+        import importlib.machinery, importlib.util
+        l = importlib.machinery.SourceFileLoader("ag_mod_retry_cls", AG); m = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l)); l.exec_module(m)
+        self.assertEqual(m.classify_turn_failure("opencode", 1, "Error: database is locked", False), "transient")
+        self.assertEqual(m.classify_turn_failure("opencode", 1, "SQLITE_BUSY: database is locked", False), "transient")
+        self.assertIsNone(m.classify_turn_failure("opencode", 1, "database is locked", True))  # output already produced
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,10 @@
+usage: ag needs [-h] {list,answer,done} ...
+
+positional arguments:
+  {list,answer,done}
+    list              open items, newest first
+    answer            record the user's answer for a queued item
+    done              close a queued item
+
+options:
+  -h, --help          show this help message and exit

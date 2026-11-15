@@ -1,4 +1,5 @@
-usage: ag ui choose [-h] [--multi] [--title TITLE] [--timeout TIMEOUT]
+usage: ag ui choose [-h] [--multi] [--title TITLE] [--timeout TIMEOUT] [--queue] [--needs-id ID]
+                    [--agent AGENT]
                     question options [options ...]
 
 positional arguments:
@@ -10,3 +11,8 @@ options:
   --multi
   --title TITLE
   --timeout TIMEOUT  seconds before giving up
+  --queue            also record this request in needs.jsonl (open until answered; timeout always
+                     queues)
+  --needs-id ID      return the recorded answer for this need instead of popping a dialog (re-
+                     check after a timeout)
+  --agent AGENT      agent the queued need is attributed to (default $AG_PARENT_AGENT)

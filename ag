@@ -1760,6 +1760,72 @@ def _ui_event(a, kind, outcome):
     sdir = state_dir(a.dir)
     if sdir.is_dir(): _event(sdir, "ui", None, kind=kind, outcome=outcome)
 
+# ---- needs queue: ui dialogs that time out keep living in <state>/needs.jsonl so a ----
+# ---- later `--needs-id` (or `ag needs answer`) can still deliver the user's answer ----
+NEEDS_NOTIFY_GAP = 600  # one inbox summary per 10 min while items are open
+
+def _needs_load(sdir):
+    out = []
+    try:
+        for line in (sdir / "needs.jsonl").read_text().splitlines():
+            try:
+                r = json.loads(line)
+                if isinstance(r, dict) and r.get("id"): out.append(r)
+            except ValueError: pass
+    except OSError: pass
+    return out
+
+def _needs_save(sdir, rows):
+    _atomic_write(sdir / "needs.jsonl", "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+
+def _needs_new_id():
+    return f"n{int(time.time() * 1000):x}-{os.urandom(3).hex()}"
+
+def _needs_ping(sdir):
+    """One 'N things need you' inbox notification per 10 min while items are open."""
+    try:
+        n = sum(1 for r in _needs_load(sdir) if r.get("status") == "open")
+        if not n: return
+        mark = sdir / "needs_notify.json"
+        if time.time() - _json_or_empty(mark).get("last", 0) < NEEDS_NOTIFY_GAP: return
+        _atomic_write(mark, json.dumps({"last": time.time()}))
+        _notify_write(f"ag: {n} things need you", "run `ag needs list` to see and answer them")
+    except Exception: pass
+
+def _needs_enqueue(a, sdir, k, status, answer=None):
+    """Append one needs.jsonl record; -> id. Secrets never reach this path."""
+    ensure_state(sdir)
+    rec = {"id": _needs_new_id(), "ts": now_iso(),
+        "agent": (getattr(a, "agent", "") or os.environ.get("AG_PARENT_AGENT") or "").strip(),
+        "kind": k, "title": a.title, "question": a.question,
+        "options": list(a.options) if k == "choose" else [a.yes, a.no] if k == "confirm" else [],
+        "status": status}
+    if answer is not None: rec["answer"] = answer
+    with open(sdir / "needs.jsonl", "a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    if status == "open": _needs_ping(sdir)
+    return rec["id"]
+
+def _needs_stored_answer(sdir, nid):
+    """Recorded answer for `--needs-id ID` once the item is answered (None otherwise)."""
+    hits = [r for r in _needs_load(sdir) if r.get("id") == nid]
+    return hits[-1].get("answer") if hits and hits[-1].get("status") == "answered" else None
+
+def _ui_needs_hit(a, sdir, k):
+    """--needs-id ID: emit the stored answer instead of popping a dialog. -> (rc, hit)."""
+    nid = (getattr(a, "needs_id", "") or "").strip()
+    if not nid: return None, False
+    val = _needs_stored_answer(sdir, nid)
+    if val is None: return None, False  # still open / unknown: fall through to the dialog
+    _ui_event(a, k, "needs")
+    if k == "confirm":
+        ans = "yes" if val == "yes" else "no"
+        emit(a, "ui", {"_text": ans, "answer": ans, "needs_id": nid})
+        return {"yes": 0, "no": 1}.get(ans, 2), True
+    if k == "choose": emit(a, "ui", {"_text": val, "choices": val.split("\n"), "needs_id": nid})
+    else: emit(a, "ui", {"_text": val, "answer": val, "needs_id": nid})
+    return 0, True
+
 def _ui_secret(a):
     """ask --secret: the value only reaches the child's env (--to-env) or a piped stdout (--stdout)."""
     cmd = list(a.cmd)
@@ -1788,32 +1854,71 @@ def _ui_secret(a):
 
 def do_ui(a):
     k = a.ui_cmd
-    if k == "ask" and a.secret: return _ui_secret(a)
+    if k == "ask" and a.secret:
+        if getattr(a, "queue", False) or getattr(a, "needs_id", ""):
+            return _ui_fail(a, 2, "--secret never touches the needs queue (values are never stored)")
+        return _ui_secret(a)
     if not ui_enabled(): return _ui_fail(a, 3, "ag ui needs macOS (osascript)")
+    sdir = state_dir(a.dir)
     if k == "notify":
         st, _ = ui_run("notify", [a.msg, a.title, "1" if a.sound else "0"])
         if st != "ok": return _ui_fail(a, 1, "notification failed")
         _ui_event(a, k, "sent")
         emit(a, "ui", {"_text": "sent", "outcome": "sent"}); return 0
+    rc, hit = _ui_needs_hit(a, sdir, k)
+    if hit: return rc
     if k == "confirm":
         st, out = ui_run("confirm", [a.question, a.yes, a.no, a.title, a.timeout], a.timeout)
         if st == "error": return _ui_fail(a, 1, "dialog failed")
         ans = ("yes" if out == a.yes else "no") if st == "ok" else "timeout" if st == "timeout" else "no"
         _ui_event(a, k, "timeout" if st == "timeout" else "answered" if st == "ok" else "cancelled")
+        if st == "timeout" or getattr(a, "queue", False):
+            nid = _needs_enqueue(a, sdir, k, "answered" if st == "ok" else "open", ans if st == "ok" else None)
+            if st != "ok":
+                emit(a, "ui", {"_text": f"timeout — queued {nid}; answer with: ag needs answer {nid} yes|no",
+                    "outcome": "timeout", "needs_id": nid})
+                return 2
         emit(a, "ui", {"_text": ans, "answer": ans})
         return {"yes": 0, "no": 1}.get(ans, 2)
     if k == "choose": st, out = ui_run("choose", [a.question, a.title, "1" if a.multi else "0", *a.options], a.timeout)
     else: st, out = ui_run("ask", [a.question, a.default, a.title, a.timeout], a.timeout)
     if st == "error": return _ui_fail(a, 1, "dialog failed")
     _ui_event(a, k, UI_OUTCOME[st])
-    if st != "ok":
-        if getattr(a, "json", False): emit(a, "ui", {"outcome": UI_OUTCOME[st]})
-        return 2
+    if st != "ok" or getattr(a, "queue", False):
+        nid = _needs_enqueue(a, sdir, k, "answered" if st == "ok" else "open", out if st == "ok" else None)
+        if st != "ok":
+            emit(a, "ui", {"_text": f"{UI_OUTCOME[st]} — queued {nid}; answer with: ag needs answer {nid} VALUE",
+                "outcome": UI_OUTCOME[st], "needs_id": nid})
+            return 2
     if k == "choose":
         vals = out.split("\n")
         emit(a, "ui", {"_text": out, "choices": vals})
     else: emit(a, "ui", {"_text": out, "answer": out})
     return 0
+
+def do_needs(a):
+    """Persistent queue (<state>/needs.jsonl) for ui dialog requests that timed out."""
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    k = a.nsub
+    if k == "list":
+        rows = [r for r in _needs_load(sdir) if r.get("status") == "open"]
+        rows.reverse()  # newest first
+        return emit(a, "needs", {"_text": "\n".join(
+            f"{r['id']}  [{r.get('agent') or 'agent?'}]  {r.get('kind')}: {r.get('question')}" for r in rows) or "no open needs",
+            "needs": rows, "count": len(rows)})
+    rows = _needs_load(sdir)
+    hit = next((r for r in reversed(rows) if r.get("id") == a.id), None)
+    if hit is None: return emit(a, "needs", error=f"no such need: {a.id}", hint="ag needs list")
+    if k == "answer":
+        val = " ".join(a.value).strip()
+        if not val: return emit(a, "needs", error="empty answer")
+        if hit.get("status") != "open": return emit(a, "needs", error=f"need {a.id} is {hit.get('status')}")
+        hit["status"] = "answered"; hit["answer"] = val; hit["answered_ts"] = now_iso()
+    else:  # done: close an open or answered item
+        if hit.get("status") == "closed": return emit(a, "needs", error=f"need {a.id} is already closed")
+        hit["status"] = "closed"; hit["done_ts"] = now_iso()
+    _needs_save(sdir, rows)
+    return emit(a, "needs", {"_text": f"{a.id} {k}", "need": hit})
 
 def do__sudo(a):
     """PATH shim target: exec the real sudo, adding -A so it uses askpass."""
@@ -18737,6 +18842,11 @@ def build():
     no = sub.add_parser("notify",help="write a notification to the configured inbox"); no.add_argument("title",nargs="?"); no.add_argument("body",nargs="*")
     no.add_argument("--dir",dest="notify_dir",default=None,help="notification inbox directory (overrides AG_NOTIFY_DIR/config)"); no.add_argument("--set-dir",dest="set_dir",default=None,metavar="DIR",help="save the default notification inbox in notify.json")
     ns = sub.add_parser("notes",help="list memory"); ns.add_argument("--limit",type=int,default=20); ns.add_argument("--grep",default=None)
+    nn = sub.add_parser("needs",help="persistent queue of ui dialog requests that timed out (list|answer|done)")
+    nns=nn.add_subparsers(dest="nsub",required=True)
+    nns.add_parser("list",help="open items, newest first")
+    nn=nns.add_parser("answer",help="record the user's answer for a queued item"); nn.add_argument("id"); nn.add_argument("value",nargs="+")
+    nn=nns.add_parser("done",help="close a queued item"); nn.add_argument("id")
     t = sub.add_parser("todo",help="task list"); ts=t.add_subparsers(dest="sub",required=True)
     ta=ts.add_parser("add"); ta.add_argument("text",nargs="*")
     tl=ts.add_parser("list"); tl.add_argument("--all",action="store_true")
@@ -18759,7 +18869,11 @@ def build():
     u.add_argument("--secret", action="store_true"); u.add_argument("--to-env", default=""); u.add_argument("--stdout", action="store_true"); u.set_defaults(cmd=[])
     for u in uis.choices.values():
         u.add_argument("--title", default=UI_TITLE)
-        if u is not uis.choices["notify"]: u.add_argument("--timeout", type=int, default=UI_DEFAULT_TIMEOUT, help="seconds before giving up")
+        if u is not uis.choices["notify"]:
+            u.add_argument("--timeout", type=int, default=UI_DEFAULT_TIMEOUT, help="seconds before giving up")
+            u.add_argument("--queue", action="store_true", help="also record this request in needs.jsonl (open until answered; timeout always queues)")
+            u.add_argument("--needs-id", dest="needs_id", default="", metavar="ID", help="return the recorded answer for this need instead of popping a dialog (re-check after a timeout)")
+            u.add_argument("--agent", default="", help="agent the queued need is attributed to (default $AG_PARENT_AGENT)")
     su = sub.add_parser("_sudo",help=argparse.SUPPRESS); su.add_argument("args",nargs=argparse.REMAINDER)
     sn = sub.add_parser("snap",help="snapshot live output (many readers OK)"); sn.add_argument("sess"); sn.add_argument("--lines",type=int,default=40); sn.add_argument("--since",type=int,default=None,help="byte offset from prior snap"); sn.add_argument("--clean",action="store_true",help="strip ANSI codes")
     sub.add_parser("sessions",help="list sessions")
@@ -19596,7 +19710,7 @@ def main(argv=None):
     # strip leading -- from run/spawn
     if a.subcmd in ("run","spawn") and getattr(a,"cmd",None) and a.cmd[0]=="--": a.cmd=a.cmd[1:]
     fn = {"run":do_run,"read":do_read,"write":do_write,"edit":do_edit,"ls":do_ls,
-        "grep":do_grep,"note":do_note,"notify":do_notify,"notes":do_notes,"todo":do_todo,"history":do_history,
+        "grep":do_grep,"note":do_note,"notify":do_notify,"notes":do_notes,"needs":do_needs,"todo":do_todo,"history":do_history,
         "approvals":do_approvals,"approve":do_approve,"shell":do_shell,"selfcheck":do_selfcheck,
         "spawn":do_spawn,"send":do_send,"snap":do_snap,"sessions":do_sessions,
         "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon,

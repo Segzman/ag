@@ -13,7 +13,7 @@ Scheduled wakes (`schedule add`) are in `ag-agents`. One global job drives all s
 {{AG}} schedule tick --all --reap       # what the job runs every 60s; --dry-run, --now ISO
 ```
 
-Registry `$AG_CONFIG_HOME/schedule-dirs.json`. Concurrent ticks are lock-safe; corrupt `schedules.json` refuses the tick. The systemd service is `Type=oneshot` with `KillMode=process`, so a stopped tick does not kill the wake workers it launched; it passes HOME, PATH, and present proxy variables.
+Registry `$AG_CONFIG_HOME/schedule-dirs.json`. Every tick also relaunches `parked` usage-limit wake jobs whose `resume_at` passed, once (old job `resumed_as`, new `parked_from`; `--dry-run` reports `would-resume`). Concurrent ticks are lock-safe; corrupt `schedules.json` refuses the tick. The systemd service is `Type=oneshot` with `KillMode=process`, so a stopped tick does not kill the wake workers it launched; it passes HOME, PATH, and present proxy variables.
 
 ## Relay schedule tick
 

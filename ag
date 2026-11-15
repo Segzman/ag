@@ -715,8 +715,8 @@ def _wake_notify(sdir, job, status):
     except Exception: pass
 
 def _wake_finish(sdir, jid, status, reply="", error="", exit_code=0,
-        fields=None, transitioned=None):
-    """Terminal transition queued/running -> done/failed, exactly once.
+        fields=None, transitioned=None, from_statuses=None):
+    """Terminal transition queued/running(/parked) -> done/failed/parked, exactly once.
 
     The read-check-write runs under a per-job flock guard (crash-releases),
     so concurrent callers serialize: the loser sees a terminal job and
@@ -740,7 +740,7 @@ def _wake_finish(sdir, jid, status, reply="", error="", exit_code=0,
             cur = _wake_read_job(sdir, jid)
         except Exception:
             return {}
-        if not cur or cur.get("status") not in ("queued", "running"):
+        if not cur or cur.get("status") not in (from_statuses or ("queued", "running")):
             return cur or {}
         if fields: cur.update(fields)
         cur.pop("wait_reason", None)
@@ -770,10 +770,15 @@ def _wake_finish(sdir, jid, status, reply="", error="", exit_code=0,
         if status == "done":
             _event(sdir, "wake_done", cur.get("trigger"), agent=cur.get("agent"),
                 exit=cur.get("exit"), job=jid)
+        elif status == "parked":
+            _event(sdir, "wake_park", cur.get("trigger"), agent=cur.get("agent"),
+                exit=cur.get("exit"), job=jid, resume_at=cur.get("resume_at"))
         else:
             _event(sdir, "wake_fail", cur.get("trigger"), agent=cur.get("agent"),
                 exit=cur.get("exit"), reason=str(error or "")[:120], job=jid)
     except Exception: pass
+    if status == "parked":
+        return cur
     try:
         notify_job = cur
         if cur.get("notify_done"):
@@ -946,7 +951,8 @@ def agent_cancel(sdir, jid, reason="cancelled"):
         return {"error": f"no such job: {jid}"}
     changed = []
     cur = _wake_finish(sdir, jid, "failed", error=reason, exit_code=130,
-        fields={"cancel_requested": True, "cancelled": True}, transitioned=changed)
+        fields={"cancel_requested": True, "cancelled": True}, transitioned=changed,
+        from_statuses=("queued", "running", "parked"))
     if not changed:
         if not cur or cur.get("status") in ("queued", "running"):
             return {"error": f"could not persist cancellation for job: {jid}"}
@@ -1142,6 +1148,13 @@ def do__wake_run(a):
         _wake_finish(sdir, jid, "failed", error=r.get("error", "max-runtime exceeded"),
             exit_code=124, fields={"timed_out": True, **_wvf, **_we})
         return 1
+    _wp = None if job.get("no_park") else _usage_park_epoch(r)
+    if _wp:  # plan cap with a parsed reset: park for the scheduler tick, not a failure
+        _wex = r.get("exit", 1)
+        _wake_finish(sdir, jid, "parked", error=r.get("error", ""),
+            exit_code=_wex if isinstance(_wex, int) else 1,
+            fields={"usage_limit": True, "resume_at": _wp, "usage_reset_at": r.get("reset_at"), **_wvf, **_we})
+        return 0
     if "error" in r:
         _mark_failed(r["error"], r.get("exit", 1) if isinstance(r.get("exit"), int) else 1, fields=_wvf or None)
         return 1
@@ -1189,7 +1202,7 @@ def wakes_reap(sdir, queued_only=True, include_running=False, agent=None, max_at
             max_runtime_s=j.get("max_runtime_s", 0), stall_s=j.get("stall_s"), job_type=j.get("job"),
             verify=j.get("verify"), verify_timeout_s=j.get("verify_timeout_s", 600), escalate=j.get("escalate"),
             cohort=({"parent": j["parent"], "group": j["group"], "quiet_s": 0} if j.get("group") else None),
-            extra={"retry_of": j["id"], "attempts": at + 1})
+            extra={"retry_of": j["id"], "attempts": at + 1, **({"no_park": True} if j.get("no_park") else {})})
         if "error" in r:
             try: mk.unlink()
             except Exception: pass
@@ -1200,6 +1213,50 @@ def wakes_reap(sdir, queued_only=True, include_running=False, agent=None, max_at
         finally: _release_wake_job(lk)
         _event(sdir, "wake_reap", j.get("trigger"), agent=j["agent"], job=r["job"], old=j["id"])
         out.append({**row, "new": r["job"], "action": "reaped"})
+    return out
+
+def _wake_resume_parked(sdir, now, dry=False):
+    """Relaunch parked jobs whose resume_at passed, once. -> [{id,agent,action,new?}]."""
+    _, jobs, _ = _wake_dirs(sdir); out = []
+    for p in sorted(jobs.glob("*.json")):
+        try: j = json.loads(p.read_text())
+        except Exception: continue
+        if j.get("status") != "parked" or j.get("resumed_as"): continue
+        try: due = float(j.get("resume_at") or 0)
+        except Exception: continue
+        if not due or due > now: continue
+        row = {"id": j.get("id"), "agent": j.get("agent"), "resume_at": due}
+        if dry: out.append({**row, "action": "would-resume"}); continue
+        lock = _acquire_wake_job(sdir, j["id"])
+        if lock is None: continue
+        try:
+            cur = _wake_read_job(sdir, j["id"])
+            if cur.get("status") != "parked" or cur.get("resumed_as"): continue
+            extra = {"parked_from": cur["id"]}
+            if cur.get("no_park"): extra["no_park"] = True
+            if cur.get("force"): extra["force"] = True
+            r = launch_wake_chat(sdir, cur.get("agent", ""), cur.get("message", ""),
+                trigger=cur.get("trigger"), exit_code=cur.get("exit"),
+                notify=cur.get("notify", ""), notify_done=bool(cur.get("notify_done")),
+                on_done=cur.get("on_done", ""), timeout_s=cur.get("timeout_s", 0),
+                max_runtime_s=cur.get("max_runtime_s", 0), stall_s=cur.get("stall_s"),
+                job_type=cur.get("job"), verify=cur.get("verify"),
+                verify_timeout_s=cur.get("verify_timeout_s", 600), escalate=cur.get("escalate"),
+                cohort=({"parent": cur.get("parent"), "group": cur["group"], "quiet_s": 0} if cur.get("group") else None),
+                extra=extra)
+            if "error" in r:
+                cur.update(status="failed", error=f"park resume failed: {str(r['error'])[:180]}",
+                    resume_error=str(r["error"])[:200], ended_at=now_iso())
+                _wake_write_job(sdir, cur)
+                _event(sdir, "wake_fail", cur.get("trigger"), agent=cur.get("agent"),
+                    job=cur.get("id"), reason=cur["resume_error"][:120])
+                out.append({**row, "action": "error", "error": cur["resume_error"]}); continue
+            cur.update(status="resumed", resumed_as=r["job"], resumed_at=now_iso())
+            cur.pop("resume_error", None); _wake_write_job(sdir, cur)
+            _event(sdir, "wake_resume", cur.get("trigger"), agent=cur.get("agent"),
+                job=r["job"], old=cur.get("id"))
+            out.append({**row, "action": "resumed", "new": r["job"]})
+        finally: _release_wake_job(lock)
     return out
 
 def do_wakes_reap(a, sdir):
@@ -1270,7 +1327,8 @@ def do_wakes(a):
         f'{j.get("id","")} {j.get("status",""):8} {j.get("agent",""):10} '
         f'{str(j.get("session") or "-"):7} trig={j.get("trigger") or "-"} '
         f'exit={j.get("backend_exit", j.get("exit", "-"))} '
-        f'{(j.get("message","") or "")[:60]}' for j in rows) or "(none)"
+        + (f'resume={_sched_ts(int(j["resume_at"]))} ' if j.get("status") == "parked" and j.get("resume_at") else "")
+        + f'{(j.get("message","") or "")[:60]}' for j in rows) or "(none)"
     return emit(a, "wakes", {"_text": txt})
 
 def do_wakes_wait(a, sdir):
@@ -1303,7 +1361,7 @@ def do_wakes_wait(a, sdir):
             if not cur:
                 return emit(a, "wakes", error=f"no such job: {jid}",
                     hint="ag wakes")
-            if cur.get("status") in ("done", "failed") or cur.get("stalled"):
+            if cur.get("status") in ("done", "failed", "parked") or cur.get("stalled"):
                 break
             if budget and time.time() - t0 > budget:
                 if getattr(a, "json", False):
@@ -1341,7 +1399,7 @@ def do_wakes_wait(a, sdir):
         for jid in list(unfinished):
             try: cur = _wake_reconcile(sdir, _wake_read_job(sdir, jid))
             except Exception: cur = {}
-            if cur and (cur.get("status") in ("done", "failed") or cur.get("stalled")):
+            if cur and (cur.get("status") in ("done", "failed", "parked") or cur.get("stalled")):
                 sid = cur.get("session"); sr = se = None
                 if sid:
                     try:
@@ -9015,7 +9073,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                 _ul_note(sdir, name, f"[limit] {_lm}", on_event, "usage_limit", backend=backend)
                 try: _ms = load_chat_meta(sdir,name,agent=a).get("sid","")
                 except Exception: _ms = ""
-                return {"error":_lm,"exit":2,"sid":_ms,"reply":_lm,"usage_limit":True,"reset_at":datetime.fromtimestamp(float(_ulc["until"]),timezone.utc).isoformat()}
+                return {"error":_lm,"exit":2,"sid":_ms,"reply":_lm,"usage_limit":True,"usage_limit_when":_ulc.get("when",""),"reset_at":datetime.fromtimestamp(float(_ulc["until"]),timezone.utc).isoformat()}
         if _fo:
             backend, model = _fo
             a = {k: v for k, v in a.items() if k not in ("effort", "acp_cmd", "transport")}; a["backend"], a["model"] = backend, model
@@ -9377,7 +9435,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             if not command: usage_log_turn(sdir, name, backend, model, _usage, rc)
         except Exception: pass
         if _intr: out["interrupted"] = True
-        if _uli: out.update(usage_limit=True, reset_at=datetime.fromtimestamp(_uli["until"], timezone.utc).isoformat(), error=_uli["label"])
+        if _uli: out.update(usage_limit=True, usage_limit_when=_uli["when"], reset_at=datetime.fromtimestamp(_uli["until"], timezone.utc).isoformat(), error=_uli["label"])
         if _timed_out["hit"]:
             out["timed_out"] = True
             out["error"] = f"max-runtime {timeout_s:g}s exceeded (backend killed)"
@@ -9545,7 +9603,8 @@ def _ul_key(a, backend):
 def _ul_record(a, backend, info):
     try:
         p = _rl_cooldown_path(_ul_key(a, backend)); p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"until": info["until"], "hits": 1, "usage_limit": True, "label": info["label"], "msg": info["msg"]}))
+        p.write_text(json.dumps({"until": info["until"], "hits": 1, "usage_limit": True, "label": info["label"],
+            "msg": info["msg"], "when": info.get("when", "")}))
     except Exception: pass
 def _ul_active(a, backend):
     """Cooldown record {until,label,msg} while this backend/account is limited, else None. Never raises."""
@@ -9578,6 +9637,15 @@ def _ul_note(sdir, name, note, on_event, ev, **kw):
     if on_event:
         try: on_event(name, "tool", note)
         except Exception: pass
+def _usage_park_epoch(r, now=None):
+    """Turn result -> future resume epoch when it can be parked, else None. Pure."""
+    try:
+        if not r.get("usage_limit") or r.get("timed_out") or r.get("interrupted"): return None
+        if not r.get("usage_limit_when"): return None  # reset text not parseable: keep old failure
+        ep = datetime.fromisoformat(str(r.get("reset_at") or "")).timestamp()
+    except Exception: return None
+    now = now or time.time()
+    return ep if ep > now else None
 
 # ---- rate-limit manager: slots + stall watchdog + shared cooldown + fallback (one block) ----
 # Key = backend+model. Slots: fcntl.flock on $AG_CACHE_HOME/ratelimit/slots/<key>/<i>.lock,
@@ -10669,6 +10737,7 @@ def do_wake(a):
     if esc_ms is not None: _wake_payload.append(["escalate",esc_ms])
     if notify_done: _wake_payload.append("notify_done")
     if getattr(a,"on",None): _wake_payload.append(["on",a.on])
+    if getattr(a,"no_park",False): _wake_payload.append("no_park")
     _rc, _h = _rcpt(a, sdir, "wake", agent, json.dumps(_wake_payload,default=str))
     if _rc is not None: return _rc
     if agent not in names:  # after _rcpt: failure stays replayable, still no job file / spawn
@@ -10709,9 +10778,12 @@ def do_wake(a):
         _rcpt_done(_h, r)
         if getattr(a, "json", False): return emit(a, "wake", {"agent": agent, "launched": True, **r})
         return emit(a, "wake", {"_text": f"wake sent -> {agent} ({r['status']}, id {rid})", "agent": agent, **r})
+    _extra = {}
+    if getattr(a,"force",False): _extra["force"] = True
+    if getattr(a,"no_park",False): _extra["no_park"] = True
     r = launch_wake_chat(sdir,agent,text,notify=notify,notify_done=notify_done,on_done=on_done,timeout_s=timeout_s,
         max_runtime_s=max_runtime_s,stall_s=stall_s,job_type=getattr(a,"job",None),verify=vcmd,verify_timeout_s=vtmo,escalate=esc_ms,
-        extra=({"force": True} if getattr(a,"force",False) else None),**ck); _rcpt_done(_h, r)
+        extra=(_extra or None),**ck); _rcpt_done(_h, r)
     if "error" in r:
         if r.get("exit") == 2: emit(a,"wake",error=r["error"]); return 2
         return emit(a,"wake",error=r["error"],hint=_agent_hint(sdir, agent))
@@ -10897,6 +10969,8 @@ def _sched_tick_dir(sdir, now, dry, reap):
                 if out["actions"]: _sched_save(sdir, rows)
                 (sdir / "schedule" / "last_tick").write_text(str(time.time()))
         finally: ll.close()
+        try: out["actions"].extend(_wake_resume_parked(sdir, now, dry))
+        except Exception as e: out["park_error"] = str(e)[:200]
         fn = globals().get("wakes_reap")
         if reap and not dry and fn:
             try: fn(sdir, queued_only=True)
@@ -18988,7 +19062,7 @@ def build():
     cmc=cms.add_parser("config",help="role defaults / per-agent override"); cmc.add_argument("--role",dest="cprole",default=None,choices=["orchestrator","sub"]); cmc.add_argument("--agent",dest="cpagent",default=None); cmc.add_argument("--enable",dest="cpenable",action="store_true",default=None); cmc.add_argument("--disable",dest="cpdisable",action="store_true"); cmc.add_argument("--max-turns",dest="cpmax",type=int,default=None); cmc.add_argument("--tokens",dest="cptokens",type=int,default=None); cmc.add_argument("--keep",dest="cpkeep",type=int,default=None); cmc.add_argument("--timeout",dest="cptimeout",type=int,default=None); cmc.add_argument("--clear",dest="cpclear",action="store_true")
     cmsh=cms.add_parser("show",help="effective settings + stats"); cmsh.add_argument("cpname",nargs="?",default="")
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
-    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the wake finishes"); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--escalate",dest="escalate",default=None,metavar="MODEL[,MODEL...]",help="needs --verify: on failed verify/turn, the worker retries the same session on each next model (one-turn override, roster unchanged); job gains escalation[]"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); wk.add_argument("--on",default=None,metavar="NODE",help="run once on a relay node")
+    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the wake finishes"); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--no-park",dest="no_park",action="store_true",help="on a usage limit with a parsed reset, fail instead of parking for the scheduler tick"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--escalate",dest="escalate",default=None,metavar="MODEL[,MODEL...]",help="needs --verify: on failed verify/turn, the worker retries the same session on each next model (one-turn override, roster unchanged); job gains escalation[]"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); wk.add_argument("--on",default=None,metavar="NODE",help="run once on a relay node")
     ch_=sub.add_parser("channel",help="shared room: @agent mentions wake members, replies post back"); chs=ch_.add_subparsers(dest="csub",required=True)
     chc=chs.add_parser("create"); chc.add_argument("name"); chc.add_argument("--agents",default="",help="comma-separated members")
     chs.add_parser("list"); chs.add_parser("rm").add_argument("name")

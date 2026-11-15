@@ -1,7 +1,7 @@
 usage: ag wake [-h] [--notify NOTIFY] [--notify-done] [--parent PARENT] [--group GROUP]
                [--quiet QUIET] [--job {mechanical,implement,review,debug,plan,hardest}]
                [--on-done ON_DONE] [--timeout TIMEOUT] [--max-runtime MAX_RUNTIME]
-               [--stall-s STALL_S] [--request-id REQUEST_ID] [--force] [--verify CMD]
+               [--stall-s STALL_S] [--request-id REQUEST_ID] [--force] [--no-park] [--verify CMD]
                [--escalate MODEL[,MODEL...]] [--verify-timeout S] [--on NODE]
                agent [message ...]
 
@@ -28,6 +28,8 @@ options:
   --request-id REQUEST_ID
                         idempotency key: replay returns the original job (replayed:true)
   --force               bypass budget limits once (logged)
+  --no-park             on a usage limit with a parsed reset, fail instead of parking for the
+                        scheduler tick
   --verify CMD          after the wake turn, the worker runs trusted CMD via sh -c in the agent
                         workdir and records {cmd,exit,tail} in the wake job + [verify] row in the
                         chat log (never from the agent's reply)

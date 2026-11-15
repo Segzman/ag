@@ -629,6 +629,7 @@ _update_commit_write
 _update_remote_sha
 _update_stamp
 _update_status_data
+_usage_park_epoch
 _usage_parse_since
 _usage_read
 _usage_rpd
@@ -648,6 +649,7 @@ _wake_notify
 _wake_read_job
 _wake_reconcile
 _wake_reply_path
+_wake_resume_parked
 _wake_state_event
 _wake_terminal
 _wake_write_job

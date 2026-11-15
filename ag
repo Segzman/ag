@@ -1271,6 +1271,17 @@ def do_wakes_reap(a, sdir):
     if getattr(a, "json", False): return emit(a, "wakes", {"reaped": rows})
     return emit(a, "wakes", {"_text": "\n".join(f'{r["old"]} {r["action"]}' + (f' -> {r["new"]}' if r.get("new") else "") + f' ({r["agent"]} lost={r["lost_status"]} attempt {r["attempts"]})' for r in rows) or "(nothing to reap)"})
 
+def _wakes_display_status(j):
+    """Status as shown by `ag wakes`: waiting-slot (model, eta) while a running job waits
+    on a ratelimit cooldown/slot, else the stored status. Never raises."""
+    try:
+        w = _rl_wait_display(j)
+        if w:
+            eta = f"{w['eta_s']}s" if w.get("eta_s") else "?"
+            return f"waiting-slot ({w['model']}, {eta})"
+    except Exception: pass
+    return (j or {}).get("status", "")
+
 def do_wakes(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     if getattr(a, "reap", False): return do_wakes_reap(a, sdir)
@@ -1321,10 +1332,10 @@ def do_wakes(a):
     rows.sort(key=lambda j: j.get("ts", ""))
     rows = rows[-(a.limit or 50):]
     if getattr(a, "json", False):
-        rows = [{**j, **({"reply": t} if (t := _wake_full_reply(sdir, j)) else {})} for j in rows]
+        rows = [{**j, **({"reply": t} if (t := _wake_full_reply(sdir, j)) else {}), **({"waiting_slot": w} if (w := _rl_wait_display(j)) else {})} for j in rows]
         return emit(a, "wakes", {"wakes": rows})
     txt = "\n".join(
-        f'{j.get("id","")} {j.get("status",""):8} {j.get("agent",""):10} '
+        f'{j.get("id","")} {_wakes_display_status(j):8} {j.get("agent",""):10} '
         f'{str(j.get("session") or "-"):7} trig={j.get("trigger") or "-"} '
         f'exit={j.get("backend_exit", j.get("exit", "-"))} '
         + (f'resume={_sched_ts(int(j["resume_at"]))} ' if j.get("status") == "parked" and j.get("resume_at") else "")
@@ -9847,18 +9858,22 @@ _TRANSIENT_RE = re.compile(
     r"|econnreset|stream (?:closed|ended|disconnected)|connection reset"
     r"|free tier can only be used from within opencode"
     r"|database is locked|sqlite_busy", re.I)  # 5xx/network + parallel opencode runs racing on its SQLite db; 429 lives in _RATELIMIT_RE
+_STALL_RE = re.compile(r"stalled: no output for", re.I)  # stall-watchdog kill text (line ~9744): no output, NOT a provider 429
 _RATELIMIT_RE = re.compile(
-    r"\b429\b|rate.?limit|too many requests|endpoint is unavailable|stalled", re.I)
+    r"\b429\b|rate.?limit|too many requests|endpoint is unavailable", re.I)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 def classify_turn_failure(backend, rc, stderr, got_output):
-    """Pure. -> "resume_missing" | "ratelimit" | "transient" | None. Output already produced = None."""
+    """Pure. -> "resume_missing" | "ratelimit" | "transient" | "stall" | None. Output already produced = None.
+    A stall (backend killed after no output) is its own kind: it retries bounded like a
+    transient failure but never counts as a rate-limit hit (no cooldown, no fallback switch)."""
     if not rc or got_output: return None
     t = _ANSI_RE.sub("", stderr or "")
     try:
         if _CTX_OVERFLOW_RE.search(t): return None  # error text only (not stream): loose match OK, never retry overflow
     except Exception: pass
     if _RESUME_MISSING_RE.search(t): return "resume_missing"
+    if _STALL_RE.search(t): return "stall"
     if _RATELIMIT_RE.search(t): return "ratelimit"
     if _TRANSIENT_RE.search(t): return "transient"
     return None
@@ -9886,10 +9901,12 @@ def _retry_plan(sdir,name,backend,sid,rc,err,timed_out,got_output,rs,lock,t0,tim
             _event(sdir,"resume_recover",name,backend=backend,old_sid=sid)
             if on_event: on_event(name,"tool",note)
             return nx
-        if kind == "transient" and rs.get("n",0) < len(RETRY_BACKOFF_S):
+        if kind in ("transient", "stall") and rs.get("n",0) < len(RETRY_BACKOFF_S):
+            # stall: bounded retry like transient, but no cooldown write and no
+            # fallback switch -- a silent backend is not a provider rate limit.
             wait = RETRY_BACKOFF_S[rs.get("n",0)]
             if timeout_s and time.monotonic() + wait >= t0 + timeout_s: return None
-            _event(sdir,"transient_retry",name,backend=backend,attempt=rs.get("n",0)+1,wait=wait,exit=rc)
+            _event(sdir,"transient_retry",name,backend=backend,attempt=rs.get("n",0)+1,wait=wait,exit=rc,kind=kind)
             time.sleep(wait)
             nx["n"] = rs.get("n",0) + 1
             return nx
@@ -10029,8 +10046,12 @@ def _usage_park_epoch(r, now=None):
 # Key = backend+model. Slots: fcntl.flock on $AG_CACHE_HOME/ratelimit/slots/<key>/<i>.lock,
 # default 4 for opencode free models, unlimited otherwise. Cooldown: .../cooldown/<key>.json
 # {until, hits}, backoff 30,60,120,240,480 capped 600 (AG_RATELIMIT_BASE_S overrides base
-# for tests). Stall: AG_STALL_S (default 240 opencode, 0 off others). Fallback: agent
-# `fallback` list, after 2 primary hits use first non-cooling entry. Never raises into turns.
+# for tests); hits decay one per _RL_DECAY_S (60s) of quiet after expiry, so an isolated
+# 429 stops counting as a strike, and a success clears the cooldown outright. Stall:
+# AG_STALL_S (default 240 opencode, 0 off others); a stall is NOT a rate limit (own retry
+# kind, no cooldown, no fallback switch). Waiting: while a turn waits on a cooldown or a
+# slot, a marker lives at .../waiting/<agent>.json so `ag wakes` can show waiting-slot.
+# Fallback: agent `fallback` list, after 2 primary hits use first non-cooling entry. Never raises into turns.
 def _rl_key(backend, model):
     """Cache key backend/model (effective model). Pure."""
     try: m = (eff_model(backend, model) or (model or "").strip() or "default")
@@ -10040,6 +10061,53 @@ def _rl_safe(key): return (re.sub(r"[^A-Za-z0-9_.-]", "_", key or "unknown")[:12
 def _rl_base(): return ag_cache_home()/"ratelimit"
 def _rl_slots_dir(key): return _rl_base()/"slots"/_rl_safe(key)
 def _rl_cooldown_path(key): return _rl_base()/"cooldown"/(_rl_safe(key)+".json")
+def _rl_wait_state_path(agent):
+    """Per-agent wait marker: $AG_CACHE_HOME/ratelimit/waiting/<safe(agent)>.json. Never raises."""
+    try: return _rl_base()/"waiting"/(_rl_safe(agent or "unknown") + ".json")
+    except Exception: return None
+def _rl_wait_state_write(agent, model, kind, key):
+    """Record that this agent's turn is waiting on a ratelimit cooldown/slot. Never raises."""
+    try:
+        p = _rl_wait_state_path(agent)
+        if p is None: return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        t = p.with_suffix(".tmp")
+        t.write_text(json.dumps({"agent": agent, "model": model, "kind": kind, "key": key, "since": time.time()}))
+        t.rename(p)  # atomic: a concurrent `ag wakes` never reads a torn file
+    except Exception: pass
+def _rl_wait_state_clear(agent):
+    try:
+        p = _rl_wait_state_path(agent)
+        if p is not None: p.unlink()
+    except Exception: pass
+def _rl_wait_state(agent, max_age_s=60.0):
+    """Fresh wait marker for this agent, else None. Stale files (crashed waits) are ignored. Never raises.
+    60s, not 15s: a live wait refreshes every 2s, but a cold `ag` invocation alone can take
+    10s+ to reach the display code (measured ~13s in this sandbox), so a tighter bound would
+    hide genuinely-waiting jobs on slow machines; a crashed wait still expires within a minute."""
+    try:
+        p = _rl_wait_state_path(agent)
+        if p is None or not p.exists(): return None
+        d = json.loads(p.read_text())
+        if time.time() - float(d.get("since") or 0) > max_age_s: return None
+        return d
+    except Exception: return None
+def _rl_wait_display(job):
+    """{"model", "kind", "eta_s"} for a running job waiting on a ratelimit slot/cooldown, else None.
+    Cooldown eta = remaining cooldown seconds (computable); slot eta is None -- how long the
+    current slot holders will run is not knowable from the lock files. Never raises."""
+    try:
+        if (job or {}).get("status") != "running": return None
+        st = _rl_wait_state((job or {}).get("agent") or "")
+        if not st: return None
+        kind = st.get("kind") or "slot"
+        eta = None
+        if kind == "cooldown":
+            try: eta = int((_rl_read_cooldown(st.get("key") or "").get("remaining") or 0) + 0.999)
+            except Exception: eta = None
+            if not eta: eta = None
+        return {"model": st.get("model") or "", "kind": kind, "eta_s": eta}
+    except Exception: return None
 def _rl_is_free(backend, model):
     """Default-limited set: opencode free ids (ends -free, big-pickle) + catalog free. Pure-ish."""
     if backend != "opencode":
@@ -10112,11 +10180,20 @@ def _rl_backoff(hits):
     except Exception: h = 1
     if h < 1: h = 1
     return min(base * (2 ** (h - 1)), 600.0)
+# Strikes decay: once a cooldown has expired, one hit is forgiven per _RL_DECAY_S
+# of quiet (no new hit on that key). Without this, hits ratcheted to the 600s
+# backoff cap and stayed there until a turn happened to succeed -- a model that
+# kept 429ing could never recover. Decay is computed on read, so the stored
+# file needs no migration; a new hit is always counted from the decayed value.
+_RL_DECAY_S = 60.0
 def _rl_read_cooldown(key):
     try:
         d = json.loads(_rl_cooldown_path(key).read_text())
         until = float(d.get("until") or 0); hits = int(d.get("hits") or 0)
         rem = until - time.time()
+        if rem <= 0 and hits:
+            quiet = max(0.0, time.time() - until)
+            hits = max(0, hits - int(quiet // _RL_DECAY_S))
         return {"until": until, "hits": hits, "remaining": rem if rem > 0 else 0, "label": d.get("label") or ""}
     except Exception: return {"until": 0, "hits": 0, "remaining": 0}
 def _rl_write_cooldown(key, hits):
@@ -10141,18 +10218,24 @@ def _rl_wait_cooldown(backend, model, sdir, name, on_event):
     """Sleep out shared cooldown; emits one tool row. Returns seconds waited. Never raises."""
     try: key = _rl_key(backend, model)
     except Exception: return 0.0
-    start = time.monotonic(); first = True
-    while True:
-        try: rem = _rl_read_cooldown(key).get("remaining") or 0
-        except Exception: return max(0.0, time.monotonic() - start) if not first else 0.0
-        if rem <= 0: break
-        if first:
-            first = False
-            try: m = eff_model(backend, model) or model
-            except Exception: m = model
-            _rl_tool_note(sdir, name, f"[ratelimit] cooling down {m} {int(rem + 0.999)}s", on_event, ev="ratelimit_cooldown", model=str(m), wait=int(rem + 0.999))
-        try: time.sleep(min(rem, 0.2))
-        except Exception: break
+    try: m = eff_model(backend, model) or model
+    except Exception: m = model
+    start = time.monotonic(); first = True; _ws_last = 0.0
+    try:
+        while True:
+            try: rem = _rl_read_cooldown(key).get("remaining") or 0
+            except Exception: return max(0.0, time.monotonic() - start) if not first else 0.0
+            if rem <= 0: break
+            if first:
+                first = False
+                _rl_tool_note(sdir, name, f"[ratelimit] cooling down {m} {int(rem + 0.999)}s", on_event, ev="ratelimit_cooldown", model=str(m), wait=int(rem + 0.999))
+                _rl_wait_state_write(name, str(m), "cooldown", key); _ws_last = time.monotonic()
+            elif time.monotonic() - _ws_last >= 2.0:
+                _rl_wait_state_write(name, str(m), "cooldown", key); _ws_last = time.monotonic()
+            try: time.sleep(min(rem, 0.2))
+            except Exception: break
+    finally:
+        _rl_wait_state_clear(name)
     return 0.0 if first else max(0.0, time.monotonic() - start)
 def _rl_acquire_slot(backend, model, sdir, name, on_event):
     """Model slot + (for free models) one of AG_MAX_FREE_TOTAL global slots. Returns (handle, waited)."""
@@ -10173,33 +10256,39 @@ def _rl_acquire_one(backend, model, sdir, name, on_event, _key=None, _lim=None):
     import fcntl
     try: d = _rl_slots_dir(key); d.mkdir(parents=True, exist_ok=True)
     except Exception: return (None, 0.0)
-    start = time.monotonic(); emitted = False
-    while True:
-        for i in range(lim):
-            p = d/f"{i}.lock"
-            try: p.touch(exist_ok=True)
-            except Exception: continue
-            try: f = open(p, "r+b")
-            except Exception:
-                try: f = open(p, "w+b")
+    start = time.monotonic(); emitted = False; _ws_last = 0.0
+    try: m = eff_model(backend, model) or model
+    except Exception: m = model
+    try:
+        while True:
+            for i in range(lim):
+                p = d/f"{i}.lock"
+                try: p.touch(exist_ok=True)
                 except Exception: continue
-            try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                try: f.close()
+                try: f = open(p, "r+b")
+                except Exception:
+                    try: f = open(p, "w+b")
+                    except Exception: continue
+                try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    try: f.close()
+                    except Exception: pass
+                    continue
+                try:
+                    f.seek(0); f.truncate()
+                    f.write(json.dumps({"pid": os.getpid(), "agent": name, "ts": now_iso()}).encode()[:500]); f.flush()
                 except Exception: pass
-                continue
-            try:
-                f.seek(0); f.truncate()
-                f.write(json.dumps({"pid": os.getpid(), "agent": name, "ts": now_iso()}).encode()[:500]); f.flush()
-            except Exception: pass
-            return ((f, p), max(0.0, time.monotonic() - start))
-        if not emitted:
-            emitted = True
-            try: m = eff_model(backend, model) or model
-            except Exception: m = model
-            _rl_tool_note(sdir, name, f"[ratelimit] waiting for a slot on {m if not _key else 'all free models'} ({lim} busy)", on_event, ev="ratelimit_wait", model=str(m), limit=lim)
-        try: time.sleep(0.2)
-        except Exception: return (None, max(0.0, time.monotonic() - start))
+                return ((f, p), max(0.0, time.monotonic() - start))
+            if not emitted:
+                emitted = True
+                _rl_tool_note(sdir, name, f"[ratelimit] waiting for a slot on {m if not _key else 'all free models'} ({lim} busy)", on_event, ev="ratelimit_wait", model=str(m), limit=lim)
+                _rl_wait_state_write(name, str(m), "slot", key); _ws_last = time.monotonic()
+            elif time.monotonic() - _ws_last >= 2.0:
+                _rl_wait_state_write(name, str(m), "slot", key); _ws_last = time.monotonic()
+            try: time.sleep(0.2)
+            except Exception: return (None, max(0.0, time.monotonic() - start))
+    finally:
+        _rl_wait_state_clear(name)
 def _rl_release_slot(h):
     if not h: return
     if isinstance(h, list):
@@ -10325,7 +10414,7 @@ def do_ratelimit(a):
                 d = json.loads(p.read_text())
                 rem = float(d.get("until") or 0) - time.time()
                 if rem < 0: rem = 0
-                cooldowns[p.stem] = {"remaining": int(rem + 0.999), "hits": int(d.get("hits") or 0)}
+                cooldowns[p.stem] = {"remaining": int(rem + 0.999), "hits": _rl_read_cooldown(p.stem).get("hits", 0)}  # decayed hits, not the stored count
                 if d.get("usage_limit"): cooldowns[p.stem].update(usage_limit=True, reset_at=datetime.fromtimestamp(float(d.get("until") or 0), timezone.utc).isoformat(), label=d.get("label") or "", msg=d.get("msg") or "")
             except Exception: continue
     except Exception: pass
@@ -15531,7 +15620,7 @@ def do_selfcheck(a):
         assert do_status(mk())==0
         assert classify_turn_failure("opencode",1,"Rate limit exceeded",False)=="ratelimit"
         assert classify_turn_failure("opencode",1,"Endpoint is unavailable",False)=="ratelimit"
-        assert classify_turn_failure("opencode",1,"stalled: no output for 1s (backend killed)",False)=="ratelimit"
+        assert classify_turn_failure("opencode",1,"stalled: no output for 1s (backend killed)",False)=="stall"  # stall is its own kind, never a rate-limit hit
         assert classify_turn_failure("claude",1,"503 service unavailable",False)=="transient"
         assert classify_turn_failure("opencode",1,"429 too many requests",True) is None
         assert _rl_key("opencode","default")=="opencode/"+OPENCODE_MODEL_DEFAULT

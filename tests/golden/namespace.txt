@@ -228,6 +228,7 @@ _PICK_MEMO
 _QCTX
 _RATELIMIT_RE
 _RESUME_MISSING_RE
+_RL_DECAY_S
 _RL_DEFAULT_FALLBACK
 _RL_KNOWN
 _ROUTE_COST
@@ -240,6 +241,7 @@ _SETUP_HELP
 _SETUP_SEQ
 _SMALL_RE
 _SORT_ATTR
+_STALL_RE
 _SUDO_ARGOPTS
 _SUDO_LONGARG
 _SUDO_LONGMAP
@@ -582,6 +584,11 @@ _rl_slots_dir
 _rl_stall_s
 _rl_tool_note
 _rl_wait_cooldown
+_rl_wait_display
+_rl_wait_state
+_rl_wait_state_clear
+_rl_wait_state_path
+_rl_wait_state_write
 _rl_write_cooldown
 _route_model
 _rt_v2
@@ -716,6 +723,7 @@ _wake_state_event
 _wake_terminal
 _wake_write_job
 _wake_write_reply
+_wakes_display_status
 _web_job_ok
 _web_profiles
 _web_rows

@@ -62,6 +62,7 @@ MODELS_TTL_S
 MODEL_BACKENDS
 MODES
 NATIVE_ORDER
+NEEDS_NOTIFY_GAP
 OLD_SKILLS
 OPENCODE_CORE_TOOLS
 OPENCODE_EDITS_BASH_ALLOW
@@ -413,6 +414,12 @@ _model_opts
 _models_api
 _models_fetch
 _models_read
+_needs_enqueue
+_needs_load
+_needs_new_id
+_needs_ping
+_needs_save
+_needs_stored_answer
 _neg_str
 _normalize_key_ref
 _notify_clip
@@ -613,6 +620,7 @@ _turn_source
 _turn_stall_s
 _ui_event
 _ui_fail
+_ui_needs_hit
 _ui_secret
 _uint
 _ul_active
@@ -849,6 +857,7 @@ do_kill
 do_link
 do_ls
 do_models
+do_needs
 do_note
 do_notes
 do_notify

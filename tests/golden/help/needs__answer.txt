@@ -1,0 +1,8 @@
+usage: ag needs answer [-h] id value [value ...]
+
+positional arguments:
+  id
+  value
+
+options:
+  -h, --help  show this help message and exit

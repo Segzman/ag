@@ -24,7 +24,21 @@ Prefer a silent notification; pop a dialog only when you need input. Exit 3 off 
 {{AG}} --dir <state> ui ask "Token?" --secret --to-env VAR -- CMD ...        # CMD runs with VAR set; you never see it
 ```
 
-`ui ask --secret` without `--to-env` refuses (exit 2) unless `--stdout` is passed and stdout is piped, not a TTY. Never route secrets into your own context; always use `--to-env`.
+`ui ask --secret` without `--to-env` refuses (exit 2) unless `--stdout` is passed and stdout is piped, not a TTY. Never route secrets into your own context; always use `--to-env`. `--secret` is never queued.
+
+## Needs queue (`ag needs`)
+
+A dialog that times out used to lose the answer; now the request is queued in `<state>/needs.jsonl` and stays answerable.
+
+```sh
+{{AG}} --dir <state> ui ask "Deploy tag?" --queue                    # dialog + recorded; `--queue` on confirm/choose/ask
+{{AG}} --dir <state> ui ask "Deploy tag?" --needs-id ID              # return the recorded answer (exit 0) once one exists
+{{AG}} --dir <state> needs list [--json]                             # open items, newest first
+{{AG}} --dir <state> needs answer ID VALUE                           # record the answer (status answered)
+{{AG}} --dir <state> needs done ID                                   # close an item
+```
+
+Timeout always queues (exit 2 still, output names the id); `--queue` also records answered dialogs. The need is attributed to `$AG_PARENT_AGENT` or `--agent`. One "N things need you" inbox notification per 10 minutes while items are open.
 
 ## Notifications (`ag notify`)
 

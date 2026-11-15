@@ -1,5 +1,5 @@
 usage: ag ui ask [-h] [--default DEFAULT] [--secret] [--to-env TO_ENV] [--stdout] [--title TITLE]
-                 [--timeout TIMEOUT]
+                 [--timeout TIMEOUT] [--queue] [--needs-id ID] [--agent AGENT]
                  question
 
 positional arguments:
@@ -13,3 +13,8 @@ options:
   --stdout
   --title TITLE
   --timeout TIMEOUT  seconds before giving up
+  --queue            also record this request in needs.jsonl (open until answered; timeout always
+                     queues)
+  --needs-id ID      return the recorded answer for this need instead of popping a dialog (re-
+                     check after a timeout)
+  --agent AGENT      agent the queued need is attributed to (default $AG_PARENT_AGENT)

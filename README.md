@@ -131,6 +131,21 @@ ag ui ask "Token?" --secret --to-env VAR -- CMD ...        # hidden dialog; runs
 - `--secret` reuses the askpass dialog. The value is never printed, logged, or written to disk: it only goes into CMD's environment. Without `--to-env` it refuses (exit 2) unless `--stdout` is given and stdout is not a TTY (e.g. piped into another program); `--stdout` and `--json` are exclusive.
 - Backend agents get a prompt hint naming `ag ui` (notify first, dialogs only when input is needed). Tests/CI: `AG_UI_CMD` replaces `osascript`.
 
+## Needs queue (`ag needs`)
+
+A dialog that times out used to lose the user's answer. Timed-out `ui confirm|choose|ask` requests (and any call with `--queue`) are appended to `<state>/needs.jsonl` and stay answerable after the fact; `--secret` is never queued or stored. The agent is attributed from `$AG_PARENT_AGENT` or `--agent`.
+
+```sh
+ag ui ask "Deploy tag?" --queue                     # dialog + recorded; `--needs-id ID` re-checks later
+ag needs list [--json]                              # open items, newest first (id, agent, kind, question)
+ag needs answer ID VALUE                            # record the answer (status answered)
+ag needs done ID                                    # close an item
+```
+
+- On timeout the call still exits 2 but prints the queued id: `timeout — queued <id>; answer with: ag needs answer <id> VALUE`. Answered dialogs recorded via `--queue` keep their answer too.
+- `ag ui ask|choose|confirm ... --needs-id ID` returns the recorded answer immediately (exit 0) once one exists, so an agent can re-check after the user catches up.
+- While items are open, a single "N things need you" notification goes to the notify inbox at most once per 10 minutes.
+
 ## Keys and providers
 
 API keys live in the macOS Keychain (service `ag`), never in argv, logs, chat, status files, or git. Refs `${keychain:NAME}` work wherever `${VAR}` refs work (agent/profile env, provider config); resolved only at child-spawn into the child env, redacted in `agents env`.

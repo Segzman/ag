@@ -484,6 +484,13 @@ _relay_error_tail
 _relay_errs_join
 _relay_git
 _relay_heartbeat
+_relay_inbox_log
+_relay_inbox_log_append
+_relay_inbox_log_bucket
+_relay_inbox_log_dir
+_relay_inbox_log_file
+_relay_inbox_log_mark
+_relay_inbox_log_rows
 _relay_inbox_messages
 _relay_inbox_select
 _relay_inbox_text

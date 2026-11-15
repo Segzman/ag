@@ -49,14 +49,16 @@ Functions (module-level, names fixed — part 2 calls them):
 - `relay_sync(cfg, now=None)` → summary dict `{"pulled": bool, "materialized": [ids], "removed": [ids],
   "reported": [result files], "ingested": [result files], "pushed": bool, "error": str|None}`. Never raises.
   1. git: `git -C checkout pull --rebase --quiet` (clone first if missing: `git clone --quiet url checkout`). dir: nothing.
-  2. **Target side**: for each `schedules/<node>/*.json` → upsert a row in `cfg.state`'s `schedules.json` with
-     id `<origin>--<id>`, agent `relay-<origin>-<agent>`, copying message/timing/overlap/catch_up/max_runtime_s/job/enabled;
-     recompute `next_due` only when timing changed or the row is new; keep runs/last_* counters. Create the agent if
-     missing (`--backend/--model/--effort/--data/--stall-s` from agent_spec, `--dir <workdir>/<origin>` mkdir'd,
-     mode = agent_spec.mode clamped to `max_mode`) using the same internals `agents add` uses; privacy guard applies
-     (a refused model = row with `last_status: "error: ..."`, not a crash). Rows with `relay_origin` set whose file is
-     gone → removed. Use `_sched_flock`/`_sched_load`/`_sched_save`; register the state dir (`_sched_reg_set`).
-     Mark materialised rows `relay_origin: <origin>`, `relay_id: <id>`.
+   2. **Target side**: for each `schedules/<node>/*.json` → upsert a row in `cfg.state`'s `schedules.json` with
+      id `<origin>--<id>`, agent `relay-<origin>-<agent>`, copying message/timing/overlap/catch_up/max_runtime_s/job/enabled;
+      recompute `next_due` only when timing changed or the row is new; keep runs/last_* counters. Create the agent if
+      missing (`--backend/--model/--effort/--data/--stall-s` from agent_spec, `--dir <workdir>/<origin>` mkdir'd,
+      mode = agent_spec.mode clamped to `max_mode`) using the same internals `agents add` uses; privacy guard applies
+      (a refused model = row with `last_status: "error: ..."`, not a crash). Rows with `relay_origin` set whose file is
+      gone → removed. Use `_sched_flock`/`_sched_load`/`_sched_save`; register the state dir (`_sched_reg_set`).
+      Mark materialised rows `relay_origin: <origin>`, `relay_id: <id>`. Each inbound message is also appended once to
+      `ag_cache_home()/relay/inbox/<name|_unaddressed>.jsonl` (persistent `relay inbox` log; dedupe by id, cap 5000 rows,
+      under the names lock) so a session that misses the pending-file window still sees it.
   3. **Target side, report**: for rows with `relay_origin` whose `last_job` is finished (`_wake_read_job` status not
      queued/running) and `relay_reported != last_job` → write the result file (reply from the job / chat log last agent
      reply), set `relay_reported = last_job`.

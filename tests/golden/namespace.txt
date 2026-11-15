@@ -221,6 +221,7 @@ _LINK_DIRS
 _LINK_PAGE
 _LINK_RESCAN_S
 _MD_FIELDS
+_MODEL_CATALOG_MAX_AGE_S
 _OR_DROPS
 _OR_PARTS
 _OR_POLICY_RE
@@ -228,6 +229,7 @@ _PICK_MEMO
 _QCTX
 _RATELIMIT_RE
 _RESUME_MISSING_RE
+_RL_DECAY_S
 _RL_DEFAULT_FALLBACK
 _RL_KNOWN
 _ROUTE_COST
@@ -240,6 +242,7 @@ _SETUP_HELP
 _SETUP_SEQ
 _SMALL_RE
 _SORT_ATTR
+_STALL_RE
 _SUDO_ARGOPTS
 _SUDO_LONGARG
 _SUDO_LONGMAP
@@ -307,6 +310,7 @@ _br_type
 _br_upload
 _budget_path
 _cached_remote
+_catalog_fresh
 _cell_clusters
 _chan_meta
 _chan_paths
@@ -462,6 +466,7 @@ _notify_set_dir
 _notify_target_dir
 _notify_write
 _opencode_bin
+_opencode_error_message
 _opencode_variants_fetch
 _or_date
 _or_fetch_all
@@ -582,6 +587,11 @@ _rl_slots_dir
 _rl_stall_s
 _rl_tool_note
 _rl_wait_cooldown
+_rl_wait_display
+_rl_wait_state
+_rl_wait_state_clear
+_rl_wait_state_path
+_rl_wait_state_write
 _rl_write_cooldown
 _route_model
 _rt_v2
@@ -716,6 +726,7 @@ _wake_state_event
 _wake_terminal
 _wake_write_job
 _wake_write_reply
+_wakes_display_status
 _web_job_ok
 _web_profiles
 _web_rows
@@ -1020,6 +1031,7 @@ merge_agent_env
 mode_env
 mode_flags
 mode_warning
+model_check
 model_choices
 model_default_variant
 model_privacy

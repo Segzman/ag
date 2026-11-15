@@ -1,0 +1,5 @@
+usage: ag policy targets [-h] [--file PFILE]
+
+options:
+  -h, --help    show this help message and exit
+  --file PFILE  also print coverage notes for this policy JSON

@@ -1,9 +1,11 @@
-usage: ag policy [-h] {render,check} ...
+usage: ag policy [-h] {render,targets,check} ...
 
 positional arguments:
-  {render,check}
-    render        render Claude Code managed settings / Codex requirements
-    check         validate a policy file
+  {render,targets,check}
+    render              render Claude Code managed settings / Codex requirements
+    targets             coverage matrix: which backend enforces each policy field
+                        (native/approx/none)
+    check               validate a policy file
 
 options:
-  -h, --help      show this help message and exit
+  -h, --help            show this help message and exit

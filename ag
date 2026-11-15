@@ -18968,7 +18968,6 @@ def do_link(a):
 # Field names follow vendor docs as of 2026-11; re-check them each release.
 POLICY_KEYS = ("version", "permission_floor", "allowed_models", "denied_models", "mcp_allow", "mcp_identity", "secret_read_ban", "network")
 POLICY_FLOORS = ("ro", "edits", "auto")
-POLICY_FILES = {"claude": "managed-settings.json", "codex": "requirements.toml", "codex-config": "codex-config.toml"}
 POLICY_NOTE = "ag policy v0: field names follow vendor docs as of 2026-11; re-check them against each release."
 POLICY_CLAUDE_MODE = {0: "plan", 1: "acceptEdits", 2: "bypassPermissions"}
 # requirements.toml constrains user values (lists); codex-config.toml sets the default (scalars)
@@ -19024,9 +19023,30 @@ def policy_validate(doc):
         "network": network if network in ("on", "off") else "on"}
     return clean, errs
 
+def _policy_rank(p):
+    return _mode_rank(p.get("permission_floor") or "edits")
+
+def _policy_glob_re(g):
+    """Pure: ag glob (** any depth, * one segment, ? one char) -> regex body. For regex-only targets (Zed, Gemini)."""
+    out, i = [], 0
+    while i < len(g):
+        if g.startswith("**/", i): out.append("(.*/)?"); i += 3
+        elif g.startswith("**", i): out.append(".*"); i += 2
+        elif g[i] == "*": out.append("[^/]*"); i += 1
+        elif g[i] == "?": out.append("[^/]"); i += 1
+        else: out.append(re.escape(g[i])); i += 1
+    return "".join(out)
+
+def _policy_yaml_list(key, items):
+    return [f"{key}:"] + [f"  - {json.dumps(x)}" for x in items] if items else [f"{key}: []"]
+
+def _policy_ignore(name, p, note):
+    """Pure: ignore-file target (gitignore-style globs, one per line). note says what it does NOT cover."""
+    return name, "\n".join([f"# {POLICY_NOTE}", f"# {note}"] + (p.get("secret_read_ban") or [])) + "\n"
+
 def claude_policy_render(p):
-    """Pure: policy dict -> Claude Code managed-settings.json text (only documented keys)."""
-    rank = _mode_rank(p.get("permission_floor") or "edits")
+    """Pure: policy dict -> (managed-settings.json, Claude Code managed settings; documented keys only)."""
+    rank = _policy_rank(p)
     off = (p.get("network") or "on") == "off"
     deny = [f"Read({'//' + g if g.startswith('**/') else g})" for g in p.get("secret_read_ban") or []]  # //** = any depth
     if off: deny += ["WebFetch", "WebSearch"]
@@ -19043,7 +19063,7 @@ def claude_policy_render(p):
         out["enabledMcpjsonServers"] = list(p["mcp_allow"])
     if p.get("allowed_models"): out["availableModels"] = list(p["allowed_models"])
     if p.get("denied_models"): out["deniedModels"] = list(p["denied_models"])
-    return json.dumps(out, indent=2) + "\n"
+    return "managed-settings.json", json.dumps(out, indent=2) + "\n"
 
 def _policy_toml_str(s):
     return json.dumps(s, ensure_ascii=True)  # JSON string == valid TOML basic string here
@@ -19052,8 +19072,8 @@ def _policy_toml_list(xs):
     return "[" + ", ".join(_policy_toml_str(x) for x in xs) + "]"
 
 def codex_policy_render(p):
-    """Pure: policy dict -> Codex requirements.toml (admin constraints: lists, not defaults)."""
-    approval, sandbox = POLICY_CODEX_ALLOW.get(_mode_rank(p.get("permission_floor") or "edits"), POLICY_CODEX_ALLOW[1])
+    """Pure: policy dict -> (requirements.toml; Codex admin constraints as lists, not defaults)."""
+    approval, sandbox = POLICY_CODEX_ALLOW.get(_policy_rank(p), POLICY_CODEX_ALLOW[1])
     lines = [f"# {POLICY_NOTE}",
         f"allowed_approval_policies = {_policy_toml_list(approval)}",
         f"allowed_sandbox_modes = {_policy_toml_list(sandbox)}"]
@@ -19064,22 +19084,304 @@ def codex_policy_render(p):
             else "# identity missing: set mcp_identity (command or url) or Codex cannot match this server"]
     if p.get("secret_read_ban"):
         lines += ["", "[permissions.filesystem]", f"deny_read = {_policy_toml_list(p['secret_read_ban'])}"]
-    return "\n".join(lines) + "\n"
+    return "requirements.toml", "\n".join(lines) + "\n"
 
 def codex_config_render(p):
-    """Pure: policy dict -> Codex config.toml defaults (user-editable; not enforcement)."""
-    approval, sandbox = POLICY_CODEX_DEFAULT.get(_mode_rank(p.get("permission_floor") or "edits"), POLICY_CODEX_DEFAULT[1])
-    return "\n".join([f"# {POLICY_NOTE}",
+    """Pure: policy dict -> (codex-config.toml; Codex config.toml defaults, user-editable, not enforced)."""
+    approval, sandbox = POLICY_CODEX_DEFAULT.get(_policy_rank(p), POLICY_CODEX_DEFAULT[1])
+    return "codex-config.toml", "\n".join([f"# {POLICY_NOTE}",
         f"approval_policy = {_policy_toml_str(approval)}",
         f"sandbox_mode = {_policy_toml_str(sandbox)}",
         "", "[sandbox_workspace_write]",
         f"network_access = {'false' if (p.get('network') or 'on') == 'off' else 'true'}"]) + "\n"
 
+def gemini_policy_render(p):
+    """Pure: policy dict -> (policies/ag.toml; Gemini CLI policy-engine rules, admin or user tier)."""
+    rank = _policy_rank(p)
+    out = [f"# {POLICY_NOTE}", ""]
+    def rule(tool, decision, priority, args=None):
+        return ["[[rule]]", f"toolName = {_policy_toml_str(tool)}"] + (
+            [f"argsPattern = {_policy_toml_str(args)}"] if args else []) + [
+            f"decision = {_policy_toml_str(decision)}", f"priority = {priority}", ""]
+    out += rule("write_file", ("deny", "allow", "allow")[rank], 100)
+    out += rule("run_shell_command", ("ask_user", "ask_user", "allow")[rank], 100)
+    if p.get("secret_read_ban"):
+        pat = ".*(" + "|".join(_policy_glob_re(g) for g in p["secret_read_ban"]) + ").*"
+        out += rule("read_file", "deny", 900, pat)
+    if p.get("mcp_allow"):
+        out += rule("mcp_*", "deny", 800)
+        for n in p["mcp_allow"]: out += rule(f"mcp_{n}_*", "allow", 900)
+    return "ag.toml", "\n".join(out).rstrip("\n") + "\n"
+
+def gemini_settings_render(p):
+    """Pure: policy dict -> (settings.json; Gemini CLI settings: model pin + sandbox network)."""
+    out = {"tools": {"sandbox": True, "sandboxNetworkAccess": (p.get("network") or "on") == "on"}}
+    if p.get("allowed_models"): out["model"] = {"name": p["allowed_models"][0]}
+    return "settings.json", json.dumps(out, indent=2) + "\n"
+
+def qwen_policy_render(p):
+    """Pure: policy dict -> (settings.json; Qwen Code settings)."""
+    off = (p.get("network") or "on") == "off"
+    out = {"tools": {"approvalMode": ("plan", "auto-edit", "yolo")[_policy_rank(p)]}}
+    if off: out["tools"]["executionSandbox"] = {"filesystem": "workspace-write", "network": "closed"}
+    if p.get("allowed_models"): out["model"] = {"name": p["allowed_models"][0]}
+    if p.get("secret_read_ban"): out["permissions"] = {"deny": [f"Read({g})" for g in p["secret_read_ban"]]}
+    if p.get("mcp_allow"): out["mcp"] = {"allowed": list(p["mcp_allow"])}
+    return "settings.json", json.dumps(out, indent=2) + "\n"
+
+def cursor_policy_render(p):
+    """Pure: policy dict -> (cli-config.json; Cursor CLI permissions + sandbox)."""
+    rank = _policy_rank(p)
+    allow = ["Read(**)"] + ([] if rank == 0 else ["Write(**)", "Edit(**)"])
+    out = {"permissions": {"allow": allow}, "sandbox": {"networkAccess": (p.get("network") or "on") == "on"}}
+    if p.get("secret_read_ban"): out["permissions"]["deny"] = [f"Read({g})" for g in p["secret_read_ban"]]
+    if p.get("allowed_models"): out["model"] = p["allowed_models"][0]
+    return "cli-config.json", json.dumps(out, indent=2) + "\n"
+
+def copilot_policy_render(p):
+    """Pure: policy dict -> (managed-settings.json; Copilot CLI managed settings)."""
+    rank = _policy_rank(p)
+    off = (p.get("network") or "on") == "off"
+    perms = {"allow": ["Read(**)"] + ([] if rank == 0 else ["Edit(**)", "Write(**)"])}
+    deny = [f"Read({g})" for g in p.get("secret_read_ban") or []] + (["Domain(*)"] if off else [])
+    if deny: perms["deny"] = deny
+    out = {"permissions": perms}
+    if off: out["sandbox"] = {"enabled": True}
+    if p.get("mcp_allow"): out["allowedMcpServers"] = [{"serverName": n} for n in p["mcp_allow"]]
+    if p.get("allowed_models"): out["model"] = p["allowed_models"][0]
+    return "managed-settings.json", json.dumps(out, indent=2) + "\n"
+
+def amp_policy_render(p):
+    """Pure: policy dict -> (settings.json; Amp disables web tools when network is off, nothing else is native)."""
+    out = {"amp.tools.disable": ["builtin:web_fetch", "builtin:web_search"]} if (p.get("network") or "on") == "off" else {}
+    return "settings.json", json.dumps(out, indent=2) + "\n"
+
+def goose_policy_render(p):
+    """Pure: policy dict -> (config.yaml; Goose GOOSE_MODE + model pin)."""
+    lines = [f"# {POLICY_NOTE}", f"GOOSE_MODE: {json.dumps(('chat', 'approve', 'auto')[_policy_rank(p)])}"]
+    if p.get("allowed_models"): lines.append(f"GOOSE_MODEL: {json.dumps(p['allowed_models'][0])}")
+    return "config.yaml", "\n".join(lines) + "\n"
+
+def aider_policy_render(p):
+    """Pure: policy dict -> (.aider.conf.yml; Aider model pin only, no permission keys)."""
+    lines = [f"# {POLICY_NOTE}"] + ([f"model: {json.dumps(p['allowed_models'][0])}"] if p.get("allowed_models") else [])
+    return ".aider.conf.yml", "\n".join(lines) + "\n"
+
+def aider_ignore_render(p):
+    return _policy_ignore(".aiderignore", p, "not an access boundary: Aider still reads ignored files when asked")
+
+def cline_ignore_render(p):
+    return _policy_ignore(".clineignore", p, "not a security boundary: enforce with a PreToolUse hook")
+
+def roo_ignore_render(p):
+    return _policy_ignore(".rooignore", p, "file tools only: shell commands are not covered")
+
+def roo_modes_render(p):
+    """Pure: policy dict -> (.roomodes; one custom mode whose groups carry the floor)."""
+    rank = _policy_rank(p)
+    floor = p.get("permission_floor") or "edits"
+    mode = {"slug": f"ag-{floor}", "name": f"ag {floor}",
+        "roleDefinition": ("Read files only.", "Read and edit files; no shell commands.", "Read, edit, and run commands.")[rank],
+        "groups": (["read"], ["read", "edit"], ["read", "edit", "command"])[rank]}
+    return ".roomodes", json.dumps({"customModes": [mode]}, indent=2) + "\n"
+
+def kilo_policy_render(p):
+    """Pure: policy dict -> (kilo.json; Kilo permission map, read globs, web tools when network is off)."""
+    rank = _policy_rank(p)
+    perm = {"edit": "deny" if rank == 0 else "allow", "bash": "allow" if rank == 2 else "ask"}
+    if p.get("secret_read_ban"): perm["read"] = {"*": "allow", **{g: "deny" for g in p["secret_read_ban"]}}
+    if (p.get("network") or "on") == "off": perm.update(webfetch="deny", websearch="deny")
+    out = {"permission": perm}
+    if p.get("allowed_models"): out["model"] = p["allowed_models"][0]
+    return "kilo.json", json.dumps(out, indent=2) + "\n"
+
+def continue_policy_render(p):
+    """Pure: policy dict -> (permissions.yaml; Continue CLI allow / ask / exclude lists)."""
+    rank = _policy_rank(p)
+    allow = (["Read(*)"], ["Read(*)", "Write", "Edit"], ["Read(*)", "Write", "Edit", "Bash"])[rank]
+    ask = (["Write", "Edit", "Bash"], ["Bash"], [])[rank]
+    lines = [f"# {POLICY_NOTE}"] + _policy_yaml_list("allow", allow) + _policy_yaml_list("ask", ask) + \
+        _policy_yaml_list("exclude", [f"Read({g})" for g in p.get("secret_read_ban") or []])
+    return "permissions.yaml", "\n".join(lines) + "\n"
+
+def devin_ignore_render(p):
+    return _policy_ignore(".devinignore", p, "Cascade file access only: the terminal can still read these paths")
+
+def crush_policy_render(p):
+    """Pure: policy dict -> (crush.json; Crush disables the bash tool below auto)."""
+    out = {} if _policy_rank(p) == 2 else {"options": {"disabled_tools": ["bash"]}}
+    return "crush.json", json.dumps(out, indent=2) + "\n"
+
+def augment_policy_render(p):
+    """Pure: policy dict -> (settings.json; Augment toolPermissions rules, first match wins)."""
+    rank = _policy_rank(p)
+    edit = "deny" if rank == 0 else "allow"
+    term = ("ask-user", "ask-user", "allow")[rank]
+    out = {"toolPermissions": [{"toolName": t, "permission": {"type": v}}
+        for t, v in (("edit", edit), ("write", edit), ("terminal", term))]}
+    if p.get("allowed_models"): out["defaultModel"] = p["allowed_models"][0]
+    return "settings.json", json.dumps(out, indent=2) + "\n"
+
+def factory_policy_render(p):
+    """Pure: policy dict -> (settings.json; Factory sandbox denyRead, model policy, network domains)."""
+    secrets, off = p.get("secret_read_ban") or [], (p.get("network") or "on") == "off"
+    out = {}
+    sb = {}
+    if secrets: sb["filesystem"] = {"denyRead": secrets, "denyWrite": secrets}
+    if off: sb["network"] = {"allowedDomains": []}
+    if sb: out["sandbox"] = dict(sb, enabled=True)
+    mp = {}
+    if p.get("allowed_models"): mp.update(allowCustomModels=False, allowedModelIds=p["allowed_models"])
+    if p.get("denied_models"): mp["blockedModelIds"] = p["denied_models"]
+    if mp: out["modelPolicy"] = mp
+    return ".factory/settings.json", json.dumps(out, indent=2) + "\n"
+
+def grok_policy_render(p):
+    """Pure: policy dict -> (config.toml; Grok CLI permission rules, models, sandbox profile)."""
+    rank, off = _policy_rank(p), (p.get("network") or "on") == "off"
+    secrets = p.get("secret_read_ban") or []
+    deny = [f"Read({g})" for g in secrets] + [f"Edit({g})" for g in secrets] + (["web_fetch", "web_search"] if off else [])
+    lines = [f"# {POLICY_NOTE}", "[ui]", 'permission_mode = "ask"', "", "[permission]",
+        f"allow = {_policy_toml_list(['Edit'] if rank else [])}", f"deny = {_policy_toml_list(deny)}", ""]
+    mdl = []
+    if p.get("allowed_models"): mdl += [f"default = {_policy_toml_str(p['allowed_models'][0])}", f"allowed_models = {_policy_toml_list(p['allowed_models'])}"]
+    if p.get("denied_models"): mdl.append(f"disabled_models = {_policy_toml_list(p['denied_models'])}")
+    if mdl: lines += ["[models]"] + mdl + [""]
+    lines += ["[sandbox]", f'profile = "{"strict" if off else "workspace"}"']
+    return "config.toml", "\n".join(lines) + "\n"
+
+def kiro_policy_render(p):
+    """Pure: policy dict -> (managed-settings.json; Kiro admin rules: deny/ask only, never allow)."""
+    secrets, mcp = p.get("secret_read_ban") or [], p.get("mcp_allow") or []
+    rules = [{"capability": "fs_write", "match": ["**"], "effect": "deny"}] if _policy_rank(p) == 0 else []
+    if secrets: rules += [{"capability": c, "match": secrets, "effect": "deny"} for c in ("fs_read", "fs_write")]
+    if mcp: rules.append({"capability": "mcp", "match": ["*"], "exclude": mcp, "effect": "deny"})
+    if (p.get("network") or "on") == "off": rules.append({"capability": "web_fetch", "effect": "deny"})
+    return "managed-settings.json", json.dumps({"rules": rules}, indent=2) + "\n"
+
+def zed_policy_render(p):
+    """Pure: policy dict -> (settings.json; Zed agent.tool_permissions with regex always_deny)."""
+    rank, off = _policy_rank(p), (p.get("network") or "on") == "off"
+    edit = ("deny", "allow", "allow")[rank]
+    tools = {"terminal": {"default": ("confirm", "confirm", "allow")[rank]}}
+    for t in ("edit_file", "write_file"):
+        tools[t] = {"default": edit}
+        if p.get("secret_read_ban"):
+            tools[t]["always_deny"] = [{"pattern": "(" + "|".join(_policy_glob_re(g) for g in p["secret_read_ban"]) + ")"}]
+    if off: tools.update(fetch={"default": "deny"}, search_web={"default": "deny"})
+    out = {"agent": {"tool_permissions": {"default": "confirm", "tools": tools}}}
+    return "settings.json", json.dumps(out, indent=2) + "\n"
+
+def opencode_policy_render(p):
+    """Pure: policy dict -> (opencode.json; V2 permissions array, mcp.use policies)."""
+    rank = _policy_rank(p)
+    perms = [{"action": "read", "resource": "**", "effect": "allow"}]
+    perms += [{"action": "read", "resource": g, "effect": "deny"} for g in p.get("secret_read_ban") or []]
+    perms += [{"action": "edit", "resource": "**", "effect": "deny" if rank == 0 else "allow"},
+        {"action": "shell", "resource": "*", "effect": "allow" if rank == 2 else "ask"}]
+    out = {"$schema": "https://opencode.ai/config.json", "permissions": perms}
+    if p.get("allowed_models"): out["model"] = p["allowed_models"][0]
+    if p.get("mcp_allow"): out["policies"] = [{"action": "mcp.use", "resource": n, "effect": "allow"} for n in p["mcp_allow"]]
+    return "opencode.json", json.dumps(out, indent=2) + "\n"
+
 def policy_render(p, target):
     """Pure: validated policy dict -> (filename, text) for one target."""
-    fns = {"claude": claude_policy_render, "codex": codex_policy_render, "codex-config": codex_config_render}
-    if target not in fns: raise ValueError(f"unknown policy target: {target}")
-    return POLICY_FILES[target], fns[target](p)
+    if target not in POLICY_TARGETS: raise ValueError(f"unknown policy target: {target}")
+    return POLICY_TARGETS[target]["fn"](p)
+
+# Coverage: what each target can enforce for each policy field. native = key exists and ag renders it;
+# approx = weaker/shared mechanism or a rendering that is not the full policy; none = not rendered (see scope/doc).
+POLICY_FIELDS = ("permission_floor", "secret_read_ban", "mcp_allow", "allowed_models", "denied_models", "network")
+_CC = "https://code.claude.com/docs/en/managed-settings"
+_CODEX = "https://learn.chatgpt.com/docs/enterprise/managed-configuration"
+_GEM = "https://raw.githubusercontent.com/google-gemini/gemini-cli/main/docs/reference/policy-engine.md"
+POLICY_TARGETS = {
+    "claude": dict(fn=claude_policy_render, scope="managed: /Library/Application Support/ClaudeCode/ (macOS), /etc/claude-code/ (Linux)", doc=_CC,
+        levels=("native", "approx", "native", "native", "native", "approx")),
+    "codex": dict(fn=codex_policy_render, scope="admin: /etc/codex/requirements.toml (macOS MDM com.openai.codex)", doc=_CODEX,
+        levels=("native", "native", "native", "none", "none", "none")),
+    "codex-config": dict(fn=codex_config_render, scope="user: ~/.codex/config.toml (defaults, not enforced)",
+        doc="https://learn.chatgpt.com/docs/config-file/config-reference",
+        levels=("approx", "none", "none", "none", "none", "approx")),
+    "gemini": dict(fn=gemini_settings_render, scope="user: ~/.gemini/settings.json; system: /etc/gemini-cli/settings.json",
+        doc="https://geminicli.com/docs/reference/configuration/", levels=("none", "none", "none", "approx", "none", "native")),
+    "gemini-policy": dict(fn=gemini_policy_render, scope="user: ~/.gemini/policies/; admin: /Library/Application Support/GeminiCli/policies/",
+        doc=_GEM, levels=("native", "approx", "approx", "none", "none", "none")),
+    "qwen": dict(fn=qwen_policy_render, scope="user: ~/.qwen/settings.json; system settings layer",
+        doc="https://qwenlm.github.io/qwen-code-docs/en/users/configuration/settings/",
+        levels=("approx", "native", "native", "approx", "none", "approx")),
+    "cursor": dict(fn=cursor_policy_render, scope="user: ~/.cursor/cli-config.json; MCP and models via team dashboard/MDM",
+        doc="https://cursor.com/docs/cli/reference/configuration",
+        levels=("approx", "native", "none", "approx", "none", "native")),
+    "copilot": dict(fn=copilot_policy_render, scope="managed: /Library/Application Support/GitHubCopilot/managed-settings.json",
+        doc="https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference",
+        levels=("approx", "native", "native", "approx", "none", "approx")),
+    "amp": dict(fn=amp_policy_render, scope="user: ~/.config/amp/settings.json", doc="https://ampcode.com/docs/cli/settings",
+        levels=("none", "none", "none", "none", "none", "approx")),
+    "goose": dict(fn=goose_policy_render, scope="user: ~/.config/goose/config.yaml", doc="https://raw.githubusercontent.com/block/goose/main/documentation/docs/guides/config-files.md",
+        levels=("approx", "none", "none", "approx", "none", "none")),
+    "aider": dict(fn=aider_policy_render, scope="user: ~/.aider.conf.yml; repo .aider.conf.yml", doc="https://aider.chat/docs/config/aider_conf.html",
+        levels=("none", "none", "none", "approx", "none", "none")),
+    "aider-ignore": dict(fn=aider_ignore_render, scope="repo root: .aiderignore", doc="https://aider.chat/docs/config/aider_conf.html",
+        levels=("none", "approx", "none", "none", "none", "none")),
+    "cline": dict(fn=cline_ignore_render, scope="workspace root: .clineignore", doc="https://docs.cline.bot/customization/clineignore",
+        levels=("none", "approx", "none", "none", "none", "none")),
+    "roo": dict(fn=roo_ignore_render, scope="workspace root: .rooignore", doc="https://docs.roocode.com/features/rooignore",
+        levels=("none", "approx", "none", "none", "none", "none")),
+    "roo-modes": dict(fn=roo_modes_render, scope="project: .roomodes (custom mode)", doc="https://roocodeinc.github.io/Roo-Code/features/custom-modes/",
+        levels=("native", "none", "none", "none", "none", "none")),
+    "kilo": dict(fn=kilo_policy_render, scope="user: ~/.config/kilo/kilo.json; managed: /Library/Application Support/kilo/kilo.json",
+        doc="https://raw.githubusercontent.com/Kilo-Org/kilocode/v7.1.17/packages/opencode/src/kilocode/skills/kilo-config.md",
+        levels=("native", "approx", "none", "approx", "none", "approx")),
+    "continue": dict(fn=continue_policy_render, scope="user: ~/.continue/permissions.yaml", doc="https://docs.continue.dev/cli/tool-permissions",
+        levels=("native", "native", "none", "none", "none", "none")),
+    "windsurf": dict(fn=devin_ignore_render, scope="workspace root: .devinignore", doc="https://docs.devin.ai/windsurf/plugins/cascade/cascade-overview",
+        levels=("none", "approx", "none", "none", "none", "none")),
+    "crush": dict(fn=crush_policy_render, scope="project: crush.json; user: ~/.config/crush/crush.json", doc="https://charm.land/crush.json",
+        levels=("approx", "none", "none", "none", "none", "none")),
+    "augment": dict(fn=augment_policy_render, scope="user: ~/.augment/settings.json", doc="https://docs.augmentcode.com/cli/permissions",
+        levels=("native", "none", "none", "approx", "none", "none")),
+    "factory": dict(fn=factory_policy_render, scope="project: .factory/settings.json; managed: /Library/Application Support/Factory/settings.json",
+        doc="https://docs.factory.com/enterprise/hierarchical-settings-and-org-control",
+        levels=("none", "native", "none", "native", "native", "native")),
+    "grok": dict(fn=grok_policy_render, scope="user: ~/.grok/config.toml; pins: /etc/grok/requirements.toml", doc="https://docs.x.ai/build/settings/reference",
+        levels=("approx", "native", "none", "native", "native", "approx")),
+    "kiro": dict(fn=kiro_policy_render, scope="managed: /Library/Application Support/Kiro/managed-settings.json", doc="https://kiro.dev/docs/enterprise/governance/permissions/",
+        levels=("approx", "approx", "approx", "none", "none", "approx")),
+    "zed": dict(fn=zed_policy_render, scope="user: ~/.config/zed/settings.json; project .zed/settings.json", doc="https://zed.dev/docs/ai/tool-permissions",
+        levels=("native", "approx", "none", "none", "none", "approx")),
+    "opencode": dict(fn=opencode_policy_render, scope="user: ~/.config/opencode/opencode.json; project opencode.json", doc="https://opencode.ai/docs/permissions/",
+        levels=("native", "native", "approx", "approx", "none", "none")),
+}
+
+def policy_coverage(p=None, names=None):
+    """Pure: coverage rows per target (file, scope, doc, field levels). With a validated policy p, also notes
+    for each field the policy sets that the target does not enforce natively."""
+    rows = []
+    for t in names or POLICY_TARGETS:
+        spec = POLICY_TARGETS[t]
+        levels = dict(zip(POLICY_FIELDS, spec["levels"]))
+        row = {"target": t, "file": policy_render(policy_validate({"version": 1})[0], t)[0], "scope": spec["scope"],
+            "doc": spec["doc"], "fields": levels, "notes": []}
+        if p:
+            used = {"permission_floor": True, "secret_read_ban": bool(p["secret_read_ban"]), "mcp_allow": bool(p["mcp_allow"]),
+                "allowed_models": bool(p["allowed_models"]), "denied_models": bool(p["denied_models"]),
+                "network": p["network"] == "off"}
+            row["notes"] = [f"{t}: {f} {'not enforced' if lv == 'none' else 'approximated'}"
+                for f, lv in levels.items() if used[f] and lv != "native"]
+        rows.append(row)
+    return rows
+
+def policy_coverage_text(rows):
+    """Pure: coverage rows -> aligned text table plus notes."""
+    head = ("target", "file") + POLICY_FIELDS
+    body = [[r["target"], r["file"]] + [r["fields"][f] for f in POLICY_FIELDS] for r in rows]
+    widths = [max(len(str(x)) for x in col) for col in zip(head, *body)]
+    fmt = lambda cells: "  ".join(str(c).ljust(w) for c, w in zip(cells, widths)).rstrip()
+    lines = [fmt(head)] + [fmt(b) for b in body]
+    notes = [n for r in rows for n in r["notes"]]
+    if notes: lines += ["", "coverage notes:"] + [f"  {n}" for n in notes]
+    return "\n".join(lines)
 
 def policy_diff(old, new, name):
     """Pure: unified diff old -> new ('' when identical)."""
@@ -19089,8 +19391,11 @@ def policy_diff(old, new, name):
 
 def do_policy(a):
     sub = getattr(a, "polsub", None) or ""
-    if sub not in ("render", "check"):
-        return emit(a, "policy", error="no policy subcommand", hint="render|check")
+    if sub not in ("render", "check", "targets"):
+        return emit(a, "policy", error="no policy subcommand", hint="render|check|targets")
+    if sub == "targets" and not getattr(a, "pfile", None):  # static matrix, no policy file needed
+        rows = policy_coverage()
+        return emit(a, "policy", {"_text": policy_coverage_text(rows), "targets": rows})
     fp = Path(getattr(a, "pfile", None) or "ag-policy.json").expanduser()
     try: doc = json.loads(fp.read_text())
     except FileNotFoundError: return emit(a, "policy", error=f"no policy file: {fp}")
@@ -19099,13 +19404,16 @@ def do_policy(a):
     if errs:
         return emit(a, "policy", error="invalid policy: " + "; ".join(errs),
             hint="schema: version permission_floor allowed_models denied_models mcp_allow mcp_identity secret_read_ban network")
+    if sub == "targets":
+        rows = policy_coverage(policy)
+        return emit(a, "policy", {"_text": policy_coverage_text(rows), "targets": rows, "file": str(fp)})
     if sub == "check":
         txt = (f"policy ok: {fp} (version={policy['version']} floor={policy['permission_floor']} "
             f"network={policy['network']} allow={len(policy['allowed_models'])} deny={len(policy['denied_models'])} "
             f"mcp={len(policy['mcp_allow'])} secret_bans={len(policy['secret_read_ban'])})")
         return emit(a, "policy", dict(policy, file=str(fp), _text=txt))
     target = getattr(a, "target", None) or "all"
-    targets = list(POLICY_FILES) if target == "all" else [target]
+    targets = list(POLICY_TARGETS) if target == "all" else [target]
     rendered = {t: policy_render(policy, t) for t in targets}
     out = getattr(a, "out", None) or ""
     if getattr(a, "dry_run", False):
@@ -19113,7 +19421,7 @@ def do_policy(a):
         diffs = {}
         for t in targets:
             name, text = rendered[t]
-            p = base/name
+            p = base/t/name
             try: old = p.read_text() if p.exists() else ""
             except Exception as e: return emit(a, "policy", error=f"cannot read {p}: {e}")
             diffs[str(p)] = policy_diff(old, text, p.name) or f"no changes: {p}"
@@ -19122,8 +19430,8 @@ def do_policy(a):
         base = Path(out).expanduser(); base.mkdir(parents=True, exist_ok=True)
         written = []
         for t in targets:
-            name, text = rendered[t]; p = base/name
-            _atomic_write(p, text); written.append(str(p))
+            name, text = rendered[t]; p = base/t/name
+            p.parent.mkdir(parents=True, exist_ok=True); _atomic_write(p, text); written.append(str(p))
         return emit(a, "policy", {"_text": "wrote " + ", ".join(written), "files": written})
     if len(targets) == 1:
         text = rendered[targets[0]][1]
@@ -19333,9 +19641,11 @@ def build():
     po=sub.add_parser("policy",help="compile an ag-policy.json into backend policy files"); pos=po.add_subparsers(dest="polsub",required=False)
     por=pos.add_parser("render",help="render Claude Code managed settings / Codex requirements")
     por.add_argument("--file",dest="pfile",default="ag-policy.json",help="policy JSON (default ag-policy.json)")
-    por.add_argument("--target",default="all",choices=list(POLICY_FILES)+["all"],help="backend policy file to render")
+    por.add_argument("--target",default="all",choices=list(POLICY_TARGETS)+["all"],help="backend policy file to render (ag policy targets lists them)")
     por.add_argument("--out",default=None,help="output directory (default: print to stdout)")
     por.add_argument("--dry-run",dest="dry_run",action="store_true",help="print a unified diff against existing files; write nothing")
+    pot=pos.add_parser("targets",help="coverage matrix: which backend enforces each policy field (native/approx/none)")
+    pot.add_argument("--file",dest="pfile",default=None,help="also print coverage notes for this policy JSON")
     poc=pos.add_parser("check",help="validate a policy file")
     poc.add_argument("--file",dest="pfile",default="ag-policy.json",help="policy JSON (default ag-policy.json)")
     st=sub.add_parser("setup",help="pick model routing, install ag skills (shared ~/.agents/skills + links), write ag pointer blocks into harness instruction files"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help=",".join(SETUP_HARNESSES) + " | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] | backend.B.(enabled|model|mode|plan|effort)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")

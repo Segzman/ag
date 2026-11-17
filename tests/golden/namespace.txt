@@ -222,6 +222,7 @@ _LINK_PAGE
 _LINK_RESCAN_S
 _MD_FIELDS
 _MODEL_CATALOG_MAX_AGE_S
+_OC_MAJOR
 _OR_DROPS
 _OR_PARTS
 _OR_POLICY_RE
@@ -467,6 +468,7 @@ _notify_target_dir
 _notify_write
 _opencode_bin
 _opencode_error_message
+_opencode_major
 _opencode_variants_fetch
 _or_date
 _or_fetch_all

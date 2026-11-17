@@ -174,7 +174,15 @@ def test_handoff_has_no_bypass_flags():
 def test_backend_opts_stable():
     check("backend-opts", ag.tui_backend_opts() == ["claude", "opencode", "gemini", "codex", "cursor", "echo"])
 
-def test_opencode_command_argv_only():
+def test_opencode_v2_argv(monkeypatch):
+    monkeypatch.setenv("AG_OPENCODE_MAJOR", "2")
+    av = ag.backend_argv("opencode", model="opencode-go/kimi-k3.1-pro", workdir="/w", sid="s1", prompt="hi", effort="high")
+    check("v2-no-dir", "--dir" not in av and "--variant" not in av and "--command" not in av, av)
+    check("v2-variant-on-model", av[av.index("-m") + 1] == "opencode-go/kimi-k3.1-pro#high", av)
+    check("v2-session-and-prompt", av[-3:] == ["--session", "s1", "hi"], av)
+
+def test_opencode_command_argv_only(monkeypatch):
+    monkeypatch.setenv("AG_OPENCODE_MAJOR", "1")
     S = ag.OPENCODE_MODEL_DEFAULT
     av = ag.backend_argv("opencode", model="", workdir=".", sid="", prompt="hi", command="rev")
     check("command-argv", av[1:] == ["run", "--format", "json", "--thinking",

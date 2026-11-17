@@ -5563,6 +5563,12 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system=""
         return argv + mf + [prompt]
     if backend=="opencode":
         argv = [_opencode_bin(),"run","--format","json","--thinking"]
+        if _opencode_major() >= 2:
+            # opencode 2.x: no --dir (runs in the process cwd, which the worker sets to workdir),
+            # no --command, and the variant rides on the model as provider/model#variant.
+            if m: argv += ["-m", m + (f"#{effort}" if effort and "#" not in m else "")]
+            if sid: argv += ["--session",sid]
+            return argv + [prompt or (f"/{command}" if command else "")]
         if command: argv += ["--command",command]
         if m: argv += ["-m",m]
         argv += ef + ["--dir",workdir]
@@ -5589,6 +5595,19 @@ def backend_argv(backend, *, model="", workdir=".", sid="", prompt="", system=""
 
 def _cursor_bin():
     return shutil.which("agent") or str(Path.home()/".local/bin/agent")
+
+_OC_MAJOR = None
+def _opencode_major():
+    """Major version of the installed opencode CLI (cached; AG_OPENCODE_MAJOR overrides, 1 if unknown)."""
+    global _OC_MAJOR
+    env = os.environ.get("AG_OPENCODE_MAJOR")
+    if env and env.isdigit(): return int(env)
+    if _OC_MAJOR is None:
+        try:
+            out = subprocess.run([_opencode_bin(), "--version"], capture_output=True, text=True, timeout=15).stdout
+            mm = re.search(r"(\d+)\.\d+", out or ""); _OC_MAJOR = int(mm.group(1)) if mm else 1
+        except Exception: _OC_MAJOR = 1
+    return _OC_MAJOR
 
 def _opencode_bin():
     exe = shutil.which("opencode")
@@ -15611,11 +15630,18 @@ def do_selfcheck(a):
         os.environ["AG_HANDOFF_BUDGET"]="junk"; assert handoff_default_budget()==4000
         del os.environ["AG_HANDOFF_BUDGET"]
         assert do_agents(mk(sub="rm",name="ho",backend=None,model=None,adir=None,role=None,persona=None,system=None))==0
+        _ocm = os.environ.get("AG_OPENCODE_MAJOR"); os.environ["AG_OPENCODE_MAJOR"] = "1"  # v1 argv contract below; v2 checked after
         oc_argv = backend_argv("opencode",model="",workdir=".",sid="",prompt="hi",command="rev")
         assert oc_argv[1:] == ["run","--format","json","--thinking","--command","rev","-m",OPENCODE_MODEL_DEFAULT,"--dir",".","hi"] and (oc_argv[0]=="opencode" or oc_argv[0].endswith("/opencode"))
         assert "--command" not in backend_argv("opencode",model="",workdir=".",sid="",prompt="hi")
         assert _parse_claude('{"type":"result","subtype":"s","total_cost_usd":null}')==[("done","s cost=$0.000")]  # null cost must not crash
         assert backend_argv("opencode",model="x",workdir=".",prompt="hi",effort="max")[-6:-1]==["x","--variant","max","--dir","."] and "--variant" not in backend_argv("opencode",prompt="hi")
+        os.environ["AG_OPENCODE_MAJOR"] = "2"  # opencode 2.x: no --dir/--variant/--command; variant rides on the model
+        _v2 = backend_argv("opencode",model="x",workdir=".",prompt="hi",effort="max")
+        assert _v2[-3:] == ["-m","x#max","hi"] and "--dir" not in _v2 and "--variant" not in _v2, _v2
+        assert backend_argv("opencode",model="x",workdir=".",prompt="",command="rev")[-1] == "/rev"
+        if _ocm is None: os.environ.pop("AG_OPENCODE_MAJOR", None)
+        else: os.environ["AG_OPENCODE_MAJOR"] = _ocm
         assert "--effort" in backend_argv("claude",prompt="hi",effort="high") and backend_argv("codex",prompt="hi",effort="low")[3:5]==["-c",'model_reasoning_effort="low"']
         # per-model variants: claude static, unknown passes through, opencode/codex from the model-list cache
         assert model_variants("claude","sonnet")==["low","medium","high","xhigh","max"] and model_variants("claude","opus")==model_variants("claude","haiku") and model_variants("gemini","x") is None

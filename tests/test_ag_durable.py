@@ -18,6 +18,13 @@ AG = _load_src(importlib.machinery.SourceFileLoader("ag_durable_t", _AG))
 DEAD_PID = 2 ** 22 + 7
 
 
+def _pid_alive(pid):
+    try: os.kill(pid, 0)
+    except ProcessLookupError: return False
+    except PermissionError: return True
+    return True
+
+
 def fresh():
     sdir = Path(tempfile.mkdtemp(prefix="agdurable-")) / "st"
     AG.ensure_state(sdir)
@@ -347,6 +354,10 @@ class EndToEnd(unittest.TestCase):
         old = self.job("dead2")
         self.assertEqual(old["status"], "interrupted"); new = old["resumed_as"]
         self.assertTrue(self.wait_for(lambda: self.job(new).get("status") == "done"), self.job(new))
+        # status "done" is written before the detached worker exits; wait for the
+        # process so teardown does not race its last writes (ENOTEMPTY on rmtree).
+        pid = self.job(new).get("pid"); self.assertTrue(pid, self.job(new))
+        self.assertTrue(self.wait_for(lambda: not _pid_alive(pid), timeout=60), ("worker still running", pid))
         self.assertEqual(self.job(new)["message"], "continue; you were interrupted")
         self.assertEqual(self.job(new)["resume_of"], "dead2")
 

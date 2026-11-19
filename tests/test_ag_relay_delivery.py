@@ -93,6 +93,16 @@ class Delivery(Relay):
         self.assertNotIn("UNDELIVERED", p.stdout)
 
 
+def _rec_sleeps(sleeps):
+    """time.sleep patch recording only the push backoff (>= 0.25s): subprocess.Popen._wait polls with
+    time.sleep(<=0.05) while a slow child is reaped, which made the counts flaky under load."""
+    real = time.sleep
+    def f(s):
+        if s >= 0.2: sleeps.append(s)
+        else: real(s)
+    return f
+
+
 class PushRace(Relay):
     def fake_git(self, body):
         p = self.bindir(self.o) / "git"
@@ -120,7 +130,7 @@ class PushRace(Relay):
         env, log, count = self.env()
         sleeps = []
         out, errs = {}, []
-        with patch.dict(os.environ, env), patch("time.sleep", side_effect=lambda s: sleeps.append(s)):
+        with patch.dict(os.environ, env), patch("time.sleep", side_effect=_rec_sleeps(sleeps)):
             ag._relay_push(self.cfg(), out, errs)
         self.assertTrue(out.get("pushed"), errs)
         self.assertEqual(errs, [])
@@ -135,7 +145,7 @@ class PushRace(Relay):
         env, log, count = self.env()
         sleeps = []
         out, errs = {}, []
-        with patch.dict(os.environ, env), patch("time.sleep", side_effect=lambda s: sleeps.append(s)):
+        with patch.dict(os.environ, env), patch("time.sleep", side_effect=_rec_sleeps(sleeps)):
             ag._relay_push(self.cfg(), out, errs)
         self.assertFalse(out.get("pushed"))
         self.assertIn("cannot lock ref", errs[0])

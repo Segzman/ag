@@ -1,0 +1,10 @@
+usage: ag grant [-h] [--list] [--all] [--deny ID] [id]
+
+positional arguments:
+  id          request id (or unique prefix)
+
+options:
+  -h, --help  show this help message and exit
+  --list      list pending requests
+  --all       with --list: include granted/denied/expired
+  --deny ID   deny a pending request (no popup)

@@ -297,6 +297,259 @@ def do_approve(a):
         return emit(a,"approve",error=f"no such id: {a.id}")
     return emit(a,"approve",{"_text":f"{a.id} approved 10min"})
 
+# ---- human gate: risky grants need PROOF OF A HUMAN (Touch ID / Watch / device password) ----
+# An agent (or any non-interactive caller) that invokes a gated action does not get a bare refusal:
+# it files a pending request in <state>/requests/ and the human runs `ag grant ID`, which shows the
+# exact command, pops the native auth dialog, then executes the stored argv once (single-use, 24h).
+# Gated list = GATED_ACTIONS below (+ "extra" keys in ~/.config/ag/gate.json). Key = subcommand path
+# ("relay alias add"). Value = (predicate(args) -> bool, or None = always; what it grants).
+GATE_TTL_S = 86400
+GATE_AGENT_ENV = ("AG_JOB_ID", "AG_PARENT_AGENT", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "OPENCODE", "OPENCODE_PID", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_CI")
+GATED_ACTIONS = {
+    "relay alias add": (None, "lets remote nodes start chats on this Mac"),
+    "relay alias rm": (None, "removes a remote-chat alias"),
+    "relay trust": (None, "grants a relay origin a higher mode cap"),
+    "access allow": (None, "allows a backend/model glob"),
+    "access rm": (None, "removes an access rule (can lift a deny)"),
+    "agents add": (lambda a: (getattr(a, "mode", None) or "") in ("auto", "full"), "creates an agent in auto/full mode"),
+    "agents set": (lambda a: (getattr(a, "mode", None) or "") in ("auto", "full"), "raises an agent to auto/full mode"),
+    "policy render": (lambda a: bool(getattr(a, "out", None)) and not getattr(a, "dry_run", False), "writes backend policy files"),
+    "relay admin": (lambda a: (getattr(a, "op", "") or "").startswith("trust"), "changes trust on another node"),
+    "kit on": (lambda a: (getattr(a, "tools", None) or "all").strip().lower() != "none", "enables MCP kit tools by default"),
+}
+# Swift helper source; compiled once into <cache>/bin/ag-auth (keyed by this source's hash). Exit 0 approved,
+# 1 denied/failed, 2 no authentication available on this Mac.
+AUTH_SWIFT = r"""import Foundation
+import LocalAuthentication
+let reason = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "ag: confirm a risky action"
+let ctx = LAContext()
+ctx.localizedCancelTitle = "Deny"
+var cerr: NSError?
+guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &cerr) else {
+    FileHandle.standardError.write(Data("unavailable: \(cerr?.localizedDescription ?? "no auth")\n".utf8)); exit(2)
+}
+final class Box: @unchecked Sendable { var ok = false; var msg = "" }
+let box = Box(), sem = DispatchSemaphore(value: 0)
+ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { ok, e in
+    box.ok = ok; box.msg = e?.localizedDescription ?? ""; sem.signal()
+}
+sem.wait()
+if !box.ok { FileHandle.standardError.write(Data("denied: \(box.msg)\n".utf8)) }
+exit(box.ok ? 0 : 1)
+"""
+
+def _gate_agent_env(env=None):
+    env = os.environ if env is None else env
+    return any((env.get(k) or "").strip() for k in GATE_AGENT_ENV)
+
+def _gate_interactive():
+    """A human at a terminal: stdin+stdout are TTYs and no agent runtime marker is set. Conservative."""
+    try: tty = sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception: tty = False
+    return tty and not _gate_agent_env()
+
+def _gate_off():
+    """AG_HUMAN_GATE=off is a test/CI switch; it is ignored inside any agent environment."""
+    return (os.environ.get("AG_HUMAN_GATE") or "").strip().lower() == "off" and not _gate_agent_env()
+
+def _gate_key(a):
+    parts = [getattr(a, "subcmd", "") or ""]
+    for at in ("rsub", "asub", "sub", "polsub", "ksub"):
+        v = getattr(a, at, None)
+        if isinstance(v, str) and v: parts.append(v)
+    return " ".join(parts)
+
+def _gate_extra():
+    d = _json_or_empty(ag_config_home() / "gate.json")
+    ex = d.get("extra") if isinstance(d, dict) else None
+    return [str(x).strip() for x in ex if str(x).strip()] if isinstance(ex, list) else []
+
+def _gate_match(a):
+    """(key, grants) when this parsed invocation is gated, else None."""
+    k = _gate_key(a)
+    if k in GATED_ACTIONS:
+        pred, why = GATED_ACTIONS[k]
+        if pred is None or pred(a): return k, why
+    if k in _gate_extra(): return k, "listed in gate.json extra"
+    return None
+
+def _gate_details(k, a):
+    """One line saying exactly what is being granted (the popup reason)."""
+    g = lambda n, d="": getattr(a, n, d)
+    if k == "relay alias add":
+        nodes = [x.strip() for x in (g("from_nodes") or "").split(",") if x.strip()]
+        who = (", ".join(nodes[:-1]) + " and " + nodes[-1]) if len(nodes) > 1 else (nodes[0] if nodes else "no node yet")
+        res = (g("resume") or "none")
+        return f"ag: allow {who} to start chats in session {g('name')} ({g('mode') or 'ro'}, {g('backend')}" + (f", resuming {res}" if res != "none" else "") + f") in {g('adir')}"
+    if k == "relay alias rm": return f"ag: remove remote-chat alias {g('name')}"
+    if k in ("access allow", "access rm"): return f"ag: {k.split()[1]} model access {g('glob')} ({g('scope') or 'global'})"
+    if k in ("agents add", "agents set"): return f"ag: {'create' if k.endswith('add') else 'set'} agent {g('name')} with mode {g('mode')}"
+    if k == "policy render": return f"ag: write backend policy files to {g('out')} from {g('pfile')}"
+    if k == "relay admin": return f"ag: run relay admin op {g('op')} on node {g('node')}"
+    if k == "kit on": return f"ag: enable kit tools {g('tools') or 'all'} (MCP servers) as the default"
+    return f"ag: run `ag {k}`"
+
+def _gate_auth_helper():
+    """Path of the compiled auth helper (built once from AUTH_SWIFT), or None. Rebuilds when the source hash changes."""
+    sw = shutil.which("swiftc")
+    if sys.platform != "darwin" or not sw: return None
+    d = ag_cache_home() / "bin"; exe, stamp = d / "ag-auth", d / "ag-auth.srchash"
+    h = hashlib.sha256(AUTH_SWIFT.encode()).hexdigest()[:16]
+    try:
+        if exe.is_file() and os.access(exe, os.X_OK) and stamp.read_text().strip() == h: return str(exe)
+    except Exception: pass
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        src, tmp = d / f"ag-auth-{os.getpid()}.swift", d / f"ag-auth-{os.getpid()}.bin"
+        src.write_text(AUTH_SWIFT)
+        r = subprocess.run([sw, "-O", str(src), "-o", str(tmp)], capture_output=True, text=True, timeout=300)
+        try: src.unlink()
+        except Exception: pass
+        if r.returncode != 0 or not tmp.is_file(): return None
+        os.replace(tmp, exe); stamp.write_text(h)
+        return str(exe)
+    except Exception: return None
+
+def _human_confirm_ex(action, details, timeout=120):
+    """True only if a human at this Mac proves presence. Never auto-approves.
+    Order: AG_AUTH_HELPER (test hook, never in an agent env) -> compiled LocalAuthentication helper
+    (Touch ID / Watch / device password) -> `ag ui` dialog (never for agent callers) -> refuse.
+    -> (ok, method)"""
+    reason = (details if str(details).startswith("ag:") else f"ag: {action}: {details}")[:240]
+    agent = _gate_agent_env()
+    stub = (os.environ.get("AG_AUTH_HELPER") or "").strip()
+    helper = stub if stub and not agent else _gate_auth_helper()
+    if helper:
+        try: r = subprocess.run([helper, reason], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        except Exception: return False, "helper-error"
+        if r.returncode == 0: return True, "stub" if stub and not agent else "localauth"
+        if r.returncode != 2 or stub: return False, "denied"
+    if not agent and ui_enabled():  # no biometrics/password available: plain confirm dialog (weaker, human callers only)
+        st, out = ui_run("confirm", [reason, "Approve", "Deny", "ag: approve?", timeout], timeout)
+        return (st == "ok" and out == "Approve"), "dialog"
+    return False, "unavailable"
+
+def human_confirm(action, details):
+    """Proof of a human at this Mac: True only if they approve the native auth popup. Never auto-approves."""
+    return _human_confirm_ex(action, details)[0]
+
+def _gate_dir(sdir):
+    d = Path(sdir) / "requests"; d.mkdir(parents=True, exist_ok=True); return d
+
+def _gate_audit(sdir, event, **kw):
+    try:
+        with open(_gate_dir(sdir) / "audit.jsonl", "a") as f:
+            f.write(json.dumps({"ts": now_iso(), "event": event, **kw}, ensure_ascii=False) + "\n")
+    except Exception: pass
+
+def _gate_load(sdir, rid):
+    """(request, error) by id or unique prefix."""
+    d = _gate_dir(sdir)
+    hits = [p for p in d.glob("g-*.json") if p.stem == rid or p.stem.startswith(rid)] if rid else []
+    if len(hits) != 1: return None, f"no such request: {rid}" if not hits else f"ambiguous request id: {rid}"
+    r = _json_or_empty(hits[0])
+    return (r, None) if isinstance(r, dict) and r.get("id") else (None, f"unreadable request: {rid}")
+
+def _gate_save(sdir, r): _atomic_write(_gate_dir(sdir) / f'{r["id"]}.json', json.dumps(r, indent=1, ensure_ascii=False))
+
+def _gate_create(a, sdir, argv, key, why):
+    """Pending request for a non-interactive caller (deduped on argv+cwd). -> request."""
+    cwd, now = os.getcwd(), time.time()
+    for p in _gate_dir(sdir).glob("g-*.json"):
+        r = _json_or_empty(p)
+        if isinstance(r, dict) and r.get("status") == "pending" and r.get("argv") == argv and r.get("cwd") == cwd and r.get("expires", 0) > now: return r
+    agent = (os.environ.get("AG_PARENT_AGENT") or "").strip() or ("claude-code" if os.environ.get("CLAUDECODE") else "non-interactive")
+    sess = next((os.environ[k] for k in ("AG_JOB_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID") if os.environ.get(k)), "")
+    r = {"id": "g-" + os.urandom(4).hex(), "status": "pending", "action": key, "grants": why, "argv": argv, "cwd": cwd,
+        "details": _gate_details(key, a), "agent": agent, "session": sess, "ts": now, "expires": now + GATE_TTL_S}
+    _gate_save(sdir, r)
+    _gate_audit(sdir, "requested", id=r["id"], action=key, argv=argv, agent=agent, session=sess)
+    msg = f"ag: {agent} requests {key}"
+    try:
+        if ui_enabled(): ui_run("notify", [msg, "ag: needs you", "1"])
+    except Exception: pass
+    try: _notify_write(msg, f'{r["details"]}\nhuman runs: ag grant {r["id"]}')
+    except Exception: pass
+    return r
+
+def gate_check(a, argv):
+    """None = proceed. Else the exit code (request filed / not approved). Called once, in main()."""
+    if _GATE["passed"]: return None
+    m = _gate_match(a)
+    if m is None or _gate_off(): return None
+    key, why = m
+    sdir = state_dir(getattr(a, "dir", None)); details = _gate_details(key, a)
+    if _gate_interactive():
+        ok, how = _human_confirm_ex(key, details)
+        _gate_audit(sdir, "confirmed" if ok else "refused", action=key, argv=argv, origin="human", method=how)
+        if ok: return None
+        return emit(a, "gate", error=f"not approved ({how}): {details}") or 1
+    r = _gate_create(a, sdir, argv, key, why)
+    cmd = f'ag grant {r["id"]} --dir {Path(sdir).absolute()}'
+    emit(a, "gate", {"pending": r["id"], "action": key, "details": details, "grant": cmd, "expires": r["expires"]},
+        error=f"pending approval {r['id']}; human runs: {cmd}", hint=f"{details} (needs a human at the Mac; expires in 24h)")
+    return 3
+_GATE = {"passed": False}
+
+def _gate_list(a, sdir):
+    rows, now = [], time.time()
+    for p in sorted(_gate_dir(sdir).glob("g-*.json"), key=lambda x: x.stat().st_mtime):
+        r = _json_or_empty(p)
+        if not isinstance(r, dict) or not r.get("id"): continue
+        if r.get("status") == "pending" and r.get("expires", 0) <= now: r["status"] = "expired"
+        if r["status"] == "pending" or getattr(a, "all", False): rows.append(r)
+    txt = "\n".join(f'{r["id"]} [{r["status"]}] {r.get("agent") or "-"} {r.get("details") or r.get("action")}' for r in rows) or "(no pending requests)"
+    return emit(a, "grant", {"_text": txt, "requests": rows})
+
+def do_grant(a):
+    sdir = state_dir(a.dir)
+    if getattr(a, "list", False): return _gate_list(a, sdir)
+    rid = getattr(a, "deny", None) or getattr(a, "id", None) or ""
+    if not rid: return emit(a, "grant", error="need a request id", hint="ag grant --list | ag grant ID | ag grant --deny ID")
+    r, err = _gate_load(sdir, rid)
+    if err: return emit(a, "grant", error=err, hint="ag grant --list")
+    rid = r["id"]
+    if r.get("status") != "pending":
+        _gate_audit(sdir, "replay_refused", id=rid, status=r.get("status"))
+        return emit(a, "grant", error=f"request {rid} is {r.get('status')}: each request is single-use", hint="the agent must file a new request")
+    if r.get("expires", 0) <= time.time():
+        r["status"] = "expired"; _gate_save(sdir, r); _gate_audit(sdir, "expired_refused", id=rid)
+        return emit(a, "grant", error=f"request {rid} expired (24h)", hint="the agent must file a new request")
+    argv = r.get("argv") if isinstance(r.get("argv"), list) and all(isinstance(x, str) for x in r["argv"]) else None
+    if not argv: return emit(a, "grant", error=f"request {rid} has no valid argv")
+    if getattr(a, "deny", None):
+        r["status"] = "denied"; r["decided"] = time.time(); _gate_save(sdir, r); _gate_audit(sdir, "denied", id=rid, origin="human")
+        return emit(a, "grant", {"_text": f"{rid} denied", "id": rid})
+    try:  # what is shown + executed come from the same argv, never from the stored description
+        pa, _ = _parse_cli(argv); key = _gate_key(pa); details = _gate_details(key, pa)
+    except SystemExit: return emit(a, "grant", error=f"request {rid} holds an argv this ag cannot parse")
+    show = "\n".join([f"request   {rid}", f"action    {key}", f"details   {details}", f"command   ag {shlex.join(argv)}", f"cwd       {r.get('cwd')}",
+        f"from      {r.get('agent')}" + (f" (session {r['session']})" if r.get("session") else ""),
+        f"requested {datetime.fromtimestamp(r['ts']).isoformat(timespec='seconds')}"])
+    print(show, file=sys.stderr)
+    ok, how = _human_confirm_ex(key, details)
+    if not ok:
+        _gate_audit(sdir, "auth_failed", id=rid, action=key, method=how)
+        return emit(a, "grant", error=f"not approved ({how}); nothing was run", hint="the request stays pending until it expires")
+    try: fd = os.open(_gate_dir(sdir) / f"{rid}.claim", os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.close(fd)
+    except FileExistsError:
+        _gate_audit(sdir, "replay_refused", id=rid, status="claimed")
+        return emit(a, "grant", error=f"request {rid} was already granted: single-use")
+    r["status"] = "granted"; r["decided"] = time.time(); r["method"] = how; _gate_save(sdir, r)
+    import io, contextlib
+    out, rc = io.StringIO(), 1
+    old_cwd, _GATE["passed"] = os.getcwd(), True
+    try:
+        if r.get("cwd") and os.path.isdir(r["cwd"]): os.chdir(r["cwd"])
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            try: rc = main(list(argv)) or 0
+            except SystemExit as e: rc = e.code if isinstance(e.code, int) else 1
+    finally:
+        _GATE["passed"] = False; os.chdir(old_cwd)
+    r["status"] = "executed" if rc == 0 else "failed"; r["rc"] = rc; r["output"] = out.getvalue()[-2000:]; _gate_save(sdir, r)
+    _gate_audit(sdir, "executed", id=rid, action=key, argv=argv, origin="human", method=how, rc=rc)
+    return emit(a, "grant", {"_text": f"{rid} granted by human ({how}), ran: rc={rc}\n{out.getvalue().rstrip()}".rstrip(), "id": rid, "rc": rc, "output": out.getvalue()}, error=None if rc == 0 else f"granted action failed rc={rc}")
+
 # ---- live pty sessions: non-blocking spawn, many readers, event pings ----
 # ponytail: stdlib pty only, no tmux. Ceilings: single host, logs unbounded, POSIX only.
 KEYS = {"enter":"\r","tab":"\t","esc":"\x1b","escape":"\x1b","up":"\x1b[A",
@@ -13942,8 +14195,7 @@ def _do_relay_alias(a, cfg):
         al_all.pop(name); _relay_alias_save(cfg, al_all)
         return emit(a, "relay", {"_text": f"relay alias {name} removed", "name": name})
     if a.asub != "add": return err("relay alias: add | list | rm")
-    if (os.environ.get("AG_PARENT_AGENT") or "").strip():
-        return err("relay alias add is human-only: an agent cannot grant remote-chat rights", "run it yourself on this node")
+    # human gate (main -> gate_check) already turned an agent's call into a pending `ag grant` request
     if not RELAY_NAME_RE.fullmatch(name): return err(f"bad relay alias name {name!r}", "lowercase letters, digits and dashes; 2-40 chars")
     if a.backend not in AGENT_BACKENDS_ALIAS: return err(f"bad --backend {a.backend!r}", "/".join(AGENT_BACKENDS_ALIAS))
     mode = a.mode or "ro"
@@ -21992,6 +22244,7 @@ def build():
     aca=acs.add_parser("allow",help="allow a backend/model glob"); aca.add_argument("glob",help="glob like opencode/* or provider/*"); aca.add_argument("--scope",default="global",choices=["global","project"]); aca.add_argument("--data",default=None,choices=["work","public"],help="per-data policy (default: base)")
     acd=acs.add_parser("deny",help="deny a backend/model glob (deny wins)"); acd.add_argument("glob",help="glob like opencode/* or provider/*"); acd.add_argument("--scope",default="global",choices=["global","project"]); acd.add_argument("--data",default=None,choices=["work","public"],help="per-data policy (default: base)")
     acr=acs.add_parser("rm",help="remove a glob from allow+deny"); acr.add_argument("glob"); acr.add_argument("--scope",default="global",choices=["global","project"]); acr.add_argument("--data",default=None,choices=["work","public"],help="per-data policy (default: base)")
+    gr=sub.add_parser("grant",help="human approval of risky actions an agent requested (Touch ID / Watch / device password popup)"); gr.add_argument("id",nargs="?",default=None,help="request id (or unique prefix)"); gr.add_argument("--list",action="store_true",help="list pending requests"); gr.add_argument("--all",action="store_true",help="with --list: include granted/denied/expired"); gr.add_argument("--deny",default=None,metavar="ID",help="deny a pending request (no popup)")
     us=sub.add_parser("usage",help="token/cost/request totals from the usage ledger"); us.add_argument("--by",default=None,choices=["provider","model","agent","project","day"],help="group breakdown"); us.add_argument("--since",default=None,help="1d|7d|30d (default: all)")
     bu=sub.add_parser("budget",help="spend/request budgets"); bus=bu.add_subparsers(dest="sub",required=True)
     bus.add_parser("show",help="limits + spent/used today")
@@ -22705,8 +22958,8 @@ def _lift_trailing_dir(argv, subs):
         out.append(t); j += 1
     return out + tail, d
 
-def main(argv=None):
-    if argv is None: argv = sys.argv[1:]
+def _parse_cli(argv):
+    """argv -> (parsed args, argv after --json handling). Shared by main() and `ag grant` (re-parse a stored request)."""
     # Global --json only before explicit `--` boundary. Tokens after the
     # first bare `--` are child args (defect 1): never strip there, so
     # `ag run -- echo --json` preserves child --json and stays text mode.
@@ -22729,8 +22982,14 @@ def main(argv=None):
     if ui_cmd is not None: a.cmd = ui_cmd
     if dirlift is not None: a.dir = dirlift
     if want_json: a.json = True
+    return a, argv
+
+def main(argv=None):
+    if argv is None: argv = sys.argv[1:]
+    argv0 = list(argv)
+    a, _ = _parse_cli(argv)
     if getattr(a, "version", False): print(VERSION); return 0
-    if not getattr(a, "subcmd", None): p.print_help(); return 1
+    if not getattr(a, "subcmd", None): build().print_help(); return 1
     # strip leading -- from run/spawn
     if a.subcmd in ("run","spawn") and getattr(a,"cmd",None) and a.cmd[0]=="--": a.cmd=a.cmd[1:]
     fn = {"run":do_run,"read":do_read,"write":do_write,"edit":do_edit,"ls":do_ls,
@@ -22744,8 +23003,10 @@ def main(argv=None):
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"browser":do_browser,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"channel":do_channel,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
-        "access":do_access,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit,"merge":do_merge}[a.subcmd]
+        "access":do_access,"grant":do_grant,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit,"merge":do_merge}[a.subcmd]
     maybe_auto_update(a.subcmd)
+    g = gate_check(a, argv0)
+    if g is not None: return g
     return fn(a)
 
 if __name__=="__main__":

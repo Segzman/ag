@@ -19,3 +19,8 @@ def _ag_isolated_state(tmp_path, monkeypatch):
     monkeypatch.setenv("AG_KIT", "none")
     # real opencode 2.x on the box: ag would exec `opencode --version` (extra fake-binary call) and switch argv shape
     monkeypatch.setenv("AG_OPENCODE_MAJOR", "1")
+    # human gate: tests drive gated commands directly; the gate itself is tested in test_ag_human_gate.py.
+    # Agent-runtime markers are scrubbed so a run inside Claude Code behaves like a plain terminal.
+    monkeypatch.setenv("AG_HUMAN_GATE", "off")
+    for k in ("AG_JOB_ID", "AG_PARENT_AGENT", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "OPENCODE", "OPENCODE_PID", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_CI"):
+        monkeypatch.delenv(k, raising=False)

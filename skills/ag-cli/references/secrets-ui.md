@@ -40,6 +40,18 @@ A dialog that times out used to lose the answer; now the request is queued in `<
 
 Timeout always queues (exit 2 still, output names the id); `--queue` also records answered dialogs. The need is attributed to `$AG_PARENT_AGENT` or `--agent`. One "N things need you" inbox notification per 10 minutes while items are open.
 
+## Human gate (`ag grant`)
+
+Gated grants (`relay alias add|rm`, `relay trust`, `access allow|rm`, `agents add|set --mode auto|full`, `policy render --out`, `kit on`, plus `gate.json` extras) need a human at the Mac. As an agent you are not that human: the command exits 3 with `pending approval ID; human runs: ag grant ID --dir <state>` and the user gets a notification. Tell the user the id; never try to approve it yourself (the Touch ID / password popup is the proof, `AG_AUTH_HELPER`/`AG_HUMAN_GATE=off` are ignored in agent envs).
+
+```sh
+{{AG}} --dir <state> grant --list [--all]      # pending requests
+{{AG}} --dir <state> grant ID                  # human: shows the command, auth popup, runs it once (24h, single-use)
+{{AG}} --dir <state> grant --deny ID           # human: reject
+```
+
+Audit: `<state>/requests/audit.jsonl`.
+
 ## Notifications (`ag notify`)
 
 ```sh

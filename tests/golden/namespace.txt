@@ -8,6 +8,7 @@ AG_ASCII_GLYPHS
 ANSI
 ASKPASS_CALLERS
 AUTH_HINT
+AUTH_SWIFT
 AcpErr
 BACKEND_TABS
 BG_STAMP_S
@@ -41,6 +42,9 @@ EFFORT_ORDER
 ENV_DENY
 ENV_SECRET_RE
 G
+GATED_ACTIONS
+GATE_AGENT_ENV
+GATE_TTL_S
 HANDOFF_BUDGET_DEFAULT
 HARNESS_HOME_FILES
 HARNESS_HOME_KEEP
@@ -228,6 +232,7 @@ _CTX_OVERFLOW_RE
 _CURSOR_MODE
 _ENV_KEY_RE
 _FORK_SECRET_ENV
+_GATE
 _GEM
 _GEMINI_AM
 _HARNESS_ARGS
@@ -410,6 +415,20 @@ _fmt_cost
 _fmt_ctx
 _follow_events
 _fork_tracked_daemon
+_gate_agent_env
+_gate_audit
+_gate_auth_helper
+_gate_create
+_gate_details
+_gate_dir
+_gate_extra
+_gate_interactive
+_gate_key
+_gate_list
+_gate_load
+_gate_match
+_gate_off
+_gate_save
 _git
 _git_out
 _git_short
@@ -418,6 +437,7 @@ _handoff_marker_path
 _harness_from_proc
 _http_json
 _http_text
+_human_confirm_ex
 _is_glue_mark
 _json_or_empty
 _keychain_ref
@@ -512,6 +532,7 @@ _or_policy_fetch
 _or_trim
 _or_trim_models
 _parse_claude
+_parse_cli
 _parse_codex
 _parse_generic
 _parse_opencode
@@ -1007,6 +1028,7 @@ do_delegate
 do_edit
 do_events
 do_forget
+do_grant
 do_grep
 do_handoff
 do_harness
@@ -1079,6 +1101,7 @@ escape_snapshot
 factory_policy_render
 foot_text
 friendly_model
+gate_check
 gemini_policy_render
 gemini_settings_render
 get_agent_context
@@ -1095,6 +1118,7 @@ harness_inventory
 harness_link
 home_agent_line
 home_flat_agents
+human_confirm
 index_by_name
 is_running
 keychain_delete

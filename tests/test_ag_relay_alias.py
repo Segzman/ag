@@ -88,7 +88,7 @@ class Alias(Env):
         self.assertNotIn("aliases", self.cfg_of(self.mac))
         self.assertEqual(self.run_ag(self.mac, "relay", "alias", "rm", "coop", ok=False).returncode, 1)
 
-    def test_add_validation_and_agent_refused(self):
+    def test_add_validation_and_agent_pending(self):
         self.init(self.mac)
         base = ["relay", "alias", "add", "coop", "--backend", "claude", "--dir", str(self.work)]
         self.assertIn("never allowed", (p := self.run_ag(self.mac, *base, "--mode", "full", ok=False)).stdout + p.stderr)
@@ -96,7 +96,7 @@ class Alias(Env):
         self.assertIn("needs --backend claude", (p := self.run_ag(self.mac, "relay", "alias", "add", "x1", "--backend", "codex",
             "--dir", str(self.work), "--resume", "latest", ok=False)).stdout + p.stderr)
         env = self.mac["env"]; self.mac["env"] = dict(env, AG_PARENT_AGENT="some-agent")
-        self.assertIn("human-only", (p := self.run_ag(self.mac, *base, ok=False)).stdout + p.stderr)
+        self.assertIn("pending approval", (p := self.run_ag(self.mac, *base, ok=False)).stdout + p.stderr)  # human gate: agent call = pending `ag grant`
         self.mac["env"] = env
         self.assertEqual(self.cfg_of(self.mac).get("aliases"), None)
 

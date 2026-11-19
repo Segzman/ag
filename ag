@@ -5626,6 +5626,95 @@ def _opencode_bin():
             return str(fallback)
     return "opencode"
 
+def _pwd_env(env, cwd):
+    """Child env whose $PWD matches the Popen cwd. Popen(cwd=...) moves the process but leaves the
+    inherited $PWD pointing at the launcher's directory (a wake worker runs in the caller's cwd, often the
+    MAIN checkout), and `opencode run` trusts $PWD over getcwd(): new sessions, and the tools in them,
+    then live in the wrong tree. None env = os.environ."""
+    e = dict(os.environ if env is None else env)
+    e["PWD"] = str(cwd)
+    return e
+
+def _oc_api(args, timeout=20):
+    """`opencode api ...` -> parsed JSON dict (the running v2 server) or None on any failure."""
+    try:
+        r = subprocess.run([_opencode_bin(), "api"] + list(args), capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return (json.loads(r.stdout) if r.stdout.strip() else {}) if r.returncode == 0 else None
+    except Exception: return None
+
+def _oc_session_dir(sid):
+    """Directory an opencode 2.x session is bound to (its tools run there on every resume), or None if unknown."""
+    d = _oc_api(["GET", f"/api/session/{sid}"])
+    try: return ((d or {}).get("data") or {}).get("location", {}).get("directory") or None
+    except Exception: return None
+
+def oc_resume_guard(sid, workdir):
+    """Resume-safety for opencode 2.x: a session keeps the directory it was created in, ignoring the
+    resuming process's cwd. If that is not `workdir`, move the session there (keeps its context); when the move
+    fails drop the sid (fresh session + history replay). Returns (sid, note); note '' when nothing changed."""
+    if not sid or _opencode_major() < 2: return sid, ""
+    cur = _oc_session_dir(sid)
+    if not cur or os.path.realpath(cur) == os.path.realpath(workdir): return sid, ""
+    _oc_api(["POST", f"/api/session/{sid}/move", "-d", json.dumps({"directory": workdir})])
+    if os.path.realpath(_oc_session_dir(sid) or "") == os.path.realpath(workdir):
+        return sid, f"[session] opencode session {sid} was bound to {cur}; moved to {workdir}"
+    return "", f"[session] opencode session {sid} was bound to {cur} (not {workdir}) and could not be moved; starting a fresh session"
+
+def _git_out(cwd, *args):
+    try: return subprocess.run(["git", "-C", str(cwd)] + list(args), capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL).stdout
+    except Exception: return ""
+
+def main_checkout_of(workdir):
+    """Main checkout dir when `workdir` is a LINKED git worktree, else ''."""
+    try:
+        common = _git_out(workdir, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        top = _git_out(workdir, "rev-parse", "--show-toplevel").strip()
+        if not common or not top or os.path.basename(common.rstrip("/")) != ".git": return ""
+        main = os.path.dirname(common.rstrip("/"))
+        return main if os.path.realpath(main) != os.path.realpath(top) else ""
+    except Exception: return ""
+
+def escape_snapshot(workdir):
+    """Fingerprint of the main checkout a worktree agent must not touch: HEAD, branch and a stat signature
+    of every tracked / untracked-unignored file (mtime, ctime, size, mode, flags: so chmod / chflags / replace count
+    even when content is unchanged). None when disabled (AG_ESCAPE_GUARD=0) or workdir is not a linked worktree."""
+    if os.environ.get("AG_ESCAPE_GUARD", "1").strip().lower() in ("0", "off", "no", "false"): return None
+    main = main_checkout_of(workdir)
+    if not main: return None
+    sig = {"HEAD": _git_out(main, "rev-parse", "HEAD").strip(), "branch": _git_out(main, "symbolic-ref", "-q", "HEAD").strip()}
+    for rel in _git_out(main, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split("\0")[:200000]:
+        if not rel: continue
+        try: st = os.lstat(os.path.join(main, rel)); sig[rel] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_mode, getattr(st, "st_flags", 0))
+        except OSError: sig[rel] = None
+    return {"main": main, "work": str(workdir), "sig": sig}
+
+def escape_changes(snap):
+    """Paths in the main checkout that differ from `snap` now ('HEAD'/'branch' for ref moves); [] = clean."""
+    if not snap: return []
+    now = escape_snapshot(snap["work"])
+    if not now: return []
+    a, b = snap["sig"], now["sig"]
+    return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+
+def escape_message(snap, changed):
+    shown = ", ".join(changed[:12]) + (f" (+{len(changed) - 12} more)" if len(changed) > 12 else "")
+    return (f"worktree escape: this turn modified the MAIN checkout {snap['main']} instead of its worktree {snap['work']}: {shown}. "
+            "Revert those edits there (they are not in the worktree). If another writer legitimately changed main meanwhile, or this agent is meant to "
+            "merge into main, set AG_ESCAPE_GUARD=0.")
+
+def macos_sandbox_argv(argv, workdir):
+    """AG_SANDBOX=1 (macOS): run the backend under sandbox-exec with every write into the MAIN checkout denied
+    (its .git stays writable so worktree commits work; the agent's own worktree, if nested, stays writable).
+    Only effective for tools that run in the wrapped process (opencode needs --standalone, added by _turn_argv)."""
+    if sys.platform != "darwin" or os.environ.get("AG_SANDBOX", "").strip().lower() not in ("1", "on", "yes", "true"): return argv
+    main, exe = main_checkout_of(workdir), shutil.which("sandbox-exec")
+    if not main or not exe: return argv
+    q = lambda x: json.dumps(x)
+    paths = {main, os.path.realpath(main)}
+    prof = ("(version 1)(allow default)(deny file-write* " + "".join(f"(subpath {q(x)})" for x in sorted(paths)) + ")"
+        "(allow file-write* " + "".join(f"(subpath {q(x + '/.git')})" for x in sorted(paths)) + "".join(f"(subpath {q(x)})" for x in sorted({str(workdir), os.path.realpath(workdir)})) + ")")
+    return [exe, "-p", prof] + list(argv)
+
 def _parse_claude(line):
     try: o = json.loads(line)
     except Exception: return [("text",line[:500])] if line.strip() else []
@@ -7291,7 +7380,7 @@ def _compact_core(sdir, a, st, force):
         import os as _os
         penv = backend_env_for_profile(sdir, a, prof) if prof else {}
         penv, _unset = agent_env_overrides(sdir, a, prof, penv)
-        env = {k: v for k, v in dict(_os.environ, **penv).items() if k not in _unset} if (penv or _unset) else None
+        env = _pwd_env({k: v for k, v in dict(_os.environ, **penv).items() if k not in _unset}, workdir)
         p = subprocess.run(argv, cwd=workdir, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, timeout=max(5, int(st.get("timeout", 120) or 120)),
             env=env)
@@ -9438,6 +9527,13 @@ def _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, 
         **({"effort":a["effort"]} if a.get("effort") else {}),
         **({"allow_cmd":a["allow_cmd"]} if backend=="claude" and isinstance(a.get("allow_cmd"),list) and a["allow_cmd"] else {}))
     if prof_name: argv = list(argv) + backend_argv_extra(backend, sdir, prof_name)
+    if backend=="opencode" and _opencode_major() >= 2 and "--standalone" not in argv and (
+            a.get("plan") or (a.get("mode") or "") in ("ro", "edits") or prof_name or os.environ.get("AG_SANDBOX")):
+        # opencode 2.x `run` talks to a shared background service that ignores this turn's OPENCODE_CONFIG (mode
+        # permission block, profile skills/MCP) and executes tools in the service process: a private server
+        # makes the config bind and keeps tools inside this (sandboxable) process.
+        argv = list(argv); argv.insert(2, "--standalone")
+    if backend=="opencode": argv = macos_sandbox_argv(argv, workdir)
     if backend=="codex" and sys_txt and not command:
         # verified: `codex exec` and `exec resume` honor -c developer_instructions=<toml string>; no first-turn prepend
         argv = list(argv); argv[3:3] = ["-c", "developer_instructions=" + json.dumps(sys_txt.replace("\x7f",""), ensure_ascii=False)]
@@ -9652,6 +9748,14 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             if not sid and meta.get("backend", backend) == backend:
                 sid = meta.get("sid","")
         if _fo: sid = ""  # other backend has no session: fresh + history replay (_rs hist or recent_history)
+        if sid and backend == "opencode":  # opencode 2.x sessions stay bound to the dir they were created in
+            sid, _sdn = oc_resume_guard(sid, workdir)
+            if _sdn:
+                try: append_chat(sdir,name,"tool",_sdn); _event(sdir,"session_dir",name,sid=sid,workdir=workdir)
+                except Exception: pass
+                if on_event:
+                    try: on_event(name,"tool",_sdn)
+                    except Exception: pass
         prompt, sys_txt, prof_name = _turn_prompt(sdir, a_eff, backend, sid, text, command, _rs)
         try:
             argv = _turn_argv(sdir, a_eff, backend, model, workdir, sid, prompt, sys_txt, command, prof_name)
@@ -9681,11 +9785,12 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if not _rs: buf.user_row(text, user_eid)
         _ck = _rs["ck"] if _rs and "ck" in _rs else ckpt_begin(name, workdir)  # retries share one checkpoint turn
         mark_running(name,True)
+        _esc0 = escape_snapshot(workdir)  # main-checkout fingerprint; a worktree agent must not change it
         chunks, sid_new, rc, err = [], "", 0, ""
         _usage, _fresh = {}, not sid
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
         _en = []
-        env = _turn_env(sdir, a_eff, backend, prof_name, _en)
+        env = _pwd_env(_turn_env(sdir, a_eff, backend, prof_name, _en), workdir)
         for _n in _en:
             if on_event: on_event(name, "tool", _n)
         _timed_out = {"hit": False}
@@ -9855,6 +9960,19 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                 if not rc: rc = 1
                 err = (err + f"\nstalled: no output for {_stall_s:g}s (backend killed; raise it: ag agents set {name} --stall-s 900, or --stall-s N per turn (wake/chat send); 0 = off)").strip()
         except Exception: pass
+        _esc_hit = False
+        try:
+            _escc = escape_changes(_esc0) if _esc0 and not _intr else []
+            if _escc:
+                _esc_hit, _escm = True, escape_message(_esc0, _escc)
+                if not rc: rc = 1
+                err = (err + "\n" + _escm).strip()
+                try: buf.error(_escm); _event(sdir, "worktree_escape", name, main=_esc0["main"], files=_escc[:50])
+                except Exception: pass
+                if on_event:
+                    try: on_event(name, "tool", _escm)
+                    except Exception: pass
+        except Exception: pass
         if _timed_out["hit"]:
             rc = 124
             err = (err + f"\nmax-runtime {timeout_s:g}s exceeded (backend killed)").strip()
@@ -9875,7 +9993,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                 _ul_note(sdir, name, f"[fallback] {backend} usage limit -> {_xf[0]}/{_xf[1]}", on_event, "usage_fallback", primary=backend, fallback=f"{_xf[0]}/{_xf[1]}")
                 buf.finalize()
                 return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs={"lock":_turn_lock,"t0":_t_guard,"n":0,"resumed":False,"ck":_ck,"xb":_xf,"hist":resume_replay_hist(sdir,name)},force=_force,stall_s=stall_s,model=_mo)
-        _nx = None if command or _uli else _retry_plan(sdir,name,backend,sid,rc,(err+"\n"+_erows).strip(),_timed_out["hit"] or _intr,bool(full) or any(r.get("role") not in ("user","error") for r in buf.rows.values()),_rs,_turn_lock,_t_guard,timeout_s,on_event)
+        _nx = None if command or _uli or _esc_hit else _retry_plan(sdir,name,backend,sid,rc,(err+"\n"+_erows).strip(),_timed_out["hit"] or _intr,bool(full) or any(r.get("role") not in ("user","error") for r in buf.rows.values()),_rs,_turn_lock,_t_guard,timeout_s,on_event)
         if _nx: _nx["ck"] = _ck
         if _nx and _force: _nx["force"] = True
         if _nx: return run_turn(sdir,name,text,on_event,command,on_start,timeout_s,_rs=_nx,force=_force,stall_s=stall_s,model=_mo)

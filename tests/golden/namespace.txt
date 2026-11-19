@@ -383,6 +383,7 @@ _fmt_ctx
 _follow_events
 _fork_tracked_daemon
 _git
+_git_out
 _git_short
 _handoff_live
 _handoff_marker_path
@@ -466,6 +467,8 @@ _notify_completion
 _notify_set_dir
 _notify_target_dir
 _notify_write
+_oc_api
+_oc_session_dir
 _opencode_bin
 _opencode_error_message
 _opencode_major
@@ -503,6 +506,7 @@ _ps_table
 _ps_tree
 _push_winsize
 _put_file
+_pwd_env
 _qdir
 _queue_running
 _queue_seq
@@ -985,6 +989,9 @@ ensure_state
 env_apply
 env_check
 env_parse
+escape_changes
+escape_message
+escape_snapshot
 factory_policy_render
 foot_text
 friendly_model
@@ -1025,7 +1032,9 @@ load_timeline
 load_todos
 load_ui
 logical_chat_rows
+macos_sandbox_argv
 main
+main_checkout_of
 mark_running
 maybe_auto_update
 maybe_fire_wake
@@ -1049,6 +1058,7 @@ native_launch
 norm_workdir
 normalize_mcp_entry
 now_iso
+oc_resume_guard
 opencode_bash_allow
 opencode_permission
 opencode_policy_render

@@ -9,6 +9,8 @@
 
 Branch `ag/<name>`, worktree `~/proj.ag-wt/<name>`. Merge it yourself (`git merge ag/w1`); ag has no merge. Shared dir = agents clobber each other.
 
+A worktree is not a sandbox. ag exports `$PWD` = the agent dir on every turn (opencode 2.x trusts `$PWD` over cwd, so a wake launched from the main checkout used to bind the session there), moves an opencode session bound to another dir back to the agent dir before resuming (`[session]` note in `chat log`), and fails any worktree-agent turn that changed the main checkout (`worktree escape: ... files`, exit 1, no retry; `AG_ESCAPE_GUARD=0` off, e.g. for a merge agent). opencode 2.x `plan`/`ro`/`edits`/profile turns run `--standalone` so the permission block applies (the shared service ignores per-turn config). `AG_SANDBOX=1` (macOS) additionally denies shell writes to the main checkout via `sandbox-exec`. Never put the main checkout's absolute path in a brief unless it must be read.
+
 ## Checkpoints, usage
 
 If the agent dir is in a git repo, every non-slash turn is snapshotted pre/post (hidden refs `refs/ag/<agent>/<n>-pre|post`; your index/HEAD untouched; last 20; `AG_CHECKPOINT=0` disables).

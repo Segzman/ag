@@ -85,8 +85,12 @@ class Acp(unittest.TestCase):
         self.log = Path(td, "calls.jsonl"); self.sd = Path(td, ".agent"); self.sd.mkdir()
         self.w = Path(td, "w"); self.w.mkdir()
         self.old = dict(os.environ)
+        # inherited dispatch env (when run from inside an ag turn) would cap modes via the parent ceiling
+        for k in ("AG_PARENT_AGENT", "AG_PARENT_MODE", "AG_MODE_CEILING"): os.environ.pop(k, None)
         os.environ.update(PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}", FAKE_LOG=str(self.log), AG_AUTO_UPDATE="0", FAKE_MODE="normal",
             AG_HOME=td+"/h", AG_CONFIG_HOME=td+"/c", AG_CACHE_HOME=td+"/k", AG_RTK="0", AG_PROBE="0", AG_SECRET_POPUP="0", AG_CHECKPOINT="0")
+        # exact-prompt asserts: no token-saving style block prepended (kit default = all)
+        Path(td, "c").mkdir(); Path(td, "c", "config.json").write_text(json.dumps({"kit": {"default": "none"}}))
         self.env = dict(os.environ)
     def tearDown(self):
         os.environ.clear(); os.environ.update(self.old)
@@ -195,7 +199,8 @@ class Acp(unittest.TestCase):
         r = ag.run_turn(self.sd, "o", "x"); self.assertEqual(r["exit"], 0, r)
         sc = [c for c in self.calls() if c.get("method") == "session/set_config_option"]
         self.assertEqual(sc[0]["params"], {"sessionId": "s-new", "configId": "model", "value": "m/b"})
-        self.assertEqual(self.calls()[0]["acp"], ["acp", "--cwd", str(self.w)])
+        # first call may be the cold-cache `opencode --version` probe (cli record): match the ACP spawn
+        self.assertEqual([c["acp"] for c in self.calls() if "acp" in c][0], ["acp", "--cwd", str(self.w)])
         self.log.write_text("")
         self.add("o2", "opencode", "--model", "m/zzz")
         r = ag.run_turn(self.sd, "o2", "x"); self.assertEqual(r["exit"], 0, r); self.assertEqual(r["reply"], "cli-ok")

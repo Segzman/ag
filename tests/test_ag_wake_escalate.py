@@ -23,6 +23,8 @@ class WakeEscalate(unittest.TestCase):
 
     def test_worker_escalates_until_pass(self):
         m, td, sd = load()
+        # kit style block (token-saving text) would be prepended to the echoed prompt; not under test here
+        m.save_agents(sd, [dict(x, kit="none") for x in m.load_agents(sd)])
         r = m.launch_wake_chat(sd, "a", "fix the thing", verify=pass_on(td, 3), escalate=["m2", "m3"])
         self.assertEqual(worker(m, sd, r["job"]), 0)
         j = m._wake_read_job(sd, r["job"])

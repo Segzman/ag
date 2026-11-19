@@ -577,7 +577,11 @@ ag policy targets [--file ag-policy.json] [--json]                      # covera
 ag policy render --file ag-policy.json [--target NAME|all]              # print to stdout
 ag policy render --file ag-policy.json --target all --out DIR           # write DIR/<target>/<file> for every target
 ag policy render --file ag-policy.json --target all --out DIR --dry-run # unified diff, writes nothing
+ag policy compile [--file .agent/policy.toml] [--backend NAME] [--out DIR] [--check] # compile the project policy for one backend; --check prints a diff, exit nonzero on drift
+ag policy log [--limit 20]                                              # policy events from the ledger (denials, compiles, checks)
 ```
+
+Policy-as-code (compile): the policy file may also live at `.agent/policy.toml` or `.agent/policy.json` (state dir first, then `./.agent/`, then `./ag-policy.json`; `$AG_POLICY_FILE` and `--file` win) and may be TOML or JSON with the same keys. Extra keys: `allow_cmds`, `deny_cmds`, `deny_paths` (merged into `secret_read_ban` for rendering), `max_mode` (`ro|edits|auto|full` ceiling — the rendered floor is capped at it), `models_allow` / `models_deny` (globs over `backend/model`, matched like `ag access` globs), and `data_class` (`{work: {models_allow, models_deny}, public: {...}}`; a per-class allow list overrides the top-level one, and `work` with no list keeps the existing `--data work` model gating). `ag policy compile --backend claude|opencode|codex|...` renders that backend's native config under `--out` (default `<state dir>/policy-compiled/_cli/<target>/<file>`); `--check` writes nothing, prints the unified diff and exits nonzero on drift. Wake/chat auto-compiles the policy for the agent's backend before launch and wires it into the config ag already passes — opencode through the `OPENCODE_CONFIG` overlay, claude into `CLAUDE_CONFIG_DIR/settings.json` when set else `<workdir>/.claude/settings.json`, codex defaults into `CODEX_HOME/config.toml` only when no config exists there — and refuses a model or mode the policy blocks (exit 2, like access). `ag run` refuses commands matching `deny_cmds` (or missing a non-empty `allow_cmds`). Every denial ag itself enforces is written to the existing ledger (`events.jsonl`, type `policy`) and shown by `ag policy log`. Fields a backend cannot express in a verified key are never guessed: Codex `requirements.toml` carries them as `# TODO(policy)` comments, and a backend with no verified format gets a `TODO.txt` sidecar (ag-side enforcement only).
 
 Schema (`version` required, the rest optional; defaults shown):
 
@@ -590,7 +594,7 @@ Schema (`version` required, the rest optional; defaults shown):
  "network": "on"}
 ```
 
-`mcp_identity` maps an `mcp_allow` name to `{"command": ...}` or `{"url": ...}`; Codex needs it for `[mcp_servers.<name>] identity`.
+`mcp_identity` maps an `mcp_allow` name to `{"command": ...}` or `{"url": ...}`; Codex needs it for `[mcp_servers.<name>] identity`. Compile-era keys in the same schema: `"allow_cmds": []`, `"deny_cmds": []`, `"deny_paths": []`, `"max_mode": null`, `"models_allow": []`, `"models_deny": []`, `"data_class": {}` — see Policy-as-code above. Claude renders command rules as `Bash(<cmd>:*)` allow/deny entries (a pattern containing `*`/`?` is used verbatim); OpenCode renders them as V2 `shell` permissions (deny last, so deny wins); `models_allow` globs are enforced by ag itself, not rendered as exact model lists.
 
 Coverage (`native` = the target's file enforces the field with a documented key; `approx` = a weaker or shared mechanism, or a partial rendering; `none` = not rendered for that target, so an admin console or another file may still enforce it). Doc URLs per target are in `ag policy targets --json` (`doc`):
 

@@ -1,0 +1,12 @@
+usage: ag policy compile [-h] [--file PFILE]
+                         [--backend {claude,opencode,codex,gemini,qwen,cursor,copilot}]
+                         [--out OUT] [--check]
+
+options:
+  -h, --help            show this help message and exit
+  --file PFILE          policy file (default: .agent/policy.toml or .agent/policy.json in the
+                        state dir or cwd)
+  --backend {claude,opencode,codex,gemini,qwen,cursor,copilot}
+                        backend to compile for
+  --out OUT             output root (default: <state dir>/policy-compiled/_cli)
+  --check               print a diff and exit non-zero on drift; write nothing

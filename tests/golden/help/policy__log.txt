@@ -1,0 +1,5 @@
+usage: ag policy log [-h] [--limit LIMIT]
+
+options:
+  -h, --help     show this help message and exit
+  --limit LIMIT  max events to show

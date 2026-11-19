@@ -101,6 +101,11 @@ def do_run(a):
     if not a.cmd:
         return emit(a, "run", error="no command given", hint='ag run -- echo hi')
     cmd_str = _shell_cmd(a.cmd)
+    _pp, _psrc, _perr = policy_load(sdir, a.cwd or os.getcwd())
+    if _perr: return emit(a, "run", error=_perr)
+    if _pp is not None and (_pce := policy_cmd_error(_pp, cmd_str)):
+        policy_log_event(sdir, "deny", backend="run", reason=_pce)
+        return emit(a, "run", error=_pce, hint="see ag policy log")
     # approval gate
     reason = check_dangerous(cmd_str, sdir)
     if reason and not a.force:
@@ -10336,6 +10341,16 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             except Exception: _ms = ""
             return {"error":_ave,"exit":2,"sid":_ms,"reply":_ave}
     except Exception: pass
+    _pge, _pgp = _policy_gate(sdir, a, backend, model)
+    if _pge:
+        try: append_chat(sdir,name,"error",_pge); policy_log_event(sdir,"deny",agent=name,backend=backend,model=eff_model(backend,model) or model,reason=_pge)
+        except Exception: pass
+        if on_event:
+            try: on_event(name,"tool",_pge)
+            except Exception: pass
+        try: _ms = load_chat_meta(sdir,name,agent=a).get("sid","")
+        except Exception: _ms = ""
+        return {"error":_pge,"exit":2,"sid":_ms,"reply":_pge}
     _force = bool(force or (_rs or {}).get("force"))
     if not _force:
         try:
@@ -10424,6 +10439,17 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                 except Exception: _ms = ""
                 return {"error":_ave,"exit":2,"sid":_ms,"reply":_ave}
         except Exception: pass
+        _pge2, _pgp2 = _policy_gate(sdir, a, backend, model)
+        if _pge2:
+            _release_agent_turn(_turn_lock); _turn_lock = None
+            try: append_chat(sdir,name,"error",_pge2); policy_log_event(sdir,"deny",agent=name,backend=backend,model=eff_model(backend,model) or model,reason=_pge2)
+            except Exception: pass
+            if on_event:
+                try: on_event(name,"tool",_pge2)
+                except Exception: pass
+            try: _ms = load_chat_meta(sdir,name,agent=a).get("sid","")
+            except Exception: _ms = ""
+            return {"error":_pge2,"exit":2,"sid":_ms,"reply":_pge2}
         if not _force and (not _rs or _fo):
             try:
                 _berr, _bw = budget_check(backend, model)
@@ -10531,7 +10557,9 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         _usage, _fresh = {}, not sid
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
         _en = []
-        env = _pwd_env(_turn_env(sdir, a_eff, backend, prof_name, _en, _kit, _kf), workdir)
+        env = _turn_env(sdir, a_eff, backend, prof_name, _en, _kit, _kf)
+        env = _policy_turn_env(sdir, a_eff, backend, workdir, env)  # policy auto-compile before launch (no-op without a policy file)
+        env = _pwd_env(env, workdir)
         for _n in _en:
             if on_event: on_event(name, "tool", _n)
         _timed_out = {"hit": False}
@@ -20682,7 +20710,8 @@ def do_link(a):
 # One policy JSON -> backend-native policy files. Renderers are pure
 # (validated dict in -> text out); only do_policy touches the filesystem.
 # Field names follow vendor docs as of 2026-11; re-check them each release.
-POLICY_KEYS = ("version", "permission_floor", "allowed_models", "denied_models", "mcp_allow", "mcp_identity", "secret_read_ban", "network")
+POLICY_KEYS = ("version", "permission_floor", "allowed_models", "denied_models", "mcp_allow", "mcp_identity", "secret_read_ban", "network", "allow_cmds", "deny_cmds", "deny_paths", "max_mode", "models_allow", "models_deny", "data_class")
+POLICY_MODES = ("ro", "edits", "auto", "full")
 POLICY_FLOORS = ("ro", "edits", "auto")
 POLICY_NOTE = "ag policy v0: field names follow vendor docs as of 2026-11; re-check them against each release."
 POLICY_CLAUDE_MODE = {0: "plan", 1: "acceptEdits", 2: "bypassPermissions"}
@@ -20731,12 +20760,37 @@ def policy_validate(doc):
             errs.append(f"mcp_identity.{name} must be {{command}} or {{url}} with a non-empty string")
     secrets = _policy_list(doc.get("secret_read_ban", []), "secret_read_ban", errs)
     for m in sorted(set(allow) & set(deny)): errs.append(f"model {m!r} is both allowed and denied")
+    allow_cmds = _policy_list(doc.get("allow_cmds", []), "allow_cmds", errs)
+    deny_cmds = _policy_list(doc.get("deny_cmds", []), "deny_cmds", errs)
+    deny_paths = _policy_list(doc.get("deny_paths", []), "deny_paths", errs)
+    models_allow = _policy_list(doc.get("models_allow", []), "models_allow", errs)
+    models_deny = _policy_list(doc.get("models_deny", []), "models_deny", errs)
+    max_mode = doc.get("max_mode")
+    if max_mode is not None and max_mode not in POLICY_MODES: errs.append(f"max_mode must be ro|edits|auto|full (got {max_mode!r})"); max_mode = None
+    dclass = {}
+    raw_dc = doc.get("data_class", {})
+    if not isinstance(raw_dc, dict): errs.append("data_class must be an object: {work|public: {models_allow, models_deny}}")
+    else:
+        for dc_name, dc_spec in raw_dc.items():
+            if dc_name not in ("work", "public"): errs.append(f"data_class.{dc_name}: unknown data class (work|public)"); continue
+            if not isinstance(dc_spec, dict): errs.append(f"data_class.{dc_name} must be an object"); continue
+            extra = sorted(set(dc_spec) - {"models_allow", "models_deny"})
+            if extra: errs.append(f"data_class.{dc_name} unknown key(s): " + ", ".join(extra))
+            dclass[dc_name] = {"models_allow": _policy_list(dc_spec.get("models_allow", []), f"data_class.{dc_name}.models_allow", errs),
+                "models_deny": _policy_list(dc_spec.get("models_deny", []), f"data_class.{dc_name}.models_deny", errs)}
+    if max_mode:  # ag-enforced ceiling: the rendered floor never exceeds max_mode (full renders as auto, the widest native floor)
+        cap = {"ro": 0, "edits": 1, "auto": 2, "full": 2}[max_mode]
+        if floor in POLICY_FLOORS and _mode_rank(floor) > cap: floor = POLICY_FLOORS[cap]
     clean = {"version": 1,
         "permission_floor": floor if floor in POLICY_FLOORS else "edits",
         "allowed_models": allow, "denied_models": deny, "mcp_allow": mcp,
         "mcp_identity": {k: v for k, v in ident.items() if k in mcp and isinstance(v, dict)},
-        "secret_read_ban": secrets,
+        "secret_read_ban": list(dict.fromkeys(secrets + deny_paths)),  # deny_paths is the compile-era alias, merged for every renderer
         "network": network if network in ("on", "off") else "on"}
+    for k, v in (("allow_cmds", allow_cmds), ("deny_cmds", deny_cmds), ("deny_paths", deny_paths),
+            ("models_allow", models_allow), ("models_deny", models_deny), ("data_class", dclass)):
+        if v: clean[k] = v  # compile-era keys appear only when set, keeping the v0 clean shape
+    if max_mode: clean["max_mode"] = max_mode
     return clean, errs
 
 def _policy_rank(p):
@@ -20766,7 +20820,10 @@ def claude_policy_render(p):
     off = (p.get("network") or "on") == "off"
     deny = [f"Read({'//' + g if g.startswith('**/') else g})" for g in p.get("secret_read_ban") or []]  # //** = any depth
     if off: deny += ["WebFetch", "WebSearch"]
+    bash = lambda c: f"Bash({c if any(ch in c for ch in '*?') else c + ':*'})"  # Claude Bash rule: trailing :* = prefix match
+    deny += [bash(c) for c in p.get("deny_cmds") or []]
     perms = {"defaultMode": POLICY_CLAUDE_MODE.get(rank, "acceptEdits")}
+    if p.get("allow_cmds"): perms["allow"] = [bash(c) for c in p["allow_cmds"]]
     if rank < 2 or off:  # bypass/auto would sidestep the floor and the network block
         perms.update(disableBypassPermissionsMode="disable", disableAutoMode="disable")
     if deny: perms["deny"] = deny
@@ -20800,6 +20857,8 @@ def codex_policy_render(p):
             else "# identity missing: set mcp_identity (command or url) or Codex cannot match this server"]
     if p.get("secret_read_ban"):
         lines += ["", "[permissions.filesystem]", f"deny_read = {_policy_toml_list(p['secret_read_ban'])}"]
+    for key in ("allow_cmds", "deny_cmds", "models_allow", "models_deny", "data_class"):
+        if p.get(key): lines.append(f"# TODO(policy): {key} has no verified codex requirements.toml key; enforced by ag itself, not rendered: {p[key]!r}")
     return "requirements.toml", "\n".join(lines) + "\n"
 
 def codex_config_render(p):
@@ -20995,6 +21054,8 @@ def opencode_policy_render(p):
     perms += [{"action": "read", "resource": g, "effect": "deny"} for g in p.get("secret_read_ban") or []]
     perms += [{"action": "edit", "resource": "**", "effect": "deny" if rank == 0 else "allow"},
         {"action": "shell", "resource": "*", "effect": "allow" if rank == 2 else "ask"}]
+    perms += [{"action": "shell", "resource": c, "effect": "allow"} for c in p.get("allow_cmds") or []]
+    perms += [{"action": "shell", "resource": c, "effect": "deny"} for c in p.get("deny_cmds") or []]  # last: deny wins
     out = {"$schema": "https://opencode.ai/config.json", "permissions": perms}
     if p.get("allowed_models"): out["model"] = p["allowed_models"][0]
     if p.get("mcp_allow"): out["policies"] = [{"action": "mcp.use", "resource": n, "effect": "allow"} for n in p["mcp_allow"]]
@@ -21107,15 +21168,20 @@ def policy_diff(old, new, name):
 
 def do_policy(a):
     sub = getattr(a, "polsub", None) or ""
+    if sub == "compile": return do_policy_compile(a)
+    if sub == "log": return do_policy_log(a)
     if sub not in ("render", "check", "targets"):
-        return emit(a, "policy", error="no policy subcommand", hint="render|check|targets")
+        return emit(a, "policy", error="no policy subcommand", hint="render|check|targets|compile|log")
     if sub == "targets" and not getattr(a, "pfile", None):  # static matrix, no policy file needed
         rows = policy_coverage()
         return emit(a, "policy", {"_text": policy_coverage_text(rows), "targets": rows})
     fp = Path(getattr(a, "pfile", None) or "ag-policy.json").expanduser()
-    try: doc = json.loads(fp.read_text())
-    except FileNotFoundError: return emit(a, "policy", error=f"no policy file: {fp}")
-    except Exception as e: return emit(a, "policy", error=f"cannot read {fp}: {e}")
+    if not fp.is_file():  # fall back to .agent/policy.{toml,json} discovery
+        found = policy_find(state_dir(getattr(a, "dir", None)), os.getcwd())
+        if found is None: return emit(a, "policy", error=f"no policy file: {fp}")
+        fp = found
+    doc, lerr = policy_load_file(fp)
+    if lerr: return emit(a, "policy", error=lerr)
     policy, errs = policy_validate(doc)
     if errs:
         return emit(a, "policy", error="invalid policy: " + "; ".join(errs),
@@ -21154,6 +21220,229 @@ def do_policy(a):
     else:
         text = "\n".join(f"# --- {t} -> {rendered[t][0]} ---\n{rendered[t][1]}" for t in targets)
     return emit(a, "policy", {"_text": text.rstrip("\n"), "targets": targets})
+
+# --- policy compile (v1): .agent/policy.toml|json -> per-backend files, auto-applied on wake/chat ---
+# Discovery: --file / $AG_POLICY_FILE, then <sdir>/policy.{toml,json} (the .agent dir), then
+# <cwd>/.agent/policy.{toml,json}, then ./ag-policy.json (the v0 name). TOML via stdlib tomllib.
+POLICY_BACKEND_TARGETS = {"claude": ["claude"], "opencode": ["opencode"], "codex": ["codex", "codex-config"]}
+
+def policy_load_file(fp):
+    """(doc, error) from a .json or .toml policy file. Never raises."""
+    fp = Path(fp).expanduser()
+    try: raw = fp.read_bytes()
+    except Exception as e: return None, f"cannot read {fp}: {e}"
+    try:
+        if fp.suffix == ".toml":
+            import tomllib
+            return tomllib.loads(raw.decode("utf-8")), None
+        return json.loads(raw.decode("utf-8")), None
+    except Exception as e: return None, f"cannot parse {fp}: {e}"
+
+def policy_find(sdir=None, cwd=None, explicit=None):
+    """First existing policy file in discovery order, else None. Pure-ish (env + existence)."""
+    cands = []
+    if explicit: cands.append(Path(explicit).expanduser())
+    env_f = (os.environ.get("AG_POLICY_FILE") or "").strip()
+    if env_f: cands.append(Path(env_f).expanduser())
+    if sdir: cands += [Path(sdir)/"policy.toml", Path(sdir)/"policy.json"]
+    base = Path(cwd or os.getcwd())
+    cands += [base/".agent"/"policy.toml", base/".agent"/"policy.json", base/"ag-policy.json"]
+    for c in cands:
+        try:
+            if c.is_file(): return c
+        except Exception: continue
+    return None
+
+def policy_load(sdir=None, cwd=None, explicit=None):
+    """(clean policy, source path, error). No policy file -> (None, None, None). Never raises."""
+    fp = policy_find(sdir, cwd, explicit)
+    if fp is None: return None, None, None
+    doc, err = policy_load_file(fp)
+    if err: return None, fp, err
+    clean, errs = policy_validate(doc)
+    if errs: return None, fp, "invalid policy: " + "; ".join(errs)
+    return clean, fp, None
+
+def policy_log_event(sdir, action, **kw):
+    """Append a policy event to the existing ledger (sdir/events.jsonl, same file as privacy/access/budget events). Never raises."""
+    if sdir is not None: _event(sdir, "policy", None, action=action, **kw)
+
+def policy_read_log(sdir, limit=20):
+    """Policy events from the ledger, oldest first. Never raises."""
+    try: rows = [json.loads(l) for l in (Path(sdir)/"events.jsonl").read_text().splitlines() if l.strip()]
+    except Exception: return []
+    rows = [r for r in rows if isinstance(r, dict) and r.get("type") == "policy"]
+    return rows[-limit:] if limit and limit > 0 else rows
+
+def _policy_glob_any(cands, pats):
+    """First glob in pats matching any candidate (case-insensitive), else None. Pure."""
+    for pat in pats or []:
+        for c in cands:
+            try:
+                if fnmatch.fnmatch((c or "").lower(), (pat or "").lower()): return pat
+            except Exception: continue
+    return None
+
+def policy_model_error(p, backend, model, data="work"):
+    """Error string when the policy's model rules block backend/model, else None. Pure.
+    data_class.<class> models_allow/models_deny override the top-level globs for that class;
+    with no per-class allow list, work keeps the existing --data gating (privacy_error/access_error, applied by callers)."""
+    try: disp = eff_model(backend, model) or model
+    except Exception: disp = model
+    cands = _access_candidates(backend, model)
+    dc = (p.get("data_class") or {}).get((data or "work").strip().lower()) or {}
+    deny = list(p.get("models_deny") or []) + list(dc.get("models_deny") or [])
+    hit = _policy_glob_any(cands, deny)
+    if hit: return f"model {disp} blocked by policy (models_deny {hit!r}); see ag policy log"
+    allow = list(dc.get("models_allow") or []) or list(p.get("models_allow") or [])
+    if allow and not _policy_glob_any(cands, allow):
+        return f"model {disp} not allowed by policy models_allow {allow}; see ag policy log"
+    return None
+
+def policy_mode_error(p, mode="", plan=False):
+    """Error string when (mode, plan) exceeds the policy max_mode ceiling, else None. Pure."""
+    mm = p.get("max_mode")
+    if not mm: return None
+    if _mode_rank(mode, plan) > _mode_rank(mm): return f"mode {mode or 'edits'} exceeds policy max_mode {mm}; see ag policy log"
+    return None
+
+def policy_cmd_error(p, cmd_str):
+    """Error string when an ag-run command hits deny_cmds / misses allow_cmds, else None. Pure.
+    A pattern matches the full command, its first token, or (plain pattern) a command prefix."""
+    cmd = (cmd_str or "").strip()
+    if not cmd: return None
+    first = cmd.split()[0] if cmd.split() else cmd
+    def hit(pat):
+        pat = (pat or "").strip()
+        if not pat: return False
+        try:
+            if fnmatch.fnmatch(cmd.lower(), pat.lower()) or fnmatch.fnmatch(first.lower(), pat.lower()): return True
+        except Exception: pass
+        return not any(ch in pat for ch in "*?[") and (cmd == pat or cmd.startswith(pat + " ") or cmd.startswith(pat + "/"))
+    for pat in p.get("deny_cmds") or []:
+        if hit(pat): return f"command blocked by policy deny_cmds {pat!r}: {cmd[:120]}"
+    allow = p.get("allow_cmds") or []
+    if allow and not any(hit(pat) for pat in allow): return f"command not in policy allow_cmds: {cmd[:120]}"
+    return None
+
+def policy_compile(p, backend, out_root):
+    """Write the backend's native config under out_root/<target>/<file>. Returns (written, diffs).
+    Only verified renderers (POLICY_TARGETS); backends without one get a TODO sidecar, never guessed keys."""
+    targets = POLICY_BACKEND_TARGETS.get(backend) or ([backend] if backend in POLICY_TARGETS else [])
+    written, diffs = [], {}
+    base = Path(out_root)
+    for t in targets:
+        name, text = policy_render(p, t)
+        fp = base/t/name
+        try: old = fp.read_text() if fp.exists() else ""
+        except Exception: old = ""
+        d = policy_diff(old, text, name)
+        if d: diffs[str(fp)] = d
+        if old != text:
+            fp.parent.mkdir(parents=True, exist_ok=True); _atomic_write(fp, text); written.append(str(fp))
+    if not targets:
+        fp = base/(backend or "unknown")/"TODO.txt"
+        txt = f"# TODO(policy): no verified native config format for backend {backend!r}; policy is enforced by ag itself only.\n"
+        try: old = fp.read_text() if fp.exists() else ""
+        except Exception: old = ""
+        if old != txt:
+            fp.parent.mkdir(parents=True, exist_ok=True); _atomic_write(fp, txt); written.append(str(fp))
+        diffs[str(fp)] = policy_diff(old, txt, fp.name)
+    return written, diffs
+
+def policy_compile_check(p, backend, out_root):
+    """(drift bool, diff text) for --check: renders in memory, writes nothing."""
+    targets = POLICY_BACKEND_TARGETS.get(backend) or ([backend] if backend in POLICY_TARGETS else [])
+    out = []
+    for t in targets:
+        name, text = policy_render(p, t)
+        fp = Path(out_root)/t/name
+        try: old = fp.read_text() if fp.exists() else ""
+        except Exception: old = ""
+        out.append(policy_diff(old, text, name) or f"no changes: {fp}")
+    return any(not d.startswith("no changes:") for d in out), "\n".join(out)
+
+def _policy_turn_env(sdir, a, backend, workdir, env):
+    """Wake/chat auto-compile: render the agent backend's policy into sdir/policy-compiled/<agent>/
+    and wire it into the env ag already passes (opencode OPENCODE_CONFIG overlay; claude CLAUDE_CONFIG_DIR
+    settings.json or <workdir>/.claude/settings.json; codex CODEX_HOME config.toml defaults when unset there).
+    No policy file / bad policy -> env unchanged (bad policy is logged, never silently enforced). Never raises."""
+    try:
+        p, src, err = policy_load(sdir, workdir)
+        if err: policy_log_event(sdir, "error", agent=a.get("name", ""), backend=backend, error=str(err)[:200]); return env
+        if p is None: return env
+        root = Path(sdir)/"policy-compiled"/re.sub(r"[^\w.-]", "_", a.get("name") or "agent")
+        written, _ = policy_compile(p, backend, root)
+        if written: policy_log_event(sdir, "compile", agent=a.get("name", ""), backend=backend, files=written, source=str(src))
+        if backend == "opencode":
+            comp = root/"opencode"/"opencode.json"
+            if comp.is_file():
+                base = {}
+                if env.get("OPENCODE_CONFIG"):
+                    try: base = json.loads(Path(env["OPENCODE_CONFIG"]).read_text())
+                    except Exception: base = {}
+                try: over = json.loads(comp.read_text())
+                except Exception: over = {}
+                for k in ("permissions", "policies"):  # policy wins over the mode overlay for these keys
+                    if k in over: base[k] = over[k]
+                base.setdefault("$schema", "https://opencode.ai/config.json")
+                outp = root/"opencode.json"; _atomic_write(outp, json.dumps(base, indent=2))
+                env = {**env, "OPENCODE_CONFIG": str(outp)}
+        elif backend == "claude":
+            comp = root/"claude"/"managed-settings.json"
+            if comp.is_file():
+                try: over = json.loads(comp.read_text())
+                except Exception: over = {}
+                dest = Path(env["CLAUDE_CONFIG_DIR"])/"settings.json" if env.get("CLAUDE_CONFIG_DIR") else Path(workdir)/".claude"/"settings.json"
+                cur = {}
+                try: cur = json.loads(dest.read_text()) if dest.is_file() else {}
+                except Exception: cur = {}
+                merged = {**cur, **{k: v for k, v in over.items() if k != "permissions"}}
+                merged["permissions"] = {**(cur.get("permissions") or {}), **(over.get("permissions") or {})}
+                if merged != cur:
+                    dest.parent.mkdir(parents=True, exist_ok=True); _atomic_write(dest, json.dumps(merged, indent=2) + "\n")
+        elif backend == "codex":
+            comp = root/"codex-config"/"codex-config.toml"
+            home = env.get("CODEX_HOME")
+            if comp.is_file() and home:
+                dest = Path(home)/"config.toml"
+                if not dest.exists():  # defaults only; never clobber a user's config.toml
+                    dest.parent.mkdir(parents=True, exist_ok=True); _atomic_write(dest, comp.read_text())
+        return env
+    except Exception: return env
+
+def _policy_gate(sdir, a, backend, model):
+    """(error, policy) for a wake/chat turn: models_allow/deny + data_class + max_mode, or (None, policy|None).
+    On a denial the caller logs it; here we only compute. Never raises."""
+    try:
+        p, _src, err = policy_load(sdir, os.path.abspath(a.get("dir", ".") or "."))
+        if err or p is None: return None, None
+        e = policy_model_error(p, backend, model, agent_data(a)) or policy_mode_error(p, a.get("mode") or "", bool(a.get("plan")))
+        return e, p
+    except Exception: return None, None
+
+def do_policy_compile(a):
+    sdir = state_dir(getattr(a, "dir", None))
+    backend = getattr(a, "backend", None) or "claude"
+    p, src, err = policy_load(sdir, os.getcwd(), getattr(a, "pfile", None))
+    if err: return emit(a, "policy", error=err, hint="policy file: .agent/policy.toml or .agent/policy.json (ag policy check validates)")
+    if p is None: return emit(a, "policy", error="no policy file found", hint="create .agent/policy.toml or .agent/policy.json, or pass --file")
+    out_root = Path(getattr(a, "out", None) or (Path(sdir)/"policy-compiled"/"_cli")).expanduser()
+    if getattr(a, "check", False):
+        drift, txt = policy_compile_check(p, backend, out_root)
+        policy_log_event(sdir, "check", backend=backend, drift=drift, source=str(src))
+        rc = emit(a, "policy", {"_text": txt, "backend": backend, "drift": drift, "check": True, "file": str(src)})
+        return 1 if drift else rc
+    written, diffs = policy_compile(p, backend, out_root)
+    policy_log_event(sdir, "compile", backend=backend, files=written, source=str(src))
+    txt = ("wrote " + ", ".join(written)) if written else f"policy already compiled for {backend}: {out_root}"
+    return emit(a, "policy", {"_text": txt, "backend": backend, "files": written, "diffs": diffs, "file": str(src)})
+
+def do_policy_log(a):
+    sdir = state_dir(getattr(a, "dir", None))
+    rows = policy_read_log(sdir, getattr(a, "limit", 20) or 20)
+    txt = "\n".join(f"{r.get('ts', '')} {r.get('action', '')} agent={r.get('agent', '')} backend={r.get('backend', '')} {r.get('reason', '') or r.get('error', '')}".rstrip() for r in rows) or "no policy events yet"
+    return emit(a, "policy", {"_text": txt, "events": rows})
 
 def build():
     p = argparse.ArgumentParser(prog="ag", description="CLI helper for autonomous agents")
@@ -21387,6 +21676,13 @@ def build():
     pot.add_argument("--file",dest="pfile",default=None,help="also print coverage notes for this policy JSON")
     poc=pos.add_parser("check",help="validate a policy file")
     poc.add_argument("--file",dest="pfile",default="ag-policy.json",help="policy JSON (default ag-policy.json)")
+    pco=pos.add_parser("compile",help="compile .agent/policy.toml|json into one backend's native config (worktree/config dir only)")
+    pco.add_argument("--file",dest="pfile",default=None,help="policy file (default: .agent/policy.toml or .agent/policy.json in the state dir or cwd)")
+    pco.add_argument("--backend",default="claude",choices=["claude","opencode","codex","gemini","qwen","cursor","copilot"],help="backend to compile for")
+    pco.add_argument("--out",default=None,help="output root (default: <state dir>/policy-compiled/_cli)")
+    pco.add_argument("--check",action="store_true",help="print a diff and exit non-zero on drift; write nothing")
+    plo=pos.add_parser("log",help="policy events from the ledger (denials, compiles, checks)")
+    plo.add_argument("--limit",type=int,default=20,help="max events to show")
     st=sub.add_parser("setup",help="pick model routing, install ag skills (shared ~/.agents/skills + links), write ag pointer blocks into harness instruction files"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help=",".join(SETUP_HARNESSES) + " | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] | backend.B.(enabled|model|mode|plan|effort)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
     lk = sub.add_parser("link", help="VM -> Mac view over outbound reverse SSH (docs/LINK.md)"); lks = lk.add_subparsers(dest="lsub", required=True)
     lki = lks.add_parser("init", help="write link.json + create the key + print the Mac authorized_keys line"); lki.add_argument("--to", required=True, help="USER@HOST"); lki.add_argument("--key", default=None, help="private key path (default ~/.ssh/ag_link, created when missing)"); lki.add_argument("--ports", default="auto", help="auto | 3000,8080"); lki.add_argument("--base", type=int, default=41000, help="mac port base"); lki.add_argument("--watch-port", dest="watch_port", type=int, default=7790, help="vm watch page port")

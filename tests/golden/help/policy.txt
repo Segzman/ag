@@ -1,11 +1,14 @@
-usage: ag policy [-h] {render,targets,check} ...
+usage: ag policy [-h] {render,targets,check,compile,log} ...
 
 positional arguments:
-  {render,targets,check}
+  {render,targets,check,compile,log}
     render              render Claude Code managed settings / Codex requirements
     targets             coverage matrix: which backend enforces each policy field
                         (native/approx/none)
     check               validate a policy file
+    compile             compile .agent/policy.toml|json into one backend's native config
+                        (worktree/config dir only)
+    log                 policy events from the ledger (denials, compiles, checks)
 
 options:
   -h, --help            show this help message and exit

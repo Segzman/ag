@@ -11328,6 +11328,7 @@ def do_wake(a):
             r = {"error": "relay not set up: ag relay init --git URL"}; _rcpt_done(_h, r); return emit(a, "wake", error=r["error"])
         if target == cfg.get("node"):
             r = {"error": "--on must name a different relay node"}; _rcpt_done(_h, r); return emit(a, "wake", error=r["error"])
+        warn = _relay_delivery_warning(cfg, target, "wake")
         origin = cfg["node"]
         rid_seed = f"{origin}\0{target}\0{agent}\0{getattr(a, 'request_id', None) or time.time()}\0{os.getpid()}\0{text}"
         rid = "w-" + hashlib.sha1(rid_seed.encode()).hexdigest()[:12]
@@ -11346,10 +11347,12 @@ def do_wake(a):
             r = {"error": f"relay publish failed: {str(e)[:180]}"}; _rcpt_done(_h, r); return emit(a, "wake", error=r["error"])
         summary = relay_sync(cfg)
         r = {"job": rid, "id": rid, "target": target, "status": f"remote@{target}",
-            **({"relay_error": summary["error"]} if summary.get("error") else {})}
+            **({"relay_error": summary["error"]} if summary.get("error") else {}),
+            **({"delivery_warning": warn} if warn else {})}
         _rcpt_done(_h, r)
         if getattr(a, "json", False): return emit(a, "wake", {"agent": agent, "launched": True, **r})
-        return emit(a, "wake", {"_text": f"wake sent -> {agent} ({r['status']}, id {rid})", "agent": agent, **r})
+        return emit(a, "wake", {"_text": f"wake sent -> {agent} ({r['status']}, id {rid})" +
+            (f"\nwarning: {warn}" if warn else ""), "agent": agent, **r})
     _extra = {}
     if getattr(a,"force",False): _extra["force"] = True
     if getattr(a,"no_park",False): _extra["no_park"] = True
@@ -11866,7 +11869,7 @@ _CHILD_PGIDS = set()  # live relay subprocess groups; the tick deadline kills th
 
 def _relay_env():
     """git never prompts, and gives up on a dead link instead of hanging (stalled pull = no more ticks)."""
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"}
     env.setdefault("GIT_HTTP_LOW_SPEED_LIMIT", "1000"); env.setdefault("GIT_HTTP_LOW_SPEED_TIME", "30")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=2")
     return env
@@ -11896,6 +11899,10 @@ def _relay_node_name():
     return re.sub(r"[^a-z0-9-]", "", (socket.gethostname() or "").split(".")[0].lower())[:24] or "node"
 RELAY_ADMIN_OPS = ("update", "notify-dir", "status")
 RELAY_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,39}$")
+RELAY_NODE_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+RELAY_SECRET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+RELAY_PUSH_TRIES = 5
+RELAY_UNDELIVERED_S = 600  # one-shot mail older than this without a result is flagged
 
 def relay_cfg():
     """$AG_CONFIG_HOME/relay.json with ~-expanded paths, or None (missing/corrupt/incomplete)."""
@@ -11961,6 +11968,77 @@ def _relay_who(cfg):
     """git -c identity args: every commit in the mailbox is authored by ag-relay <node>@ag-relay."""
     return ("-c", "user.name=ag-relay", "-c", f"user.email={cfg['node']}@ag-relay")
 
+def _relay_git_lock(cfg):
+    """Blocking lock around one sync's git ops (checkout sibling, so git add -A never sees it).
+    Two syncs in the same checkout otherwise race refs and leave a rebase in progress."""
+    if os.name != "posix" or cfg.get("transport") != "git": return None
+    import fcntl
+    co = Path(cfg["checkout"])
+    co.parent.mkdir(parents=True, exist_ok=True)
+    f = open(str(co) + ".lock", "a+b")
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    return f
+
+def _relay_rebase_pending(co):
+    g = Path(co) / ".git"
+    return "merge" if (g / "rebase-merge").is_dir() else ("apply" if (g / "rebase-apply").is_dir() else None)
+
+def _relay_finish_rebase(cfg, co):
+    """Finish a clean stale rebase, abort a conflicted/empty one. -> None | error text."""
+    if not _relay_rebase_pending(co): return None
+    rc, msg = _relay_cmd(["git", "-C", str(co), "rebase", "--continue"])
+    if rc == 0: return None
+    rc2, msg2 = _relay_cmd(["git", "-C", str(co), "rebase", "--abort"])
+    return None if rc2 == 0 else f"stale rebase: {(msg2 or msg or 'abort failed')[:150]}"
+
+def _relay_delivery_warning(cfg, target, kind="wake", name=None):
+    """Why mail sent to target may never run: no heartbeat, no backends, no claimed mailbox.
+    Advisory only -- the mailbox still accepts the job, and the target may catch up later."""
+    hb = _relay_jload(relay_root(cfg) / "nodes" / f"{target}.json") or {}
+    if not hb: return f"no heartbeat from {target} yet (has it run ag relay sync?)"
+    problems = []
+    if kind in ("wake", "schedule") and not hb.get("backends"):
+        problems.append(f"{target} reports no usable backends")
+    if kind == "say" and isinstance(hb.get("names"), list):
+        names = [str(x) for x in hb["names"]]
+        if not names and not hb.get("default_name"):
+            problems.append(f"{target} has no claimed relay name (ag relay name claim NAME)")
+        elif name and name not in names and name != hb.get("default_name"):
+            problems.append(f"{target} has no mailbox named {name}")
+    age = time.time() - float(hb.get("last_seen") or 0)
+    if hb.get("last_seen") and age > 3600: problems.append(f"{target} last synced {_relay_ago(age)} ago")
+    return "; ".join(problems) or None
+
+def _relay_undelivered_reason(cfg, target):
+    """Best available reason a one-shot mail file has not produced a result."""
+    hb = _relay_jload(relay_root(cfg) / "nodes" / f"{target}.json") or {}
+    if not hb: return "no heartbeat from target"
+    if not hb.get("backends"): return "target reports no usable backends"
+    age = time.time() - float(hb.get("last_seen") or 0)
+    if hb.get("last_seen") and age > 3600: return f"target last synced {_relay_ago(age)} ago"
+    return "target has not reported a result yet"
+
+def _relay_undelivered(cfg, now):
+    """One-shot jobs sent by us, older than 10 min, with no result file yet."""
+    out, root = [], relay_root(cfg)
+    sdir, rdir = root / "schedules", root / "results" / cfg["node"]
+    if not sdir.is_dir(): return out
+    for tgt in sorted(d for d in sdir.iterdir() if d.is_dir()):
+        for f in sorted(tgt.glob(f'{cfg["node"]}--*.json')):
+            m = _relay_jload(f) or {}
+            if not m.get("once"): continue
+            rid = m.get("id")
+            if not rid: continue
+            at = float(m.get("at_epoch") or 0)
+            age = (now - at) if at else (now - f.stat().st_mtime)
+            if age < RELAY_UNDELIVERED_S: continue
+            if rdir.is_dir() and any(rdir.glob(f'{tgt.name}--{rid}--*.json')): continue
+            hb = _relay_jload(root / "nodes" / f"{tgt.name}.json") or {}
+            if f'{cfg["node"]}--{rid}' in (hb.get("picked") or []): continue  # target pulled it; just still running
+            out.append({"target": tgt.name, "id": rid, "agent": m.get("agent"),
+                "age_s": int(age), "reason": _relay_undelivered_reason(cfg, tgt.name)})
+    return out
+
 def _relay_pull(cfg, out, errs):
     """Clone (first git round) or pull --rebase; dir transport = the folder itself.
     Pending local mail writes (e.g. a just-unpublished file) are committed first: rebase refuses a dirty tree."""
@@ -11971,6 +12049,7 @@ def _relay_pull(cfg, out, errs):
         return True
     co = Path(cfg["checkout"])
     if (co / ".git").exists():
+        _relay_finish_rebase(cfg, co)  # a crashed/concurrent sync can leave an empty or conflicted rebase behind
         rc, st = _relay_cmd(["git", "-C", str(co), "status", "--porcelain"])
         if rc == 0 and st.strip():
             who = _relay_who(cfg)
@@ -11981,6 +12060,7 @@ def _relay_pull(cfg, out, errs):
             if e: errs.append(f"pre-commit: {e}"); return False
         e = _relay_git(["git", "-C", str(co), "pull", "--rebase", "--quiet"])
         op = "pull"
+        if e: _relay_finish_rebase(cfg, co)  # never leave a conflicted rebase for the next tick
     else:
         co.parent.mkdir(parents=True, exist_ok=True)
         e = _relay_git(["git", "clone", "--quiet", cfg["url"], str(co)])
@@ -12324,15 +12404,21 @@ def _relay_heartbeat(cfg, root, now, cache):
     """nodes/<node>.json: who we are, what we can run, what is waiting for us."""
     nd = root / "schedules" / cfg["node"]
     rdir = root / "results" / cfg["node"]
+    f = root / "nodes" / f'{cfg["node"]}.json'
+    names = _relay_names()["names"]
     hb = {"node": cfg["node"], "ag_version": VERSION, "ag_commit": _relay_commit(), "backends": _relay_backends(),
         "last_seen": int(now), "schedules_in": len(list(nd.glob("*.json"))) if nd.is_dir() else 0,
-        "results_pending": len([f for f in (list(rdir.glob("*.json")) if rdir.is_dir() else []) if f.name not in cache])}
-    f = root / "nodes" / f'{cfg["node"]}.json'
+        "picked": sorted(f.stem for f in nd.glob("*.json")) if nd.is_dir() else [],
+        "results_pending": len([f for f in (list(rdir.glob("*.json")) if rdir.is_dir() else []) if f.name not in cache]),
+        "names": sorted(names), "default_name": next((n for n, v in names.items() if v.get("default")), None)}
+    old = _relay_jload(f) or {}
+    if old.get("age_recipient"): hb["age_recipient"] = old["age_recipient"]  # cached ssh recipient survives heartbeats
     f.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(f, json.dumps(hb, indent=1))
     return hb
 def _relay_push(cfg, out, errs):
-    """add -A, commit (only when something changed), push; rejection -> pull --rebase + retry (<=3 tries)."""
+    """add -A, commit (only when something changed), push; rejection ('cannot lock ref', 'fetch first')
+    -> pull --rebase + jittered backoff, 5 attempts. A rebase left behind is continued/aborted first."""
     node, co = cfg["node"], Path(cfg["checkout"])
     who = _relay_who(cfg)
     if _relay_git(["git", "-C", str(co), "add", "-A"]) is not None: errs.append("git add failed"); return
@@ -12341,13 +12427,20 @@ def _relay_push(cfg, out, errs):
         e = _relay_git(["git", "-C", str(co), *who, "commit", "--quiet", f"--author=ag-relay <{node}@ag-relay>",
             "-m", f"relay: {node} sync"])
         if e: errs.append(f"commit: {e}")
-    msg, e = "", None
-    for _ in range(3):
+    last = ""
+    for attempt in range(RELAY_PUSH_TRIES):
         rc, msg = _relay_cmd(["git", "-C", str(co), "push", "--quiet", "-u", "origin", "HEAD"])
         if rc == 0: out["pushed"] = True; return
+        last = (msg or "").strip() or last
+        low = last.lower()
+        permanent = any(x in low for x in ("permission denied", "authentication failed", "could not read username",
+            "repository not found", "does not appear to be a git repository"))
+        if permanent or attempt == RELAY_PUSH_TRIES - 1: break
         e = _relay_git(["git", "-C", str(co), *who, "pull", "--rebase", "--quiet"])
-        if e: errs.append(f"rebase: {e}"); return
-    errs.append(f"push: {(msg or e or 'rejected')[:150]}")
+        _relay_finish_rebase(cfg, co)  # conflict/empty todo: abort so the next attempt starts clean
+        if e: last = e
+        time.sleep(min(4.0, 0.25 * (2 ** attempt)) + (os.urandom(1)[0] / 255) * 0.25)  # jitter: peers do not retry in lockstep
+    errs.append(f"push: {(last or 'rejected')[:150]}")
 
 def relay_sync(cfg, now=None):
     """One mailbox round: pull, materialize+prune (target), report results (target), ingest (origin),
@@ -12356,6 +12449,7 @@ def relay_sync(cfg, now=None):
     now = time.time() if now is None else float(now)
     out = {"pulled": False, "materialized": [], "removed": [], "reported": [], "ingested": [], "admin": [], "pushed": False, "error": None}
     errs = []
+    lk = _relay_git_lock(cfg)
     try:
         if _relay_pull(cfg, out, errs):
             root = relay_root(cfg)
@@ -12367,6 +12461,7 @@ def relay_sync(cfg, now=None):
             _relay_heartbeat(cfg, root, now, _relay_ing_cache()[0])
             if cfg["transport"] == "git": _relay_push(cfg, out, errs)
     except Exception as e: errs.append(f"sync: {type(e).__name__}: {str(e)[:120]}")
+    finally: _ctx_unlock(lk)
     out["error"] = _relay_errs_join(errs)
     return out
 
@@ -12382,6 +12477,7 @@ def _relay_status(cfg):
     ours = _relay_commit()
     hb = _relay_jload(root / "nodes" / f'{cfg["node"]}.json') or {}
     monitored = {"node": cfg["node"], "peers": [], "sent": [], "received": [], "results": [], "alerts": [],
+        "undelivered": _relay_undelivered(cfg, now),
         "root": str(root), "backends": _relay_backends(), "commit": ours,
         "last_seen": hb.get("last_seen"), "ag_version": hb.get("ag_version") or VERSION}
     for f in sorted((root / "nodes").glob("*.json")):
@@ -12623,6 +12719,7 @@ def _do_relay_say(a, cfg):
         peer = peers[0]
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", peer): return err(f"bad --peer {peer!r}")
     if peer == cfg["node"]: return err("--peer must name a different relay node")
+    warn = _relay_delivery_warning(cfg, peer, "say", name)
     sdir = state_dir(a.dir); ensure_state(sdir)
     if name in st["names"]: _relay_ensure_echo_agent(sdir, name)  # claim's echo agent lives in the cwd-relative state dir
     row = next((r for r in load_agents(sdir) if r.get("name") == name), None)
@@ -12640,8 +12737,139 @@ def _do_relay_say(a, cfg):
     except Exception as e: return err(f"relay publish failed: {str(e)[:180]}")
     summary = relay_sync(cfg)
     data = {"name": name, "peer": peer, "id": rid, "status": f"remote@{peer}",
+        **({"relay_error": summary["error"]} if summary.get("error") else {}),
+        **({"delivery_warning": warn} if warn else {})}
+    txt = f"say sent -> {peer} as {name} (id {rid})" + (f"\nwarning: {warn}" if warn else "")
+    return emit(a, "relay", {"_text": txt, **data})
+
+def _relay_secret_path(cfg, node, name):
+    return relay_root(cfg) / "secrets" / node / f"{name}.age"
+
+def _relay_age_recipient(cfg, node):
+    """Cached ssh public key for NODE, else that key from the relay repo's deploy keys (`gh api`). -> (key|None, error|None)."""
+    hb = _relay_jload(relay_root(cfg) / "nodes" / f"{node}.json") or {}
+    rec = str(hb.get("age_recipient") or "").strip()
+    if rec: return rec, None
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?/?$", cfg.get("url") or "")
+    if not m:
+        return None, f"no age recipient for {node}: cache its ssh public key as nodes/{node}.json age_recipient"
+    if not shutil.which("gh"):
+        return None, f"gh not installed: cache the deploy key as nodes/{node}.json age_recipient"
+    rc, out = _relay_cmd(["gh", "api", f"repos/{m.group(1)}/{m.group(2)}/keys", "--jq", '.[] | [.title,.key] | @tsv'], timeout=30)
+    rows = [l.split("\t", 1) for l in (out or "").splitlines() if "\t" in l]
+    pick = next((k.strip() for t, k in rows if t.strip().lower() == node), None) \
+        or next((k.strip() for _, k in rows if k.strip().startswith("ssh-ed25519")), None) \
+        or (rows[0][1].strip() if rows else None)
+    if rc != 0 or not pick:
+        tail = (out or "").strip().splitlines()
+        return None, f"cannot read deploy keys for {m.group(1)}/{m.group(2)}: {(tail[-1] if tail else 'no ssh keys')[:160]}"
+    hb.update(node=hb.get("node") or node, age_recipient=pick)
+    f = relay_root(cfg) / "nodes" / f"{node}.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(f, json.dumps(hb, indent=1))
+    return pick, None
+
+def _relay_secret_key(cfg):
+    """This node's relay ssh private key (age -i accepts OpenSSH ed25519/rsa)."""
+    cands = [os.environ.get("AG_RELAY_SSH_KEY"), cfg.get("ssh_key"), "~/.ssh/ag_relay", "~/.ssh/ag_relay_ed25519", "~/.ssh/id_ed25519"]
+    for c in cands:
+        if not c: continue
+        p = Path(os.path.expanduser(str(c)))
+        if p.is_file(): return p, None
+    return None, "no relay ssh key: set AG_RELAY_SSH_KEY or ssh_key in relay.json (or ~/.ssh/ag_relay)"
+
+def _relay_secret_value(prompt):
+    """Value from stdin (piped) or the same hidden dialog as `ag ui ask --secret`. Never argv."""
+    if not sys.stdin.isatty():
+        try: val = sys.stdin.read()
+        except Exception as e: return None, f"cannot read stdin: {type(e).__name__}"
+    else:
+        st, val = secret_dialog(prompt)
+        if st != "ok": return None, f"secret prompt {st}"
+    val = (val or "").rstrip("\r\n")
+    return (val, None) if val else (None, "empty secret")
+
+def _relay_secret_encrypt(cfg, node, name, value):
+    """age -r <node ssh pubkey>; plaintext only ever travels over age's stdin."""
+    age = shutil.which("age")
+    if not age: return None, "age not installed (brew install age) -- relay secrets need it"
+    rec, e = _relay_age_recipient(cfg, node)
+    if e: return None, e
+    f = _relay_secret_path(cfg, node, name)
+    tmp = f.with_name(f.name + ".tmp")
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        try: tmp.unlink()
+        except OSError: pass
+        p = subprocess.run([age, "-r", rec, "-o", str(tmp)], input=value, capture_output=True, text=True,
+            timeout=60, env=_relay_env())
+    except Exception as e:
+        try: tmp.unlink()
+        except OSError: pass
+        return None, f"age failed: {type(e).__name__}: {str(e)[:150]}"
+    if p.returncode != 0 or not tmp.is_file():
+        try: tmp.unlink()
+        except OSError: pass
+        tail = (p.stderr or "").strip().splitlines()
+        return None, f"age: {(tail[-1] if tail else 'encryption failed')[:180]}"
+    try: os.chmod(tmp, 0o600)
+    except OSError: pass
+    os.replace(tmp, f)
+    return f, None
+
+def _relay_secret_decrypt(cfg, node, name):
+    age = shutil.which("age")
+    if not age: return None, "age not installed (brew install age) -- relay secrets need it"
+    f = _relay_secret_path(cfg, node, name)
+    if not f.is_file(): return None, f"no relay secret {node}/{name} (run ag relay sync first)"
+    key, e = _relay_secret_key(cfg)
+    if e: return None, e
+    try:
+        p = subprocess.run([age, "-d", "-i", str(key), str(f)], capture_output=True, text=True, timeout=60, env=_relay_env())
+    except Exception as e:
+        return None, f"age failed: {type(e).__name__}: {str(e)[:150]}"
+    if p.returncode != 0:
+        tail = (p.stderr or "").strip().splitlines()
+        return None, f"age decrypt: {(tail[-1] if tail else 'failed')[:180]}"
+    return p.stdout, None
+
+def _do_relay_secret(a, cfg):
+    cmd = "relay"
+    def err(m, h=None): return emit(a, cmd, error=m, hint=h) or 1
+    sub = getattr(a, "secsub", "")
+    name = (getattr(a, "name", None) or "").strip()
+    node = (getattr(a, "node", None) or "").strip()
+    if sub in ("put", "rm"):
+        if not RELAY_NODE_RE.fullmatch(node): return err(f"bad relay node {node!r}")
+        if not RELAY_SECRET_RE.fullmatch(name):
+            return err(f"bad secret name {name!r}", "letters, digits, dot, dash, underscore (max 64)")
+    elif sub == "get":
+        node = cfg["node"]
+        if not RELAY_SECRET_RE.fullmatch(name):
+            return err(f"bad secret name {name!r}", "letters, digits, dot, dash, underscore (max 64)")
+    else: return err("relay secret: put | get | rm")
+    if sub == "put":
+        val, e = _relay_secret_value(f"relay secret {node}/{name}")
+        if e: return err(e)
+        f, e = _relay_secret_encrypt(cfg, node, name, val)
+        if e: return err(e)
+        summary = relay_sync(cfg)
+        data = {"node": node, "name": name, "path": str(f),
+            **({"relay_error": summary["error"]} if summary.get("error") else {})}
+        return emit(a, cmd, {"_text": f"secret {node}/{name} encrypted -> {f}", **data})
+    if sub == "get":
+        val, e = _relay_secret_decrypt(cfg, node, name)
+        if e: return err(e)
+        sys.stdout.write(val); sys.stdout.flush()  # stdout only: values never enter emit/json/events
+        return 0
+    f = _relay_secret_path(cfg, node, name)
+    if not f.is_file(): return err(f"no relay secret {node}/{name}")
+    try: f.unlink()
+    except OSError as e: return err(f"cannot remove {f}: {e}")
+    summary = relay_sync(cfg)
+    data = {"node": node, "name": name,
         **({"relay_error": summary["error"]} if summary.get("error") else {})}
-    return emit(a, "relay", {"_text": f"say sent -> {peer} as {name} (id {rid})", **data})
+    return emit(a, cmd, {"_text": f"secret {node}/{name} removed", **data})
 
 def do_relay(a):
     cmd = "relay"
@@ -12685,6 +12913,9 @@ def do_relay(a):
         L.append("sent: " + (", ".join(f'{x["id"]} -> {x["target"]} ({x["spec"]})' + ("" if x["enabled"] else " [disabled]") + f', agent {x["agent"]}' for x in st["sent"]) or "none"))
         L.append("received: " + (", ".join(f'{x["origin"]}--{x["id"]} ({x["spec"]})' + ("" if x["enabled"] else " [disabled]") + f', agent {x["agent"]}' for x in st["received"]) or "none"))
         L.append("recent results: " + (", ".join(f'{x["id"]} via {x["target"]} {x["status"] or "-"} {_sched_ts(x["ts"])}' for x in st["results"]) or "none"))
+        if st["undelivered"]:
+            L.append("UNDELIVERED: " + "; ".join(f'{x["id"]} -> {x["target"]} (waiting {_relay_ago(x["age_s"])}) {x["reason"]}'
+                for x in st["undelivered"]))
         return emit(a, cmd, {**st, "_text": "\n".join(L)})
     if a.rsub == "results":
         cache = _relay_ing_cache()[0]
@@ -12726,7 +12957,8 @@ def do_relay(a):
     if a.rsub == "name": return _do_relay_names(a, cfg)
     if a.rsub == "inbox": return _do_relay_inbox(a, cfg)
     if a.rsub == "say": return _do_relay_say(a, cfg)
-    return err("relay: init | sync | status | results | admin | name | inbox | say")
+    if a.rsub == "secret": return _do_relay_secret(a, cfg)
+    return err("relay: init | sync | status | results | admin | name | inbox | say | secret")
 
 def orch_snapshot(sdir):
     ensure_state(sdir)
@@ -20213,6 +20445,10 @@ def build():
     ryns.add_parser("list",help="relay names, their sessions, default owner and claim time")
     rin=rys.add_parser("inbox",help="unseen messages addressed to a relay name (NAME or chat-NAME)"); rin.add_argument("--name",default=None,help="relay name (default: this session's claim)"); rin.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)"); rin.add_argument("--peek",action="store_true",help="print unseen messages without advancing the cursor"); rin.add_argument("--all",action="store_true",help="include already-seen messages from the relay inbox log"); rin.add_argument("--since",type=float,default=None,metavar="HOURS",help="only messages at/after N hours ago"); rin.add_argument("--hook",choices=["claude-inject"],default=None,help="print a Claude Code UserPromptSubmit hook JSON object (nothing when empty)")
     rsay=rys.add_parser("say",help="send a message to a peer as a relay name (wake NAME --on PEER --notify-done)"); rsay.add_argument("message",nargs="+"); rsay.add_argument("--name",default=None,help="relay name (default: this session's claim)"); rsay.add_argument("--session",default=None,help="session id (default $AG_RELAY_SESSION)"); rsay.add_argument("--peer",default=None,metavar="NODE",help="peer node (default: the single other node under nodes/)")
+    rsec=rys.add_parser("secret",help="end-to-end secrets for a relay node (age to its deploy ssh key; ciphertext in git)"); rsecs=rsec.add_subparsers(dest="secsub",required=True)
+    rsecp=rsecs.add_parser("put",help="encrypt NAME for NODE from stdin/hidden prompt and commit it to the mailbox"); rsecp.add_argument("node"); rsecp.add_argument("name")
+    rsecg=rsecs.add_parser("get",help="decrypt this node's NAME with its relay ssh key to stdout (never logged)"); rsecg.add_argument("name")
+    rsecr=rsecs.add_parser("rm",help="delete and commit NODE's encrypted NAME"); rsecr.add_argument("node"); rsecr.add_argument("name")
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50);     ws.add_argument("--wait",default=None,nargs="+",help="block until one or more wake jobs finish (exit 0 ok, 1 failed, 124 timeout)"); ws.add_argument("--wait-group",dest="wait_group",default=None,help="block until all jobs of cohort GROUP finish (same exit codes)"); ws.add_argument("--timeout",type=int,default=30);  ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3)
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")

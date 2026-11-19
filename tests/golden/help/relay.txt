@@ -1,7 +1,7 @@
-usage: ag relay [-h] {init,sync,status,results,admin,name,inbox,say} ...
+usage: ag relay [-h] {init,sync,status,results,admin,name,inbox,say,secret} ...
 
 positional arguments:
-  {init,sync,status,results,admin,name,inbox,say}
+  {init,sync,status,results,admin,name,inbox,say,secret}
     init                write relay.json; clone for --git; first heartbeat
     sync                pull mailbox, materialise/report inbound schedules, ingest results,
                         heartbeat, push
@@ -12,6 +12,8 @@ positional arguments:
     inbox               unseen messages addressed to a relay name (NAME or chat-NAME)
     say                 send a message to a peer as a relay name (wake NAME --on PEER --notify-
                         done)
+    secret              end-to-end secrets for a relay node (age to its deploy ssh key; ciphertext
+                        in git)
 
 options:
   -h, --help            show this help message and exit

@@ -177,3 +177,16 @@ becomes a chat message/notification to the user, then is archived. Write atomica
   today `schedule`/`_wake_run` are in UPDATE_SKIP, so a node only ever driven by its tick (the VM) never updates.
 - Relay results: if the backend exits non-zero with no reply, `error_tail` must carry the backend's stderr tail
   (the VM shows only `(exit 1) (failed)` today).
+
+## Part 6 — delivery warnings, push races, secrets (2026-11-19, fx-relay)
+- Heartbeat gains `names` (claimed relay names), `default_name`, `picked` (inbound one-shot ids this node pulled) and an
+  optional cached `age_recipient`; it is preserved across heartbeats.
+- `wake --on NODE` warns (exit 0, `delivery_warning`) when `nodes/NODE.json` has `backends: []` or no heartbeat;
+  `relay say` warns when the peer advertises no claimed mailbox (or not the addressed name). `relay status` lists
+  one-shot mail older than 10 min without a result and not in the peer's `picked` as `UNDELIVERED` plus the reason.
+- `_relay_push` retries 5 times with `pull --rebase` and jittered backoff (`cannot lock ref`, `fetch first`); relay git
+  ops hold `<checkout>.lock`, and a stale rebase is continued or aborted before pull and after a failed pull.
+- `relay secret put NODE NAME` reads stdin or the hidden `ui ask --secret` dialog, encrypts with `age -r` to the node's
+  deploy ssh key (heartbeat `age_recipient`, else `gh api repos/OWNER/REPO/keys`), writes `secrets/NODE/NAME.age` and
+  syncs (commit+push). `relay secret get NAME` decrypts on the node with `AG_RELAY_SSH_KEY` / `relay.json` `ssh_key` /
+  `~/.ssh/ag_relay` to stdout only; `relay secret rm NODE NAME` deletes and syncs. Plaintext never touches disk/git/logs.

@@ -1,0 +1,14 @@
+usage: ag mem add [-h] [--scope SCOPE] [--visibility VISIBILITY] [--origin {human,agent}]
+                  name [text ...]
+
+positional arguments:
+  name
+  text
+
+options:
+  -h, --help            show this help message and exit
+  --scope SCOPE         global | project:NAME | node:NAME
+  --visibility VISIBILITY
+                        all | nodes:a,b
+  --origin {human,agent}
+                        default: detected (agent unless an interactive human, PROVENANCE)

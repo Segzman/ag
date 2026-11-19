@@ -1,0 +1,15 @@
+usage: ag mem [-h] {add,get,list,rm,search,sync,context} ...
+
+positional arguments:
+  {add,get,list,rm,search,sync,context}
+    add                 add/update one memory entry
+    get                 print one entry (frontmatter + body)
+    list                list entries
+    rm                  remove one entry (local + relay copy)
+    search              search names + bodies
+    sync                sync memory via the relay mailbox: pull, materialise visible entries,
+                        publish mine, push
+    context             compact shared-memory digest for prompts (max 1500 chars)
+
+options:
+  -h, --help            show this help message and exit

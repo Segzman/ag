@@ -1,0 +1,8 @@
+usage: ag mem search [-h] [--scope SCOPE] query [query ...]
+
+positional arguments:
+  query
+
+options:
+  -h, --help     show this help message and exit
+  --scope SCOPE  only this scope

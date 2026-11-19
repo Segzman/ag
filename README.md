@@ -722,6 +722,26 @@ Admin ops travel as `admin/<target>/<origin>--<id>.json` and run once on the tar
 - Relay secrets are end-to-end: `relay secret put NODE NAME` reads from stdin (piped) or the same hidden dialog as `ui ask --secret`, encrypts with `age -r <deploy ssh pubkey>` and commits `secrets/NODE/NAME.age` (the pubkey comes from `nodes/NODE.json` `age_recipient` or `gh api repos/OWNER/REPO/keys`). `relay secret get NAME` on that node decrypts with its relay ssh key (`$AG_RELAY_SSH_KEY`, `relay.json` `ssh_key`, or `~/.ssh/ag_relay`/`id_ed25519`) to stdout only; `relay secret rm NODE NAME` deletes and commits the removal. Plaintext never touches disk, git or events; missing `age` is a clear error.
 - Git pushes retry `pull --rebase` with jittered backoff (5 attempts, covers `cannot lock ref` / `fetch first`); relay git ops hold a checkout lock and a stale rebase is continued or aborted before the next pull.
 
+## Shared memory (`ag mem`)
+
+One memory store shared by every relay node and backend: small Markdown files with frontmatter (`name`, `scope`, `visibility`, `writer`, `origin`, `updated`) in `$AG_CONFIG_HOME/memory/`, synced through the relay mailbox's `memory/` dir.
+
+```sh
+ag mem add NAME "text" [--scope global|project:NAME|node:NAME] [--visibility all|nodes:a,b] [--origin human|agent]
+ag mem get NAME                  # frontmatter + body
+ag mem list [--scope S]          # every entry: scope, visibility, writer, origin, updated
+ag mem rm NAME                   # local entry + the relay copy
+ag mem search QUERY [--scope S]  # names + bodies, case-insensitive
+ag mem sync                      # relay sync + materialise visible entries + publish mine + push
+ag mem context [--project NAME]  # compact digest for prompts (max 1500 chars)
+```
+
+- Origin rules (PROVENANCE): origin is detected conservatively — agent markers (`AG_JOB_ID`, `CLAUDECODE`, …) or a non-TTY stdin mean `agent`, and `--origin human` is honoured only for an interactive human caller. Agent-origin writes may use `project:`/`node:` scope only; `global` needs human origin (refused with exit 3 and logged).
+- ACL: the relay mailbox may carry `admin/memory-policy.json` — `{"nodes": {"NODE": {"memory.write": ["project:*", "node:NODE"]}}}` (patterns: exact scope, `project:*`, `*`). A node with no entry is unrestricted. Writes that break the origin rule or the policy are rejected and appended to `memory/violations.log`; the same checks run on inbound entries during sync, so a violating or secret-bearing file planted in the mailbox is never materialised.
+- Secrets never sync: `add` and `sync` refuse anything matching ag's existing secret scanners (`REDACT_VALS` value patterns, `REDACT_KEYS` key-shaped lines) with a clear error (exit 2).
+- Visibility: a node only materialises entries whose `visibility` is `all` or `nodes:` lists it. A node only ever publishes entries it wrote itself. Plain `relay sync` also materialises newly arrived memory.
+- Wake prompts include the `mem context` digest only when `config.json` sets `"mem": {"inject": true}` (default off); the digest covers `global`, the agent's assigned `project:` and this `node:` entries, capped at 1500 chars.
+
 ## Link (VM -> Mac live view)
 
 A VM with no inbound access shows its sites + long-running jobs on the Mac: one outbound `ssh -N -T -R` supervisor (Mac needs only its sshd). Full spec: [docs/LINK.md](docs/LINK.md).

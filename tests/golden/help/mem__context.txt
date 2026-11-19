@@ -1,0 +1,5 @@
+usage: ag mem context [-h] [--project PROJECT]
+
+options:
+  -h, --help         show this help message and exit
+  --project PROJECT  include project:NAME entries

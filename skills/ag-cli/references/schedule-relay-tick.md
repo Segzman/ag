@@ -31,6 +31,22 @@ Delivery: `wake --on NODE` warns when the peer heartbeat lists no usable backend
 
 Secrets: `{{AG}} --dir <state> relay secret put NODE NAME` reads stdin or the hidden `ui ask --secret` dialog, encrypts with `age -r` to the node's deploy ssh key (cached as `nodes/NODE.json` `age_recipient`, else `gh api repos/OWNER/REPO/keys`), and commits `secrets/NODE/NAME.age`. `relay secret get NAME` decrypts on that node with its relay ssh key (`AG_RELAY_SSH_KEY` / `relay.json` `ssh_key` / `~/.ssh/ag_relay`) to stdout only; `relay secret rm NODE NAME` removes and commits. Plaintext never lands on disk or in logs; a missing `age` binary is a clear error.
 
+## Shared memory (`mem`)
+
+One store for all nodes/backends: `$AG_CONFIG_HOME/memory/<name>.md` (frontmatter `name`, `scope`, `visibility`, `writer`, `origin`, `updated`), synced via the relay mailbox `memory/` dir.
+
+```sh
+{{AG}} mem add NAME "text" [--scope global|project:NAME|node:NAME] [--visibility all|nodes:a,b] [--origin human|agent]
+{{AG}} mem get NAME
+{{AG}} mem list [--scope S]
+{{AG}} mem rm NAME
+{{AG}} mem search QUERY [--scope S]
+{{AG}} mem sync                      # relay sync + materialise visible entries + publish own + push
+{{AG}} mem context [--project NAME]  # digest for prompts, max 1500 chars
+```
+
+Origin is detected conservatively (agent markers or non-TTY stdin = agent; `--origin human` honoured only for an interactive human). Agent-origin writes: `project:`/`node:` scope only — `global` needs human origin (exit 3, logged to `memory/violations.log`). Relay ACL: mailbox `admin/memory-policy.json` = `{"nodes": {"NODE": {"memory.write": ["project:*"]}}}`; no entry = unrestricted; violations are rejected + logged, and inbound entries are re-checked at sync. Anything matching the secret scanners (`REDACT_VALS`/`REDACT_KEYS`) is refused (exit 2) and never syncs. A node materialises only entries whose visibility includes it and publishes only its own. Wake prompts include the `mem context` digest only with `config.json` `"mem": {"inject": true}` (default off).
+
 ## ratelimit
 
 ```sh

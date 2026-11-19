@@ -10816,6 +10816,17 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs, kit=None):
             prompt = ("[background context — labeled sources; memory notes are "
                 "fallible and may be stale]\n" + _ctx["text"][:CTX_TOTAL] +
                 "\n\n---\n[current request — answer this]:\n" + prompt)
+        # shared-memory digest (ag mem), behind config mem.inject (default off)
+        try:
+            if (_ag_conf().get("mem") or {}).get("inject"):
+                _proj = None
+                try:
+                    _asg = ctx_load_assignments(sdir).get(name) or {}
+                    if _asg.get("project"): _proj = Path(str(_asg["project"])).name
+                except Exception: pass
+                _dg = mem_context(project=_proj)
+                if _dg: prompt = _dg + "\n\n---\n" + prompt
+        except Exception: pass
     if "style" in _kit["tools"] and not command and not kit_style_preloaded(backend, a.get("dir", ".") or "."):
         _st = kit_style_text()
         if _st: sys_txt = (sys_txt + "\n\n--- token-saving style ---\n" + _st) if sys_txt else _st
@@ -13998,6 +14009,7 @@ def relay_sync(cfg, now=None):
             except Exception as e: errs.append(f"feedback: {type(e).__name__}: {str(e)[:100]}")  # must not skip report/admin/ingest
             _relay_report(cfg, root, now, out, errs)
             _relay_admin(cfg, root, now, out, errs)
+            _mem_materialize(cfg, root)
             _relay_ingest(cfg, root, now, out, errs)
             _relay_heartbeat(cfg, root, now, _relay_ing_cache()[0])
             if cfg["transport"] == "git": _relay_push(cfg, out, errs)
@@ -14709,6 +14721,224 @@ def do_relay(a):
     if a.rsub == "alias": return _do_relay_alias(a, cfg)
     if a.rsub == "secret": return _do_relay_secret(a, cfg)
     return err("relay: init | sync | status | results | admin | name | inbox | say | alias | secret")
+
+# ---- shared memory (`ag mem`): one store for every node/backend, synced through the relay
+# mailbox. Store = $AG_CONFIG_HOME/memory/<name>.md, frontmatter name/scope/visibility/
+# writer/origin/updated + body. Origin + trust rules reuse docs/muse2-ag/PROVENANCE.md:
+# detection is conservative (unsure => agent); agent-origin writes are project/node scope
+# only, global needs a human. ACL: relay admin policy admin/memory-policy.json in the
+# mailbox, {"nodes": {NODE: {"memory.write": [scope patterns]}}}; no entry = unrestricted.
+# Anything matching ag's secret scanners (REDACT_VALS / REDACT_KEYS) is refused, never synced.
+MEM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{0,60}$")
+MEM_CONTEXT_CAP = 1500
+
+def mem_dir(): return ag_config_home() / "memory"
+def mem_node():
+    cfg = relay_cfg()
+    return cfg["node"] if cfg else _relay_node_name()
+def mem_detect_origin(env=None):
+    """PROVENANCE P1, conservative: agent markers or a non-TTY stdin => agent."""
+    env = os.environ if env is None else env
+    if any(env.get(k) for k in ("AG_JOB_ID", "AG_PARENT_AGENT", "CLAUDECODE", "CODEX_SANDBOX", "OPENCODE")): return "agent"
+    try: return "human" if sys.stdin.isatty() else "agent"
+    except Exception: return "agent"
+def mem_secret_hit(text):
+    """Why `text` must never enter the shared store, or None (ag's existing scanners)."""
+    if REDACT_VALS.search(text or ""): return "matches a known secret value pattern (REDACT_VALS)"
+    for line in (text or "").splitlines():
+        k, sep, v = line.partition(":")
+        k, v = k.strip(), v.strip()
+        if k.lower() in ("author", "authors"): continue  # REDACT_KEYS' "auth" would false-positive prose
+        if sep and REDACT_KEYS.search(k) and len(v) >= 4 and not v.startswith(("<", "REDACTED")):
+            return f"secret-shaped key line: {k[:40]}:"
+    return None
+def mem_scope_ok(scope):
+    if scope == "global": return True
+    k, sep, n = (scope or "").partition(":")
+    return bool(sep) and k in ("project", "node") and bool(MEM_NAME_RE.match(n or ""))
+def mem_visibility_ok(vis):
+    if vis == "all": return True
+    if not (vis or "").startswith("nodes:"): return False
+    xs = [x for x in vis[6:].split(",") if x]
+    return bool(xs) and all(MEM_NAME_RE.match(x) for x in xs)
+def mem_visible(e, node):
+    vis = e.get("visibility") or "all"
+    return vis == "all" or (vis.startswith("nodes:") and node in [x for x in vis[6:].split(",") if x])
+def mem_render(e):
+    fm = "\n".join(f"{k}: {e.get(k, '')}" for k in ("name", "scope", "visibility", "writer", "origin", "updated"))
+    return f"---\n{fm}\n---\n{(e.get('body') or '').rstrip()}\n"
+def mem_parse(text):
+    if not (text or "").startswith("---\n"): return None
+    fm, sep, body = text[4:].partition("\n---\n")
+    if not sep: return None
+    e = {"body": body.rstrip("\n")}
+    for line in fm.splitlines():
+        k, s, v = line.partition(":")
+        if s: e[k.strip()] = v.strip()
+    if not MEM_NAME_RE.match(e.get("name") or "") or not mem_scope_ok(e.get("scope") or ""): return None
+    e.setdefault("visibility", "all"); e.setdefault("writer", ""); e.setdefault("origin", "agent"); e.setdefault("updated", "")
+    return e
+def mem_load(d=None):
+    d = mem_dir() if d is None else Path(d)
+    out = []
+    if d.is_dir():
+        for f in sorted(d.glob("*.md")):
+            try: e = mem_parse(f.read_text())
+            except Exception: e = None
+            if e: out.append(e)
+    return out
+def mem_policy(cfg=None):
+    """Relay-admin ACL from the mailbox: admin/memory-policy.json ({} when unset)."""
+    cfg = relay_cfg() if cfg is None else cfg
+    if not cfg: return {}
+    p = _json_or_empty(relay_root(cfg) / "admin" / "memory-policy.json")
+    return p if isinstance(p, dict) else {}
+def mem_write_allowed(policy, node, scope):
+    ent = ((policy or {}).get("nodes") or {}).get(node)
+    pats = ent.get("memory.write") if isinstance(ent, dict) else None
+    if not isinstance(pats, list): return True  # no policy entry for this node = unrestricted
+    return any(isinstance(p, str) and (p in ("*", scope) or (p.endswith(":*") and scope.startswith(p[:-1]))) for p in pats)
+def mem_log_violation(kind, node, scope, name, why):
+    try:
+        d = mem_dir(); d.mkdir(parents=True, exist_ok=True)
+        with open(d / "violations.log", "a") as f:
+            f.write(json.dumps({"ts": now_iso(), "kind": kind, "node": node, "scope": scope, "name": name, "why": why}) + "\n")
+    except Exception: pass
+def mem_check_write(e, policy, log=True):
+    """(error, is_permission) for putting entry e in the store; logs violations."""
+    hit = mem_secret_hit(f'{e.get("name", "")}\n{e.get("body", "")}')
+    if hit: return f"refused: memory must never contain secrets ({hit})", False
+    if e.get("origin") == "agent" and e.get("scope") == "global":
+        if log: mem_log_violation("origin", e.get("writer", ""), e["scope"], e["name"], "agent-origin write to global scope")
+        return "refused: agent-origin writes are project/node scope only; global needs human origin", True
+    if not mem_write_allowed(policy, e.get("writer", ""), e.get("scope", "")):
+        if log: mem_log_violation("acl", e.get("writer", ""), e["scope"], e["name"], "memory.write policy does not allow this scope")
+        return f'refused: relay memory policy does not allow node {e.get("writer", "")} to write scope {e["scope"]}', True
+    return None, False
+def _mem_reject_seen(name, updated):
+    """True when this exact rejected entry was already logged (the relay tick must not re-log it every minute)."""
+    p = mem_dir() / ".rejects.json"
+    seen = _json_or_empty(p)
+    if not isinstance(seen, dict): seen = {}
+    if seen.get(name) == updated: return True
+    seen[name] = updated
+    try: _atomic_write(p, json.dumps(seen))
+    except Exception: pass
+    return False
+def mem_put_local(e):
+    d = mem_dir(); d.mkdir(parents=True, exist_ok=True)
+    _atomic_write(d / f'{e["name"]}.md', mem_render(e))
+def _mem_materialize(cfg, root, policy=None):
+    """Copy visible, policy-clean relay entries into the local store. Returns names. Never raises."""
+    out = []
+    try:
+        rdir = Path(root) / "memory"
+        if not rdir.is_dir(): return out
+        me, policy = cfg["node"], mem_policy(cfg) if policy is None else policy
+        for e in mem_load(rdir):
+            why, _perm = mem_check_write(e, policy, log=False)
+            if why:
+                if not _mem_reject_seen(e.get("name", ""), e.get("updated") or ""):
+                    mem_log_violation("sync-in", e.get("writer", ""), e.get("scope", ""), e.get("name", ""), why)
+                continue
+            if not mem_visible(e, me): continue
+            cur = next((x for x in mem_load() if x["name"] == e["name"]), None)
+            if cur is None or (e.get("updated") or "") >= (cur.get("updated") or ""):
+                mem_put_local(e); out.append(e["name"])
+    except Exception: pass
+    return out
+def mem_sync(cfg):
+    """Piggyback on relay sync: pull, materialise visible entries, publish my own, push."""
+    out = {"published": [], "materialized": [], "skipped": [], "relay_error": None}
+    r = relay_sync(cfg); out["relay_error"] = r.get("error")
+    root, me, policy = relay_root(cfg), cfg["node"], mem_policy(cfg)
+    rdir = root / "memory"; rdir.mkdir(parents=True, exist_ok=True)
+    out["materialized"] = _mem_materialize(cfg, root, policy)
+    for e in mem_load():
+        if e.get("writer") != me: continue  # a node only ever publishes its own entries
+        why, _perm = mem_check_write(e, policy)
+        if why: mem_log_violation("sync-out", me, e.get("scope", ""), e.get("name", ""), why); out["skipped"].append(e["name"]); continue
+        f = rdir / f'{e["name"]}.md'
+        cur = mem_parse(f.read_text()) if f.exists() else None
+        if cur is None or (e.get("updated") or "") >= (cur.get("updated") or ""):
+            _atomic_write(f, mem_render(e)); out["published"].append(e["name"])
+    r2 = relay_sync(cfg)
+    out["relay_error"] = r2.get("error") or out["relay_error"]
+    return out
+def mem_context(project=None, node=None, cap=MEM_CONTEXT_CAP):
+    """Compact digest of the entries a wake prompt may see (<= cap chars; '' when empty)."""
+    node = node or mem_node()
+    es = [e for e in mem_load() if mem_visible(e, node) and
+          (e["scope"] == "global" or e["scope"] == f"node:{node}" or (project and e["scope"] == f"project:{project}"))]
+    es.sort(key=lambda e: (0 if e["scope"] == "global" else 1 if e["scope"].startswith("project:") else 2, e["name"]))
+    if not es: return ""
+    lines = ["[shared memory — synced via ag mem; fallible, may be stale]"]
+    for e in es:
+        first = next((l.strip() for l in (e.get("body") or "").splitlines() if l.strip()), "")
+        lines.append(f'- [{e["scope"]}] {e["name"]}: {first[:120]}')
+    s = "\n".join(lines)
+    return s if len(s) <= cap else s[:cap - 1].rstrip() + "…"
+def do_mem(a):
+    cmd = "mem"
+    def err(m, h=None): return emit(a, cmd, error=m, hint=h) or 1
+    sub = getattr(a, "memsub", None) or ""
+    if sub == "add":
+        name = (getattr(a, "name", "") or "").strip()
+        if not MEM_NAME_RE.match(name): return err(f"bad memory name {name!r}", "lowercase letters, digits, - and _")
+        scope = (getattr(a, "scope", None) or "global").strip()
+        if not mem_scope_ok(scope): return err(f"bad --scope {scope!r}", "global | project:NAME | node:NAME")
+        vis = (getattr(a, "visibility", None) or "all").strip()
+        if vis != "all" and not vis.startswith("nodes:") and "," in vis: vis = "nodes:" + vis  # bare a,b shorthand
+        if not mem_visibility_ok(vis): return err(f"bad --visibility {vis!r}", "all | nodes:a,b")
+        body = " ".join(getattr(a, "text", None) or []).strip()
+        if not body: return err("empty memory text", 'ag mem add NAME "text"')
+        origin = mem_detect_origin()
+        want = getattr(a, "origin", None)
+        if want == "human" and origin != "human":
+            mem_log_violation("origin", mem_node(), scope, name, "--origin human claimed by a non-human caller")
+            emit(a, cmd, error="refused: --origin human is honoured only for an interactive human caller (PROVENANCE)"); return 3
+        if want: origin = want
+        e = {"name": name, "scope": scope, "visibility": vis, "writer": mem_node(), "origin": origin,
+             "updated": now_iso(), "body": body}
+        why, perm = mem_check_write(e, mem_policy())
+        if why: emit(a, cmd, error=why); return 3 if perm else 2
+        mem_put_local(e)
+        return emit(a, cmd, {"_text": f"mem {name} [{scope}] by {e['writer']} ({origin})", **e})
+    if sub == "get":
+        e = next((x for x in mem_load() if x["name"] == (getattr(a, "name", "") or "")), None)
+        if not e: return err(f"no such memory: {getattr(a, 'name', '')}", "ag mem list")
+        return emit(a, cmd, {"_text": mem_render(e), **e})
+    if sub == "list":
+        es = mem_load()
+        if getattr(a, "scope", None): es = [e for e in es if e["scope"] == a.scope]
+        txt = "\n".join(f'{e["name"]:24} {e["scope"]:20} {e["visibility"]:14} {e["writer"]:10} {e["origin"]:6} {e["updated"]}' for e in es) or "(no memory)"
+        return emit(a, cmd, {"_text": txt, "entries": es})
+    if sub == "rm":
+        name = getattr(a, "name", "") or ""
+        f = mem_dir() / f"{name}.md"
+        if not f.exists(): return err(f"no such memory: {name}", "ag mem list")
+        f.unlink()
+        cfg = relay_cfg()
+        if cfg:  # drop the shared copy too, so the next sync does not resurrect it
+            try: (relay_root(cfg) / "memory" / f"{name}.md").unlink()
+            except OSError: pass
+        return emit(a, cmd, {"_text": f"mem {name} removed", "name": name, "removed": True})
+    if sub == "search":
+        q = " ".join(getattr(a, "query", None) or []).lower()
+        es = [e for e in mem_load() if q in e["name"].lower() or q in (e.get("body") or "").lower()]
+        if getattr(a, "scope", None): es = [e for e in es if e["scope"] == a.scope]
+        txt = "\n".join(f'{e["name"]:24} {e["scope"]:20} {next((l.strip() for l in (e.get("body") or "").splitlines() if l.strip()), "")[:100]}' for e in es) or "(no matches)"
+        return emit(a, cmd, {"_text": txt, "entries": es})
+    if sub == "sync":
+        cfg = relay_cfg()
+        if not cfg: return err("relay not set up", "ag relay init --git URL | --dir PATH")
+        out = mem_sync(cfg)
+        txt = f'mem sync ({cfg["node"]}): published={len(out["published"])} materialized={len(out["materialized"])} skipped={len(out["skipped"])}'
+        return emit(a, cmd, {**out, "_text": txt}, error=out["relay_error"])
+    if sub == "context":
+        dg = mem_context(project=getattr(a, "project", None))
+        return emit(a, cmd, {"_text": dg or "(no shared memory)", "digest": dg})
+    return err("mem: add | get | list | rm | search | sync | context")
 
 def orch_snapshot(sdir):
     ensure_state(sdir)
@@ -22777,6 +23007,14 @@ def build():
     rsecp=rsecs.add_parser("put",help="encrypt NAME for NODE from stdin/hidden prompt and commit it to the mailbox"); rsecp.add_argument("node"); rsecp.add_argument("name")
     rsecg=rsecs.add_parser("get",help="decrypt this node's NAME with its relay ssh key to stdout (never logged)"); rsecg.add_argument("name")
     rsecr=rsecs.add_parser("rm",help="delete and commit NODE's encrypted NAME"); rsecr.add_argument("node"); rsecr.add_argument("name")
+    mm=sub.add_parser("mem",help="shared memory across relay nodes (add|get|list|rm|search|sync|context)"); mms=mm.add_subparsers(dest="memsub",required=True)
+    mma=mms.add_parser("add",help="add/update one memory entry"); mma.add_argument("name"); mma.add_argument("text",nargs="*"); mma.add_argument("--scope",default="global",help="global | project:NAME | node:NAME"); mma.add_argument("--visibility",default="all",help="all | nodes:a,b"); mma.add_argument("--origin",default=None,choices=["human","agent"],help="default: detected (agent unless an interactive human, PROVENANCE)")
+    mmg=mms.add_parser("get",help="print one entry (frontmatter + body)"); mmg.add_argument("name")
+    mml=mms.add_parser("list",help="list entries"); mml.add_argument("--scope",default=None,help="only this scope")
+    mmr=mms.add_parser("rm",help="remove one entry (local + relay copy)"); mmr.add_argument("name")
+    mmq=mms.add_parser("search",help="search names + bodies"); mmq.add_argument("query",nargs="+"); mmq.add_argument("--scope",default=None,help="only this scope")
+    mms.add_parser("sync",help="sync memory via the relay mailbox: pull, materialise visible entries, publish mine, push")
+    mmc=mms.add_parser("context",help="compact shared-memory digest for prompts (max 1500 chars)"); mmc.add_argument("--project",default=None,help="include project:NAME entries")
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
     ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50);     ws.add_argument("--wait",default=None,nargs="+",help="block until one or more wake jobs finish (exit 0 ok, 1 failed, 124 timeout)"); ws.add_argument("--wait-group",dest="wait_group",default=None,help="block until all jobs of cohort GROUP finish (same exit codes)"); ws.add_argument("--timeout",type=int,default=30);  ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3); ws.add_argument("--retry",default=None,action="append",metavar="JOB[,JOB]",help="re-send a failed or usage-parked wake with its original agent, message and verify/escalate options"); ws.add_argument("--model",default=None,metavar="M",help="with --retry: one-off model override for the retry (roster unchanged)")
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
@@ -23577,7 +23815,7 @@ def main(argv=None):
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"browser":do_browser,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"channel":do_channel,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
-        "access":do_access,"grant":do_grant,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit,"merge":do_merge}[a.subcmd]
+        "access":do_access,"grant":do_grant,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit,"merge":do_merge,"mem":do_mem}[a.subcmd]
     maybe_auto_update(a.subcmd)
     g = gate_check(a, argv0)
     if g is not None: return g

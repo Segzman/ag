@@ -1,10 +1,10 @@
 usage: ag [-h] [--dir DIR] [--json] [--version]
-          {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,budget,policy,setup,link} ...
+          {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,mem,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,budget,policy,setup,link} ...
 
 CLI helper for autonomous agents
 
 positional arguments:
-  {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,budget,policy,setup,link}
+  {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,mem,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,budget,policy,setup,link}
     run                 run shell cmd, logged
     read                read file numbered
     write               write file (arg or stdin)
@@ -57,6 +57,7 @@ positional arguments:
     schedule            recurring wakes (one global launchd/cron tick)
     relay               run schedules made here on another machine (mailbox: git repo | synced
                         folder)
+    mem                 shared memory across relay nodes (add|get|list|rm|search|sync|context)
     receipts            idempotency receipts (--request-id)
     wakes               list wake jobs (queued/running/done/failed)
     _wake_run           ==SUPPRESS==

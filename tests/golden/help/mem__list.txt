@@ -1,0 +1,5 @@
+usage: ag mem list [-h] [--scope SCOPE]
+
+options:
+  -h, --help     show this help message and exit
+  --scope SCOPE  only this scope

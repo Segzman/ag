@@ -602,9 +602,61 @@ def verify_log_row(sdir, name, v):
     try: append_chat(sdir, name, "tool", f'[verify] exit={v.get("exit")}')
     except Exception: pass
 
+def diff_base(workdir):
+    """Baseline for the wake diff gate: HEAD sha + hash of `git status
+    --porcelain` at turn start. None when workdir is not a git repo. Never
+    raises. The status hash matters: pre-existing dirt must not mask a
+    no-op turn (the old bug — verify exit 0 passed while nothing changed)."""
+    try:
+        hr = _git(workdir, "rev-parse", "HEAD")
+        if hr.returncode != 0: return None
+        base = {"head": hr.stdout.strip()}
+        st = _git(workdir, "status", "--porcelain")
+        base["status"] = hashlib.sha256(st.stdout.encode()).hexdigest() if st.returncode == 0 else ""
+        return base
+    except Exception: return None
+
+def diff_check(workdir, base):
+    """Wake diff-gate verdict: new commits since base or uncommitted changes
+    (vs the base snapshot). -> {base_sha, head_sha, changed, diff_stat};
+    never raises. diff_stat is a compact summary line for `ag wakes`."""
+    out = {"base_sha": (base or {}).get("head"), "head_sha": None, "changed": False, "diff_stat": ""}
+    try:
+        hr = _git(workdir, "rev-parse", "HEAD")
+        if hr.returncode != 0: return out
+        head = hr.stdout.strip(); out["head_sha"] = head
+        stat = ""
+        if base and head and head != base.get("head"):
+            out["changed"] = True
+            cr = _git(workdir, "diff", "--stat", f"{base.get('head')}..{head}")
+            if cr.returncode == 0 and cr.stdout.strip():
+                ls = [l for l in cr.stdout.splitlines() if l.strip()]
+                stat = ls[-1]  # "N files changed, ..." summary line
+        st = _git(workdir, "status", "--porcelain")
+        if st.returncode == 0 and st.stdout.strip():
+            dirty = hashlib.sha256(st.stdout.encode()).hexdigest()
+            if not base or dirty != base.get("status"):
+                out["changed"] = True
+                n = len(st.stdout.strip().splitlines())
+                stat = (stat + " | " if stat else "") + f"{n} uncommitted"
+        out["diff_stat"] = stat
+    except Exception as e:
+        out["diff_stat"] = f"diff error: {type(e).__name__}"[:80]
+    return out
+
+def _require_diff(explicit, row, has_verify=False):
+    """Resolve the wake diff gate. Explicit --require-diff/--no-require-diff
+    wins, then the agent's wake_require_diff config, then the wake CLI's
+    default (ON with --verify on an agent that has a worktree); other
+    launch_wake_chat callers (delegate, schedules) default OFF."""
+    if explicit is not None: return bool(explicit)
+    if isinstance(row, dict) and row.get("wake_require_diff") is not None:
+        return bool(row["wake_require_diff"])
+    return bool(has_verify) and bool(isinstance(row, dict) and row.get("worktree"))
+
 def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
         notify="", notify_done=False, on_done="", timeout_s=0, max_runtime_s=0, stall_s=None, job_type=None, cohort=None, extra=None,
-        verify=None, verify_timeout_s=600, escalate=None):
+        verify=None, verify_timeout_s=600, escalate=None, require_diff=None):
     """Enqueue one wake job + spawn tracked worker. Returns {job,session} or {error}."""
     try: rows = load_agents(sdir)
     except Exception: rows = []
@@ -646,6 +698,7 @@ def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
     if verify and vtmo is None:
         _event(sdir, "wake_fail", trigger, agent=agent, exit=exit_code, reason="invalid verify-timeout")
         return {"error": "invalid --verify-timeout: need finite seconds >= 0"}
+    _arow = next((r for r in rows if r.get("name") == agent), None)
     jid = hashlib.sha256(f"{time.time()}{agent}{message}{os.getpid()}{trigger}".encode()).hexdigest()[:8]
     sid = hashlib.sha256(f"{time.time()}{agent}{jid}{os.getpid()}".encode()).hexdigest()[:6]
     try:
@@ -663,6 +716,7 @@ def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
         **({"job": job_type} if job_type else {}),
         **({"verify": verify, "verify_timeout_s": vtmo if vtmo is not None else 600} if verify else {}),
         **({"escalate": list(escalate)} if verify and escalate is not None else {}),
+        "require_diff": _require_diff(require_diff, _arow),  # wake CLI passes the resolved value; other callers default off
         **({"parent": cohort["parent"], "group": cohort["group"]} if cohort else {}), **(extra or {})}
     def _publish(wsid, sp):
         if cohort: _cohort_add(sdir, cohort, jid)
@@ -1111,6 +1165,11 @@ def do__wake_run(a):
             cur["status"] = "running"
             cur["pid"] = os.getpid()
             cur["running_at"] = cur["guard_acquired_at"] = now_iso()
+            if job.get("require_diff"):  # diff gate baseline: turn start, not enqueue
+                try:
+                    _db = diff_base(verify_workdir(sdir, agent))
+                    if _db: cur["base_sha"], cur["base_status"] = _db["head"], _db["status"]
+                except Exception: pass
             cur.pop("wait_reason", None)
             _wake_write_job(sdir, cur)
         finally:
@@ -1123,14 +1182,26 @@ def do__wake_run(a):
         _mark_failed(f"turn error: {e}", 1)
         return 1
     _wvf = {}
+    _rd = bool(job.get("require_diff"))
+    def _diff_verdict():
+        """Diff gate for this job: changed since the base snapshot? None when off."""
+        if not _rd: return None
+        try: _bj = _wake_read_job(sdir, jid) or {}
+        except Exception: _bj = {}
+        base = {"head": _bj["base_sha"], "status": _bj.get("base_status")} if _bj.get("base_sha") else None
+        return diff_check(verify_workdir(sdir, agent), base)
+    def _diff_fields(d):
+        return {"base_sha": d.get("base_sha"), "head_sha": d.get("head_sha"), "diff_stat": d.get("diff_stat", "")}
     esc_ms = job.get("escalate") if vcmd else None
+    _dv = None
     if esc_ms is not None:  # escalation ladder (as chat send): failed attempt (backend error or verify != 0) retries the same session on the next model
         cur = next((x.get("model") or "default" for x in load_agents(sdir) if x.get("name")==agent), "default"); esc = []
         for i in range(len(esc_ms)+1):
             if i:
+                _nochg = _dv is not None and _dv["exit_ok"] and not _dv["changed"]
                 try: append_chat(sdir, agent, "tool", f"[escalate] -> {cur} (verify exit {v['exit']})")
                 except Exception: pass
-                try: r = run_turn(sdir, agent, f"{message}\n\nThe previous attempt failed verification (`{vcmd}`, exit {v['exit']}). Output:\n{v['tail']}\nFix it.",
+                try: r = run_turn(sdir, agent, (f"{message}\n\nThe previous attempt changed nothing in the worktree. Do the work there (edit or commit files)." if _nochg else f"{message}\n\nThe previous attempt failed verification (`{vcmd}`, exit {v['exit']}). Output:\n{v['tail']}\nFix it."),
                     timeout_s=max_runtime_s, stall_s=job.get("stall_s"), force=bool(job.get("force")), model=cur)
                 except Exception as e: r = {"error": f"turn error: {e}", "exit": 1}
             if "error" in r and not r.get("timed_out"): v = {"cmd": vcmd, "exit": -1, "tail": str(r["error"])[:2000]}
@@ -1138,15 +1209,20 @@ def do__wake_run(a):
                 try: v = run_verify(sdir, agent, vcmd, job.get("verify_timeout_s") or 600)
                 except Exception as e: v = {"cmd": vcmd, "exit": 1, "tail": f"verify error: {e}"}
                 verify_log_row(sdir, agent, v)
-            esc.append({"model": cur, "exit": r.get("exit"), "verify_exit": v["exit"]})
-            if v["exit"] == 0 or i == len(esc_ms): break
+            _dv = _diff_verdict()
+            if _dv is not None: _dv["exit_ok"] = v["exit"] == 0
+            esc.append({"model": cur, "exit": r.get("exit"), "verify_exit": v["exit"], **({"changed": _dv["changed"]} if _dv else {})})
+            if (v["exit"] == 0 and (_dv is None or _dv["changed"])) or i == len(esc_ms): break
             cur = esc_ms[i]
         r["verify"] = v; _wvf = {"verify": v, "escalation": esc}
+        if _dv is not None: _wvf.update(_diff_fields(_dv))
     elif vcmd and ("error" not in r or r.get("timed_out")):  # verify only after a turn that ran; backend exit stays untouched
         try: r["verify"] = run_verify(sdir, agent, vcmd, job.get("verify_timeout_s") or 600)
         except Exception as e: r["verify"] = {"cmd": vcmd, "exit": 1, "tail": f"verify error: {e}"}
         verify_log_row(sdir, agent, r["verify"])
         _wvf = {"verify": r["verify"]}
+        _dv = _diff_verdict()
+        if _dv is not None: _wvf.update(_diff_fields(_dv))
     _we = {"backend_stderr": str(r.get("stderr") or "")[-8000:]} if r.get("stderr") else {}
     if r.get("timed_out"):
         _mark_failed(r.get("error", "max-runtime exceeded"), 124, fields={"timed_out": True, **_wvf, **_we})
@@ -1169,6 +1245,12 @@ def do__wake_run(a):
     if code != 0:
         excerpt = " ".join(str(r.get("reply") or "").split())[:160]
         _mark_failed(f"backend exit {code}" + (f": {excerpt}" if excerpt else ""), code, fields={**_wvf, **_we} or None)
+        return 1
+    if _rd and _dv is None:  # diff gate without --verify: run it after a clean turn
+        _dv = _diff_verdict()
+        if _dv is not None: _wvf = {**_wvf, **_diff_fields(_dv)}
+    if _dv is not None and not _dv["changed"]:
+        _mark_failed("no changes produced", 1, fields={**_wvf, **_diff_fields(_dv)})
         return 1
     _wake_finish(sdir, jid, "done", reply=r.get("reply", ""), fields=_wvf or None)
     return 0
@@ -1205,6 +1287,7 @@ def wakes_reap(sdir, queued_only=True, include_running=False, agent=None, max_at
             notify=j.get("notify", ""), notify_done=bool(j.get("notify_done")), on_done=j.get("on_done", ""), timeout_s=j.get("timeout_s", 0),
             max_runtime_s=j.get("max_runtime_s", 0), stall_s=j.get("stall_s"), job_type=j.get("job"),
             verify=j.get("verify"), verify_timeout_s=j.get("verify_timeout_s", 600), escalate=j.get("escalate"),
+            require_diff=j.get("require_diff"),
             cohort=({"parent": j["parent"], "group": j["group"], "quiet_s": 0} if j.get("group") else None),
             extra={"retry_of": j["id"], "attempts": at + 1, **({"no_park": True} if j.get("no_park") else {})})
         if "error" in r:
@@ -1246,6 +1329,7 @@ def _wake_resume_parked(sdir, now, dry=False):
                 max_runtime_s=cur.get("max_runtime_s", 0), stall_s=cur.get("stall_s"),
                 job_type=cur.get("job"), verify=cur.get("verify"),
                 verify_timeout_s=cur.get("verify_timeout_s", 600), escalate=cur.get("escalate"),
+                require_diff=cur.get("require_diff"),
                 cohort=({"parent": cur.get("parent"), "group": cur["group"], "quiet_s": 0} if cur.get("group") else None),
                 extra=extra)
             if "error" in r:
@@ -1345,6 +1429,7 @@ def do_wakes(a):
         + (f'resume={_sched_ts(int(j["resume_at"]))} ' if j.get("status") == "parked" and j.get("resume_at") else "")
         + f'{(j.get("message","") or "")[:60]}'
         + (f' error={(j.get("error") or "")[:120]}' if j.get("status") == "failed" and j.get("error") else "")
+        + (f' diff={str(j.get("diff_stat"))[:48]}' if j.get("diff_stat") else "")
         for j in rows) or "(none)"
     return emit(a, "wakes", {"_text": txt})
 
@@ -8192,6 +8277,8 @@ def do_agents(a):
                 except Exception: _sv = -1
                 if _sv < 0 or _sv != _sv: return emit(a, "agents", error=f"bad --stall-s {a.stall_s!r}: seconds, 0 = off (\"\" clears)")
                 updates["stall_s"] = _sv if _sv > 0 else 0
+        if getattr(a, "wake_require_diff", None) is not None:
+            updates["wake_require_diff"] = a.wake_require_diff == "on"
         if "effort" in updates and updates["effort"]:
             _er = next((r for r in rows if r["name"] == a.name), {})
             _eb = updates.get("backend") or _er.get("backend", "claude")
@@ -11415,8 +11502,13 @@ def do_wake(a):
         esc_ms = [m.strip() for m in a.escalate.split(",") if m.strip()]
     if not agent: return emit(a,"wake",error="no agent given",hint="ag wake <agent> <message>")
     if not text: return emit(a,"wake",error="empty message",hint="ag wake <agent> <message>")
-    try: names = [r.get("name") for r in load_agents(sdir)]
-    except Exception: names = []
+    try: _rows = load_agents(sdir); names = [r.get("name") for r in _rows]
+    except Exception: _rows, names = [], []
+    _rd = getattr(a, "require_diff", None)
+    if _rd is None:  # explicit --require-diff/--no-require-diff wins; agent config resolves in launch_wake_chat;
+        _ar = next((r for r in _rows if r.get("name") == agent), None)  # default: ON with --verify on an agent with a worktree
+        if not (_ar and _ar.get("wake_require_diff") is not None):
+            _rd = bool(vcmd) and bool(_ar.get("worktree")) if _ar else False
     if notify and notify not in names:
         return emit(a,"wake",error=f"no such agent: {notify}",hint=_agent_hint(sdir, notify))
     ck, cerr = _cohort_kw(sdir, a)
@@ -11425,6 +11517,7 @@ def do_wake(a):
         return emit(a,"wake",error=cerr,hint=_agent_hint(sdir, parent))
     _wake_payload = [text,notify,on_done,timeout_s,max_runtime_s,stall_s,ck.get("cohort"),vcmd,vtmo]
     if esc_ms is not None: _wake_payload.append(["escalate",esc_ms])
+    if _rd is not None: _wake_payload.append(["require_diff", _rd])
     if notify_done: _wake_payload.append("notify_done")
     if getattr(a,"on",None): _wake_payload.append(["on",a.on])
     if getattr(a,"no_park",False): _wake_payload.append("no_park")
@@ -11476,6 +11569,7 @@ def do_wake(a):
     if getattr(a,"no_park",False): _extra["no_park"] = True
     r = launch_wake_chat(sdir,agent,text,notify=notify,notify_done=notify_done,on_done=on_done,timeout_s=timeout_s,
         max_runtime_s=max_runtime_s,stall_s=stall_s,job_type=getattr(a,"job",None),verify=vcmd,verify_timeout_s=vtmo,escalate=esc_ms,
+        require_diff=_rd,
         extra=(_extra or None),**ck); _rcpt_done(_h, r)
     if "error" in r:
         if r.get("exit") == 2: emit(a,"wake",error=r["error"]); return 2
@@ -20486,7 +20580,7 @@ def build():
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)"); agrm.add_argument("--purge",action="store_true",help="also remove chat log and metadata")
     agrs=ags.add_parser("reset",help="clear stored backend session ids; keep config and chat log"); agrs.add_argument("name")
     agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback when rate-limited: MODEL, or BACKEND/MODEL | BACKEND:MODEL to fail over to another backend on a usage limit (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)')
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback when rate-limited: MODEL, or BACKEND/MODEL | BACKEND:MODEL to fail over to another backend on a usage limit (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)'); ags2.add_argument("--wake-require-diff",dest="wake_require_diff",default=None,choices=["on","off"],help="wake diff gate default for this agent: fail wakes that change nothing in the worktree (on|off; default on with --verify on an agent with a worktree)")
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)
@@ -20538,7 +20632,7 @@ def build():
     cmc=cms.add_parser("config",help="role defaults / per-agent override"); cmc.add_argument("--role",dest="cprole",default=None,choices=["orchestrator","sub"]); cmc.add_argument("--agent",dest="cpagent",default=None); cmc.add_argument("--enable",dest="cpenable",action="store_true",default=None); cmc.add_argument("--disable",dest="cpdisable",action="store_true"); cmc.add_argument("--max-turns",dest="cpmax",type=int,default=None); cmc.add_argument("--tokens",dest="cptokens",type=int,default=None); cmc.add_argument("--keep",dest="cpkeep",type=int,default=None); cmc.add_argument("--timeout",dest="cptimeout",type=int,default=None); cmc.add_argument("--clear",dest="cpclear",action="store_true")
     cmsh=cms.add_parser("show",help="effective settings + stats"); cmsh.add_argument("cpname",nargs="?",default="")
     cmr=cms.add_parser("run",help="manual compaction now"); cmr.add_argument("cpname"); cmr.add_argument("--force",dest="cpforce",action="store_true")
-    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the wake finishes"); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--no-park",dest="no_park",action="store_true",help="on a usage limit with a parsed reset, fail instead of parking for the scheduler tick"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--escalate",dest="escalate",default=None,metavar="MODEL[,MODEL...]",help="needs --verify: on failed verify/turn, the worker retries the same session on each next model (one-turn override, roster unchanged); job gains escalation[]"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); wk.add_argument("--on",default=None,metavar="NODE",help="run once on a relay node")
+    wk=sub.add_parser("wake",help="wake a registered agent in background"); wk.add_argument("agent"); wk.add_argument("message",nargs="*"); wk.add_argument("--notify",default=""); wk.add_argument("--notify-done",dest="notify_done",action="store_true",help="write a notification when the wake finishes"); wk.add_argument("--parent",default=None,help="auto-wake PARENT when its cohort finishes"); wk.add_argument("--group",default=None); wk.add_argument("--quiet",type=float,default=0,help="deliver partial cohort results after S seconds"); wk.add_argument("--job",default=None,choices=JOB_KEYS,help="record job type in the wake job"); wk.add_argument("--on-done",default=""); wk.add_argument("--timeout",type=float,default=0); wk.add_argument("--max-runtime",dest="max_runtime",type=float,default=0,help="hard backend runtime limit in seconds (0=unlimited); starts after guard acquired"); wk.add_argument("--stall-s",dest="stall_s",type=float,default=None,help="stall watchdog seconds for this turn (0 = off; default: agent/AG_STALL_S/backend default)"); wk.add_argument("--request-id",dest="request_id",default=None,help="idempotency key: replay returns the original job (replayed:true)"); wk.add_argument("--force",action="store_true",help="bypass budget limits once (logged)"); wk.add_argument("--no-park",dest="no_park",action="store_true",help="on a usage limit with a parsed reset, fail instead of parking for the scheduler tick"); wk.add_argument("--verify",dest="verify",default=None,metavar="CMD",help="after the wake turn, the worker runs trusted CMD via sh -c in the agent workdir and records {cmd,exit,tail} in the wake job + [verify] row in the chat log (never from the agent's reply)"); wk.add_argument("--escalate",dest="escalate",default=None,metavar="MODEL[,MODEL...]",help="needs --verify: on failed verify/turn, the worker retries the same session on each next model (one-turn override, roster unchanged); job gains escalation[]"); wk.add_argument("--verify-timeout",dest="verify_timeout",type=float,default=600,metavar="S",help="verify command timeout in seconds (default 600)"); wk.add_argument("--require-diff",dest="require_diff",action="store_true",default=None,help="diff gate: after the turn the agent's worktree must have new commits since the wake started or uncommitted changes, else the job fails 'no changes produced' (default on with --verify when the agent has a worktree)"); wk.add_argument("--no-require-diff",dest="require_diff",action="store_false",help="turn the diff gate off (review-only jobs)"); wk.add_argument("--on",default=None,metavar="NODE",help="run once on a relay node")
     ch_=sub.add_parser("channel",help="shared room: @agent mentions wake members, replies post back"); chs=ch_.add_subparsers(dest="csub",required=True)
     chc=chs.add_parser("create"); chc.add_argument("name"); chc.add_argument("--agents",default="",help="comma-separated members")
     chs.add_parser("list"); chs.add_parser("rm").add_argument("name")

@@ -37,6 +37,7 @@ First ag delegation in a project: `{{AG}} route --check --json`; if `configured`
 - Tasks are self-contained: what to do, what done looks like. Agents see only the task + their own history.
 - `agents add|set --dir` = the agent workdir (there is no `--cwd` there). One writer per worktree: parallel writers need `agents add ... --worktree` (state `--dir` must be inside a git repo); a shared dir = agents clobber each other.
 - `--verify "<cmd>"` runs via `sh -c` in the agent's workdir: give test paths relative to it.
+- Verify must see work: `wake --verify` on a worktree agent also requires a diff (new commits or uncommitted changes since the wake started; `--no-require-diff` off, `agents set N --wake-require-diff on|off` pins it); a no-op turn fails `no changes produced` and escalates like a failed verify. Job json carries `base_sha`/`head_sha`/`diff_stat`.
 - `wake` is at-most-once *launch*: verify via `events` + `wakes`; relaunch lost ones with `wakes --reap`.
 - Usage limit hit: not retried; result has `usage_limit: true` + `reset_at`. Configure failover with `agents add|set --fallback BACKEND/MODEL` (e.g. `codex/default`).
 - `chat steer` interrupts the running turn (queued turns keep FIFO order).

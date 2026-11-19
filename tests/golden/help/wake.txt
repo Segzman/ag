@@ -2,7 +2,8 @@ usage: ag wake [-h] [--notify NOTIFY] [--notify-done] [--parent PARENT] [--group
                [--quiet QUIET] [--job {mechanical,implement,review,debug,plan,hardest}]
                [--on-done ON_DONE] [--timeout TIMEOUT] [--max-runtime MAX_RUNTIME]
                [--stall-s STALL_S] [--request-id REQUEST_ID] [--force] [--no-park] [--verify CMD]
-               [--escalate MODEL[,MODEL...]] [--verify-timeout S] [--on NODE]
+               [--escalate MODEL[,MODEL...]] [--verify-timeout S] [--require-diff]
+               [--no-require-diff] [--on NODE]
                agent [message ...]
 
 positional arguments:
@@ -38,4 +39,8 @@ options:
                         on each next model (one-turn override, roster unchanged); job gains
                         escalation[]
   --verify-timeout S    verify command timeout in seconds (default 600)
+  --require-diff        diff gate: after the turn the agent's worktree must have new commits since
+                        the wake started or uncommitted changes, else the job fails 'no changes
+                        produced' (default on with --verify when the agent has a worktree)
+  --no-require-diff     turn the diff gate off (review-only jobs)
   --on NODE             run once on a relay node

@@ -589,6 +589,7 @@ _relay_undelivered_reason
 _relay_who
 _release_agent_turn
 _release_wake_job
+_require_diff
 _retry_plan
 _rj
 _rl_acquire_one
@@ -918,6 +919,8 @@ delegate_task
 detect_harness
 detect_harnesses
 devin_ignore_render
+diff_base
+diff_check
 diff_screen_lines
 disp_model
 do__acp

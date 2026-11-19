@@ -86,7 +86,7 @@ class Delivery(Relay):
         self.assertEqual(d["data"]["undelivered"], [])  # target pulled it; long-running is not undelivered
         self.hbput("muse", backends=["echo"])
         rd = self.root / "results" / "mac"
-        rd.mkdir(parents=True)
+        rd.mkdir(parents=True, exist_ok=True)  # feedback sync already copies peers' feedback.jsonl into results/<node>/
         (rd / "muse--dead--1.json").write_text("{}")
         p, d = self.j(self.o, "relay", "status")
         self.assertEqual(d["data"]["undelivered"], [])

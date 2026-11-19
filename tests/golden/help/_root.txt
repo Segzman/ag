@@ -1,10 +1,10 @@
 usage: ag [-h] [--dir DIR] [--json] [--version]
-          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,budget,policy,setup,link} ...
+          {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,budget,policy,setup,link} ...
 
 CLI helper for autonomous agents
 
 positional arguments:
-  {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,budget,policy,setup,link}
+  {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,budget,policy,setup,link}
     run                 run shell cmd, logged
     read                read file numbered
     write               write file (arg or stdin)
@@ -15,6 +15,8 @@ positional arguments:
     notify              write a notification to the configured inbox
     notes               list memory
     needs               persistent queue of ui dialog requests that timed out (list|answer|done)
+    feedback            report an ag bug (appends to <state>/feedback.jsonl); harvest mines chat
+                        logs + wake jobs for ag failures; report groups by signature
     todo                task list
     history             run log
     approvals           list approval requests

@@ -1,0 +1,14 @@
+usage: ag feedback [-h] [--severity {low,med,high}] [--agent AGENT] [--since SINCE] [--md]
+                   [text ...]
+
+positional arguments:
+  text                  feedback text, or: harvest | report (as the first word, alone or with
+                        flags only)
+
+options:
+  -h, --help            show this help message and exit
+  --severity {low,med,high}
+                        severity for a manual entry (default med)
+  --agent AGENT         agent the entry is attributed to (default $AG_PARENT_AGENT)
+  --since SINCE         harvest window: 1d|7d|30d (default 7d)
+  --md                  report: markdown, pasteable into a plan

@@ -46,6 +46,7 @@ Single-file Python CLI, stdlib only, POSIX. Binary: `{{AG}}`. Delegating to othe
 - `references/models-privacy.md` - `ag models` flags/ranking/openrouter, data-privacy rule + zdr/retain/train table.
 - `references/setup-update.md` - `ag setup` flags and UIs, `ag update`, `ag push`.
 - `references/schedule-relay-tick.md` - global schedule tick install, relay tick/admin, `ratelimit`.
+- `references/feedback.md` - `ag feedback` report/harvest/report, prompt hint opt-out, relay feedback sync.
 - `references/access-budget-link.md` - `access`, `usage`, `budget`, `policy`, VM -> Mac `link`.
 - `references/kit.md` - `kit` status/on/off/list/doctor, `agents set --kit`, scoped MCP + style delivery, worktree index seeding.
 

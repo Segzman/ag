@@ -2581,6 +2581,248 @@ def do_needs(a):
     _needs_save(sdir, rows)
     return emit(a, "needs", {"_text": f"{a.id} {k}", "need": hit})
 
+# ---- ag feedback: users/agents report ag's own bugs; harvest mines local logs for more ----
+# ponytail: one append-only jsonl per state dir (<state>/feedback.jsonl). Signatures are
+# normalized (urls/paths/hex/numbers -> placeholders) so report + harvest dedupe the same
+# failure across agents and days. Relay copies are redacted with the existing secret
+# scanner (REDACT_VALS + _redact_json, the harness-export scanner) before they travel.
+# Ceiling: harvest is regex over local chat logs + wake job records; a user pasting a
+# foreign traceback into a chat can false-positive — entries say origin=harvest, review them.
+FEEDBACK_SENTENCE = 'If ag itself misbehaves (bad flag, crash, wrong state), run: ag feedback "<what happened>"'
+FEEDBACK_SEVERITIES = ("low", "med", "high")
+_FEEDBACK_FLAG_RE = re.compile(r"[Uu]nrecognized (?:arguments|flag)")
+_FEEDBACK_ERROR_RE = re.compile(r"\berror=\S+")
+
+def feedback_path(sdir): return Path(sdir) / "feedback.jsonl"
+
+def feedback_prompt_on():
+    """The one-sentence prompt hint is on unless config feedback.prompt=false (config.json).
+    AG_FEEDBACK_PROMPT=0|1 overrides the config (tests set 0 so exact-prompt assertions stay exact)."""
+    ev = os.environ.get("AG_FEEDBACK_PROMPT", "").strip().lower()
+    if ev in ("0", "off", "no", "false"): return False
+    if ev in ("1", "on", "yes", "true"): return True
+    fb = _ag_conf().get("feedback")
+    return not (isinstance(fb, dict) and fb.get("prompt") is False)
+
+def feedback_node():
+    try:
+        cfg = relay_cfg()
+        if cfg: return cfg["node"]
+    except Exception: pass
+    return _relay_node_name()
+
+def _feedback_origin():
+    """PROVENANCE kind when _origin() exists (P1), else 'unknown' (conservative)."""
+    fn = globals().get("_origin")
+    if callable(fn):
+        try:
+            o = fn()
+            if isinstance(o, dict) and o.get("kind"): return str(o["kind"])
+        except Exception: pass
+    return "unknown"
+
+def feedback_signature(text):
+    """Normalized failure signature: same failure, any agent/day/ids -> same string. Pure."""
+    s = _ANSI_RE.sub("", str(text or "")).lower()
+    s = re.sub(r"https?://\S+", "<url>", s)
+    s = re.sub(r"(?<![\w./])/(?:\S+)", "<path>", s)
+    s = re.sub(r"0x[0-9a-f]+", "<hex>", s)
+    s = re.sub(r"\b[0-9a-f]{8,}\b", "<hex>", s)
+    s = re.sub(r"\d+(?:\.\d+)?", "#", s)
+    return " ".join(s.split())[:160] or "empty"
+
+def _feedback_row(text, severity="med", agent="", origin="unknown", kind="", source="", agents=None):
+    return {"ts": now_iso(), "text": str(text or "")[:2000],
+        "severity": severity if severity in FEEDBACK_SEVERITIES else "med",
+        "agent": agent or "", "node": feedback_node(), "origin": origin, "version": VERSION,
+        "signature": feedback_signature(text),
+        **({"kind": kind} if kind else {}), **({"source": source} if source else {}),
+        **({"agents": agents} if agents else {})}
+
+def _feedback_append(sdir, row):
+    p = feedback_path(sdir); p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as f: f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return row
+
+def _feedback_load(sdir):
+    out = []
+    try:
+        for line in feedback_path(sdir).read_text().splitlines():
+            try:
+                r = json.loads(line)
+                if isinstance(r, dict) and r.get("text"): out.append(r)
+            except ValueError: pass
+    except OSError: pass
+    return out
+
+def _feedback_redact_text(text): return REDACT_VALS.sub("REDACTED", str(text or ""))
+
+def _feedback_redact_row(row):
+    r = json.loads(json.dumps(row))  # deep copy: _redact_json mutates
+    _redact_json(r)
+    if isinstance(r.get("text"), str): r["text"] = _feedback_redact_text(r["text"])
+    return r
+
+def _feedback_epoch(v):
+    if isinstance(v, (int, float)) and v: return float(v)
+    if isinstance(v, str) and v:
+        e = _relay_epoch(v)
+        if e is not None: return float(e)
+        try: return float(v)
+        except ValueError: return None
+    return None
+
+def _feedback_hits(text):
+    """[(kind, evidence line)] for ag-side failures in one text blob. Pure."""
+    t = _ANSI_RE.sub("", str(text or ""))
+    out, seen = [], set()
+    def add(kind, line):
+        line = " ".join(str(line or "").split())[:300]
+        if line and kind not in seen: seen.add(kind); out.append((kind, line))
+    if "Traceback (most recent call last)" in t:
+        exc = list(re.finditer(r"^.*(?:Error|Exception|Exit|Interrupt)\b[^\n]*$", t, re.M))
+        add("traceback", exc[-1].group(0) if exc else "Traceback (most recent call last)")
+    for kind, rx in (("unrecognized-flag", _FEEDBACK_FLAG_RE), ("usage-limit", _USAGE_LIMIT_RE),
+                     ("stall", _STALL_RE), ("error-field", _FEEDBACK_ERROR_RE)):
+        m = rx.search(t)
+        if m:
+            ls = t.rfind("\n", 0, m.start()) + 1; le = t.find("\n", m.end())
+            add(kind, t[ls:le if le >= 0 else None])
+    return out
+
+def _feedback_harvest_candidates(sdir, cutoff):
+    """Yield (agent, kind, evidence) from chat logs + wake job records at/after cutoff (epoch|None)."""
+    cdir = Path(sdir) / "chats"
+    if cdir.is_dir():
+        for f in sorted(cdir.glob("*.jsonl")):
+            try: lines = f.read_text(errors="replace").splitlines()
+            except OSError: continue
+            for ln in lines:
+                try: r = json.loads(ln)
+                except ValueError: r = None
+                if isinstance(r, dict):
+                    if r.get("role") == "user": continue  # the user's own pasted text is not an ag failure
+                    ep = _feedback_epoch(r.get("ts"))
+                    if cutoff and ep is not None and ep < cutoff: continue
+                    text = str(r.get("text") or "")
+                else: text = ln
+                for kind, line in _feedback_hits(text): yield (f.stem, kind, line)
+    jdir = Path(sdir) / "wake" / "jobs"
+    if jdir.is_dir():
+        for f in sorted(jdir.glob("*.json")):
+            try: j = json.loads(f.read_text())
+            except Exception: continue
+            if not isinstance(j, dict): continue
+            ep = _feedback_epoch(j.get("ended_at") or j.get("started_at") or j.get("created_at") or j.get("ts"))
+            if cutoff and ep is not None and ep < cutoff: continue
+            agent = str(j.get("agent") or "")
+            err = str(j.get("error") or "").strip()
+            if j.get("stalled"): yield (agent, "stall", f"stalled: no output for 0s (wake job {j.get('id') or f.stem}, status {j.get('status') or '?'})")
+            if err:
+                hits = _feedback_hits(err)
+                for kind, line in hits: yield (agent, kind, line)
+                if j.get("status") == "failed" and not hits: yield (agent, "error-field", f"error={err}")
+
+def _feedback_groups(rows):
+    """signature -> {count, first, last, agents(set), example(row)} preserving first-seen order."""
+    g = {}
+    for r in rows:
+        sig = r.get("signature") or feedback_signature(r.get("text") or "")
+        e = g.setdefault(sig, {"signature": sig, "count": 0, "first": r.get("ts") or "", "last": r.get("ts") or "",
+            "agents": set(), "example": r})
+        e["count"] += 1
+        if r.get("ts"):
+            if not e["first"] or r["ts"] < e["first"]: e["first"] = r["ts"]
+            if r["ts"] > e["last"]: e["last"] = r["ts"]
+        if r.get("agent"): e["agents"].add(str(r["agent"]))
+        for x in (r.get("agents") or []): e["agents"].add(str(x))
+    return sorted(g.values(), key=lambda e: (-e["count"], e["first"]))
+
+def do_feedback(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    words = list(getattr(a, "text", None) or [])
+    sub = ""
+    if words and words[0] in ("harvest", "report") and all(w.startswith("-") for w in words[1:]):
+        sub, words = words[0], words[1:]
+    if sub == "harvest":
+        try: cutoff = _usage_parse_since(getattr(a, "since", None) or "7d")
+        except ValueError as e: return emit(a, "feedback", error=str(e))
+        have = {r.get("signature") or feedback_signature(r.get("text") or "") for r in _feedback_load(sdir)}
+        agg = {}
+        for agent, kind, line in _feedback_harvest_candidates(sdir, cutoff):
+            line = _feedback_redact_text(line)
+            sig = feedback_signature(line)
+            e = agg.setdefault(sig, {"kind": kind, "line": line, "agents": set(), "count": 0})
+            e["count"] += 1
+            if agent: e["agents"].add(agent)
+        added = []
+        for sig, e in agg.items():
+            if sig in have: continue
+            row = _feedback_row(e["line"], severity="med", agent=sorted(e["agents"])[0] if e["agents"] else "",
+                origin="harvest", kind=e["kind"], source="harvest", agents=sorted(e["agents"]))
+            row["count"] = e["count"]
+            added.append(_feedback_append(sdir, row))
+        return emit(a, "feedback", {"_text": f"harvested {len(added)} new feedback signature(s) "
+            f"({sum(e['count'] for e in agg.values())} hit(s), {len(agg) - len(added)} already known)",
+            "added": len(added), "signatures": [r["signature"] for r in added], "file": str(feedback_path(sdir))})
+    if sub == "report":
+        rows = _feedback_load(sdir)
+        groups = [{**e, "agents": sorted(e["agents"]), "example_text": (e["example"].get("text") or "")[:300]} for e in _feedback_groups(rows)]
+        if getattr(a, "md", False):
+            lines = ["## ag feedback report", "", f"{len(rows)} {'entry' if len(rows) == 1 else 'entries'}, {len(groups)} signature(s).", ""]
+            for e in groups:
+                lines += [f"### {e['signature']}", "",
+                    f"- count: {e['count']}; first: {e['first'] or '-'}; last: {e['last'] or '-'}; "
+                    f"agents: {', '.join(e['agents']) or '-'}",
+                    f"- example: {e['example_text']}", ""]
+            return emit(a, "feedback", {"_text": "\n".join(lines).rstrip(), "groups": groups, "total": len(rows)})
+        txt = "\n".join(f"{e['count']}x  {e['first'] or '-'} .. {e['last'] or '-'}  "
+            f"[{', '.join(e['agents']) or '-'}]  {e['signature']}" for e in groups) or "no feedback yet"
+        return emit(a, "feedback", {"_text": txt, "groups": groups, "total": len(rows)})
+    text = " ".join(words).strip()
+    if not text: return emit(a, "feedback", error="no feedback text", hint='ag feedback "what happened" | ag feedback harvest | ag feedback report [--md]')
+    agent = getattr(a, "agent", None) or os.environ.get("AG_PARENT_AGENT") or ""
+    row = _feedback_append(sdir, _feedback_row(text, severity=getattr(a, "severity", None) or "med",
+        agent=agent, origin=_feedback_origin()))
+    return emit(a, "feedback", {"_text": f"feedback recorded ({row['signature']})", "feedback": row, "file": str(feedback_path(sdir))})
+
+def _relay_feedback(cfg, root, now, out, errs):
+    """Publish this node's feedback.jsonl (redacted) to feedback/<node>.jsonl, and copy every
+    remote node's published file into results/<node>/feedback.jsonl (redacted again on copy)."""
+    node = cfg["node"]
+    dirs, seen = [], set()
+    for x in [str(_relay_state(cfg))] + _sched_reg_get():
+        try: d = Path(x).expanduser().resolve()
+        except Exception: continue
+        if d not in seen: seen.add(d); dirs.append(d)
+    rows, have = [], set()
+    for d in dirs:
+        for r in _feedback_load(d):
+            sig = (r.get("ts") or "") + "|" + (r.get("signature") or feedback_signature(r.get("text") or ""))
+            if sig not in have: have.add(sig); rows.append(_feedback_redact_row(r))
+    try:
+        fdir = root / "feedback"; fdir.mkdir(parents=True, exist_ok=True)
+        _atomic_write(fdir / f"{node}.jsonl", "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    except OSError as e: errs.append(f"feedback publish: {e}")
+    fdir = root / "feedback"
+    if not fdir.is_dir(): return
+    for f in sorted(fdir.glob("*.jsonl")):
+        if f.stem == node: continue
+        try: lines = f.read_text(errors="replace").splitlines()
+        except OSError as e: errs.append(f"feedback {f.name}: {e}"); continue
+        red = []
+        for ln in lines:
+            if not ln.strip(): continue
+            try: r = json.loads(ln)
+            except ValueError: r = {"text": ln}
+            if isinstance(r, dict): red.append(json.dumps(_feedback_redact_row(r), ensure_ascii=False))
+        try:
+            dest = root / "results" / f.stem / "feedback.jsonl"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(dest, "".join(x + "\n" for x in red))
+            out.setdefault("feedback", []).append(f.stem)
+        except OSError as e: errs.append(f"feedback {f.name}: {e}")
+
 # ---- ag browser: per-agent isolated Chrome over CDP (stdlib RFC 6455 client, no deps) ----
 class BrowserError(Exception):
     def __init__(self, msg, hint=None): super().__init__(msg); self.hint = hint
@@ -10580,6 +10822,7 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs, kit=None):
     if backend in RTK_NOHOOK and not command and rtk_on() and "rtk" in _kit["tools"]:
         sys_txt = (sys_txt + "\n\n" + RTK_HINT) if sys_txt else RTK_HINT
     if not command and secret_enabled(): sys_txt = (sys_txt + "\n\n" + SECRET_HINT) if sys_txt else SECRET_HINT
+    if not command and feedback_prompt_on(): sys_txt = (sys_txt + "\n\n" + FEEDBACK_SENTENCE) if sys_txt else FEEDBACK_SENTENCE
     if sys_txt and backend not in ("claude","codex") and not sid and not command:
         # backends without a native system flag: lead the first turn with the role block
         prompt = f'[system role: {a.get("persona") or "custom"}]\n{sys_txt}\n\n---\n{prompt}'
@@ -12107,6 +12350,9 @@ def _api_turn(sdir, name, text, on_event=None, command=None, on_start=None, time
                 _prof = (a.get("profile") or "").strip()
                 _px = profile_system_extra(sdir, _prof) if _prof else ""
                 if _px: sys_txt = ((sys_txt + "\n\n---\nprofile context ---\n" + _px) if sys_txt else _px)[:20000]
+            except Exception: pass
+            try:
+                if feedback_prompt_on(): sys_txt = ((sys_txt + "\n\n" + FEEDBACK_SENTENCE) if (sys_txt or "").strip() else FEEDBACK_SENTENCE)
             except Exception: pass
             hist = api_history_rows(sdir, name, api_budget())
             msgs = []
@@ -13740,7 +13986,7 @@ def relay_sync(cfg, now=None):
     heartbeat, git push. Returns {"pulled", "materialized", "removed", "reported", "ingested", "pushed", "error"}.
     Never raises."""
     now = time.time() if now is None else float(now)
-    out = {"pulled": False, "materialized": [], "removed": [], "reported": [], "ingested": [], "admin": [], "pushed": False, "error": None}
+    out = {"pulled": False, "materialized": [], "removed": [], "reported": [], "ingested": [], "admin": [], "feedback": [], "pushed": False, "error": None}
     errs = []
     lk = _relay_git_lock(cfg)
     try:
@@ -13748,6 +13994,8 @@ def relay_sync(cfg, now=None):
             root = relay_root(cfg)
             _relay_materialize(cfg, root, now, out, errs)
             _relay_inbox_log(cfg, root, now, errs)
+            try: _relay_feedback(cfg, root, now, out, errs)
+            except Exception as e: errs.append(f"feedback: {type(e).__name__}: {str(e)[:100]}")  # must not skip report/admin/ingest
             _relay_report(cfg, root, now, out, errs)
             _relay_admin(cfg, root, now, out, errs)
             _relay_ingest(cfg, root, now, out, errs)
@@ -22364,6 +22612,12 @@ def build():
     nns.add_parser("list",help="open items, newest first")
     nn=nns.add_parser("answer",help="record the user's answer for a queued item"); nn.add_argument("id"); nn.add_argument("value",nargs="+")
     nn=nns.add_parser("done",help="close a queued item"); nn.add_argument("id")
+    fb = sub.add_parser("feedback",help="report an ag bug (appends to <state>/feedback.jsonl); harvest mines chat logs + wake jobs for ag failures; report groups by signature")
+    fb.add_argument("text",nargs="*",help='feedback text, or: harvest | report (as the first word, alone or with flags only)')
+    fb.add_argument("--severity",default="med",choices=["low","med","high"],help="severity for a manual entry (default med)")
+    fb.add_argument("--agent",default=None,help="agent the entry is attributed to (default $AG_PARENT_AGENT)")
+    fb.add_argument("--since",default=None,help="harvest window: 1d|7d|30d (default 7d)")
+    fb.add_argument("--md",action="store_true",help="report: markdown, pasteable into a plan")
     t = sub.add_parser("todo",help="task list"); ts=t.add_subparsers(dest="sub",required=True)
     ta=ts.add_parser("add"); ta.add_argument("text",nargs="*")
     tl=ts.add_parser("list"); tl.add_argument("--all",action="store_true")
@@ -23313,7 +23567,7 @@ def main(argv=None):
     # strip leading -- from run/spawn
     if a.subcmd in ("run","spawn") and getattr(a,"cmd",None) and a.cmd[0]=="--": a.cmd=a.cmd[1:]
     fn = {"run":do_run,"read":do_read,"write":do_write,"edit":do_edit,"ls":do_ls,
-        "grep":do_grep,"note":do_note,"notify":do_notify,"notes":do_notes,"needs":do_needs,"todo":do_todo,"history":do_history,
+        "grep":do_grep,"note":do_note,"notify":do_notify,"notes":do_notes,"needs":do_needs,"feedback":do_feedback,"todo":do_todo,"history":do_history,
         "approvals":do_approvals,"approve":do_approve,"shell":do_shell,"selfcheck":do_selfcheck,
         "spawn":do_spawn,"send":do_send,"snap":do_snap,"sessions":do_sessions,
         "kill":do_kill,"wait":do_wait,"events":do_events,"_daemon":do_daemon,

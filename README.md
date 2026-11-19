@@ -163,6 +163,22 @@ ag grant --deny ID                 # reject without a popup
 - Tests/CI: `AG_AUTH_HELPER=PATH` (program run with the reason as argv[1]; exit 0 approves) and `AG_HUMAN_GATE=off` (plain environments only).
 - Later: a FIDO2/passkey assertion (WebAuthn via a platform authenticator or a YubiKey, verified against a registered public key) could replace the LocalAuthentication helper so approval also works from an SSH/remote session; the `human_confirm(action, details) -> bool` seam is the only place that changes.
 
+## Feedback (`ag feedback`)
+
+ag improves itself from what happens in chats: users and agents report ag's own bugs into one append-only log, `<state>/feedback.jsonl`.
+
+```sh
+ag feedback "wake crashed on --bogus flag" [--severity low|med|high] [--agent NAME]   # append one entry
+ag feedback harvest [--since 7d]                                                     # mine chat logs + wake jobs for ag failures
+ag feedback report [--md]                                                            # group by signature (counts, first/last, agents)
+```
+
+- A manual entry records `ts`, `text`, `severity` (default `med`), `agent` (or `$AG_PARENT_AGENT`), `node` (relay node, else hostname), `origin` (`human|agent|schedule|relay` when provenance `_origin()` is implemented, else `unknown`), `version` (ag VERSION) and a normalized `signature` (urls/paths/hex/numbers folded away, so the same failure dedupes across agents and days).
+- Every wake/chat system prompt carries one sentence — `If ag itself misbehaves (bad flag, crash, wrong state), run: ag feedback "<what happened>"` — unless disabled with `"feedback": {"prompt": false}` in `config.json` (`feedback.prompt=false`).
+- `harvest` scans chat logs (skipping `user` rows) and wake job records for ag-side failures — tracebacks, `Unrecognized flag`/arguments, usage-limit failures, stalls, `error=` fields — dedupes by signature against everything already in the log, and appends new entries with `origin: "harvest"`, a `kind`, a hit `count` and the example `agents`.
+- `report` groups all entries by signature with counts, first/last seen and example agents; `--md` prints a markdown version pasteable into a plan.
+- Relay: `relay sync` publishes this node's `feedback.jsonl` (redacted) to `feedback/<node>.jsonl` in the mailbox and copies every remote node's file into `results/<node>/feedback.jsonl`, redacted with the existing secret scanner (`REDACT_VALS` + key redaction) so keys pasted into a crash dump never travel.
+
 ## Browser (`ag browser`)
 
 Per-agent isolated Chrome driven over the DevTools Protocol. Each NAME gets its own profile under `<state>/browser/NAME/` (cookies and logins persist across `open`), headless unless `--headed`.

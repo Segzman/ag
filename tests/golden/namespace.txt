@@ -41,6 +41,8 @@ EFFORT_OPTS
 EFFORT_ORDER
 ENV_DENY
 ENV_SECRET_RE
+FEEDBACK_SENTENCE
+FEEDBACK_SEVERITIES
 G
 GATED_ACTIONS
 GATE_AGENT_ENV
@@ -231,6 +233,8 @@ _CTX_LIMIT_RE
 _CTX_OVERFLOW_RE
 _CURSOR_MODE
 _ENV_KEY_RE
+_FEEDBACK_ERROR_RE
+_FEEDBACK_FLAG_RE
 _FORK_SECRET_ENV
 _GATE
 _GEM
@@ -414,6 +418,16 @@ _event_text
 _event_types
 _event_wake_key
 _fb_split
+_feedback_append
+_feedback_epoch
+_feedback_groups
+_feedback_harvest_candidates
+_feedback_hits
+_feedback_load
+_feedback_origin
+_feedback_redact_row
+_feedback_redact_text
+_feedback_row
 _first_json_obj
 _fmt_cost
 _fmt_ctx
@@ -610,6 +624,7 @@ _relay_env
 _relay_epoch
 _relay_error_tail
 _relay_errs_join
+_relay_feedback
 _relay_finish_rebase
 _relay_git
 _relay_git_lock
@@ -1044,6 +1059,7 @@ do_daemon
 do_delegate
 do_edit
 do_events
+do_feedback
 do_forget
 do_grant
 do_grep
@@ -1116,6 +1132,10 @@ escape_changes
 escape_message
 escape_snapshot
 factory_policy_render
+feedback_node
+feedback_path
+feedback_prompt_on
+feedback_signature
 foot_text
 friendly_model
 gate_check

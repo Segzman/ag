@@ -19,6 +19,8 @@ def _ag_isolated_state(tmp_path, monkeypatch):
     monkeypatch.setenv("AG_KIT", "none")
     # real opencode 2.x on the box: ag would exec `opencode --version` (extra fake-binary call) and switch argv shape
     monkeypatch.setenv("AG_OPENCODE_MAJOR", "1")
+    # the feedback one-liner would be appended to every system prompt; test_ag_feedback.py turns it back on
+    monkeypatch.setenv("AG_FEEDBACK_PROMPT", "0")
     # No test may reach osascript / Notification Center or a real ag-auth popup: ui_run() execs AG_UI_CMD instead
     # of osascript, and AG_AUTH_HELPER (honoured outside agent envs) is a deny-stub. Tests that need a log set their own.
     noop = tmp_path / "noop-ui"; noop.write_text("#!/bin/sh\nexit 0\n"); noop.chmod(0o755)

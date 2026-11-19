@@ -3912,7 +3912,7 @@ KIT_STYLE_DEFAULT = """# Token-saving working style
 - Build discipline (ponytail): lazy senior developer - efficient, not careless. Reuse first (existing helper, stdlib, platform feature, installed dependency), then the least code that works. No unrequested abstractions or dependencies; deletion over addition. Bug fix = root cause; check callers of what you touch. Non-trivial logic leaves one runnable check."""
 
 def kit_config_default():
-    v = (_ag_conf().get("kit") or {}).get("default")
+    v = os.environ.get("AG_KIT") or (_ag_conf().get("kit") or {}).get("default")  # AG_KIT: env override (tests set none)
     if isinstance(v, list): v = ",".join(str(x) for x in v)
     return (str(v or "").strip().lower()) or "all"
 

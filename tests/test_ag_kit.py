@@ -25,6 +25,7 @@ class Env(unittest.TestCase):
         self.env = dict(os.environ, AG_HOME=str(self.home), AG_CONFIG_HOME=str(self.cfg),
             AG_CACHE_HOME=str(self.cache), AG_AUTO_UPDATE="0", AG_KIT_WT="fg",
             PATH=f"{self.bin}:/usr/bin:/bin:/usr/sbin:/sbin")
+        self.env.pop("AG_KIT", None)  # conftest sets none; these tests exercise the real default
         self.addCleanup(shutil.rmtree, self.td, True)
 
     # -- helpers -------------------------------------------------------------

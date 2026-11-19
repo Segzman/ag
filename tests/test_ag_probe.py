@@ -35,7 +35,7 @@ class Base(unittest.TestCase):
         self.bin = self.td / "bin"; self.bin.mkdir()
         self.state = self.td / ".agent"
         self.env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", FAKE_DIR=str(self.td), AG_AUTO_UPDATE="0",
-                        AG_HOME=str(self.td / "home"), AG_CACHE_HOME=str(self.td / "cache"), AG_RETRY="1")
+                        AG_HOME=str(self.td / "home"), AG_CACHE_HOME=str(self.td / "cache"), AG_RETRY="1", AG_PROBE="1")  # conftest sets 0
         (self.td / "home").mkdir()
 
     def fake(self, name, body):

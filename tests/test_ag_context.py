@@ -149,7 +149,7 @@ def test_command_untouched():
     proj = mkproj()
     (proj / "custom.md").write_text("# CMDRULES\n")
     (st / "agents.json").write_text(json.dumps(
-        [dict(echo_agent("o", proj), backend="opencode",
+        [dict(echo_agent("o", proj), backend="opencode", data="public",  # muse-spark trains: work-data policy blocks it
               model="opencode/muse-spark-1.3-contributor-free")]))
     assign(st, "o", scope="")
     seen = {}
@@ -497,7 +497,7 @@ def test_resumed_sid_refresh_stubbed():
     proj = mkproj()
     (proj / "custom.md").write_text("# V1\n")
     (st / "agents.json").write_text(json.dumps(
-        [dict(echo_agent("o", proj), backend="opencode",
+        [dict(echo_agent("o", proj), backend="opencode", data="public",  # muse-spark trains: work-data policy blocks it
               model="opencode/muse-spark-1.3-contributor-free")]))
     assign(st, "o", scope="", task="T")
     # seed a resumed native session id, as a prior opencode turn would leave

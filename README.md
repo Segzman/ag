@@ -731,6 +731,8 @@ The style block comes from the toksave section of `~/.claude/AGENTS.md` (between
 
 Worktrees: `agents add|set|fork --worktree` seeds the new worktree's code index in the background — copy the main checkout's `.codegraph/` + `codegraph sync <wt>`, or `codegraph init` when there is no index (repo under 50k files); never blocks launch. `AG_KIT_WT=fg` runs it in the foreground for debugging.
 
+`AG_KIT=none|all|LIST` overrides the config default for one process (the test suite sets `none` so the style block never leaks into exact-prompt assertions).
+
 Ledger: every finished turn is tagged `kit=on|off` plus the tools used (usage ledger row and the `chat` event), so token savings can be A/B-tested later.
 
 ## Roles

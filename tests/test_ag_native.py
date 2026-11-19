@@ -172,7 +172,7 @@ def test_handoff_has_no_bypass_flags():
     check("handoff-echo-err", not ok and "no native" in txt, txt)
 
 def test_backend_opts_stable():
-    check("backend-opts", ag.tui_backend_opts() == ["claude", "opencode", "gemini", "codex", "cursor", "echo"])
+    check("backend-opts", ag.tui_backend_opts() == ["claude", "opencode", "gemini", "codex", "cursor", "echo", "api"])
 
 def test_opencode_v2_argv(monkeypatch):
     monkeypatch.setenv("AG_OPENCODE_MAJOR", "2")

@@ -282,6 +282,9 @@ class ApiT(unittest.TestCase):
 
     def test_api_validate_privacy_access(self):
         ag = load_ag()
+        # in-process api_validate must see this test's providers, not the machine's
+        self.addCleanup(os.environ.update, {k: os.environ.get(k, "") for k in ("AG_HOME", "AG_CONFIG_HOME")})
+        os.environ.update(AG_HOME=self.env["AG_HOME"], AG_CONFIG_HOME=self.env["AG_CONFIG_HOME"])
         self.assertIn("PROVIDER/MODEL", ag.api_validate("api", "default") or "")
         self.assertIn("no such provider", ag.api_validate("api", "nosuch/x") or "")
         self.assertIsNone(ag.api_validate("api", "groq/llama-test"))

@@ -258,7 +258,7 @@ def test_no_recursion():
     check("no-run-turn-recursion", calls == [], calls)
 
 def test_command_untouched():
-    st = fresh_state([dict(echo_agent("o"), backend="opencode",
+    st = fresh_state([dict(echo_agent("o"), backend="opencode", data="public",  # muse-spark trains: work-data policy blocks it
                            model="opencode/muse-spark-1.3-contributor-free")])
     enable(st)
     seen = {}

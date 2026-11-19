@@ -1,8 +1,9 @@
-usage: ag stop [-h] [--cascade] agent
+usage: ag stop [-h] [--cascade] [--all-wakes] agent
 
 positional arguments:
   agent
 
 options:
-  -h, --help  show this help message and exit
-  --cascade   also stop agents whose jobs record parent == agent
+  -h, --help   show this help message and exit
+  --cascade    also stop agents whose jobs record parent == agent
+  --all-wakes  also cancel parked wakes (auto-resume jobs), not just queued/running

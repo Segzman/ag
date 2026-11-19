@@ -28,8 +28,9 @@ Last child done -> ONE wake to `--parent` with all summaries (automated tool res
 
 ```sh
 {{AG}} --dir <state> queue w [--cancel ID | --hold | --release]   # waiting turns; hold = no new turn starts
-{{AG}} --dir <state> stop w [--cascade]       # hold + cancel waiters + interrupt turn + cancel wakes (+ children)
-{{AG}} --dir <state> chat steer w "new instruction"   # interrupt, run this next on same session
+{{AG}} --dir <state> stop w [--cascade] [--all-wakes]   # hold + cancel waiters + interrupt turn + cancel wakes (+ parked wakes with --all-wakes)
+{{AG}} --dir <state> chat stop w        # alias of `stop w` (same flags)
+{{AG}} --dir <state> chat steer w "new instruction" [--timeout 30]   # interrupt, run this next on same session
 ```
 
-Interrupted turns exit 130, keep partial reply, never retried. `stop` leaves HOLD: `queue w --release` to resume. FIFO within priority; steer jumps ahead.
+Interrupted turns exit 130, keep partial reply, never retried. `stop` leaves HOLD: `queue w --release` to resume. FIFO within priority; steer jumps ahead. Steer never hangs: `--timeout S` (default 30) budgets the queue/FIFO/HOLD/guard wait AND the follow-up turn together; an expired wait exits with `queue wait ... timed out` (then `stop` the stuck agent). Steer on an idle agent does not start a turn: it says `no running turn to steer` and exits 1 - use `chat send`. `ag chat stop NAME` is the same as `ag stop NAME`.

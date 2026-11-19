@@ -407,14 +407,15 @@ Sends the SAME self-contained task to 2+ agents in parallel (one `run_turn` per 
 ag queue w [--json]                  # waiting turns in run order: position, id, prio, source, pid, text
 ag queue w --cancel ID               # drop one waiter (its process exits: "cancelled from queue")
 ag queue w --hold | --release        # HOLD: no new turn starts; waiters keep waiting
-ag stop w [--cascade]                # hold + cancel waiters + interrupt running turn + cancel wakes
-ag chat steer w "text" [--json]      # interrupt running turn, run this next on the same session
+ag stop w [--cascade] [--all-wakes]  # hold + cancel waiters + interrupt running turn + cancel wakes (--all-wakes also cancels parked auto-resume wakes)
+ag chat stop w [--cascade] [--all-wakes]   # alias of ag stop w
+ag chat steer w "text" [--json]      # interrupt running turn, run this next on the same session (--timeout S, default 30; idle agent = error)
 ```
 
 - Every turn (chat/delegate/wake) takes a ticket `queue/<agent>/<prio>-<seq>-<id>.json` and starts only when it is the lowest live ticket and the flock is free: FIFO within priority, steer (`0`) before normal (`5`). Dead-pid tickets are reaped. `status`/`agents list --json` show depth.
 - Interrupted turns (`stop`, `steer`) exit 130, keep their partial reply in the log, are marked `interrupted` (wake job `failed`/`interrupted`) and never retried.
-- `stop` leaves HOLD in place (`ag queue w --release`). `--cascade` also stops agents whose active wake jobs, tickets or running turn record `parent == w`. Python: `agent_stop(sdir, name, cascade=False)`.
-- Steer text sent to the model: `[steer] user interrupted the previous turn; new instruction: <text>`; on an idle agent it is a plain priority-0 turn.
+- `stop` leaves HOLD in place (`ag queue w --release`). `--cascade` also stops agents whose active wake jobs, tickets or running turn record `parent == w`. `--all-wakes` extends the cancelled wakes from queued/running to include parked (usage-limit auto-resume) jobs. `ag chat stop w` is the same command (the guessed form works). Python: `agent_stop(sdir, name, cascade=False, all_wakes=False)`.
+- Steer text sent to the model: `[steer] user interrupted the previous turn; new instruction: <text>`. On an idle agent steer does NOT start a turn — it says `no running turn to steer` and exits 1 (use `chat send`). `chat steer --timeout S` (default 30) is a hard budget for the whole steer: the queue/FIFO/HOLD/guard wait gives up with `queue wait for <agent> timed out` (never blocks forever), and the follow-up turn gets the remaining budget. `--timeout 0` = unlimited.
 
 ## Channels
 

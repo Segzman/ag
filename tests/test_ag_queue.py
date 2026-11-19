@@ -94,14 +94,19 @@ class QueueTest(unittest.TestCase):
         self.assertEqual([l.split()[1] for l in self.launches()], ["MSG-A", "MSG-B", "MSG-C"])
 
     def test_priority_jumps_queue(self):
+        p = self.bg("chat", "send", "q", "SLOW-1")  # a running turn: steer on an idle agent now just errors
+        self.wait(self.running)
         self.ag("queue", "q", "--hold")
         a = self.bg("chat", "send", "q", "MSG-A"); self.wait(lambda: len(self.tickets()) == 1)
         b = self.bg("chat", "send", "q", "MSG-B"); self.wait(lambda: len(self.tickets()) == 2)
         s = self.bg("chat", "steer", "q", "MSG-S"); self.wait(lambda: len(self.tickets()) == 3)
-        self.assertEqual(self.tickets()[0]["text"], "MSG-S")
+        self.assertIn("MSG-S", self.tickets()[0]["text"])  # steer text carries the [steer] prefix
         self.ag("queue", "q", "--release")
-        for p in (a, b, s): self.assertEqual(self.finish(p)[0], 0)
-        self.assertEqual([l.split()[1] for l in self.launches()], ["MSG-S", "MSG-A", "MSG-B"])
+        for x in (p, a, b, s): self.finish(x)
+        ls = self.launches()
+        self.assertIn("SLOW-1", ls[0])
+        self.assertIn("new instruction: MSG-S", ls[1])
+        self.assertEqual([l.split()[1] for l in ls[2:]], ["MSG-A", "MSG-B"])
 
     def test_cancel_waiter(self):
         self.ag("queue", "q", "--hold")

@@ -21,11 +21,11 @@ First ag delegation in a project: `{{AG}} route --check --json`; if `configured`
 {{AG}} --dir <state> chat send w "<self-contained task>" --job implement
 {{AG}} --dir <state> chat send w "<task>" --verify "<cmd>" --escalate m2,m3   # check the work, climb models on fail
 {{AG}} --dir <state> chat log w --last                                  # final reply, raw text; chat diff = turn patch
-{{AG}} --dir <state> chat steer w "new instruction"                     # interrupts the running turn, runs next
+{{AG}} --dir <state> chat steer w "new instruction"                     # interrupts the running turn, runs next (--timeout 30 bounds the whole steer)
 {{AG}} --dir <state> wake w "<task>" --max-runtime 900 [--request-id K]  # background, returns now
 {{AG}} --dir <state> wakes --wait <job> --timeout 60                    # block: exit 0 ok, 1 failed, 124 timeout
 {{AG}} --dir <state> crosscheck a b "<task>" [--judge j]                # second opinion, AGREE/DISAGREE
-{{AG}} --dir <state> stop w [--cascade]                                 # hold + cancel + interrupt; queue w --release resumes
+{{AG}} --dir <state> stop w [--cascade] [--all-wakes]                   # hold + cancel + interrupt; chat stop w = same; queue w --release resumes
 {{AG}} --dir <state> agents set w --fallback codex/default              # failover on usage limit; primary retried after reset
 {{AG}} --dir <state> channel post room "@a review, then @b ship"        # shared room hand-off chain
 {{AG}} --dir <state> schedule add w --every 15m "msg"                   # recurring; needs global tick (ag-cli reference)
@@ -40,7 +40,7 @@ First ag delegation in a project: `{{AG}} route --check --json`; if `configured`
 - Verify must see work: `wake --verify` on a worktree agent also requires a diff (new commits or uncommitted changes since the wake started; `--no-require-diff` off, `agents set N --wake-require-diff on|off` pins it); a no-op turn fails `no changes produced` and escalates like a failed verify. Job json carries `base_sha`/`head_sha`/`diff_stat`.
 - `wake` is at-most-once *launch*: verify via `events` + `wakes`; relaunch lost ones with `wakes --reap`.
 - Usage limit hit: not retried; result has `usage_limit: true` + `reset_at`. Configure failover with `agents add|set --fallback BACKEND/MODEL` (e.g. `codex/default`).
-- `chat steer` interrupts the running turn (queued turns keep FIFO order).
+- `chat steer` interrupts the running turn (queued turns keep FIFO order). Idle agent: steer says so and exits - use `chat send`. A stuck-looking agent: `ag stop NAME` (or `ag chat stop NAME`), then `ag queue NAME --release`.
 - Wait with `wakes --wait` or `events --follow --exit-on-match`, never shell polling loops.
 - Agent self-reports lie: use `--verify "<cmd>"` with a real check; review `chat diff` before accepting.
 - Prefer `--mode ro` for review/plan jobs; never `full` unless asked. Child mode cannot exceed the parent's.

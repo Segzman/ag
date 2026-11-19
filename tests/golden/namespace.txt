@@ -54,6 +54,9 @@ KEYCHAIN_NAME_RE
 KEYCHAIN_SERVICE
 KEYS
 KEYS_HELP
+KIT_STYLE_CAP
+KIT_STYLE_DEFAULT
+KIT_TOOLS
 LOCAL_PROVIDERS
 MAX_OUT
 MODELS
@@ -349,6 +352,7 @@ _compact_path
 _compact_prompt
 _compact_state_str
 _copy_missing
+_count_files
 _crosscheck_canon
 _ctx_assign_path
 _ctx_assignment_text
@@ -407,6 +411,7 @@ _keys_security_bin
 _kill_active_backend
 _kill_backend_group
 _kill_tree
+_kit_worktree_index
 _lift_trailing_dir
 _link_ak
 _link_auto_ports
@@ -958,6 +963,7 @@ do_hosts
 do_keys
 do_keys_new
 do_kill
+do_kit
 do_link
 do_ls
 do_models
@@ -1005,6 +1011,7 @@ eff_system
 effort_for_turn
 emit
 ensure_effective_profile
+ensure_kit_scope
 ensure_state
 env_apply
 env_check
@@ -1039,6 +1046,16 @@ keychain_set
 keys_selfcheck
 kilo_policy_render
 kiro_policy_render
+kit_config_default
+kit_effective
+kit_installed
+kit_mcp_entries
+kit_parse_spec
+kit_reach
+kit_save_default
+kit_scope_dir
+kit_style_preloaded
+kit_style_text
 launch_wake_chat
 live_session_count
 load_agents

@@ -6,5 +6,6 @@ positional arguments:
 
 options:
   -h, --help         show this help message and exit
-  --timeout TIMEOUT
+  --timeout TIMEOUT  hard budget in seconds for the whole steer: queue/FIFO wait + the follow-up
+                     turn (0=unlimited, default 30); steer on an idle agent just says so
   --force            bypass budget limits once (logged)

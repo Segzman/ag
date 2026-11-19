@@ -1,0 +1,9 @@
+usage: ag chat stop [-h] [--cascade] [--all-wakes] name
+
+positional arguments:
+  name
+
+options:
+  -h, --help   show this help message and exit
+  --cascade    also stop agents whose jobs record parent == name
+  --all-wakes  also cancel parked wakes

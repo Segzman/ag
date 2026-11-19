@@ -99,6 +99,7 @@ Path
 QUEUE_PRIO_NORMAL
 QUEUE_PRIO_STEER
 QueueCancelled
+QueueTimeout
 REAP_NOTE
 REDACT_KEYS
 REDACT_VALS
@@ -646,6 +647,7 @@ _spawn_wake_session
 _sput
 _sroot
 _sstatus
+_stop_text
 _swrite
 _sync_export
 _sync_file_name

@@ -1,0 +1,8 @@
+usage: ag bench report [-h] [--out OUT] [results]
+
+positional arguments:
+  results     results JSONL (default bench-results.jsonl)
+
+options:
+  -h, --help  show this help message and exit
+  --out OUT   also write the markdown table to this file

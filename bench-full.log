@@ -1,0 +1,863 @@
+== tests/test_ag_access.py
+..........                                                               [100%]
+10 passed in 37.96s
+== tests/test_ag_acp.py
+..........                                                               [100%]
+10 passed in 61.15s (0:01:01)
+== tests/test_ag_agents_create.py
+........                                                                 [100%]
+8 passed in 3.10s
+== tests/test_ag_agents_sessions.py
+..                                                                       [100%]
+2 passed in 5.21s
+== tests/test_ag_api.py
+....F.                                                                   [100%]
+=================================== FAILURES ===================================
+____________________ ApiT.test_api_validate_privacy_access _____________________
+
+self = <tests.test_ag_api.ApiT testMethod=test_api_validate_privacy_access>
+
+    def test_api_validate_privacy_access(self):
+        ag = load_ag()
+        self.assertIn("PROVIDER/MODEL", ag.api_validate("api", "default") or "")
+        self.assertIn("no such provider", ag.api_validate("api", "nosuch/x") or "")
+>       self.assertIsNone(ag.api_validate("api", "groq/llama-test"))
+E       AssertionError: 'no such provider: groq (ag providers list)' is not None
+
+tests/test_ag_api.py:287: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_ag_api.py::ApiT::test_api_validate_privacy_access - Asserti...
+1 failed, 5 passed in 28.70s
+== tests/test_ag_api_compat.py
+......                                                                   [100%]
+6 passed in 20.43s
+== tests/test_ag_browser.py
+......ss                                                                 [100%]
+6 passed, 2 skipped in 0.15s
+== tests/test_ag_catalog.py
+.......                                                                  [100%]
+7 passed in 20.09s
+== tests/test_ag_channel.py
+...........                                                              [100%]
+11 passed in 11.81s
+== tests/test_ag_chatlog.py
+.............                                                            [100%]
+13 passed in 11.61s
+== tests/test_ag_cli.py
+..........                                                               [100%]
+10 passed in 45.20s
+== tests/test_ag_cohort.py
+..............                                                           [100%]
+14 passed in 146.75s (0:02:26)
+== tests/test_ag_compact.py
+..........F........                                                      [100%]
+=================================== FAILURES ===================================
+____________________________ test_command_untouched ____________________________
+
+    def test_command_untouched():
+        st = fresh_state([dict(echo_agent("o"), backend="opencode",
+                               model="opencode/muse-spark-1.3-contributor-free")])
+        enable(st)
+        seen = {}
+        orig = ag.backend_argv
+        def cap(backend, **kw):
+            if not kw.get("command"):
+                seen.setdefault("prompts", []).append(kw.get("prompt", ""))
+            return ["printf", "%s\n", kw.get("prompt", "")]
+        ag.backend_argv = cap
+        try:
+            for i in range(5):
+                r = ag.run_turn(st, "o", f"arg{i}", command="review")
+>               assert "error" not in r, r
+E               AssertionError: {'error': 'model opencode/muse-spark-1.3-contributor-free may train on your data (opencode docs); use --data public or... docs); use --data public or a zero-retention model (space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)'}
+E               assert 'error' not in {'error': 'model opencode/muse-spark-1.3-contributor-free may train on your data (opencode docs); use --data public or... docs); use --data public or a zero-retention model (space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)'}
+
+tests/test_ag_compact.py:274: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_ag_compact.py::test_command_untouched - AssertionError: {'e...
+1 failed, 18 passed in 58.72s
+== tests/test_ag_context.py
+....F.............F                                                      [100%]
+=================================== FAILURES ===================================
+____________________________ test_command_untouched ____________________________
+
+    def test_command_untouched():
+        st = fresh_state([])
+        proj = mkproj()
+        (proj / "custom.md").write_text("# CMDRULES\n")
+        (st / "agents.json").write_text(json.dumps(
+            [dict(echo_agent("o", proj), backend="opencode",
+                  model="opencode/muse-spark-1.3-contributor-free")]))
+        assign(st, "o", scope="")
+        seen = {}
+        orig = ag.backend_argv
+        def cap(backend, **kw):
+            seen.update(kw)
+            return ["printf", "%s\n", kw.get("prompt", "")]
+        ag.backend_argv = cap
+        try:
+            r = ag.run_turn(st, "o", "do review", command="review")
+        finally:
+            ag.backend_argv = orig
+>       check("command-ok", "error" not in r, r)
+
+tests/test_ag_context.py:165: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'command-ok', cond = False
+extra = {'error': 'model opencode/muse-spark-1.3-contributor-free may train on your data (opencode docs); use --data public or... docs); use --data public or a zero-retention model (space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)'}
+
+    def check(name, cond, extra=""):
+        global PASS
+        if not cond:
+>           raise AssertionError(f"FAIL {name} {extra}")
+E           AssertionError: FAIL command-ok {'error': 'model opencode/muse-spark-1.3-contributor-free may train on your data (opencode docs); use --data public or a zero-retention model (space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)', 'exit': 2, 'sid': '', 'reply': 'model opencode/muse-spark-1.3-contributor-free may train on your data (opencode docs); use --data public or a zero-retention model (space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)'}
+
+tests/test_ag_context.py:33: AssertionError
+----------------------------- Captured stdout call -----------------------------
+{"ok": true, "cmd": "context", "data": {"agent": "o", "project": "/tmp/agctx-proj-nuxlz1dt", "scope": "", "files": [], "task": "", "acceptance": "", "updated": "2026-11-19T19:42:20+00:00"}}
+_______________________ test_resumed_sid_refresh_stubbed _______________________
+
+    def test_resumed_sid_refresh_stubbed():
+        st = fresh_state([])
+        proj = mkproj()
+        (proj / "custom.md").write_text("# V1\n")
+        (st / "agents.json").write_text(json.dumps(
+            [dict(echo_agent("o", proj), backend="opencode",
+                  model="opencode/muse-spark-1.3-contributor-free")]))
+        assign(st, "o", scope="", task="T")
+        # seed a resumed native session id, as a prior opencode turn would leave
+        ag.save_chat_meta(st, "o", {"sid": "ses_9", "sids": {"opencode": "ses_9"},
+                                    "backend": "opencode",
+                                    "model": "opencode/muse-spark-1.3-contributor-free",
+                                    "dir": str(proj), "role": "sub"})
+        seen = {}
+        orig = ag.backend_argv
+        def cap(backend, **kw):
+            seen.update(kw)
+            seen["backend"] = backend
+            return ["printf", "%s\n", kw.get("prompt", "")]
+        ag.backend_argv = cap
+        try:
+            r1 = ag.run_turn(st, "o", "first")
+        finally:
+            ag.backend_argv = orig
+>       check("resumed-turn-ok", "error" not in r1, r1)
+
+tests/test_ag_context.py:519: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'resumed-turn-ok', cond = False
+extra = {'error': 'model opencode/muse-spark-1.3-contributor-free may train on your data (opencode docs); use --data public or... docs); use --data public or a zero-retention model (space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)'}
+
+    def check(name, cond, extra=""):
+        global PASS
+        if not cond:
+>           raise AssertionError(f"FAIL {name} {extra}")
+E           AssertionError: FAIL resumed-turn-ok {'error': 'model opencode/muse-spark-1.3-contributor-free may train on your data (opencode docs); use --data public or a zero-retention model (space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)', 'exit': 2, 'sid': 'ses_9', 'reply': 'model opencode/muse-spark-1.3-contributor-free may train on your data (opencode docs); use --data public or a zero-retention model (space-bunny-free, longcat-2.5-preview-free, step-5-preview-free)'}
+
+tests/test_ag_context.py:33: AssertionError
+----------------------------- Captured stdout call -----------------------------
+{"ok": true, "cmd": "context", "data": {"agent": "o", "project": "/tmp/agctx-proj-7hfonv5u", "scope": "", "files": [], "task": "T", "acceptance": "", "updated": "2026-11-19T19:42:28+00:00"}}
+=========================== short test summary info ============================
+FAILED tests/test_ag_context.py::test_command_untouched - AssertionError: FAI...
+FAILED tests/test_ag_context.py::test_resumed_sid_refresh_stubbed - Assertion...
+2 failed, 17 passed in 10.61s
+== tests/test_ag_crosscheck.py
+.....................                                                    [100%]
+21 passed in 52.96s
+== tests/test_ag_devmode.py
+..........                                                               [100%]
+10 passed in 14.71s
+== tests/test_ag_dirflag.py
+...................                                                      [100%]
+19 passed in 4.60s
+== tests/test_ag_env.py
+.......                                                                  [100%]
+7 passed in 21.96s
+== tests/test_ag_escalate.py
+..............                                                           [100%]
+14 passed in 34.60s
+== tests/test_ag_events_follow.py
+F....                                                                    [100%]
+=================================== FAILURES ===================================
+__________________ test_follow_json_filters_and_exit_on_match __________________
+
+    def test_follow_json_filters_and_exit_on_match():
+        with tempfile.TemporaryDirectory(prefix="agev-") as td:
+            (Path(td) / "events.jsonl").touch()
+            p = _follow(td, "--json", "--agent", "w", "--type", "wake_done",
+                "--exit-on-match", "--timeout", "5")
+            time.sleep(0.5)
+            _append(td,
+                {"ts": "t1", "type": "spawn", "agent": "w"},
+                {"ts": "t2", "type": "wake_fail", "agent": "w"},
+                {"ts": "t3", "type": "wake_done", "agent": "other"},
+                {"ts": "t4", "type": "wake_done", "agent": "w", "job": "j1"})
+            out, err = p.communicate(timeout=10)
+>           assert p.returncode == 0, (p.returncode, out, err)
+E           AssertionError: (124, '', '')
+E           assert 124 == 0
+E            +  where 124 = <Popen: returncode: 124 args: ['/home/hatch/workspace/.pytest-venv/bin/pytho...>.returncode
+
+tests/test_ag_events_follow.py:61: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_ag_events_follow.py::test_follow_json_filters_and_exit_on_match
+1 failed, 4 passed in 13.62s
+== tests/test_ag_fork.py
+.......                                                                  [100%]
+7 passed in 1.45s
+== tests/test_ag_guard.py
+
+no tests ran in 0.05s
+== tests/test_ag_handoff.py
+.......                                                                  [100%]
+7 passed in 28.33s
+== tests/test_ag_harness_roles.py
+........                                                                 [100%]
+8 passed in 29.96s
+== tests/test_ag_keys.py
+..........                                                               [100%]
+10 passed in 20.02s
+== tests/test_ag_limiter.py
+...........                                                              [100%]
+11 passed in 27.94s
+== tests/test_ag_link.py
+.................                                                        [100%]
+17 passed in 31.97s
+== tests/test_ag_mode_ceiling.py
+........                                                                 [100%]
+8 passed in 15.29s
+== tests/test_ag_modes.py
+.........                                                                [100%]
+9 passed in 20.74s
+== tests/test_ag_multihost.py
+...........                                                              [100%]
+11 passed in 129.42s (0:02:09)
+== tests/test_ag_native.py
+........F.F                                                              [100%]
+=================================== FAILURES ===================================
+___________________________ test_backend_opts_stable ___________________________
+
+    def test_backend_opts_stable():
+>       check("backend-opts", ag.tui_backend_opts() == ["claude", "opencode", "gemini", "codex", "cursor", "echo"])
+
+tests/test_ag_native.py:175: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'backend-opts', cond = False, extra = ''
+
+    def check(name, cond, extra=""):
+        global PASS
+        if not cond:
+>           raise AssertionError(f"FAIL {name} {extra}")
+E           AssertionError: FAIL backend-opts
+
+tests/test_ag_native.py:28: AssertionError
+______________________ test_cli_headless_discovers_slash _______________________
+
+    def test_cli_headless_discovers_slash():
+        td = Path(tempfile.mkdtemp(prefix="agncli-"))
+        env = dict(os.environ, AGENT_CLI_DIR=str(td))
+        def run(*args):
+            return subprocess.run([sys.executable, str(AG)] + list(args),
+                capture_output=True, text=True, timeout=30, env=env)
+        p = run("agents", "add", "h", "--backend", "echo", "--role", "sub")
+        assert p.returncode == 0, (p.stdout, p.stderr)
+        p = run("chat", "send", "h", "/help")
+        check("cli-help", p.returncode == 0 and "/harness" in p.stdout, (p.stdout, p.stderr))
+        p = run("chat", "send", "h", "/nope")
+        check("cli-unknown", "unknown command" in (p.stdout + p.stderr), (p.stdout, p.stderr))
+        p = run("chat", "send", "h", "\\harness current")
+        check("cli-backslash", "echo" in (p.stdout + p.stderr), (p.stdout, p.stderr))
+        p = run("chat", "send", "h", "/harness use claude")
+        check("cli-switch", "echo -> claude" in (p.stdout + p.stderr), (p.stdout, p.stderr))
+        p = run("chat", "send", "h", "/model")
+        check("cli-model", "default" in (p.stdout + p.stderr), (p.stdout, p.stderr))
+        p = run("--json", "chat", "send", "h", "/nope")
+        o = json.loads(p.stdout or "{}")
+        check("cli-json-fail", o.get("ok") is False and "nope" in o.get("hint", ""), o)
+        p = run("chat", "send", "h", "--command", "rev", "some args")
+>       check("cli-command-rejected", "opencode-only" in (p.stdout + p.stderr), (p.stdout, p.stderr))
+
+tests/test_ag_native.py:233: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'cli-command-rejected', cond = False
+extra = ('', 'usage: ag [-h] [--dir DIR] [--json] [--version]\n          {run,read,write,edit,ls,grep,note,notify,notes,needs,...ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: some args\n')
+
+    def check(name, cond, extra=""):
+        global PASS
+        if not cond:
+>           raise AssertionError(f"FAIL {name} {extra}")
+E           AssertionError: FAIL cli-command-rejected ('', 'usage: ag [-h] [--dir DIR] [--json] [--version]\n          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,route,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: some args\n')
+
+tests/test_ag_native.py:28: AssertionError
+----------------------------- Captured stdout call -----------------------------
+ok cli-help
+ok cli-unknown
+ok cli-backslash
+ok cli-switch
+ok cli-model
+ok cli-json-fail
+=========================== short test summary info ============================
+FAILED tests/test_ag_native.py::test_backend_opts_stable - AssertionError: FA...
+FAILED tests/test_ag_native.py::test_cli_headless_discovers_slash - Assertion...
+2 failed, 9 passed in 11.74s
+== tests/test_ag_needs.py
+......                                                                   [100%]
+6 passed in 25.52s
+== tests/test_ag_notify.py
+.....                                                                    [100%]
+5 passed in 36.48s
+== tests/test_ag_openrouter.py
+.......                                                                  [100%]
+7 passed in 12.75s
+== tests/test_ag_parallel.py
+..F                                                                      [100%]
+=================================== FAILURES ===================================
+____________________ test_one_timeout_leaves_three_healthy _____________________
+
+    def test_one_timeout_leaves_three_healthy():
+        """All four share the barrier; k1 has --timeout 2 so its backend is
+        killed while k2-k4 are still blocked in the barrier. Survivors must
+        still be alive (killing one job kills nothing else), then release and
+        all three finish. Per-call env selects backend behavior explicitly;
+        the fake never scans the (stateless, history-replaying) transcript."""
+        names = ["k1", "k2", "k3", "k4"]
+        td = _setup_state(names)
+        pardir, bindir, env = _setup_fake(mode="barrier")
+        procs = []
+        try:
+            specs = [
+                ("k1", ["--timeout", "2", "slow-task"]),
+                ("k2", ["hello-k2"]),
+                ("k3", ["hello-k3"]),
+                ("k4", ["hello-k4"]),
+            ]
+            for name, extra in specs:
+                full_env = dict(os.environ, **env)
+                procs.append(subprocess.Popen(
+                    [sys.executable, str(AG), "--dir", str(td),
+                     "--json", "chat", "send", name] + extra,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env=full_env))
+            mx = _wait_max(pardir, 4, timeout=20)
+>           assert mx >= 4, f"no 4-way overlap before timeout: max_active={mx}"
+E           AssertionError: no 4-way overlap before timeout: max_active=3
+E           assert 3 >= 4
+
+tests/test_ag_parallel.py:249: AssertionError
+=============================== warnings summary ===============================
+tests/test_ag_parallel.py::test_four_distinct_agents_overlap
+  /home/hatch/workspace/.pytest-venv/lib/python3.12/site-packages/_pytest/python.py:191: PytestReturnNotNoneWarning: Test functions should return None, but tests/test_ag_parallel.py::test_four_distinct_agents_overlap returned <class 'int'>.
+  Did you mean to use `assert` instead of `return`?
+  See https://docs.pytest.org/en/stable/how-to/assert.html#return-not-none for more information.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_ag_parallel.py::test_one_timeout_leaves_three_healthy - Ass...
+1 failed, 2 passed, 1 warning in 42.27s
+== tests/test_ag_policy.py
+................                                                         [100%]
+16 passed in 0.22s
+== tests/test_ag_privacy.py
+........                                                                 [100%]
+8 passed in 26.12s
+== tests/test_ag_probe.py
+...........                                                              [100%]
+11 passed in 34.78s
+== tests/test_ag_profile_native.py
+
+no tests ran in 0.04s
+== tests/test_ag_profiles.py
+...........                                                              [100%]
+11 passed in 56.78s
+== tests/test_ag_queue.py
+........                                                                 [100%]
+8 passed in 47.90s
+== tests/test_ag_ranking.py
+...........                                                              [100%]
+11 passed in 28.28s
+== tests/test_ag_ratelimit.py
+.....                                                                    [100%]
+5 passed in 22.60s
+== tests/test_ag_reap.py
+........                                                                 [100%]
+8 passed in 2.41s
+== tests/test_ag_relay.py
+..........                                                               [100%]
+10 passed in 84.34s (0:01:24)
+== tests/test_ag_relay_inbox_log.py
+....                                                                     [100%]
+4 passed in 21.53s
+== tests/test_ag_relay_names.py
+..........                                                               [100%]
+10 passed in 52.43s
+== tests/test_ag_relay_once.py
+.                                                                        [100%]
+1 passed in 12.59s
+== tests/test_ag_relay_sched.py
+.....                                                                    [100%]
+5 passed in 4.16s
+== tests/test_ag_relay_tz.py
+........                                                                 [100%]
+8 passed in 10.63s
+== tests/test_ag_retry.py
+......                                                                   [100%]
+6 passed in 44.09s
+== tests/test_ag_route_effort.py
+.........                                                                [100%]
+9 passed in 40.45s
+== tests/test_ag_schedule.py
+................                                                         [100%]
+16 passed in 51.05s
+== tests/test_ag_secret.py
+.FF...                                                                   [100%]
+=================================== FAILURES ===================================
+__________________ SecretTest.test_backend_toolout_note_once ___________________
+
+self = <tests.test_ag_secret.SecretTest testMethod=test_backend_toolout_note_once>
+
+    def test_backend_toolout_note_once(self):
+        os.environ["AG_ASKPASS_CMD"] = "true"
+        try:
+            m = _load_src(importlib.machinery.SourceFileLoader("ag_secret_mod", AG))
+            self.state.mkdir(parents=True)
+            class Buf: pass
+            buf, seen = Buf(), []
+            on = lambda n, k, t: seen.append((k, t))
+            m.secret_toolout(self.state, "a1", "ok", buf, on)
+            self.assertEqual(seen, [])
+            for _ in range(2):
+                m.secret_toolout(self.state, "a1",
+                    "sudo: a terminal is required to read the password", buf, on)
+            self.assertEqual(len(seen), 1)
+            self.assertIn("retry", seen[0][1])
+            ev = (self.state / "events.jsonl").read_text()
+            self.assertEqual(ev.count('"secret_needed"'), 1)
+            env = m.secret_env(self.state, {"PATH": "/bin", "GIT_ASKPASS": "/mine"})
+            self.assertEqual(env["GIT_ASKPASS"], "/mine")
+>           self.assertTrue(env["SUDO_ASKPASS"].endswith("/bin/ag-askpass"))
+                            ^^^^^^^^^^^^^^^^^^^
+E           KeyError: 'SUDO_ASKPASS'
+
+tests/test_ag_secret.py:153: KeyError
+______________ SecretTest.test_echo_on_keyword_prompt_not_echoed _______________
+
+self = <tests.test_ag_secret.SecretTest testMethod=test_echo_on_keyword_prompt_not_echoed>
+
+    def test_echo_on_keyword_prompt_not_echoed(self):
+        code = "x=input('Enter OTP code: '); print('len', len(x))"
+        sid = self.spawn(sys.executable, "-c", code)
+        self.assertTrue(self.wait(lambda: "len" in self.out(sid)), self.out(sid))
+        self.assertIn("len 6", self.out(sid))
+        self.wait(lambda: self.exited(sid))
+>       self.assert_no_secret_on_disk()
+
+tests/test_ag_secret.py:94: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/test_ag_secret.py:65: in assert_no_secret_on_disk
+    self.assertNotIn(SECRET.encode(), p.read_bytes(), str(p))
+E   AssertionError: b's3cret' unexpectedly found in b'Enter OTP code: s3cret\r\nlen 6\r\n' : /tmp/ag-secret-5srjpphq/.agent/sessions/8a26bf/output.log
+=========================== short test summary info ============================
+FAILED tests/test_ag_secret.py::SecretTest::test_backend_toolout_note_once - ...
+FAILED tests/test_ag_secret.py::SecretTest::test_echo_on_keyword_prompt_not_echoed
+2 failed, 4 passed in 11.27s
+== tests/test_ag_setup.py
+...............                                                          [100%]
+15 passed in 30.91s
+== tests/test_ag_setup_form.py
+.....                                                                    [100%]
+5 passed in 25.85s
+== tests/test_ag_setup_sparse.py
+....                                                                     [100%]
+4 passed in 6.74s
+== tests/test_ag_setup_ui.py
+........                                                                 [100%]
+8 passed in 25.45s
+== tests/test_ag_skill_flags.py
+..                                                                       [100%]
+2 passed in 0.18s
+== tests/test_ag_spawn_secret_env.py
+.                                                                        [100%]
+1 passed in 1.89s
+== tests/test_ag_ssh_wake.py
+.....                                                                    [100%]
+5 passed in 43.91s
+== tests/test_ag_stall.py
+......F..FF                                                              [100%]
+=================================== FAILURES ===================================
+_______________ StallFlags.test_wake_job_records_per_turn_stall ________________
+
+self = <tests.test_ag_stall.StallFlags testMethod=test_wake_job_records_per_turn_stall>
+
+    def test_wake_job_records_per_turn_stall(self):
+        p = self.ag("agents", "add", "e2", "--backend", "echo", "--dir", str(self.td))
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        p = self.ag("wake", "e2", "--stall-s", "7", "quick")
+>       self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+E       AssertionError: 2 != 0 : ('', 'usage: ag [-h] [--dir DIR] [--json] [--version]\n          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,route,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: quick\n')
+
+tests/test_ag_stall.py:128: AssertionError
+________________ StallE2E.test_per_turn_disable_wins_over_agent ________________
+
+self = <tests.test_ag_stall.StallE2E testMethod=test_per_turn_disable_wins_over_agent>
+
+    def test_per_turn_disable_wins_over_agent(self):
+        # agent stall_s=1 would kill attempt 1; --stall-s 0 disables -> whole turn succeeds
+        p2 = self.ag("--json", "chat", "send", "s1", "--stall-s", "0", "hi",
+                     extra={"FAKE_MODE": "slow"})
+>       self.assertEqual(p2.returncode, 0, (p2.stdout, p2.stderr))
+E       AssertionError: 2 != 0 : ('', 'usage: ag [-h] [--dir DIR] [--json] [--version]\n          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,route,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: hi\n')
+
+tests/test_ag_stall.py:205: AssertionError
+___________ StallE2E.test_wake_worker_uses_agent_and_per_turn_stall ____________
+
+self = <tests.test_ag_stall.StallE2E testMethod=test_wake_worker_uses_agent_and_per_turn_stall>
+
+    def test_wake_worker_uses_agent_and_per_turn_stall(self):
+        # AG_RETRY=0: single killed attempt ends the job (no ratelimit spin)
+        # agent stall_s=1, no per-turn flag: silent attempt killed -> stalled error in job
+        self.ag("agents", "add", "w1", "--backend", "opencode", "--model", "opencode/paywalled-x",
+                "--stall-s", "1")
+        p = self.ag("wake", "w1", "die quietly",
+                    extra={"FAKE_MODE": "stallsilent", "AG_RETRY": "0"})
+        self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+        j, deadline = {}, time.time() + 90
+        while time.time() < deadline:
+            j = self.job()
+            if j.get("agent") == "w1" and j.get("status") in ("done", "failed"): break
+            time.sleep(0.2)
+        self.assertEqual(j.get("status"), "failed", j)
+        self.assertIn("stalled: no output for 1s", j.get("error", ""), j)
+        self.assertIn("raise it: ag agents set w1 --stall-s 900", j.get("error", ""), j)
+        # per-turn --stall-s 0: watchdog off -> raw backend failure, no stalled text
+        p2 = self.ag("wake", "w1", "--stall-s", "0", "run again",
+                     extra={"FAKE_MODE": "stallsilent", "AG_RETRY": "0"})
+>       self.assertEqual(p2.returncode, 0, (p2.stdout, p2.stderr))
+E       AssertionError: 2 != 0 : ('', 'usage: ag [-h] [--dir DIR] [--json] [--version]\n          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,route,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: run again\n')
+
+tests/test_ag_stall.py:228: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_ag_stall.py::StallFlags::test_wake_job_records_per_turn_stall
+FAILED tests/test_ag_stall.py::StallE2E::test_per_turn_disable_wins_over_agent
+FAILED tests/test_ag_stall.py::StallE2E::test_wake_worker_uses_agent_and_per_turn_stall
+3 failed, 8 passed in 37.29s
+== tests/test_ag_streaming.py
+...........................                                              [100%]
+27 passed in 21.88s
+== tests/test_ag_tick_health.py
+.......                                                                  [100%]
+7 passed in 4.54s
+== tests/test_ag_turn_seams.py
+......                                                                   [100%]
+6 passed in 20.63s
+== tests/test_ag_ui.py
+........................................................................ [ 93%]
+.....                                                                    [100%]
+77 passed in 80.28s (0:01:20)
+== tests/test_ag_uicmd.py
+..........                                                               [100%]
+10 passed in 16.12s
+== tests/test_ag_update.py
+...                                                                      [100%]
+3 passed in 1.87s
+== tests/test_ag_usage_limit.py
+......                                                                   [100%]
+6 passed in 19.30s
+== tests/test_ag_variants.py
+.......                                                                  [100%]
+7 passed in 31.01s
+== tests/test_ag_verify.py
+...................                                                      [100%]
+19 passed in 15.72s
+== tests/test_ag_vm_backends.py
+...........                                                              [100%]
+11 passed in 19.15s
+== tests/test_ag_wake.py
+.................F...                                                    [100%]
+=================================== FAILURES ===================================
+______________________ test_timeout_ignores_queued_waits _______________________
+
+    def test_timeout_ignores_queued_waits():
+        """Queued jobs waiting for the turn guard never report backend-stalled:
+        hold the guard past the timeout, see queued + no wake_stall, release to
+        done. Running-state stalls are covered in test_ag_wake_status.py."""
+        td = Path(tempfile.mkdtemp(prefix="agw-"))
+        run(td, "agents", "add", "to", "--backend", "echo", "--role", "sub")
+        lockdir = td / "wake" / "locks"
+        lockdir.mkdir(parents=True, exist_ok=True)
+        lockf = open(lockdir / "to.lock", "a+b")
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+        try:
+            _, o = run_json(td, "wake", "to", "slow-one", "--timeout", "1")
+            jid = o["data"].get("job")
+            assert jid, o
+            assert wait_for(td, lambda: _job(td, jid).get("status") == "queued", timeout=10), wakes(td)
+            time.sleep(3)  # past the 1s timeout while still queued
+            j = _job(td, jid)
+            assert j.get("status") == "queued" and not j.get("stalled"), j
+            assert not any(e["type"] == "wake_stall" and e.get("job") == jid
+                for e in events(td)), events(td)
+        finally:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+            lockf.close()
+        ok = wait_for(td, lambda: _job(td, jid).get("status") == "done", timeout=15)
+        assert ok, wakes(td)
+>       assert not _job(td, jid).get("stalled"), wakes(td)
+E       AssertionError: [{'id': '0db901b7', 'agent': 'to', 'message': 'slow-one', 'trigger': None, ...}]
+E       assert not True
+E        +  where True = <built-in method get of dict object at 0x73fc93b1c780>('stalled')
+E        +    where <built-in method get of dict object at 0x73fc93b1c780> = {'id': '0db901b7', 'agent': 'to', 'message': 'slow-one', 'trigger': None, ...}.get
+E        +      where {'id': '0db901b7', 'agent': 'to', 'message': 'slow-one', 'trigger': None, ...} = _job(PosixPath('/tmp/agw-wlmm2xtm'), '0db901b7')
+
+tests/test_ag_wake.py:360: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_ag_wake.py::test_timeout_ignores_queued_waits - AssertionEr...
+1 failed, 20 passed in 159.16s (0:02:39)
+== tests/test_ag_wake_control.py
+.....F..FFF.                                                             [100%]
+=================================== FAILURES ===================================
+________________________ test_stall_behavior_unchanged _________________________
+
+    def test_stall_behavior_unchanged():
+        """Queued jobs waiting for the turn guard never stall (status track):
+        hold the guard past the timeout, see queued + no stall, release to done."""
+        td = Path(tempfile.mkdtemp(prefix="agwc-"))
+        assert run(td, "agents", "add", "s1", "--backend", "echo", "--role", "sub").returncode == 0
+        lockdir = td / "wake" / "locks"
+        lockdir.mkdir(parents=True, exist_ok=True)
+        lockf = open(lockdir / "s1.lock", "a+b")
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+        try:
+            _, o = run_json(td, "wake", "s1", "slow-stall", "--timeout", "1")
+            jid = o["data"].get("job")
+            assert jid, o
+            assert wait_for(td, lambda: job(td, jid).get("status") == "queued", timeout=10), wakes(td)
+            time.sleep(3)  # past the 1s timeout while still queued
+            j = job(td, jid)
+            assert j.get("status") == "queued" and not j.get("stalled"), j
+            assert not any(e["type"] == "wake_stall" and e.get("job") == jid
+                for e in events(td)), events(td)
+        finally:
+            fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+            lockf.close()
+        assert wait_for(td, lambda: job(td, jid).get("status") == "done", timeout=15), wakes(td)
+>       assert not job(td, jid).get("stalled"), wakes(td)
+E       AssertionError: [{'id': '10a9a7ff', 'agent': 's1', 'message': 'slow-stall', 'trigger': None, ...}]
+E       assert not True
+E        +  where True = <built-in method get of dict object at 0x7fe90b1b1f80>('stalled')
+E        +    where <built-in method get of dict object at 0x7fe90b1b1f80> = {'id': '10a9a7ff', 'agent': 's1', 'message': 'slow-stall', 'trigger': None, ...}.get
+E        +      where {'id': '10a9a7ff', 'agent': 's1', 'message': 'slow-stall', 'trigger': None, ...} = job(PosixPath('/tmp/agwc-rey9o7cj'), '10a9a7ff')
+
+tests/test_ag_wake_control.py:254: AssertionError
+_____________ test_chat_send_timeout_kills_tree_and_releases_guard _____________
+
+    def test_chat_send_timeout_kills_tree_and_releases_guard():
+        td = Path(tempfile.mkdtemp(prefix="agwc-"))
+        assert run(td, "agents", "add", "f1", "--backend", "echo", "--role", "sub").returncode == 0
+        bindir = Path(tempfile.mkdtemp(prefix="agwc-bin-"))
+        pidfile = td / "backend.pids"
+        make_slow_printf(bindir, pidfile)
+        env = fake_env(bindir)
+        p, o = run_json(td, "chat", "send", "f1", "--timeout", "1", "slow-fg", env=env)
+>       assert p.returncode == 124, (p.stdout, p.stderr)
+E       AssertionError: ('', 'usage: ag [-h] [--dir DIR] [--json] [--version]
+E                   {run,read,write,edit,ls,grep,note,notify,notes,needs,...e,ratelimit,access,usage,bench,budget,policy,setup,link}
+E                   ...
+E         ag: error: unrecognized arguments: slow-fg
+E         ')
+E       assert 2 == 124
+E        +  where 2 = CompletedProcess(args=['/home/hatch/workspace/.pytest-venv/bin/python', '/home/hatch/workspace/ag-task-benchcap/ag', '...e,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: slow-fg\n').returncode
+
+tests/test_ag_wake_control.py:285: AssertionError
+______________________ test_chat_send_timeout_validation _______________________
+
+    def test_chat_send_timeout_validation():
+        td = Path(tempfile.mkdtemp(prefix="agwc-"))
+        assert run(td, "agents", "add", "f2", "--backend", "echo", "--role", "sub").returncode == 0
+        for bad in ("-1", "nan", "inf", "-inf"):
+            p = run(td, "chat", "send", "f2", "--timeout", bad, "msg")
+            assert p.returncode != 0, (bad, p.stdout, p.stderr)
+>           assert "timeout" in (p.stderr or p.stdout).lower(), (bad, p.stdout, p.stderr)
+E           AssertionError: ('-1', '', 'usage: ag [-h] [--dir DIR] [--json] [--version]
+E                       {run,read,write,edit,ls,grep,note,notify,notes,...route,ratelimit,access,usage,bench,budget,policy,setup,link}
+E                       ...
+E             ag: error: unrecognized arguments: msg
+E             ')
+E           assert 'timeout' in 'usage: ag [-h] [--dir dir] [--json] [--version]\n          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,...,route,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: msg\n'
+E            +  where 'usage: ag [-h] [--dir dir] [--json] [--version]\n          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,...,route,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: msg\n' = <built-in method lower of str object at 0x3bc21fa0>()
+E            +    where <built-in method lower of str object at 0x3bc21fa0> = ('usage: ag [-h] [--dir DIR] [--json] [--version]\n          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,...,route,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: msg\n').lower
+E            +      where 'usage: ag [-h] [--dir DIR] [--json] [--version]\n          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,...,route,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: msg\n' = CompletedProcess(args=['/home/hatch/workspace/.pytest-venv/bin/python', '/home/hatch/workspace/ag-task-benchcap/ag', '...route,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: msg\n').stderr
+
+tests/test_ag_wake_control.py:302: AssertionError
+_________________________ test_delegate_timeout_parity _________________________
+
+    def test_delegate_timeout_parity():
+        td = Path(tempfile.mkdtemp(prefix="agwc-"))
+        assert run(td, "agents", "add", "orch", "--backend", "echo", "--role", "orchestrator").returncode == 0
+        assert run(td, "agents", "add", "d1", "--backend", "echo", "--role", "sub").returncode == 0
+        bindir = Path(tempfile.mkdtemp(prefix="agwc-bin-"))
+        pidfile = td / "backend.pids"
+        make_slow_printf(bindir, pidfile)
+        env = fake_env(bindir)
+        p, o = run_json(td, "delegate", "d1", "--timeout", "1", "slow-task", env=env)
+>       assert p.returncode == 124, (p.stdout, p.stderr)
+E       AssertionError: ('', 'usage: ag [-h] [--dir DIR] [--json] [--version]
+E                   {run,read,write,edit,ls,grep,note,notify,notes,needs,...ratelimit,access,usage,bench,budget,policy,setup,link}
+E                   ...
+E         ag: error: unrecognized arguments: slow-task
+E         ')
+E       assert 2 == 124
+E        +  where 2 = CompletedProcess(args=['/home/hatch/workspace/.pytest-venv/bin/python', '/home/hatch/workspace/ag-task-benchcap/ag', '...ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: slow-task\n').returncode
+
+tests/test_ag_wake_control.py:317: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_ag_wake_control.py::test_stall_behavior_unchanged - Asserti...
+FAILED tests/test_ag_wake_control.py::test_chat_send_timeout_kills_tree_and_releases_guard
+FAILED tests/test_ag_wake_control.py::test_chat_send_timeout_validation - Ass...
+FAILED tests/test_ag_wake_control.py::test_delegate_timeout_parity - Assertio...
+4 failed, 8 passed in 93.14s (0:01:33)
+== tests/test_ag_wake_escalate.py
+......                                                                   [100%]
+6 passed in 6.11s
+== tests/test_ag_wake_full_reply.py
+....                                                                     [100%]
+4 passed in 0.39s
+== tests/test_ag_wake_integration.py
+...                                                                      [100%]
+3 passed in 6.51s
+== tests/test_ag_wake_park.py
+.F..                                                                     [100%]
+=================================== FAILURES ===================================
+_____________________ WakePark.test_no_park_keeps_failure ______________________
+
+self = <tests.test_ag_wake_park.WakePark testMethod=test_no_park_keeps_failure>
+
+    def test_no_park_keeps_failure(self):
+        self.limit()
+>       jid = self.wake("no park", "--no-park")
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_ag_wake_park.py:148: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/test_ag_wake_park.py:59: in wake
+    self.assertTrue(o.get("ok"), (p.stdout, p.stderr, o))
+E   AssertionError: None is not true : ('', 'usage: ag [-h] [--dir DIR] [--json] [--version]\n          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,route,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: no park\n', {})
+=========================== short test summary info ============================
+FAILED tests/test_ag_wake_park.py::WakePark::test_no_park_keeps_failure - Ass...
+1 failed, 3 passed in 20.20s
+== tests/test_ag_wake_state.py
+.........                                                                [100%]
+9 passed in 1.62s
+== tests/test_ag_wake_status.py
+.FF.......                                                               [100%]
+=================================== FAILURES ===================================
+____________________ test_queued_with_timeout_never_stalls _____________________
+
+    def test_queued_with_timeout_never_stalls():
+        """A queued job waiting for the guard is not backend work: no stalled
+        flag and no wake_stall event no matter how long it waits."""
+        td = Path(tempfile.mkdtemp(prefix="agws-qs-"))
+        assert run(td, "agents", "add", "qs", "--backend", "echo", "--role", "sub").returncode == 0
+        lk = hold_agent_lock(td, "qs")
+        try:
+            _, o = run_json(td, "wake", "qs", "patient", "--timeout", "1")
+            assert o.get("ok"), o
+            jid = o["data"].get("job")
+            assert jid, o
+            assert wait_for(lambda: job(td, jid).get("status") == "queued", timeout=10), wakes(td)
+            time.sleep(3)  # past the 1s timeout while still queued
+            j = job(td, jid)
+            assert j.get("status") == "queued", j
+            assert not j.get("stalled"), j
+            assert not any(e["type"] == "wake_stall" and e.get("job") == jid for e in events(td)), \
+                events(td)
+        finally:
+            release(lk)
+        ok = wait_for(lambda: job(td, jid).get("status") == "done", timeout=20)
+        assert ok, job(td, jid)
+>       assert not job(td, jid).get("stalled"), job(td, jid)
+E       AssertionError: {'id': '6d81134a', 'agent': 'qs', 'message': 'patient', 'trigger': None, ...}
+E       assert not True
+E        +  where True = <built-in method get of dict object at 0x740218501200>('stalled')
+E        +    where <built-in method get of dict object at 0x740218501200> = {'id': '6d81134a', 'agent': 'qs', 'message': 'patient', 'trigger': None, ...}.get
+E        +      where {'id': '6d81134a', 'agent': 'qs', 'message': 'patient', 'trigger': None, ...} = job(PosixPath('/tmp/agws-qs-ohayky8b'), '6d81134a')
+
+tests/test_ag_wake_status.py:175: AssertionError
+_____________________ test_invalid_cwd_never_runs_sentinel _____________________
+
+    def test_invalid_cwd_never_runs_sentinel():
+        """Missing project dir: job fails naming the directory, and the backend
+        binary never executes (sentinel untouched)."""
+        td = Path(tempfile.mkdtemp(prefix="agws-cwd-"))
+        bindir = Path(tempfile.mkdtemp(prefix="agws-cwd-bin-"))
+        sentinel = td / "SHOULD_NOT_EXIST_SENTINEL"
+        make_script(bindir / "claude",
+            '#!/bin/sh\ntouch "$AG_SENTINEL"\n'
+            'echo \'{"type":"system","subtype":"init","session_id":"fake"}\'\n'
+            'echo \'{"type":"result","subtype":"success","total_cost_usd":0}\'\n')
+        assert run(td, "agents", "add", "bad", "--backend", "claude",
+            "--role", "sub", "--dir", "/nonexistent-ag-wake-xyz").returncode == 0
+        env = {"PATH": str(bindir) + os.pathsep + "/usr/bin:/bin", "AG_SENTINEL": str(sentinel)}
+        _, o = run_json(td, "wake", "bad", "will-fail", env=env)
+        assert o.get("ok"), o
+        jid = o["data"].get("job")
+        ok = wait_for(lambda: job(td, jid).get("status") == "failed", timeout=20)
+        assert ok, wakes(td)
+        err = job(td, jid).get("error") or ""
+        assert "project directory" in err, err
+>       assert not sentinel.exists(), "backend ran despite missing cwd"
+E       AssertionError: backend ran despite missing cwd
+E       assert not True
+E        +  where True = exists()
+E        +    where exists = PosixPath('/tmp/agws-cwd-l7vv3j00/SHOULD_NOT_EXIST_SENTINEL').exists
+
+tests/test_ag_wake_status.py:199: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_ag_wake_status.py::test_queued_with_timeout_never_stalls - ...
+FAILED tests/test_ag_wake_status.py::test_invalid_cwd_never_runs_sentinel - A...
+2 failed, 8 passed in 70.52s (0:01:10)
+== tests/test_ag_wake_validate.py
+...F                                                                     [100%]
+=================================== FAILURES ===================================
+__________________________ test_max_runtime_chat_hint __________________________
+
+    def test_max_runtime_chat_hint():
+        td = Path(tempfile.mkdtemp(prefix="agwv-"))
+        assert run(td, "agents", "add", "m1", "--backend", "echo", "--role", "sub").returncode == 0
+        bindir = Path(tempfile.mkdtemp(prefix="agwv-bin-"))
+        (bindir / "printf").write_text("#!/usr/bin/env python3\nimport time; time.sleep(60)\nprint('done')\n")
+        (bindir / "printf").chmod(0o755)
+        env = {"PATH": str(bindir) + os.pathsep + os.environ.get("PATH", "")}
+        p, o = run_json(td, "chat", "send", "m1", "--timeout", "1", "slow-fg", env=env)
+>       assert p.returncode == 124, (p.stdout, p.stderr)
+E       AssertionError: ('', 'usage: ag [-h] [--dir DIR] [--json] [--version]
+E                   {run,read,write,edit,ls,grep,note,notify,notes,needs,...e,ratelimit,access,usage,bench,budget,policy,setup,link}
+E                   ...
+E         ag: error: unrecognized arguments: slow-fg
+E         ')
+E       assert 2 == 124
+E        +  where 2 = CompletedProcess(args=['/home/hatch/workspace/.pytest-venv/bin/python', '/home/hatch/workspace/ag-task-benchcap/ag', '...e,ratelimit,access,usage,bench,budget,policy,setup,link}\n          ...\nag: error: unrecognized arguments: slow-fg\n').returncode
+
+tests/test_ag_wake_validate.py:80: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_ag_wake_validate.py::test_max_runtime_chat_hint - Assertion...
+1 failed, 3 passed in 7.92s
+== tests/test_ag_wake_wait.py
+...                                                                      [100%]
+3 passed in 27.70s
+== tests/test_ag_web.py
+...........                                                              [100%]
+11 passed in 37.79s
+== tests/test_ag_worktree.py
+....                                                                     [100%]
+4 passed in 13.78s
+== tests/test_install.py
+..............                                                           [100%]
+14 passed in 40.91s
+== tests/test_setup_muse.py
+....                                                                     [100%]
+4 passed in 148.79s (0:02:28)

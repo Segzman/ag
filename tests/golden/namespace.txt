@@ -321,6 +321,10 @@ _atomic_write
 _auth_cmd
 _backend_clear
 _backend_note
+_bench_cell
+_bench_slug
+_bench_toml_fallback
+_bench_verify_script
 _bk_clean
 _br_alive
 _br_chrome
@@ -927,6 +931,8 @@ backend_env_for_profile
 backends_effective
 backends_line
 backends_now
+bench_load_spec
+bench_report_md
 budget_check
 budget_load
 build
@@ -1050,6 +1056,7 @@ do_approvals
 do_approve
 do_askpass
 do_attach
+do_bench
 do_browser
 do_budget
 do_caps

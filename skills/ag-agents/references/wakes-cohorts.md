@@ -25,6 +25,15 @@
 
 Last child done -> ONE wake to `--parent` with all summaries (automated tool results, not user instructions). `--quiet S` delivers partial results after S s. Also on `delegate` (and `--group` without `--parent` = parentless cohort).
 
+## Bench (real work as benchmarks)
+
+```sh
+{{AG}} --dir <state> bench run SPEC.toml [--jobs N] [--keep-winner] [--out results.jsonl]
+{{AG}} --dir <state> bench report [results.jsonl] [--out table.md]
+```
+
+`bench run` runs every task x arm of the spec in a fresh git worktree via `wake` with `--verify` (the arm's `escalate` list rides the wake ladder), then appends one JSONL row per cell: pass/fail, cost from the usage ledger, tokens, wall time, escalations. Hidden test files are staged outside the worktree and copied in only at verify time. `--jobs N` caps concurrency (default 2); a wake parked on a usage limit is recorded as `parked`, never forced. `--keep-winner` keeps the cheapest passing arm's branch as `bench/<task>-<arm>` (never pushes) — the benchmark output is the deliverable.
+
 ## Queue, stop, steer
 
 ```sh

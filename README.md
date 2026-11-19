@@ -591,6 +591,37 @@ ag chat send w "task" --force | ag wake w "task" --force | ag delegate w "task" 
 - **Adaptive routing (opt-in, default OFF):** `routing.json` `usage.adapt: true` (threshold `usage.adapt_threshold`, default 85; `usage.adapt_effort`, default on): when a backend reaches the threshold % of a configured window, or is parked on a usage limit, wake/chat turns and `ag route` prefer the agent's `--fallback` (same- or cross-backend), else the cheapest model in the same backend, and `--effort` steps down one notch. Every adaptation is logged (`[usage-adapt]` chat row + `usage_adapt` event; `ag route` annotates the job). Nothing changes unless enabled.
 - **Budgets:** daily/monthly USD + per-provider rpd; at turn start a breach refuses (exit 2) unless `--force`; at 80% one `[budget]` warning row.
 
+## Benchmarks (`ag bench`)
+
+Run real work as a benchmark: a spec (TOML) lists tasks and arms; every task x arm cell runs in a fresh git worktree via `ag wake` with `--verify`, and one JSONL row per cell records pass/fail, cost (from the usage ledger), tokens, wall time and escalations.
+
+```sh
+ag bench run SPEC.toml [--jobs N] [--keep-winner] [--out results.jsonl]
+ag bench report [results.jsonl] [--out table.md]
+```
+
+```toml
+[[task]]
+name = "fix-parser"
+repo = "~/myrepo"            # path (relative to the spec file if not absolute)
+base = "main"                # git ref the fresh worktree starts from
+prompt = "Fix the parser so the hidden tests pass. Do not commit."
+verify = "python3 -m pytest -q tests/test_hidden.py"
+hidden = ["hidden/test_hidden.py"]   # copied into the worktree ONLY at verify time
+
+[[arm]]
+name = "echo-cheap"
+backend = "echo"             # any backend; model/effort optional
+model = "default"
+escalate = ["bigger-model"]  # optional wake --escalate ladder (needs the verify)
+```
+
+- Spec parsing uses `tomllib` when available (Python 3.11+) with a built-in fallback parser for the spec subset. Hidden entries may also be `{src = "...", dest = "..."}` tables.
+- Hidden files are staged outside the worktree and copied in only by the verify wrapper, so the agent never sees them during its turn; the same wrapper runs on every escalated attempt.
+- `--jobs N` caps concurrent cells (default 2). Usage limits are respected, not fought: a wake the worker parks for a plan limit is recorded as a `parked` result row, never forced or retried.
+- `--keep-winner` keeps the passing worktree of the cheapest passing arm per task as branch `bench/<task>-<arm>` (the benchmark output IS the deliverable) and removes every other worktree/scratch branch. Bench never pushes.
+- `ag bench report` renders the results JSONL as a markdown table and names the cheapest passing winner per task.
+
 ## Context and handoff
 
 Scoped task + memory so the next agent continues, not restarts (details: [docs/AGENT_CONTEXT.md](docs/AGENT_CONTEXT.md)).

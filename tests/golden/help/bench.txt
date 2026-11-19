@@ -1,0 +1,10 @@
+usage: ag bench [-h] {run,report} ...
+
+positional arguments:
+  {run,report}
+    run         run a bench spec (TOML: [[task]] repo/base/prompt/verify/hidden + [[arm]]
+                backend/model/effort/escalate)
+    report      render a results JSONL as a markdown table (+ cheapest passing winner per task)
+
+options:
+  -h, --help    show this help message and exit

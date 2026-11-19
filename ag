@@ -22814,6 +22814,278 @@ def do_policy_log(a):
     txt = "\n".join(f"{r.get('ts', '')} {r.get('action', '')} agent={r.get('agent', '')} backend={r.get('backend', '')} {r.get('reason', '') or r.get('error', '')}".rstrip() for r in rows) or "no policy events yet"
     return emit(a, "policy", {"_text": txt, "events": rows})
 
+# ---- bench: real work as benchmarks. `ag bench run SPEC.toml` runs every
+# task x arm in a fresh git worktree via `ag wake --verify` (the arm's escalate
+# list rides wake's own ladder), then records pass/fail, ledger cost, tokens,
+# wall time and escalations as one JSONL row per cell. Hidden test files are
+# staged OUTSIDE the worktree and copied in only by the verify wrapper, so the
+# agent never sees them during its turn. --keep-winner turns the cheapest
+# passing cell's branch into bench/<task>-<arm>: the benchmark IS the work.
+# Usage limits are respected, never fought: a wake the worker parks stays a
+# "parked" result row (no --force, no retry). Bench never pushes.
+def _bench_toml_fallback(text):
+    """Minimal TOML subset for bench specs when tomllib is unavailable
+    (pre-3.11): [table], [[array-table]], key = "str"|'str'|num|bool|[list].
+    Raises ValueError on anything outside the subset."""
+    root, cur = {}, None
+    def _val(v):
+        v = v.strip()
+        if v.startswith("[") and v.endswith("]"):
+            inner = v[1:-1].strip()
+            return [_val(x) for x in inner.split(",")] if inner else []
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            return v[1:-1].replace('\\"', '"') if v[0] == '"' else v[1:-1]
+        if v in ("true", "false"): return v == "true"
+        try: return int(v)
+        except ValueError: pass
+        try: return float(v)
+        except ValueError: pass
+        raise ValueError(f"unsupported TOML value: {v!r}")
+    for raw in text.splitlines():
+        ln = raw.strip()
+        if not ln or ln.startswith("#"): continue
+        if ln.startswith("[[") and ln.endswith("]]"):
+            key = ln[2:-2].strip(); root.setdefault(key, [])
+            if not isinstance(root[key], list): raise ValueError(f"{key}: not an array table")
+            root[key].append({}); cur = root[key][-1]; continue
+        if ln.startswith("[") and ln.endswith("]"):
+            cur = root.setdefault(ln[1:-1].strip(), {}); continue
+        m = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(.+)", ln)
+        if not m or cur is None: raise ValueError(f"unsupported TOML line: {raw!r}")
+        cur[m.group(1)] = _val(m.group(2))
+    return root
+
+def bench_load_spec(path):
+    """SPEC.toml -> (spec, error). spec: {name, tasks[], arms[]} normalized:
+    task {name, repo, base, prompt, verify, hidden:[{src, dest}]};
+    arm {name, backend, model, effort, escalate[]}. Pure-ish (reads path)."""
+    p = Path(path).expanduser()
+    try: text = p.read_text()
+    except Exception as e: return None, f"cannot read spec {p}: {e}"
+    try:
+        try:
+            import tomllib
+            doc = tomllib.loads(text)
+        except ImportError:
+            doc = _bench_toml_fallback(text)
+    except Exception as e: return None, f"bad spec TOML {p}: {e}"
+    if not isinstance(doc, dict): return None, f"bad spec {p}: top level must be a table"
+    errs, tasks, arms = [], [], []
+    for i, t in enumerate(doc.get("task") or doc.get("tasks") or []):
+        if not isinstance(t, dict): errs.append(f"task #{i + 1}: not a table"); continue
+        hid = []
+        for h in t.get("hidden") or t.get("hidden_files") or []:
+            if isinstance(h, str): hid.append({"src": h, "dest": h})
+            elif isinstance(h, dict) and h.get("src"): hid.append({"src": str(h["src"]), "dest": str(h.get("dest") or h["src"])})
+            else: errs.append(f"task {t.get('name', i + 1)}: bad hidden entry {h!r}")
+        row = {"name": str(t.get("name") or f"task{i + 1}"), "repo": str(t.get("repo") or ""),
+            "base": str(t.get("base") or t.get("ref") or "HEAD"), "prompt": str(t.get("prompt") or ""),
+            "verify": str(t.get("verify") or ""), "hidden": hid}
+        for k in ("repo", "prompt", "verify"):
+            if not row[k]: errs.append(f"task {row['name']}: missing {k}")
+        tasks.append(row)
+    for i, a_ in enumerate(doc.get("arm") or doc.get("arms") or []):
+        if not isinstance(a_, dict): errs.append(f"arm #{i + 1}: not a table"); continue
+        esc = a_.get("escalate") or []
+        if isinstance(esc, str): esc = [m.strip() for m in esc.split(",") if m.strip()]
+        row = {"backend": str(a_.get("backend") or ""), "model": str(a_.get("model") or "default"),
+            "effort": str(a_.get("effort") or ""), "escalate": [str(m) for m in esc]}
+        row["name"] = str(a_.get("name") or f"{row['backend']}-{row['model']}")
+        if not row["backend"]: errs.append(f"arm {row['name']}: missing backend")
+        arms.append(row)
+    if not tasks: errs.append("spec has no [[task]] entries")
+    if not arms: errs.append("spec has no [[arm]] entries")
+    if errs: return None, "invalid bench spec: " + "; ".join(errs)
+    return {"name": str((doc.get("bench") or {}).get("name") or p.stem), "tasks": tasks, "arms": arms}, None
+
+def _bench_slug(s): return re.sub(r"[^A-Za-z0-9_.-]", "-", str(s or "")).strip("-.")[:48] or "x"
+
+def _bench_verify_script(run_dir, task):
+    """Verify wrapper for one task: copies staged hidden files into the
+    worktree (verify cwd), then runs the task's real verify command.
+    -> path (str) or None when the task has no hidden files."""
+    if not task["hidden"]: return None
+    stage = run_dir / "hidden" / _bench_slug(task["name"])
+    sp = run_dir / f"verify-{_bench_slug(task['name'])}.sh"
+    body = ("#!/bin/sh\n# ag bench: hidden files enter the worktree only now, at verify time\n"
+        f"if [ -d {shlex.quote(str(stage))} ]; then cp -R {shlex.quote(str(stage))}/. ./ || exit 97; fi\n"
+        f"exec sh -c {shlex.quote(task['verify'])}\n")
+    sp.write_text(body)
+    try: sp.chmod(0o755)
+    except Exception: pass
+    return str(sp)
+
+def _bench_cell(sdir, run_dir, cell):
+    """One task x arm: wake --verify in the cell's worktree, poll the job,
+    diff the usage ledger for this cell's agent. Never raises; -> row."""
+    task, arm = cell["task"], cell["arm"]
+    row = {"ts": now_iso(), "task": task["name"], "arm": arm["name"], "backend": arm["backend"],
+        "model": arm["model"], "effort": arm["effort"], "repo": cell["repo"], "base": task["base"],
+        "worktree": cell["wt"], "branch": cell["branch"], "agent": cell["agent"],
+        "status": "error", "pass": False, "verify_exit": None, "cost_usd": None,
+        "tokens_in": 0, "tokens_out": 0, "tokens": 0, "wall_s": 0.0, "escalations": 0,
+        "escalation": [], "job": None, "error": ""}
+    t0 = time.time()
+    try:
+        before = len(_usage_read())
+        script = _bench_verify_script(run_dir, task)
+        vcmd = shlex.quote(script) if script else task["verify"]
+        # wake's message positional must precede its flags (argparse nargs="*")
+        cmd = [sys.executable, str(Path(ag_script_path()).resolve()), "--dir", str(sdir), "--json",
+            "wake", cell["agent"], task["prompt"], "--verify", vcmd]
+        if arm["escalate"]: cmd += ["--escalate", ",".join(arm["escalate"])]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        try: launched = (json.loads(p.stdout or "{}").get("data") or {})
+        except Exception: launched = {}
+        jid = launched.get("job")
+        row["job"] = jid
+        if not jid:
+            row["error"] = ((json.loads(p.stdout or "{}").get("error") if p.stdout else None)
+                or (p.stderr or "").strip() or "wake launch failed")[:200]
+            return row
+        job, deadline = {}, time.time() + 7200
+        while time.time() < deadline:
+            job = _wake_read_job(sdir, jid) or {}
+            if job.get("status") in ("done", "failed", "parked"): break
+            time.sleep(0.25)
+        led = [r for r in _usage_read()[before:] if r.get("agent") == cell["agent"]]
+        costs = [r["cost"] if isinstance(r.get("cost"), (int, float)) else r.get("cost_equiv") for r in led]
+        costs = [c for c in costs if isinstance(c, (int, float))]
+        if costs: row["cost_usd"] = round(sum(costs), 6)
+        row["tokens_in"] = sum(int(r.get("in") or 0) for r in led)
+        row["tokens_out"] = sum(int(r.get("out") or 0) for r in led)
+        row["tokens"] = row["tokens_in"] + row["tokens_out"]
+        esc = job.get("escalation") or []
+        row["escalation"] = esc
+        row["escalations"] = max(0, len(esc) - 1)
+        v = job.get("verify") or {}
+        row["verify_exit"] = v.get("exit")
+        if job.get("status") == "parked":
+            row["status"] = "parked"
+            row["error"] = f"usage limit: parked until {job.get('resume_at') or 'reset'} (not retried)"
+        elif v.get("exit") == 0:
+            row["status"] = "pass"; row["pass"] = True
+        elif job.get("status") in ("done", "failed"):
+            row["status"] = "fail"
+            tail_lines = (v.get("tail") or "").splitlines()
+            row["error"] = str(job.get("error") or (tail_lines[-1] if tail_lines else ""))[:200]
+        else:
+            row["error"] = "wake job did not finish within 7200s"
+    except Exception as e:
+        row["error"] = f"{type(e).__name__}: {str(e)[:180]}"
+    row["wall_s"] = round(time.time() - t0, 2)
+    return row
+
+def bench_report_md(rows):
+    """Results rows -> markdown table + cheapest-passing winner per task. Pure."""
+    L = ["| task | arm | backend/model | result | cost | tokens | wall | escalations |",
+         "|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        cost = "-" if r.get("cost_usd") is None else f"${r['cost_usd']:.4f}"
+        bm = f"{r.get('backend', '')}/{r.get('model', '')}" + (f"@{r['effort']}" if r.get("effort") else "")
+        L.append(f"| {r.get('task', '')} | {r.get('arm', '')} | {bm} | {r.get('status', '')} "
+            f"| {cost} | {r.get('tokens', 0)} | {r.get('wall_s', 0)}s | {r.get('escalations', 0)} |")
+    wins = {}
+    for r in rows:
+        if r.get("pass"):
+            k = (r.get("cost_usd") is None, r.get("cost_usd") or 0, r.get("wall_s") or 0)
+            if r.get("task") not in wins or k < wins[r["task"]][0]: wins[r["task"]] = (k, r)
+    for t, (_, r) in sorted(wins.items()):
+        L.append(f"\nwinner {t}: {r.get('arm', '')} "
+            + ("-" if r.get("cost_usd") is None else f"${r['cost_usd']:.4f}")
+            + (f" (kept branch {r['kept_branch']})" if r.get("kept_branch") else ""))
+    return "\n".join(L) + "\n"
+
+def do_bench(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    sub = getattr(a, "bsub", None)
+    if sub == "report":
+        rp = Path(getattr(a, "results", None) or "bench-results.jsonl").expanduser()
+        try: rows = [json.loads(ln) for ln in rp.read_text().splitlines() if ln.strip()]
+        except Exception as e: return emit(a, "bench", error=f"cannot read results {rp}: {e}", hint="ag bench run SPEC.toml first")
+        md = bench_report_md(rows)
+        if getattr(a, "out", None):
+            try: Path(a.out).expanduser().write_text(md)
+            except Exception as e: return emit(a, "bench", error=f"cannot write {a.out}: {e}")
+        return emit(a, "bench", {"_text": md.rstrip("\n"), "rows": len(rows), "results": str(rp)})
+    if sub != "run": return emit(a, "bench", error="no bench subcommand", hint="run|report")
+    spec, err = bench_load_spec(a.spec)
+    if err: return emit(a, "bench", error=err, hint="ag bench run SPEC.toml")
+    spec_dir = Path(a.spec).expanduser().resolve().parent
+    jobs_n = max(1, int(getattr(a, "jobs", 2) or 2))
+    run_id = time.strftime("%Y%m%d%H%M%S") + "-" + hashlib.sha256(f"{time.time()}{os.getpid()}".encode()).hexdigest()[:6]
+    run_dir = Path(sdir) / "bench" / run_id; run_dir.mkdir(parents=True, exist_ok=True)
+    # Stage hidden files outside any worktree; register agents + create
+    # worktrees sequentially (registry and git worktree metadata are shared).
+    cells, setup_errs = [], []
+    agents = load_agents(sdir)
+    for task in spec["tasks"]:
+        stage = run_dir / "hidden" / _bench_slug(task["name"])
+        for h in task["hidden"]:
+            src = Path(h["src"]).expanduser()
+            if not src.is_absolute(): src = spec_dir / src
+            dst = stage / h["dest"]
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True); dst.write_bytes(src.read_bytes())
+            except Exception as e: setup_errs.append(f"task {task['name']}: hidden {h['src']}: {e}")
+        repo = Path(task["repo"]).expanduser()
+        if not repo.is_absolute(): repo = spec_dir / repo
+        sha = _git(repo, "rev-parse", "--verify", "--quiet", f"{task['base']}^{{commit}}")
+        for arm in spec["arms"]:
+            cell = {"task": task, "arm": arm, "repo": str(repo),
+                "agent": _bench_slug(f"bench-{task['name']}-{arm['name']}"),
+                "wt": str(run_dir / "wt" / _bench_slug(f"{task['name']}-{arm['name']}")),
+                "branch": f"bench/run-{run_id}-{_bench_slug(task['name'])}-{_bench_slug(arm['name'])}"}
+            if sha.returncode:
+                setup_errs.append(f"task {task['name']}: bad base {task['base']!r} in {repo}")
+                cells.append({**cell, "setup_error": f"bad base {task['base']!r}"}); continue
+            r = _git(repo, "worktree", "add", "-b", cell["branch"], cell["wt"], sha.stdout.strip())
+            if r.returncode:
+                setup_errs.append(f"task {task['name']} x {arm['name']}: worktree add: {r.stderr.strip()[:160]}")
+                cells.append({**cell, "setup_error": "worktree add failed"}); continue
+            row = {"name": cell["agent"], "backend": arm["backend"], "model": arm["model"],
+                "dir": cell["wt"], "role": "sub", **({"effort": arm["effort"]} if arm["effort"] else {})}
+            agents = [x for x in agents if x.get("name") != cell["agent"]] + [row]
+            cells.append(cell)
+    save_agents(sdir, agents)
+    def _run_cell(cell):
+        if cell.get("setup_error"):
+            return {"ts": now_iso(), "task": cell["task"]["name"], "arm": cell["arm"]["name"],
+                "backend": cell["arm"]["backend"], "model": cell["arm"]["model"], "effort": cell["arm"]["effort"],
+                "repo": cell["repo"], "base": cell["task"]["base"], "worktree": cell["wt"], "branch": cell["branch"],
+                "agent": cell["agent"], "status": "error", "pass": False, "verify_exit": None, "cost_usd": None,
+                "tokens_in": 0, "tokens_out": 0, "tokens": 0, "wall_s": 0.0, "escalations": 0,
+                "escalation": [], "job": None, "error": cell["setup_error"]}
+        return _bench_cell(sdir, run_dir, cell)
+    with _cf.ThreadPoolExecutor(max_workers=jobs_n) as ex:
+        rows = list(ex.map(_run_cell, cells))
+    # Winner keeping: cheapest passing arm per task keeps its worktree's
+    # branch as bench/<task>-<arm>; every other worktree is removed and its
+    # scratch branch deleted. Never pushes.
+    kept = {}
+    if getattr(a, "keep_winner", False):
+        for task in spec["tasks"]:
+            cand = [r for r in rows if r["task"] == task["name"] and r.get("pass")]
+            if not cand: continue
+            win = min(cand, key=lambda r: (r.get("cost_usd") is None, r.get("cost_usd") or 0, r.get("wall_s") or 0))
+            kb = f"bench/{_bench_slug(task['name'])}-{_bench_slug(win['arm'])}"
+            if _git(win["repo"], "branch", "-m", win["branch"], kb).returncode == 0:
+                win["kept_branch"] = kb; kept[task["name"]] = kb
+    for r in rows:
+        wt, repo = Path(r["worktree"]), r["repo"]
+        if wt.is_dir(): _git(repo, "worktree", "remove", "--force", str(wt))
+        if not r.get("kept_branch"): _git(repo, "branch", "-D", r["branch"])
+    outp = Path(getattr(a, "out", None) or "bench-results.jsonl").expanduser()
+    try:
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        with open(outp, "a") as f:
+            for r in rows: f.write(json.dumps(r) + "\n")
+    except Exception as e: return emit(a, "bench", error=f"cannot write results {outp}: {e}")
+    txt = bench_report_md(rows).rstrip("\n") + f"\nresults: {outp} ({len(rows)} cells, jobs={jobs_n})"
+    if setup_errs: txt += "\nsetup errors: " + "; ".join(setup_errs)
+    return emit(a, "bench", {"_text": txt, "results": str(outp), "rows": rows, "kept": kept,
+        "passed": sum(1 for r in rows if r.get("pass")), "cells": len(rows)})
+
 def build():
     p = argparse.ArgumentParser(prog="ag", description="CLI helper for autonomous agents")
     p.add_argument("--dir", default=None, help="state dir (default ./.agent)")
@@ -23058,6 +23330,11 @@ def build():
     acr=acs.add_parser("rm",help="remove a glob from allow+deny"); acr.add_argument("glob"); acr.add_argument("--scope",default="global",choices=["global","project"]); acr.add_argument("--data",default=None,choices=["work","public"],help="per-data policy (default: base)")
     gr=sub.add_parser("grant",help="human approval of risky actions an agent requested (Touch ID / Watch / device password popup)"); gr.add_argument("id",nargs="?",default=None,help="request id (or unique prefix)"); gr.add_argument("--list",action="store_true",help="list pending requests"); gr.add_argument("--all",action="store_true",help="with --list: include granted/denied/expired"); gr.add_argument("--deny",default=None,metavar="ID",help="deny a pending request (no popup)")
     us=sub.add_parser("usage",help="token/cost/request totals from the usage ledger"); us.add_argument("--by",default=None,choices=["provider","model","agent","project","day"],help="group breakdown"); us.add_argument("--since",default=None,help="1d|7d|30d (default: all)")
+    bn=sub.add_parser("bench",help="run real tasks as benchmarks: task x arm in fresh worktrees via wake --verify (run|report)"); bns=bn.add_subparsers(dest="bsub",required=False)
+    bnr=bns.add_parser("run",help="run a bench spec (TOML: [[task]] repo/base/prompt/verify/hidden + [[arm]] backend/model/effort/escalate)")
+    bnr.add_argument("spec",help="bench spec TOML file"); bnr.add_argument("--jobs",type=int,default=2,help="concurrent cells (default 2)"); bnr.add_argument("--keep-winner",dest="keep_winner",action="store_true",help="keep the cheapest passing arm per task as branch bench/<task>-<arm> (never pushes)"); bnr.add_argument("--out",default=None,help="results JSONL to append (default bench-results.jsonl)")
+    bnp=bns.add_parser("report",help="render a results JSONL as a markdown table (+ cheapest passing winner per task)")
+    bnp.add_argument("results",nargs="?",default=None,help="results JSONL (default bench-results.jsonl)"); bnp.add_argument("--out",default=None,help="also write the markdown table to this file")
     bu=sub.add_parser("budget",help="spend/request budgets"); bus=bu.add_subparsers(dest="sub",required=True)
     bus.add_parser("show",help="limits + spent/used today")
     bset=bus.add_parser("set",help="set daily/monthly USD + provider rpd"); bset.add_argument("--daily",type=float,default=None,help="USD per UTC day"); bset.add_argument("--monthly",type=float,default=None,help="USD per UTC month"); bset.add_argument("--provider",default=None,help="provider id for --rpd"); bset.add_argument("--rpd",type=int,default=None,help="requests per UTC day for --provider")
@@ -23815,7 +24092,7 @@ def main(argv=None):
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"browser":do_browser,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"channel":do_channel,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
-        "access":do_access,"grant":do_grant,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit,"merge":do_merge,"mem":do_mem}[a.subcmd]
+        "access":do_access,"grant":do_grant,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit,"merge":do_merge,"mem":do_mem,"bench":do_bench}[a.subcmd]
     maybe_auto_update(a.subcmd)
     g = gate_check(a, argv0)
     if g is not None: return g

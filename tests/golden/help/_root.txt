@@ -1,10 +1,10 @@
 usage: ag [-h] [--dir DIR] [--json] [--version]
-          {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,mem,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,budget,policy,setup,link} ...
+          {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,mem,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,bench,budget,policy,setup,link} ...
 
 CLI helper for autonomous agents
 
 positional arguments:
-  {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,mem,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,budget,policy,setup,link}
+  {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,mem,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,bench,budget,policy,setup,link}
     run                 run shell cmd, logged
     read                read file numbered
     write               write file (arg or stdin)
@@ -78,6 +78,8 @@ positional arguments:
     grant               human approval of risky actions an agent requested (Touch ID / Watch /
                         device password popup)
     usage               token/cost/request totals from the usage ledger
+    bench               run real tasks as benchmarks: task x arm in fresh worktrees via wake
+                        --verify (run|report)
     budget              spend/request budgets
     policy              compile an ag-policy.json into backend policy files
     setup               pick model routing, install ag skills (shared ~/.agents/skills + links),

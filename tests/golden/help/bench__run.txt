@@ -1,0 +1,11 @@
+usage: ag bench run [-h] [--jobs JOBS] [--keep-winner] [--out OUT] spec
+
+positional arguments:
+  spec           bench spec TOML file
+
+options:
+  -h, --help     show this help message and exit
+  --jobs JOBS    concurrent cells (default 2)
+  --keep-winner  keep the cheapest passing arm per task as branch bench/<task>-<arm> (never
+                 pushes)
+  --out OUT      results JSONL to append (default bench-results.jsonl)

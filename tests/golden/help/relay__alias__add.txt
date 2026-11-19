@@ -1,0 +1,20 @@
+usage: ag relay alias add [-h] --backend BACKEND --dir ADIR [--model MODEL] [--mode MODE]
+                          [--from FROM_NODES] [--resume RESUME] [--active-min ACTIVE_MIN]
+                          name
+
+positional arguments:
+  name
+
+options:
+  -h, --help            show this help message and exit
+  --backend BACKEND     claude|opencode|codex|cursor|gemini
+  --dir ADIR            workdir the chat runs in
+  --model MODEL
+  --mode MODE           ro|edits|auto (default ro); capped by this node's relay max_mode; full is
+                        refused
+  --from FROM_NODES     comma-separated sender nodes allowed (default none: must be explicit)
+  --resume RESUME       latest = newest Claude Code session for --dir | SESSION_ID | none =
+                        dedicated agent alias-NAME
+  --active-min ACTIVE_MIN
+                        minutes of interactive-session inactivity before a headless run is allowed
+                        (default 15)

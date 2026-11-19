@@ -1,4 +1,4 @@
-usage: ag relay name claim [-h] [--session SESSION] [--default] [--force] name
+usage: ag relay name claim [-h] [--session SESSION] [--default] [--force] [--pid PID] name
 
 positional arguments:
   name
@@ -8,3 +8,5 @@ options:
   --session SESSION  session id (default $AG_RELAY_SESSION)
   --default          also receive unaddressed messages (at most one default)
   --force            take the name even when another session holds it
+  --pid PID          pid of the interactive session; relay alias treats a dead pid as no live
+                     session

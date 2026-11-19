@@ -1,0 +1,10 @@
+usage: ag relay alias [-h] {add,list,rm} ...
+
+positional arguments:
+  {add,list,rm}
+    add          define alias NAME (human only; stored in relay.json)
+    list         aliases with effective mode and last remote chat
+    rm           remove alias NAME
+
+options:
+  -h, --help     show this help message and exit

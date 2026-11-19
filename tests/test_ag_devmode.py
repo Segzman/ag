@@ -55,15 +55,19 @@ class UpdateChecks(Env):
 
         src = self.td / "copy" / "ag"; src.parent.mkdir(); src.write_text("old\n")
         class Resp:
+            status, headers = 200, {}
             def __init__(self, body): self.body = body
-            def read(self): return self.body
+            def read(self, n=-1):
+                n = len(self.body) if n < 0 else n
+                out, self.body = self.body[:n], self.body[n:]
+                return out
             def __enter__(self): return self
             def __exit__(self, *a): return False
         with patch.object(ag, "_update_remote_sha", return_value=SHA), \
                 patch.object(urllib.request, "urlopen", return_value=Resp(b"# new\n")) as urlopen:
             status, _ = ag.self_update(src)
         self.assertEqual(status, "updated")
-        self.assertEqual(urlopen.call_args.args[0], f"https://raw.githubusercontent.com/Segzman/ag/{SHA}/ag")
+        self.assertEqual(urlopen.call_args.args[0].full_url, f"https://raw.githubusercontent.com/Segzman/ag/{SHA}/ag")
         self.assertEqual(src.read_text(), "# new\n")
         self.assertEqual(ag._update_commit_read(), SHA)
         with patch.object(ag, "_update_remote_sha", return_value=SHA), \

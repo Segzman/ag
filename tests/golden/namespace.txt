@@ -182,6 +182,8 @@ UI_OUTCOME
 UI_TITLE
 UPDATE_API_URL
 UPDATE_BRANCH
+UPDATE_DL_ATTEMPTS
+UPDATE_DL_CHUNK
 UPDATE_EVERY_S
 UPDATE_NET_TIMEOUT_S
 UPDATE_RAW_PINNED
@@ -738,6 +740,7 @@ _update_check_inline
 _update_commit_path
 _update_commit_read
 _update_commit_write
+_update_download
 _update_remote_sha
 _update_stamp
 _update_status_data

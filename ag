@@ -22290,6 +22290,35 @@ def _update_check_inline():
     except Exception: pass
     return {"status": status, "detail": detail}
 
+UPDATE_DL_ATTEMPTS = 8
+UPDATE_DL_CHUNK = 64 * 1024
+
+def _update_download(url, timeout=UPDATE_NET_TIMEOUT_S, attempts=UPDATE_DL_ATTEMPTS):
+    """Fetch url in chunks. A dropped transfer resumes with `Range: bytes=<have>-`; a server
+    answering 200 to a Range restarts from zero. Done only when length == Content-Length."""
+    import http.client
+    buf, total, last = bytearray(), None, "no attempt"
+    for i in range(attempts):
+        if i: time.sleep(min(2 ** (i - 1), 8))
+        hdr = {"User-Agent": "ag-self-update"}
+        if buf: hdr["Range"] = f"bytes={len(buf)}-"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=timeout) as r:
+                if buf and r.status != 206: buf = bytearray()  # Range ignored: restart clean
+                clen = r.headers.get("Content-Length")
+                if clen is not None: total = len(buf) + int(clen)
+                while chunk := r.read(UPDATE_DL_CHUNK): buf += chunk
+            if total is None or len(buf) == total: return bytes(buf)
+            last = f"short read {len(buf)}/{total}"
+        except http.client.IncompleteRead as e:
+            buf += e.partial; last = f"IncompleteRead ({len(buf)} bytes kept)"
+        except urllib.error.HTTPError as e:
+            if e.code < 500: raise
+            last = f"HTTP {e.code}"
+        except (ConnectionError, TimeoutError, socket.timeout, urllib.error.URLError) as e:
+            last = f"{type(e).__name__}: {e}"
+    raise OSError(f"download failed after {attempts} attempts: {last}")
+
 def self_update(src=None):
     """-> (status, detail). status: updated|current|skipped|error."""
     src = Path(src or ag_script_path()); repo = src.parent
@@ -22308,13 +22337,12 @@ def self_update(src=None):
         m = g("merge", "-q", "--ff-only", "@{u}")
         if m.returncode: return "error", "git merge: " + m.stderr.strip()[:200]
         return "updated", f"{old} -> {g('rev-parse', '--short', 'HEAD').stdout.strip()} ({behind} commits)"
-    import urllib.request, py_compile, tempfile
+    import py_compile, tempfile
     sha, have = _update_remote_sha(), _update_commit_read()
     if sha and have and (sha == have or sha.startswith(have) or have.startswith(sha)):
         return "current", sha[:12]
     url = UPDATE_RAW_PINNED.format(sha=sha) if sha else UPDATE_RAW_URL
-    try:
-        with urllib.request.urlopen(url, timeout=UPDATE_NET_TIMEOUT_S) as r: new = r.read()
+    try: new = _update_download(url)
     except Exception as e: return "error", f"download: {e}"
     if new == src.read_bytes():
         if sha: _update_commit_write(sha)

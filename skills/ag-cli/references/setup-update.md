@@ -14,7 +14,7 @@ Per-project check: `{{AG}} route --check --json`; if `configured` is false, ask 
 
 ## ag update
 
-ag auto-checks GitHub once a day in a detached process; applies on next run. `schedule tick` runs the same daily check inline (same stamp), so a timer-only node still updates. Git checkout: `fetch` + `merge --ff-only`, only if clean, tracking, not ahead. Copy install: cheap `git ls-remote` sha compare (GitHub API fallback), download the pinned sha from raw, compile check, atomic swap, record in `~/.cache/ag/update-commit` (also the relay heartbeat commit).
+ag auto-checks GitHub once a day in a detached process; applies on next run. `schedule tick` runs the same daily check inline (same stamp), so a timer-only node still updates. Git checkout: `fetch` + `merge --ff-only`, only if clean, tracking, not ahead. Copy install: cheap `git ls-remote` sha compare (GitHub API fallback), download the pinned sha from raw in chunks (dropped connection resumes via Range, up to 8 attempts; a 200 reply to Range restarts clean; length must match Content-Length), compile check, atomic swap, record in `~/.cache/ag/update-commit` (also the relay heartbeat commit).
 
 ```sh
 {{AG}} update                  # run now

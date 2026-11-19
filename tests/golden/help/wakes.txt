@@ -1,6 +1,7 @@
 usage: ag wakes [-h] [--agent AGENT] [--limit LIMIT] [--wait WAIT [WAIT ...]]
                 [--wait-group WAIT_GROUP] [--timeout TIMEOUT] [--cancel CANCEL] [--group GROUP]
                 [--stop] [--reap] [--dry-run] [--include-running] [--max-attempts MAX_ATTEMPTS]
+                [--retry JOB[,JOB]] [--model M]
 
 options:
   -h, --help            show this help message and exit
@@ -19,3 +20,6 @@ options:
   --dry-run
   --include-running     also reap jobs lost mid-turn
   --max-attempts MAX_ATTEMPTS
+  --retry JOB[,JOB]     re-send a failed or usage-parked wake with its original agent, message and
+                        verify/escalate options
+  --model M             with --retry: one-off model override for the retry (roster unchanged)

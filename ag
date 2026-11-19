@@ -410,6 +410,66 @@ def _wake_reply_path(sdir, jid):
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", jid)[:64]
     return jobs / f"{safe}.reply.md"
 
+def _wake_turnlog_path(sdir, jid):
+    _, jobs, _ = _wake_dirs(sdir)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", jid)[:64]
+    return jobs / f"{safe}.turns.jsonl"
+
+def _wake_turnlog(sdir, jid, event, **kw):
+    """Append one row to the wake's durable turn log (wake/jobs/<id>.turns.jsonl):
+    started / session (backend session id) / tool / toolout / verify / escalation /
+    parked / interrupted / finished / failed. Append-only, never raises."""
+    try:
+        row = {"ts": now_iso(), "event": event, "job": jid}
+        for k, v in kw.items():
+            if v is not None: row[k] = v[:500] if isinstance(v, str) else v
+        with open(_wake_turnlog_path(sdir, jid), "a") as f:
+            f.write(json.dumps(row) + "\n")
+        return row
+    except Exception: return {}
+
+def _wake_turnlog_read(sdir, jid):
+    try:
+        return [json.loads(l) for l in _wake_turnlog_path(sdir, jid).read_text().splitlines() if l.strip()]
+    except Exception: return []
+
+def _wake_job_update(sdir, jid, **fields):
+    """Locked in-place update of a non-terminal job (e.g. recording the backend
+    session id mid-turn so a later tick can resume it). Returns the job."""
+    lock = _acquire_wake_job(sdir, jid)
+    if lock is None: return _wake_read_job(sdir, jid)
+    try:
+        cur = _wake_read_job(sdir, jid)
+        if cur and cur.get("status") in ("queued", "running", "parked"):
+            cur.update(fields); _wake_write_job(sdir, cur)
+        return cur or {}
+    finally: _release_wake_job(lock)
+
+def _wake_resume_opted_in(sdir, job):
+    """wake.resume opt-in for resume-after-crash: job field, agent row
+    (wake_resume / wake.resume), or global config wake.resume=true."""
+    try:
+        if (job or {}).get("resume"): return True
+        rows = load_agents(sdir)
+        a = next((r for r in rows if r.get("name") == (job or {}).get("agent")), None) or {}
+        if a.get("wake_resume"): return True
+        if isinstance(a.get("wake"), dict) and a["wake"].get("resume"): return True
+        cfg = _ag_conf()
+        return isinstance(cfg.get("wake"), dict) and cfg["wake"].get("resume") is True
+    except Exception: return False
+
+def _wake_backend_sid(sdir, job):
+    """Backend session id for a wake: job field, its turn log, then chat meta. '' if unknown."""
+    try:
+        for k in ("backend_sid", "backend_session", "session_id"):
+            if (job or {}).get(k): return str(job[k])
+        for row in reversed(_wake_turnlog_read(sdir, (job or {}).get("id", ""))):
+            if row.get("event") == "session" and row.get("backend_sid"): return str(row["backend_sid"])
+        meta = load_chat_meta(sdir, (job or {}).get("agent", ""))
+        sids = meta.get("sids") or {}
+        return str(next(iter(sids.values()), "") or meta.get("sid") or "")
+    except Exception: return ""
+
 def _wake_write_reply(sdir, jid, text):
     p = _wake_reply_path(sdir, jid)
     t = p.with_suffix(".tmp")
@@ -656,7 +716,7 @@ def _require_diff(explicit, row, has_verify=False):
 
 def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
         notify="", notify_done=False, on_done="", timeout_s=0, max_runtime_s=0, stall_s=None, job_type=None, cohort=None, extra=None,
-        verify=None, verify_timeout_s=600, escalate=None, require_diff=None):
+        verify=None, verify_timeout_s=600, escalate=None, require_diff=None, model=None):
     """Enqueue one wake job + spawn tracked worker. Returns {job,session} or {error}."""
     try: rows = load_agents(sdir)
     except Exception: rows = []
@@ -717,10 +777,13 @@ def launch_wake_chat(sdir, agent, message, trigger=None, exit_code=None,
         **({"verify": verify, "verify_timeout_s": vtmo if vtmo is not None else 600} if verify else {}),
         **({"escalate": list(escalate)} if verify and escalate is not None else {}),
         "require_diff": _require_diff(require_diff, _arow),  # wake CLI passes the resolved value; other callers default off
-        **({"parent": cohort["parent"], "group": cohort["group"]} if cohort else {}), **(extra or {})}
+        **({"parent": cohort["parent"], "group": cohort["group"]} if cohort else {}),
+        **({"model_override": model} if model else {}), **(extra or {})}
     def _publish(wsid, sp):
         if cohort: _cohort_add(sdir, cohort, jid)
         _wake_write_job(sdir, job)
+        _wake_turnlog(sdir, jid, "started", agent=agent, session=sid,
+            model=job.get("model_override"))
         _event(sdir, "wake", trigger, agent=agent, exit=exit_code, job=jid, **({"job_type": job_type} if job_type else {}))
     try:
         wsid = _spawn_wake_session(sdir, agent, jid, sid=sid, pre_fork=_publish)
@@ -830,6 +893,16 @@ def _wake_finish(sdir, jid, status, reply="", error="", exit_code=0,
         else:
             _event(sdir, "wake_fail", cur.get("trigger"), agent=cur.get("agent"),
                 exit=cur.get("exit"), reason=str(error or "")[:120], job=jid)
+    except Exception: pass
+    try:
+        if status == "done":
+            _wake_turnlog(sdir, jid, "finished", agent=cur.get("agent"), exit=cur.get("backend_exit", 0))
+        elif status == "parked":
+            _wake_turnlog(sdir, jid, "parked", agent=cur.get("agent"),
+                resume_at=cur.get("resume_at"), reason=str(error or "")[:200])
+        else:
+            _wake_turnlog(sdir, jid, "failed", agent=cur.get("agent"),
+                reason=str(error or "")[:200], exit=exit_code)
     except Exception: pass
     if status == "parked":
         return cur
@@ -1176,11 +1249,20 @@ def do__wake_run(a):
             _release_wake_job(lock)
     max_runtime_s = _valid_runtime(job.get("max_runtime_s")) or 0
     vcmd = str(job.get("verify") or "")
+    def _turn_ev(name, kind, txt):
+        # tool/edit summary as the backend emits it -> durable turn log
+        if kind in ("tool", "toolout"):
+            _wake_turnlog(sdir, jid, kind, summary=str(txt or "")[:200])
+    def _note_sid(r):
+        if r and r.get("sid"):
+            _wake_turnlog(sdir, jid, "session", backend_sid=str(r["sid"]))
+            _wake_job_update(sdir, jid, backend_sid=str(r["sid"]))
     try:
-        r = run_turn(sdir, agent, message, on_start=_on_start, timeout_s=max_runtime_s, stall_s=job.get("stall_s"), force=bool(job.get("force")))
+        r = run_turn(sdir, agent, message, on_start=_on_start, timeout_s=max_runtime_s, stall_s=job.get("stall_s"), force=bool(job.get("force")), model=job.get("model_override") or None, on_event=_turn_ev)
     except Exception as e:
         _mark_failed(f"turn error: {e}", 1)
         return 1
+    _note_sid(r)
     _wvf = {}
     _rd = bool(job.get("require_diff"))
     def _diff_verdict():
@@ -1199,16 +1281,19 @@ def do__wake_run(a):
         for i in range(len(esc_ms)+1):
             if i:
                 _nochg = _dv is not None and _dv["exit_ok"] and not _dv["changed"]
+                _wake_turnlog(sdir, jid, "escalation", model=cur)
                 try: append_chat(sdir, agent, "tool", f"[escalate] -> {cur} (verify exit {v['exit']})")
                 except Exception: pass
                 try: r = run_turn(sdir, agent, (f"{message}\n\nThe previous attempt changed nothing in the worktree. Do the work there (edit or commit files)." if _nochg else f"{message}\n\nThe previous attempt failed verification (`{vcmd}`, exit {v['exit']}). Output:\n{v['tail']}\nFix it."),
-                    timeout_s=max_runtime_s, stall_s=job.get("stall_s"), force=bool(job.get("force")), model=cur)
+                    timeout_s=max_runtime_s, stall_s=job.get("stall_s"), force=bool(job.get("force")), model=cur, on_event=_turn_ev)
                 except Exception as e: r = {"error": f"turn error: {e}", "exit": 1}
+                _note_sid(r)
             if "error" in r and not r.get("timed_out"): v = {"cmd": vcmd, "exit": -1, "tail": str(r["error"])[:2000]}
             else:
                 try: v = run_verify(sdir, agent, vcmd, job.get("verify_timeout_s") or 600)
                 except Exception as e: v = {"cmd": vcmd, "exit": 1, "tail": f"verify error: {e}"}
                 verify_log_row(sdir, agent, v)
+            _wake_turnlog(sdir, jid, "verify", cmd=vcmd, exit=v["exit"])
             _dv = _diff_verdict()
             if _dv is not None: _dv["exit_ok"] = v["exit"] == 0
             esc.append({"model": cur, "exit": r.get("exit"), "verify_exit": v["exit"], **({"changed": _dv["changed"]} if _dv else {})})
@@ -1220,6 +1305,7 @@ def do__wake_run(a):
         try: r["verify"] = run_verify(sdir, agent, vcmd, job.get("verify_timeout_s") or 600)
         except Exception as e: r["verify"] = {"cmd": vcmd, "exit": 1, "tail": f"verify error: {e}"}
         verify_log_row(sdir, agent, r["verify"])
+        _wake_turnlog(sdir, jid, "verify", cmd=vcmd, exit=r["verify"]["exit"])
         _wvf = {"verify": r["verify"]}
         _dv = _diff_verdict()
         if _dv is not None: _wvf.update(_diff_fields(_dv))
@@ -1228,11 +1314,17 @@ def do__wake_run(a):
         _mark_failed(r.get("error", "max-runtime exceeded"), 124, fields={"timed_out": True, **_wvf, **_we})
         return 1
     _wp = None if job.get("no_park") else _usage_park_epoch(r)
-    if _wp:  # plan cap with a parsed reset: park for the scheduler tick, not a failure
+    _unknown_reset = bool(r.get("usage_limit")) and not r.get("usage_limit_when")
+    try: _park_retries = int(job.get("park_retries") or 0)
+    except Exception: _park_retries = 0
+    if _wp and _unknown_reset and _park_retries >= WAKE_PARK_MAX_RETRIES:
+        _wp = None  # unknown-reset auto-retries are capped at 3; fall through to failed
+    if _wp:  # plan cap: park for the scheduler tick, not a failure (unknown reset parks until cooling ends)
         _wex = r.get("exit", 1)
         _wake_finish(sdir, jid, "parked", error=r.get("error", ""),
             exit_code=_wex if isinstance(_wex, int) else 1,
-            fields={"usage_limit": True, "resume_at": _wp, "usage_reset_at": r.get("reset_at"), **_wvf, **_we})
+            fields={"usage_limit": True, "resume_at": _wp, "usage_reset_at": r.get("reset_at"),
+                **({"usage_reset_unknown": True, "park_retries": _park_retries + 1} if _unknown_reset else {}), **_wvf, **_we})
         return 0
     if "error" in r:
         # carry backend_stderr too: error-dict failures (preflight, usage-limit)
@@ -1287,7 +1379,7 @@ def wakes_reap(sdir, queued_only=True, include_running=False, agent=None, max_at
             notify=j.get("notify", ""), notify_done=bool(j.get("notify_done")), on_done=j.get("on_done", ""), timeout_s=j.get("timeout_s", 0),
             max_runtime_s=j.get("max_runtime_s", 0), stall_s=j.get("stall_s"), job_type=j.get("job"),
             verify=j.get("verify"), verify_timeout_s=j.get("verify_timeout_s", 600), escalate=j.get("escalate"),
-            require_diff=j.get("require_diff"),
+            require_diff=j.get("require_diff"), model=j.get("model_override") or None,
             cohort=({"parent": j["parent"], "group": j["group"], "quiet_s": 0} if j.get("group") else None),
             extra={"retry_of": j["id"], "attempts": at + 1, **({"no_park": True} if j.get("no_park") else {})})
         if "error" in r:
@@ -1322,7 +1414,10 @@ def _wake_resume_parked(sdir, now, dry=False):
             extra = {"parked_from": cur["id"]}
             if cur.get("no_park"): extra["no_park"] = True
             if cur.get("force"): extra["force"] = True
+            if cur.get("park_retries"): extra["park_retries"] = cur["park_retries"]
+            if cur.get("usage_reset_unknown"): extra["usage_reset_unknown"] = True
             r = launch_wake_chat(sdir, cur.get("agent", ""), cur.get("message", ""),
+                model=cur.get("model_override") or None,
                 trigger=cur.get("trigger"), exit_code=cur.get("exit"),
                 notify=cur.get("notify", ""), notify_done=bool(cur.get("notify_done")),
                 on_done=cur.get("on_done", ""), timeout_s=cur.get("timeout_s", 0),
@@ -1344,6 +1439,153 @@ def _wake_resume_parked(sdir, now, dry=False):
             _event(sdir, "wake_resume", cur.get("trigger"), agent=cur.get("agent"),
                 job=r["job"], old=cur.get("id"))
             out.append({**row, "action": "resumed", "new": r["job"]})
+        finally: _release_wake_job(lock)
+    return out
+
+WAKE_RESUME_MSG = "continue; you were interrupted"
+WAKE_PARK_MAX_RETRIES = 3
+
+def _wake_retry_one(sdir, old, model=None):
+    """Re-send one failed/parked/interrupted wake with its original agent,
+    message and verify/escalate options. -> row {id,agent,action,new?}."""
+    jid = old.get("id", "")
+    row = {"id": jid, "agent": old.get("agent"), "action": "skipped"}
+    if old.get("status") not in ("failed", "parked", "interrupted"):
+        row["action"] = f'skipped-{old.get("status") or "unknown"}'; return row
+    extra = {"retry_of": jid}
+    try: extra["attempts"] = int(old.get("attempts") or 1) + 1
+    except Exception: extra["attempts"] = 2
+    if old.get("no_park"): extra["no_park"] = True
+    if old.get("force"): extra["force"] = True
+    if old.get("park_retries"): extra["park_retries"] = old["park_retries"]
+    # a parked job is claimed under its per-job lock for the whole relaunch,
+    # so the scheduler tick cannot resume the same job at the same time
+    held = _acquire_wake_job(sdir, jid) if old.get("status") == "parked" else None
+    try:
+        if held is not None:
+            cur = _wake_read_job(sdir, jid)
+            if not cur or cur.get("status") != "parked":
+                row["action"] = f'skipped-{(cur or {}).get("status") or "unknown"}'; return row
+            old = cur
+        r = launch_wake_chat(sdir, old.get("agent", ""), old.get("message", ""),
+            trigger=old.get("trigger"), exit_code=old.get("exit"),
+            notify=old.get("notify", ""), notify_done=bool(old.get("notify_done")),
+            on_done=old.get("on_done", ""), timeout_s=old.get("timeout_s", 0),
+            max_runtime_s=old.get("max_runtime_s", 0), stall_s=old.get("stall_s"),
+            job_type=old.get("job"), verify=old.get("verify"),
+            verify_timeout_s=old.get("verify_timeout_s", 600), escalate=old.get("escalate"),
+            require_diff=old.get("require_diff"), model=model or old.get("model_override") or None,
+            cohort=({"parent": old.get("parent"), "group": old["group"], "quiet_s": 0} if old.get("group") else None),
+            extra=extra)
+        if "error" in r:
+            row.update(action="error", error=str(r["error"])[:200]); return row
+        _wake_turnlog(sdir, jid, "retry", new=r["job"], model=model or old.get("model_override"))
+        if held is not None:
+            cur = _wake_read_job(sdir, jid)
+            if cur:
+                cur.update(retried_as=r["job"], status="retried", ended_at=now_iso())
+                _wake_write_job(sdir, cur)
+        else:
+            lk = _acquire_wake_job(sdir, jid)
+            if lk is not None:
+                try:
+                    cur = _wake_read_job(sdir, jid)
+                    if cur: cur["retried_as"] = r["job"]; _wake_write_job(sdir, cur)
+                finally: _release_wake_job(lk)
+        _event(sdir, "wake_retry", old.get("trigger"), agent=old.get("agent"), job=r["job"], old=jid)
+        row.update(action="retried", new=r["job"]); return row
+    finally: _release_wake_job(held)
+
+def do_wakes_retry(a, sdir):
+    if getattr(a, "model", None) and not getattr(a, "retry", None):
+        return emit(a, "wakes", error="--model needs --retry", hint="ag wakes --retry JOB --model M")
+    ids = [x.strip() for chunk in (getattr(a, "retry", None) or []) for x in str(chunk).split(",") if x.strip()]
+    rows, missing = [], []
+    for jid in ids:
+        old = _wake_read_job(sdir, jid)
+        if not old: missing.append(jid); continue
+        rows.append(_wake_retry_one(sdir, old, model=getattr(a, "model", None)))
+    if missing and not rows:
+        return emit(a, "wakes", error=f"no such job: {missing[0]}", hint="ag wakes")
+    if getattr(a, "json", False):
+        return emit(a, "wakes", {"retried": rows, **({"missing": missing} if missing else {})})
+    txt = "\n".join(f'{r["id"]} {r["action"]}' + (f' -> {r["new"]}' if r.get("new") else "") + f' ({r.get("agent") or ""})' for r in rows)
+    txt += "".join(f"\n{m} no such job" for m in missing)
+    return emit(a, "wakes", {"_text": txt or "(nothing to retry)"})
+
+def _wake_worker_dead(sdir, job):
+    """True when a running wake's worker is gone: dead pid, or a dead/missing
+    tracked session for a job older than the 5s startup grace. Never raises."""
+    try:
+        pid = job.get("pid")
+        if pid:
+            try: return not _pid_alive(int(pid))
+            except Exception: return False
+        sid = job.get("session")
+        if not sid: return False
+        st = _sstatus(_sroot(sdir) / sid)
+        if st: return not st.get("running")
+        try: age = time.time() - datetime.fromisoformat(job.get("ts") or "").timestamp()
+        except Exception: age = 999
+        return age >= 5
+    except Exception: return False
+
+def _wake_handle_interrupted(sdir, now=None, dry=False):
+    """Tick step: running wakes whose worker died with no finished event.
+    Mark interrupted (turn log + job), then either resume the backend session
+    (session id known + wake.resume opt-in) with WAKE_RESUME_MSG, or fail with
+    a clear reason. The per-job flock is the lock file: a concurrent tick or
+    retry holds it and this pass skips, so a wake never double-runs.
+    -> [{id,agent,action,new?,reason?}]."""
+    _, jobs, _ = _wake_dirs(sdir); out = []
+    for p in sorted(jobs.glob("*.json")):
+        try: j = json.loads(p.read_text())
+        except Exception: continue
+        if j.get("status") != "running" or j.get("resumed_as"): continue
+        if not _wake_worker_dead(sdir, j): continue
+        row = {"id": j.get("id"), "agent": j.get("agent")}
+        if dry: out.append({**row, "action": "would-interrupt"}); continue
+        lock = _acquire_wake_job(sdir, j["id"])
+        if lock is None: continue
+        try:
+            cur = _wake_read_job(sdir, j["id"])
+            if not cur or cur.get("status") != "running" or cur.get("resumed_as"): continue
+            if not _wake_worker_dead(sdir, cur): continue
+            sid = _wake_backend_sid(sdir, cur)
+            _wake_turnlog(sdir, cur["id"], "interrupted", agent=cur.get("agent"),
+                pid=cur.get("pid"), backend_sid=sid or None)
+            _event(sdir, "wake_interrupted", cur.get("trigger"), agent=cur.get("agent"), job=cur["id"])
+            if sid and _wake_resume_opted_in(sdir, cur):
+                r = launch_wake_chat(sdir, cur.get("agent", ""), WAKE_RESUME_MSG,
+                    trigger=cur.get("trigger"), exit_code=cur.get("exit"),
+                    notify=cur.get("notify", ""), notify_done=bool(cur.get("notify_done")),
+                    on_done=cur.get("on_done", ""), timeout_s=cur.get("timeout_s", 0),
+                    max_runtime_s=cur.get("max_runtime_s", 0), stall_s=cur.get("stall_s"),
+                    job_type=cur.get("job"), verify=cur.get("verify"),
+                    verify_timeout_s=cur.get("verify_timeout_s", 600), escalate=cur.get("escalate"),
+                    require_diff=cur.get("require_diff"), model=cur.get("model_override") or None,
+                    cohort=({"parent": cur.get("parent"), "group": cur["group"], "quiet_s": 0} if cur.get("group") else None),
+                    extra={"resume_of": cur["id"], "backend_sid": sid})
+                if "error" not in r:
+                    cur.update(status="interrupted", interrupted=True, resumed_as=r["job"],
+                        backend_sid=sid, ended_at=now_iso(),
+                        error="worker died; resumed backend session in a new wake")
+                    _wake_write_job(sdir, cur)
+                    _wake_turnlog(sdir, cur["id"], "resumed", new=r["job"], backend_sid=sid)
+                    _event(sdir, "wake_resume", cur.get("trigger"), agent=cur.get("agent"), job=r["job"], old=cur["id"])
+                    out.append({**row, "action": "resumed", "new": r["job"]}); continue
+                reason = f"interrupted: worker died and resume failed: {str(r['error'])[:140]}"
+            elif not sid:
+                reason = "interrupted: worker died with no finished event; no backend session id known, cannot resume"
+            else:
+                reason = "interrupted: worker died with no finished event; wake.resume is not enabled, not resuming"
+            cur.update(status="failed", interrupted=True, lost_status="running",
+                backend_sid=sid or cur.get("backend_sid"), error=reason, backend_exit=-1, ended_at=now_iso())
+            _wake_write_job(sdir, cur)
+            _wake_turnlog(sdir, cur["id"], "failed", agent=cur.get("agent"), reason=reason, exit=-1)
+            _event(sdir, "wake_fail", cur.get("trigger"), agent=cur.get("agent"),
+                exit=cur.get("exit"), reason=reason[:120], job=cur["id"])
+            out.append({**row, "action": "failed", "reason": reason})
         finally: _release_wake_job(lock)
     return out
 
@@ -1372,6 +1614,7 @@ def _wakes_display_status(j):
 
 def do_wakes(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
+    if getattr(a, "retry", None) or getattr(a, "model", None): return do_wakes_retry(a, sdir)
     if getattr(a, "reap", False): return do_wakes_reap(a, sdir)
     if getattr(a, "cancel", None) and (getattr(a, "wait", None) or getattr(a, "wait_group", None)):
         return emit(a, "wakes", error="--cancel and --wait are incompatible",
@@ -10756,14 +10999,18 @@ def _ul_note(sdir, name, note, on_event, ev, **kw):
         try: on_event(name, "tool", note)
         except Exception: pass
 def _usage_park_epoch(r, now=None):
-    """Turn result -> future resume epoch when it can be parked, else None. Pure."""
+    """Turn result -> future resume epoch when it can be parked, else None. Pure.
+    Unknown reset: park until the usage cooling ends (reset_at from the scan,
+    which defaults to +1h, else +1h from now) instead of failing outright;
+    the wake worker caps those auto-retries at 3 (park_retries)."""
     try:
         if not r.get("usage_limit") or r.get("timed_out") or r.get("interrupted"): return None
-        if not r.get("usage_limit_when"): return None  # reset text not parseable: keep old failure
         ep = datetime.fromisoformat(str(r.get("reset_at") or "")).timestamp()
-    except Exception: return None
+    except Exception: ep = None
     now = now or time.time()
-    return ep if ep > now else None
+    if r.get("usage_limit_when"):
+        return ep if ep and ep > now else None
+    return ep if ep and ep > now else now + _UL_DEFAULT_S
 
 # ---- rate-limit manager: slots + stall watchdog + shared cooldown + fallback (one block) ----
 # Key = backend+model. Slots: fcntl.flock on $AG_CACHE_HOME/ratelimit/slots/<key>/<i>.lock,
@@ -12179,6 +12426,8 @@ def _sched_tick_dir(sdir, now, dry, reap):
         finally: ll.close()
         try: out["actions"].extend(_wake_resume_parked(sdir, now, dry))
         except Exception as e: out["park_error"] = str(e)[:200]
+        try: out["actions"].extend(_wake_handle_interrupted(sdir, now, dry))
+        except Exception as e: out["interrupt_error"] = str(e)[:200]
         fn = globals().get("wakes_reap")
         if reap and not dry and fn:
             try: fn(sdir, queued_only=True)
@@ -21088,7 +21337,7 @@ def build():
     rsecg=rsecs.add_parser("get",help="decrypt this node's NAME with its relay ssh key to stdout (never logged)"); rsecg.add_argument("name")
     rsecr=rsecs.add_parser("rm",help="delete and commit NODE's encrypted NAME"); rsecr.add_argument("node"); rsecr.add_argument("name")
     rc_=sub.add_parser("receipts",help="idempotency receipts (--request-id)").add_subparsers(dest="sub",required=True).add_parser("gc"); rc_.add_argument("--days",type=float,default=7)
-    ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50);     ws.add_argument("--wait",default=None,nargs="+",help="block until one or more wake jobs finish (exit 0 ok, 1 failed, 124 timeout)"); ws.add_argument("--wait-group",dest="wait_group",default=None,help="block until all jobs of cohort GROUP finish (same exit codes)"); ws.add_argument("--timeout",type=int,default=30);  ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3)
+    ws=sub.add_parser("wakes",help="list wake jobs (queued/running/done/failed)"); ws.add_argument("--agent",default=None); ws.add_argument("--limit",type=int,default=50);     ws.add_argument("--wait",default=None,nargs="+",help="block until one or more wake jobs finish (exit 0 ok, 1 failed, 124 timeout)"); ws.add_argument("--wait-group",dest="wait_group",default=None,help="block until all jobs of cohort GROUP finish (same exit codes)"); ws.add_argument("--timeout",type=int,default=30);  ws.add_argument("--cancel",default=None,help="cancel one wake job (incompatible with --wait)"); ws.add_argument("--group",default=None,help="show cohort"); ws.add_argument("--stop",action="store_true",help="with --group: disposition=stopped (never deliver)"); ws.add_argument("--reap",action="store_true",help="relaunch jobs lost to a dead worker"); ws.add_argument("--dry-run",action="store_true"); ws.add_argument("--include-running",action="store_true",help="also reap jobs lost mid-turn"); ws.add_argument("--max-attempts",type=int,default=3); ws.add_argument("--retry",default=None,action="append",metavar="JOB[,JOB]",help="re-send a failed or usage-parked wake with its original agent, message and verify/escalate options"); ws.add_argument("--model",default=None,metavar="M",help="with --retry: one-off model override for the retry (roster unchanged)")
     wr=sub.add_parser("_wake_run",help=argparse.SUPPRESS); wr.add_argument("jid")
     sub.add_parser("_acp",help=argparse.SUPPRESS).add_argument("spec")
     hosts=sub.add_parser("hosts",help="outbound SSH host and project mappings"); hsub=hosts.add_subparsers(dest="hostsub",required=True)

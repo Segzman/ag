@@ -25,6 +25,10 @@ Registry `$AG_CONFIG_HOME/schedule-dirs.json`. Every tick also relaunches `parke
 
 Relay admin ops run remotely without a shell: `{{AG}} --dir <state> relay admin NODE update|notify-dir PATH|status [--wait S]` publishes `admin/<target>/<origin>--<id>.json`; the target runs it once and returns `results/<origin>/<target>--<id>--admin.json`. `relay.json` `admin_ops` limits them (default all three; `[]` disables). `ag push` inside the ag checkout pushes, publishes `update` to every peer in `nodes/` except itself, and syncs; peers update on their next sync and report the new commit in their heartbeat.
 
+Delivery: `wake --on NODE` warns when the peer heartbeat lists no usable backends; `relay say` warns when the peer has no claimed mailbox (`names`) or not the addressed one. Both still send and report `delivery_warning`; `relay status` lists one-shot mail older than 10 min without a result as `UNDELIVERED` with the reason. Git pushes retry `pull --rebase` with jittered backoff (5 attempts; `cannot lock ref`, `fetch first`), hold a checkout lock, and continue/abort a stale rebase before pulling.
+
+Secrets: `{{AG}} --dir <state> relay secret put NODE NAME` reads stdin or the hidden `ui ask --secret` dialog, encrypts with `age -r` to the node's deploy ssh key (cached as `nodes/NODE.json` `age_recipient`, else `gh api repos/OWNER/REPO/keys`), and commits `secrets/NODE/NAME.age`. `relay secret get NAME` decrypts on that node with its relay ssh key (`AG_RELAY_SSH_KEY` / `relay.json` `ssh_key` / `~/.ssh/ag_relay`) to stdout only; `relay secret rm NODE NAME` removes and commits. Plaintext never lands on disk or in logs; a missing `age` binary is a clear error.
+
 ## ratelimit
 
 ```sh

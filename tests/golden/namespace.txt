@@ -287,7 +287,9 @@ _ag_home
 _ag_owned_dir
 _age_s
 _agent_hint
+_agent_last_activity
 _agent_lock_path
+_agent_wakes
 _ago
 _api_http_once
 _api_turn
@@ -779,6 +781,8 @@ _web_profiles
 _web_rows
 _web_v2
 _ws_xor
+_wt_dirty
+_wt_unmerged
 _xterm256_rgb
 _zen_lists
 _zen_parse
@@ -953,6 +957,7 @@ do_access
 do_agents
 do_agents_create
 do_agents_fork
+do_agents_gc
 do_agents_ps
 do_approvals
 do_approve
@@ -984,6 +989,7 @@ do_kill
 do_kit
 do_link
 do_ls
+do_merge
 do_models
 do_needs
 do_note

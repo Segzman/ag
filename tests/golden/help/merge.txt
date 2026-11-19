@@ -1,0 +1,11 @@
+usage: ag merge [-h] [--into INTO] [--verify VERIFY] [--squash] [--keep] agent
+
+positional arguments:
+  agent
+
+options:
+  -h, --help       show this help message and exit
+  --into INTO      target branch (default: the worktree's base branch)
+  --verify VERIFY  shell command run in the worktree before merging (must exit 0)
+  --squash         squash the branch into one commit
+  --keep           keep worktree, branch and agent

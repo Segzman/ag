@@ -1,9 +1,10 @@
-usage: ag agents [-h] {list,ps,add,create,rm,reset,fork,set,doctor,env,caps} ...
+usage: ag agents [-h] {list,ps,add,create,rm,gc,reset,fork,set,doctor,env,caps} ...
 
 positional arguments:
-  {list,ps,add,create,rm,reset,fork,set,doctor,env,caps}
+  {list,ps,add,create,rm,gc,reset,fork,set,doctor,env,caps}
     ps                  live process trees per agent
     create              draft an agent from one sentence (proposal; --yes creates)
+    gc                  remove failed/idle agents + their merged worktrees (lists unless --yes)
     reset               clear stored backend session ids; keep config and chat log
     fork                clone config + chat history with fresh session (lineage:
                         forked_from/forked_at/fork_turn)

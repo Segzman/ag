@@ -3556,6 +3556,343 @@ def profile_set_agent(sdir, agent, name):
     return {"ok": True, "agent": agent, "profile": name or "",
         "sid_cleared": cleared}
 
+# ---- kit: token-saving toolkit delivered per agent, scoped (ag kit) ----
+# toksave wires rtk/codegraph/context-mode/style into each CLI's GLOBAL config
+# and silently misses backends (claude -p never loads ~/.claude/AGENTS.md;
+# codex/gemini/cursor get partial wiring). ag delivers the same toolkit per
+# agent through the scoped-config machinery above:
+#   codegraph/ctx -> MCP servers: claude --mcp-config JSON, opencode mcp in
+#     OPENCODE_CONFIG, codex [mcp_servers.*] in scoped CODEX_HOME/config.toml;
+#     gemini/cursor have no verified scoped MCP hook (TODO, skipped + reported).
+#     toksave runmcp proxy when installed, direct binaries otherwise.
+#   style -> composed system prompt (toksave block from ~/.claude/AGENTS.md,
+#     never duplicated when the backend already loads it).
+#   rtk -> existing rewrite + hint, gated on the kit.
+# Default: config kit.default ('all' = every installed tool; missing tools
+# skipped and reported). Per-agent override: agents set NAME --kit LIST|all|none.
+KIT_TOOLS = ("codegraph", "ctx", "rtk", "style")
+KIT_STYLE_CAP = 12000
+KIT_STYLE_DEFAULT = """# Token-saving working style
+
+- Principles: think before coding (state assumptions, ask when unclear, no silent picks); minimum code that solves the problem, nothing speculative; surgical edits (touch only what the task needs, match local style); goal-driven (define checks, loop until they pass).
+- Response style (caveman): terse prose, full technical accuracy. Drop filler, pleasantries, hedging, tool-call narration. Fragments fine; standard acronyms fine; code, commands, paths, API names, exact error strings verbatim. Normal prose for security warnings, irreversible actions, ambiguous step order, user clarification.
+- Build discipline (ponytail): lazy senior developer - efficient, not careless. Reuse first (existing helper, stdlib, platform feature, installed dependency), then the least code that works. No unrequested abstractions or dependencies; deletion over addition. Bug fix = root cause; check callers of what you touch. Non-trivial logic leaves one runnable check."""
+
+def kit_config_default():
+    v = (_ag_conf().get("kit") or {}).get("default")
+    if isinstance(v, list): v = ",".join(str(x) for x in v)
+    return (str(v or "").strip().lower()) or "all"
+
+def kit_save_default(spec):
+    """Persist kit.default in ag's config.json (atomic). -> spec."""
+    p = _ag_conf_path(); p.parent.mkdir(parents=True, exist_ok=True)
+    cfg = _ag_conf()
+    cfg.setdefault("kit", {})["default"] = spec
+    _atomic_write(p, json.dumps(cfg, indent=2))
+    return spec
+
+def kit_parse_spec(spec):
+    """'all'|'none'|comma list -> (tools, error). Pure."""
+    s = (spec or "").strip().lower()
+    if not s or s in ("all", "on"): return list(KIT_TOOLS), None
+    if s in ("none", "off"): return [], None
+    toks = [t.strip() for t in s.split(",") if t.strip()]
+    bad = [t for t in toks if t not in KIT_TOOLS]
+    if bad: return [], f"unknown tool(s): {','.join(bad)}"
+    return toks, None
+
+def kit_installed():
+    """Tool -> binary path ('' = missing). style is text-only, always present."""
+    return {"codegraph": shutil.which("codegraph") or "",
+        "ctx": shutil.which("context-mode") or "",
+        "rtk": shutil.which("rtk") or "", "style": "1"}
+
+def kit_effective(agent):
+    """Resolve one agent's kit: row kit wins over config kit.default; only
+    installed tools run, missing ones are reported. -> {spec, tools, skipped}."""
+    spec = str((agent or {}).get("kit") or "").strip().lower() or kit_config_default()
+    tools, _ = kit_parse_spec(spec)
+    inst = kit_installed()
+    skipped = [t for t in tools if not inst.get(t)]
+    return {"spec": spec, "tools": [t for t in tools if inst.get(t)], "skipped": skipped}
+
+def kit_mcp_entries(tools, backend):
+    """Normalized MCP entries for the kit's server tools on this backend.
+    toksave runmcp proxy when installed, direct binary otherwise; ctx has no
+    verified agent id for cursor, so it is absent (reported, never faked)."""
+    out = {}
+    tok = shutil.which("toksave")
+    if "codegraph" in tools:
+        cmd = [tok] if tok else [shutil.which("codegraph") or "codegraph"]
+        args = ["runmcp", "codegraph", "serve", "--mcp"] if tok else ["serve", "--mcp"]
+        out["codegraph"] = normalize_mcp_entry("codegraph", {"command": cmd, "args": args})
+    if "ctx" in tools:
+        aid = {"claude": "claude-code", "codex": "codex", "opencode": "opencode"}.get(backend)
+        if aid:  # context-mode knows claude-code/codex/opencode; cursor: none
+            cmd = [tok] if tok else [shutil.which("context-mode") or "context-mode"]
+            args = (["runmcp", "context-mode", "server", "--agent", aid] if tok
+                else ["server", "--agent", aid])
+            out["context-mode"] = normalize_mcp_entry("context-mode", {"command": cmd, "args": args})
+    return out
+
+def kit_style_text():
+    """caveman/ponytail/principles block: toksave section of ~/.claude/AGENTS.md
+    (between TOKSAVE markers) when present, else the built-in default. Capped."""
+    try: t = (_ag_home()/".claude"/"AGENTS.md").read_text(errors="replace")
+    except Exception: t = ""
+    m = re.search(r"<!--\s*TOKSAVE[^\n]*:START\s*-->(.*?)<!--\s*TOKSAVE:END\s*-->", t, re.S)
+    if m and m.group(1).strip(): return m.group(1).strip()[:KIT_STYLE_CAP]
+    return KIT_STYLE_DEFAULT
+
+def kit_style_preloaded(backend, workdir):
+    """True when the backend already loads the toksave block itself (opencode's
+    global AGENTS.md, or project files the backend reads): never duplicate it."""
+    try:
+        wd = Path(workdir or ".").expanduser()
+        cands = []
+        if backend == "opencode":
+            cands += [_ag_home()/".config"/"opencode"/"AGENTS.md", wd/"AGENTS.md"]
+        elif backend in ("codex", "gemini", "cursor"):
+            cands.append(wd/"AGENTS.md")
+        elif backend == "claude":
+            cands += [wd/"CLAUDE.md", wd/"AGENTS.md"]
+        for p in cands:
+            if p.is_file() and re.search(r"<!--\s*TOKSAVE[^\n]*:START", _read_text_cap(p, 20000)):
+                return True
+    except Exception: pass
+    return False
+
+def kit_scope_dir(sdir, name):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:64] or "x"
+    return sdir/"kit"/safe
+
+def ensure_kit_scope(sdir, agent, prof_name="", kit=None):
+    """Generate the agent's scoped kit configs (idempotent, .agent state only).
+    Merges any profile MCP into the same files so one flag/env var carries
+    both; kit wins name clashes. -> {dir, files, unsupported, skipped}."""
+    backend = (agent or {}).get("backend", "claude")
+    kit = kit if kit is not None else kit_effective(agent)
+    root = kit_scope_dir(sdir, (agent or {}).get("name", "") or "x")
+    files, unsup = {}, []
+    mcp_tools = [t for t in ("codegraph", "ctx") if t in kit["tools"]]
+    if backend not in ("claude", "opencode", "codex"):
+        if mcp_tools and backend in ("gemini", "cursor"):
+            unsup.append(f"{backend}: kit MCP wiring TODO (no verified scoped "
+                "config hook); style+rtk still delivered via prompt")
+        return {"dir": str(root), "files": files, "unsupported": unsup,
+            "tools": kit["tools"], "skipped": kit["skipped"]}
+    if not mcp_tools: return {"dir": str(root), "files": files, "unsupported": unsup,
+        "tools": kit["tools"], "skipped": kit["skipped"]}
+    root.mkdir(parents=True, exist_ok=True)
+    entries = {}
+    if prof_name:
+        p = load_profiles(sdir).get(prof_name) or {}
+        entries.update(load_mcp_normalized(
+            p.get("mcp") if isinstance(p.get("mcp"), str) else "")[0])
+    entries.update(kit_mcp_entries(kit["tools"], backend))
+    if backend == "claude":
+        cfg, u = translate_mcp_for_backend(entries, "claude")
+        unsup += u
+        _atomic_write(root/"claude_mcp.json", json.dumps(cfg, indent=2))
+        files["claude_mcp"] = str(root/"claude_mcp.json")
+    elif backend == "opencode":
+        base = {}
+        if prof_name:
+            eff = ensure_effective_profile(sdir, prof_name)
+            src = (eff.get("files") or {}).get("opencode_config")
+            if src:
+                try: base = json.loads(Path(src).read_text())
+                except Exception: base = {}
+        ocfg, u = translate_mcp_for_backend(entries, "opencode")
+        unsup += u
+        merged = dict(base); merged.setdefault("$schema", "https://opencode.ai/config.json")
+        mm = dict(merged.get("mcp") or {}); mm.update(ocfg.get("mcp") or {})
+        merged["mcp"] = mm
+        _atomic_write(root/"opencode.json", json.dumps(merged, indent=2))
+        files["opencode_config"] = str(root/"opencode.json")
+    else:  # codex: scoped CODEX_HOME with config.toml (+ auth symlink, skills)
+        xtra = ""
+        if prof_name:
+            p = load_profiles(sdir).get(prof_name) or {}
+            if p.get("codex_config"): xtra = _read_text_cap(p["codex_config"], 8000)
+        xcfg, u = translate_mcp_for_backend(entries, "codex")
+        unsup += u
+        chome = root/"codex-home"; chome.mkdir(parents=True, exist_ok=True)
+        _atomic_write(chome/"config.toml", _codex_toml_for(xcfg.get("mcp_servers") or {}, xtra))
+        files["codex_home"] = str(chome)
+        try:
+            real_auth = _ag_home()/".codex"/"auth.json"
+            link = chome/"auth.json"
+            if real_auth.is_file() and not link.exists():
+                try: link.symlink_to(real_auth)
+                except Exception: pass  # symlink unavailable: codex falls back to real home auth
+        except Exception: pass
+        try:  # keep profile skills + real-home skills visible in the scoped home
+            cskills = chome/"skills"; cskills.mkdir(parents=True, exist_ok=True)
+            if prof_name:
+                eff = ensure_effective_profile(sdir, prof_name)
+                cdir = Path((eff.get("files") or {}).get("opencode_config_dir") or "")/"skills"
+                if cdir.is_dir():
+                    for d in sorted(cdir.iterdir()):
+                        if d.is_dir() and (d/"SKILL.md").is_file(): _copy_missing(d, cskills/d.name)
+            real_skills = _ag_home()/".codex"/"skills"
+            if real_skills.is_dir():
+                for d in sorted(real_skills.iterdir()):
+                    if not d.is_dir(): continue
+                    t = cskills/d.name
+                    if t.exists(): continue
+                    try: t.symlink_to(d, target_is_directory=True)
+                    except Exception: pass
+        except Exception: pass
+    return {"dir": str(root), "files": files, "unsupported": unsup,
+        "tools": kit["tools"], "skipped": kit["skipped"]}
+
+def kit_reach(sdir, agent, eff=None):
+    """Doctor row per tool: does it actually reach this agent's model?
+    Reads the generated scoped config (never the backend). Pure of network."""
+    backend = (agent or {}).get("backend", "claude")
+    kit = kit_effective(agent)
+    if eff is None: eff = ensure_kit_scope(sdir, agent, (agent or {}).get("profile") or "", kit)
+    files = eff.get("files") or {}
+    def _server_listed(tool):
+        name = "codegraph" if tool == "codegraph" else "context-mode"
+        try:
+            if backend == "claude" and files.get("claude_mcp"):
+                return name in (json.loads(Path(files["claude_mcp"]).read_text()).get("mcpServers") or {})
+            if backend == "opencode" and files.get("opencode_config"):
+                return name in (json.loads(Path(files["opencode_config"]).read_text()).get("mcp") or {})
+            if backend == "codex" and files.get("codex_home"):
+                return f'[mcp_servers."{name}"]' in (Path(files["codex_home"])/"config.toml").read_text()
+        except Exception: pass
+        return False
+    rows = []
+    for t in KIT_TOOLS:
+        if t in kit["tools"]:
+            if t == "style":
+                if kit_style_preloaded(backend, (agent or {}).get("dir", ".") or "."):
+                    rows.append({"tool": t, "ok": True, "status": "preloaded by backend instructions; not duplicated"})
+                else:
+                    rows.append({"tool": t, "ok": True, "status": "in composed system prompt"})
+            elif t == "rtk":
+                if backend in RTK_NOHOOK:
+                    rows.append({"tool": t, "ok": rtk_on(), "status":
+                        "prompt hint in composed turn (no-hook backend)" if rtk_on() else "rtk off/missing"})
+                else:
+                    rows.append({"tool": t, "ok": rtk_on(), "status":
+                        "own hook/plugin (ag agents doctor checks it)" if rtk_on() else "rtk off/missing"})
+            else:
+                hit = _server_listed(t)
+                where = {"claude": "claude --mcp-config (scoped)", "opencode": "OPENCODE_CONFIG mcp section",
+                    "codex": "scoped CODEX_HOME config.toml"}.get(backend)
+                rows.append({"tool": t, "ok": hit, "status": where if hit else
+                    (f"no scoped MCP hook for {backend} (TODO)" if backend in ("gemini", "cursor")
+                    else f"no MCP on {backend} backend")})
+        else:
+            why = "not installed" if t in kit["skipped"] else "off (kit)"
+            rows.append({"tool": t, "ok": None, "status": why})
+    return rows
+
+def _count_files(root, cap=50001):
+    """File count under root, None past cap. Prunes .git; never raises."""
+    n = 0
+    try:
+        for dp, dns, fns in os.walk(root):
+            dns[:] = [d for d in dns if d != ".git"]
+            n += len(fns)
+            if n > cap: return None
+    except Exception: return None
+    return n
+
+def _kit_worktree_index(sdir, name, repo, wtpath, spec=None):
+    """Seed .codegraph for a fresh agent worktree in the background (never
+    blocks launch): copy the main checkout's index + codegraph sync, or
+    codegraph init when there is none (repo under 50k files). AG_KIT_WT=fg
+    runs it in the foreground (tests/debug)."""
+    try:
+        tools = kit_effective({"kit": spec} if spec else {})["tools"]
+        if "codegraph" not in tools: return None
+        cg = shutil.which("codegraph")
+        if not cg:
+            _event(sdir, "kit_wt", name, action="skip", why="codegraph not installed"); return None
+        src = Path(repo)/".codegraph"
+        if src.is_dir():
+            action = "copy+sync"
+            script = (f"cp -a {shlex.quote(str(src))} {shlex.quote(str(wtpath))}"
+                f" && {shlex.quote(cg)} sync {shlex.quote(str(wtpath))}")
+        else:
+            n = _count_files(repo)
+            if n is None:
+                _event(sdir, "kit_wt", name, action="skip", why="repo over 50k files"); return None
+            action, script = "init", f"{shlex.quote(cg)} init {shlex.quote(str(wtpath))}"
+        log = kit_scope_dir(sdir, name)/"wt.log"
+        kit_scope_dir(sdir, name).mkdir(parents=True, exist_ok=True)
+        if os.environ.get("AG_KIT_WT") == "fg":
+            subprocess.run(["/bin/sh", "-c", script], capture_output=True, timeout=300,
+                env=dict(os.environ))
+        else:
+            with open(log, "a") as lf:
+                subprocess.Popen(["/bin/sh", "-c", script], stdout=lf, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, env=dict(os.environ), start_new_session=(os.name == "posix"))
+        _event(sdir, "kit_wt", name, action=action, path=str(wtpath))
+        return action
+    except Exception as e:
+        try: _event(sdir, "kit_wt", name, action="error", why=str(e)[:160])
+        except Exception: pass
+        return None
+
+def do_kit(a):
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    sub = getattr(a, "ksub", None) or "status"
+    inst = kit_installed()
+    if sub == "on":
+        spec = (getattr(a, "tools", None) or "all").strip().lower()
+        tools, err = kit_parse_spec(spec)
+        if err: return emit(a, "kit", error=err, hint="codegraph,ctx,rtk,style | all | none")
+        kit_save_default(spec if spec in ("all", "none") else ",".join(tools))
+        skipped = [t for t in tools if not inst.get(t)]
+        txt = f"kit default = {spec}" + (f"  (skipped, not installed: {','.join(skipped)})" if skipped else "")
+        return emit(a, "kit", {"_text": txt, "default": spec, "skipped": skipped})
+    if sub == "off":
+        kit_save_default("none")
+        return emit(a, "kit", {"_text": "kit default = none (per-agent --kit still wins)", "default": "none"})
+    if sub == "list":
+        how = {"codegraph": "MCP server (codegraph serve --mcp; toksave runmcp proxy when installed)",
+            "ctx": "MCP server (context-mode; --agent per backend; cursor unsupported, reported)",
+            "rtk": "command rewrite + prompt hint (claude/opencode use their own hook/plugin)",
+            "style": "caveman/ponytail/principles block in the composed system prompt"}
+        data = {"tools": [{"tool": t, "installed": bool(inst.get(t)), "path": inst.get(t) or "", "delivery": how[t]} for t in KIT_TOOLS],
+            "default": kit_config_default()}
+        if getattr(a, "json", False): return emit(a, "kit", data)
+        L = []
+        for t in KIT_TOOLS:
+            state = "built-in   " if t == "style" else ("installed " + (inst.get(t) or "") if inst.get(t) else "missing    ")
+            L.append(f'{t:10} {state} {how[t]}')
+        return emit(a, "kit", {"_text": "\n".join(L) + f"\ndefault: {kit_config_default()}", **data})
+    rows = load_agents(sdir)
+    if sub == "doctor":
+        sel = [r for r in rows if (getattr(a, "agent", None) in (None, "", r["name"]))]
+        if getattr(a, "agent", None) and not sel:
+            return emit(a, "kit", error=f"no such agent: {a.agent}", hint="ag agents list")
+        data = {"agents": [{"name": r["name"], "backend": r.get("backend", "claude"),
+            "spec": kit_effective(r)["spec"], "tools": kit_reach(sdir, r)} for r in sel]}
+        if getattr(a, "json", False): return emit(a, "kit", data)
+        L = []
+        for ag in data["agents"]:
+            L.append(f'{ag["name"]} ({ag["backend"]}, kit={ag["spec"]})')
+            for t in ag["tools"]:
+                mark = "ok " if t["ok"] else (" - " if t["ok"] is None else "BAD")
+                L.append(f'  {mark} {t["tool"]:10} {t["status"]}')
+        return emit(a, "kit", {"_text": "\n".join(L) or "(no agents)", **data})
+    # status (default)
+    data = {"default": kit_config_default(), "installed": {k: bool(v) for k, v in inst.items()},
+        "agents": [{"name": r["name"], "backend": r.get("backend", "claude"), **kit_effective(r)} for r in rows]}
+    if getattr(a, "json", False): return emit(a, "kit", data)
+    L = [f'default: {data["default"]}   installed: ' + ",".join(k for k in KIT_TOOLS if inst.get(k))]
+    for k in data["agents"]:
+        L.append(f'{k["name"]:12} {k["backend"]:9} kit={k["spec"]:18} tools={",".join(k["tools"]) or "-"}'
+            + (f'  skipped: {",".join(k["skipped"])}' if k["skipped"] else ""))
+    return emit(a, "kit", {"_text": "\n".join(L), **data})
+
 def do_harness_profile(a):
     sdir = state_dir(a.dir); ensure_state(sdir)
     sub = getattr(a, "psub", None) or "list"
@@ -7476,9 +7813,10 @@ def _git(cwd, *args):
     try: return subprocess.run(["git","-C",str(cwd),*args],capture_output=True,text=True,timeout=60)
     except Exception as e: return subprocess.CompletedProcess(args,1,"",str(e))
 
-def wt_create(name, adir, base=None):
+def wt_create(name, adir, base=None, sdir=None, spec=None):
     """Per-agent git worktree at <repo-parent>/<repo>.ag-wt/<name>, branch ag/<name>.
-    -> (info, err, hint). Reuses an identical existing worktree; never nests in repo."""
+    -> (info, err, hint). Reuses an identical existing worktree; never nests in repo.
+    sdir+spec: seed .codegraph for the fresh worktree in the background (kit)."""
     d = Path(adir).expanduser()
     cd = _git(d,"rev-parse","--path-format=absolute","--git-common-dir")
     if cd.returncode or not d.is_dir():
@@ -7501,6 +7839,9 @@ def wt_create(name, adir, base=None):
     path.parent.mkdir(parents=True,exist_ok=True)
     r = _git(repo,"worktree","add","-b",branch,str(path),info["base"])
     if r.returncode: return None, "git worktree add failed: "+(r.stderr.strip()[:200]), None
+    if sdir is not None:
+        try: _kit_worktree_index(sdir, name, repo, path, spec)
+        except Exception: pass
     return info, None, None
 
 def wt_remove(wt, force=False):
@@ -7729,14 +8070,15 @@ def do_agents_fork(a, sdir):
     adir = scol.get("dir", ".") or "."
     wt = None
     if getattr(a, "worktree", False):
-        wt, err, hint = wt_create(new, adir, getattr(a, "base", None))
+        wt, err, hint = wt_create(new, adir, getattr(a, "base", None), sdir=sdir,
+            spec=str(scol.get("kit") or "").strip() or None)
         if err: return emit(a, "agents", error=err, hint=hint)
         adir = wt["path"]
     row = {"name": new, "backend": be, "model": mod or "default", "dir": adir, "role": scol.get("role", "sub") or "sub",
         "persona": pers, "system": scol.get("system", "") or "",
         "instructions": list(scol.get("instructions") or []),
         "forked_from": src, "forked_at": now_iso(), "fork_turn": fork_turn}
-    for k in ("mode", "plan", "effort", "transport", "acp_cmd", "profile", "env", "env_unset", "subscription_only", "data", "fallback", "claude_config_dir", "allow_cmd"):  # data: a fork must not silently change privacy class
+    for k in ("mode", "plan", "effort", "transport", "acp_cmd", "profile", "env", "env_unset", "subscription_only", "data", "fallback", "claude_config_dir", "allow_cmd", "kit"):  # data: a fork must not silently change privacy class
         if k == "effort":
             if eff not in (None, ""): row["effort"] = eff
             continue
@@ -8012,7 +8354,8 @@ def do_agents(a):
             except Exception: return emit(a,"agents",error=f"bad --stall-s {_sse!r}: seconds, 0 = off (\"\" clears)")
         wt, adir = None, a.adir or "."
         if getattr(a,"worktree",False):
-            wt, err, hint = wt_create(a.name, adir, getattr(a,"base",None))
+            wt, err, hint = wt_create(a.name, adir, getattr(a,"base",None), sdir=sdir,
+                spec=(getattr(a,"kit",None) or "").strip() or None)
             if err: return emit(a,"agents",error=err,hint=hint)
             adir = wt["path"]
         _ac = [s.strip() for s in (getattr(a,"allow_cmd",None) or []) if s.strip()]
@@ -8103,6 +8446,13 @@ def do_agents(a):
                 except Exception: _sv = -1
                 if _sv < 0 or _sv != _sv: return emit(a, "agents", error=f"bad --stall-s {a.stall_s!r}: seconds, 0 = off (\"\" clears)")
                 updates["stall_s"] = _sv if _sv > 0 else 0
+        if getattr(a, "kit", None) is not None:
+            ks = (a.kit or "").strip().lower()
+            if ks:
+                _, _kerr = kit_parse_spec(ks)
+                if _kerr: return emit(a, "agents", error=f"bad --kit {a.kit!r}: {_kerr}",
+                    hint="codegraph,ctx,rtk,style | all | none (\"\" clears to config default)")
+            updates["kit"] = ks
         if "effort" in updates and updates["effort"]:
             _er = next((r for r in rows if r["name"] == a.name), {})
             _eb = updates.get("backend") or _er.get("backend", "claude")
@@ -8117,7 +8467,8 @@ def do_agents(a):
             if cur.get("worktree"): return emit(a, "agents", error=f"{a.name} already has a worktree", hint=cur["worktree"]["path"])
             if agent_busy(sdir, a.name):
                 return emit(a, "agents", error=f"{a.name} is busy (turn or handoff running); retry when idle.")
-            wt, err, hint = wt_create(a.name, updates.get("dir") or cur.get("dir") or ".", getattr(a, "base", None))
+            wt, err, hint = wt_create(a.name, updates.get("dir") or cur.get("dir") or ".", getattr(a, "base", None),
+                sdir=sdir, spec=str(updates.get("kit") or cur.get("kit") or "").strip() or None)
             if err: return emit(a, "agents", error=err, hint=hint)
             updates.update({"dir": wt["path"], "worktree": wt})
         ok, message = update_agent_settings(sdir, a.name, updates)
@@ -9379,10 +9730,12 @@ def _acp_selfcheck(td):
     assert parse_usage("acp", json.dumps({"ag_acp": "done", "usage": {"inputTokens": 5, "outputTokens": 2, "cachedReadTokens": 3}}))["in"] == 8
 
 # --- run_turn seams: each turn feature edits ONE helper ---
-def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
+def _turn_prompt(sdir, a, backend, sid, text, command, _rs, kit=None):
     """Prompt for one turn. Returns (prompt, sys_txt, prof_name): history replay
-    / bare command, profile+context+rtk+secret additions, system-role prepend."""
+    / bare command, profile+context+rtk+secret additions, system-role prepend.
+    kit (resolved {tools,skipped}) gates the rtk hint and the style block."""
     name = a.get("name", "")
+    _kit = kit if kit is not None else kit_effective(a)
     if command:
         # native custom command: message text is command args, sent bare.
         prompt = text
@@ -9414,7 +9767,10 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
             prompt = ("[background context — labeled sources; memory notes are "
                 "fallible and may be stale]\n" + _ctx["text"][:CTX_TOTAL] +
                 "\n\n---\n[current request — answer this]:\n" + prompt)
-    if backend in RTK_NOHOOK and not command and rtk_on():
+    if "style" in _kit["tools"] and not command and not kit_style_preloaded(backend, a.get("dir", ".") or "."):
+        _st = kit_style_text()
+        if _st: sys_txt = (sys_txt + "\n\n--- token-saving style ---\n" + _st) if sys_txt else _st
+    if backend in RTK_NOHOOK and not command and rtk_on() and "rtk" in _kit["tools"]:
         sys_txt = (sys_txt + "\n\n" + RTK_HINT) if sys_txt else RTK_HINT
     if not command and secret_enabled(): sys_txt = (sys_txt + "\n\n" + SECRET_HINT) if sys_txt else SECRET_HINT
     if sys_txt and backend not in ("claude","codex") and not sid and not command:
@@ -9426,28 +9782,46 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs):
         if _sh: prompt = f"{prompt}\n\n{_sh}"
     return prompt, sys_txt, prof_name
 
-def _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, prof_name):
-    """backend_argv (+mode/plan kwargs only when set) + profile extras. May raise ValueError.
+def _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, prof_name, kit=None, kf=None):
+    """backend_argv (+mode/plan kwargs only when set) + profile/kit extras. May raise ValueError.
+    kit kf = ensure_kit_scope files dict (claude --mcp-config; profile servers are
+    merged into the kit file, so the profile's own --mcp-config is never duplicated).
     ACP transport: wraps that argv (cli fallback) in the private `_acp` bridge."""
     if acp_on(a, backend, command) or backend == "acp":
-        cli = None if backend == "acp" else _turn_argv(sdir, dict(a, transport="cli"), backend, model, workdir, sid, prompt, sys_txt, command, prof_name)
+        cli = None if backend == "acp" else _turn_argv(sdir, dict(a, transport="cli"), backend, model, workdir, sid, prompt, sys_txt, command, prof_name, kit=kit, kf=kf)
         return acp_bridge_argv(sdir, a, backend, model, workdir, sid, prompt, cli)
     argv = backend_argv(backend,model=model,workdir=workdir,sid=sid,prompt=prompt,
         system=sys_txt if backend=="claude" else "",command=command or "",
         **({"mode":a.get("mode") or "","plan":bool(a.get("plan"))} if a.get("mode") or a.get("plan") else {}),
         **({"effort":a["effort"]} if a.get("effort") else {}),
         **({"allow_cmd":a["allow_cmd"]} if backend=="claude" and isinstance(a.get("allow_cmd"),list) and a["allow_cmd"] else {}))
-    if prof_name: argv = list(argv) + backend_argv_extra(backend, sdir, prof_name)
+    extras = backend_argv_extra(backend, sdir, prof_name) if prof_name else []
+    if backend == "claude" and (kf or {}).get("claude_mcp"):
+        # kit file carries profile servers too: one --mcp-config total
+        out, i = [], 0
+        while i < len(extras):
+            if i + 1 < len(extras) and extras[i] == "--mcp-config": i += 2
+            else: out.append(extras[i]); i += 1
+        extras = out + ["--mcp-config", kf["claude_mcp"]]
+    if extras: argv = list(argv) + extras
     if backend=="codex" and sys_txt and not command:
         # verified: `codex exec` and `exec resume` honor -c developer_instructions=<toml string>; no first-turn prepend
         argv = list(argv); argv[3:3] = ["-c", "developer_instructions=" + json.dumps(sys_txt.replace("\x7f",""), ensure_ascii=False)]
     return argv
 
-def _turn_env(sdir, a, backend, prof, notes=None):
+def _turn_env(sdir, a, backend, prof, notes=None, kit=None, kf=None):
     """Full child env: os.environ + scoped profile env (OPENCODE_CONFIG/DIR,
-    CODEX_HOME) + profile/agent env + subscription strip + opencode mode
-    overlay + secret askpass wiring. `notes` collects unresolved-ref notes."""
+    CODEX_HOME) + kit scoped config (OPENCODE_CONFIG mcp / CODEX_HOME, merged
+    with any profile files) + profile/agent env + subscription strip + opencode
+    mode overlay + secret askpass wiring. `notes` collects unresolved-ref notes."""
     env = dict(os.environ, **(backend_env_for_profile(sdir, a, prof) if prof else {}))
+    if backend == "opencode" and (kf or {}).get("opencode_config"):
+        env["OPENCODE_CONFIG"] = kf["opencode_config"]
+    elif backend == "codex" and (kf or {}).get("codex_home"):
+        env["CODEX_HOME"] = kf["codex_home"]
+    if kit is not None and notes is not None:
+        for t in (kit.get("skipped") or []):
+            notes.append(f"[kit] {t} skipped (not installed)")
     merge_agent_env(sdir, a, prof, env, notes)
     env["AG_PARENT_AGENT"] = a.get("name", "") or ""  # dispatch mode ceiling: children inherit this turn's agent+mode
     env["AG_PARENT_MODE"] = "plan" if a.get("plan") else (a.get("mode") or "")
@@ -9652,9 +10026,19 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             if not sid and meta.get("backend", backend) == backend:
                 sid = meta.get("sid","")
         if _fo: sid = ""  # other backend has no session: fresh + history replay (_rs hist or recent_history)
-        prompt, sys_txt, prof_name = _turn_prompt(sdir, a_eff, backend, sid, text, command, _rs)
+        prof_name = (a_eff.get("profile") or "").strip()
+        _kit = kit_effective(a_eff)
+        _kf = {}
+        if _kit["tools"] and backend in ("claude", "opencode", "codex") \
+                and any(t in _kit["tools"] for t in ("codegraph", "ctx")):
+            try: _kf = ensure_kit_scope(sdir, a_eff, prof_name, _kit).get("files") or {}
+            except Exception as _ke:
+                _kf = {}
+                try: _event(sdir, "kit_error", name, error=str(_ke)[:160])
+                except Exception: pass
+        prompt, sys_txt, prof_name = _turn_prompt(sdir, a_eff, backend, sid, text, command, _rs, _kit)
         try:
-            argv = _turn_argv(sdir, a_eff, backend, model, workdir, sid, prompt, sys_txt, command, prof_name)
+            argv = _turn_argv(sdir, a_eff, backend, model, workdir, sid, prompt, sys_txt, command, prof_name, _kit, _kf)
             _mw = mode_warning(backend, a_eff.get("mode") or "", bool(a_eff.get("plan")))
             if _mw and not _rs:
                 _event(sdir, "mode_warn", name, warning=_mw)
@@ -9685,7 +10069,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         _usage, _fresh = {}, not sid
         # scoped profile env (OPENCODE_CONFIG/DIR, CODEX_HOME): no globals touched
         _en = []
-        env = _turn_env(sdir, a_eff, backend, prof_name, _en)
+        env = _turn_env(sdir, a_eff, backend, prof_name, _en, _kit, _kf)
         for _n in _en:
             if on_event: on_event(name, "tool", _n)
         _timed_out = {"hit": False}
@@ -9914,7 +10298,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if on_event:
             try: on_event(name,"timeline",dict(agent_row))
             except Exception: pass
-        _event(sdir,"chat",name,exit=rc)
+        _event(sdir,"chat",name,exit=rc,kit="on" if _kit["tools"] else "off",
+            kit_tools=",".join(_kit["tools"]))
         if on_event: on_event(name,"exit",str(rc))
         out = {"sid":sid_new or sid,"exit":rc,"reply":full}
         if rc != 0 and _fail_text: out["stderr"] = _fail_text[-8000:]  # stderr tail, else provider error text (see _fail_text)
@@ -9925,7 +10310,8 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
             except Exception: pass
             out["usage"] = usage_short(_usage)
         try:
-            if not command: usage_log_turn(sdir, name, backend, model, _usage, rc)
+            if not command: usage_log_turn(sdir, name, backend, model, _usage, rc,
+                kit="on" if _kit["tools"] else "off", kit_tools=_kit["tools"])
         except Exception: pass
         if _intr: out["interrupted"] = True
         if _uli: out.update(usage_limit=True, usage_limit_when=_uli["when"], reset_at=datetime.fromtimestamp(_uli["until"], timezone.utc).isoformat(), error=_uli["label"])
@@ -16973,8 +17359,10 @@ def usage_cost(backend, model, acc):
         except Exception: pass
         return None, False
     except Exception: return None, False
-def usage_log_turn(sdir, name, backend, model, acc, exit_code=0):
-    """Append one JSON line per finished turn (global ledger, all projects). Never raises."""
+def usage_log_turn(sdir, name, backend, model, acc, exit_code=0, kit=None, kit_tools=None):
+    """Append one JSON line per finished turn (global ledger, all projects).
+    kit tags mark the token-saving tools that reached this turn (ag bench A/B).
+    Never raises."""
     try:
         acc = acc or {}
         p = usage_ledger_path()
@@ -16990,6 +17378,8 @@ def usage_log_turn(sdir, name, backend, model, acc, exit_code=0):
             "cache_read": int(acc.get("cache_read") or 0), "cache_write": int(acc.get("cache_write") or 0),
             "cache": int(acc.get("cache_read") if acc.get("cache_read") is not None else acc.get("cache") or 0),
             "reasoning": int(acc.get("reasoning") or 0), "cost": cost, "subscription": bool(sub), "requests": 1, "exit": int(exit_code or 0)}
+        if kit: row["kit"] = kit
+        if kit: row["kit_tools"] = ",".join(kit_tools or [])
         # subscription turns keep cost null (budgets), but record the CLI's API-equivalent figure for receipts
         if sub and isinstance(acc.get("cost"), (int, float)): row["cost_equiv"] = round(float(acc["cost"]), 6)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -20136,7 +20526,7 @@ def build():
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)"); agrm.add_argument("--purge",action="store_true",help="also remove chat log and metadata")
     agrs=ags.add_parser("reset",help="clear stored backend session ids; keep config and chat log"); agrs.add_argument("name")
     agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
-    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback when rate-limited: MODEL, or BACKEND/MODEL | BACKEND:MODEL to fail over to another backend on a usage limit (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)')
+    ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback when rate-limited: MODEL, or BACKEND/MODEL | BACKEND:MODEL to fail over to another backend on a usage limit (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)'); ags2.add_argument("--kit",default=None,help='token-saving kit tools: codegraph,ctx,rtk,style | all | none ("" clears to config kit.default; scoped MCP + style, ag kit doctor)')
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)
@@ -20235,6 +20625,14 @@ def build():
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
     pu = sub.add_parser("push",help="git push, then signal relay peers to update and sync"); pu.add_argument("push_args",nargs=argparse.REMAINDER,help="git push arguments (e.g. origin master)")
     mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS+("api",)); mo.add_argument("--provider",default=None,help="with --backend api: list GET {base}/models of this provider (ollama|lmstudio|custom)"); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by Artificial Analysis intelligence/coding/agentic score, speed, tier (openrouter.ai/rankings + models.dev)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only"); mo.add_argument("--sort",choices=("intel","coding","speed","popular"),default=None,help="rank order (implies --rank)"); mo.add_argument("--auto",choices=("on","off"),default=None,help="toggle background catalog refresh (config.json catalog_auto)"); mo.add_argument("--status",action="store_true",help="last fetch per catalog source + auto state"); mo.add_argument("--zdr",action="store_true",help="zero-retention models only (data privacy)"); mo.add_argument("--bg",action="store_true",help=argparse.SUPPRESS)
+    kt = sub.add_parser("kit", help="token-saving toolkit (codegraph/ctx/rtk/style) delivered per agent, scoped"); kts=kt.add_subparsers(dest="ksub",required=False)
+    kts.add_parser("status", help="config default + per-agent effective kit (default subcommand)")
+    kto=kts.add_parser("on", help="enable by default (config kit.default; missing tools skipped + reported)")
+    kto.add_argument("--tools", default=None, help="comma list codegraph,ctx,rtk,style (default all installed)")
+    kts.add_parser("off", help="disable by default (kit.default=none; per-agent --kit still wins)")
+    kts.add_parser("list", help="tools, install state, how each reaches the model")
+    ktd=kts.add_parser("doctor", help="per agent: which tool actually reaches the model (generated config + composed prompt)")
+    ktd.add_argument("--agent", default=None, help="one agent (default: all)")
     rt=sub.add_parser("route",help="effective job-type model routing"); rt.add_argument("job",nargs="?",default=None,choices=JOB_KEYS); rt.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile to show (default: detected harness)"); rt.add_argument("--json",action="store_true",default=argparse.SUPPRESS); rt.add_argument("--check",action="store_true",help="per-project setup check: configured? + questions to ask the user")
     rl=sub.add_parser("ratelimit",help="rate-limit slots + cooldowns (opencode free-tier)"); rl.add_argument("op",nargs="?",default=None,help="clear"); rl.add_argument("key",nargs="?",default=None,help="cooldown key backend/model (clear one)")
     ac=sub.add_parser("access",help="allow/deny backend/model globs (routing.json access)"); acs=ac.add_subparsers(dest="sub",required=True)
@@ -20958,7 +21356,7 @@ def main(argv=None):
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"browser":do_browser,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"channel":do_channel,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
-        "access":do_access,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link}[a.subcmd]
+        "access":do_access,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)
 

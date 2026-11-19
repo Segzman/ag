@@ -1,0 +1,13 @@
+usage: ag kit [-h] {status,on,off,list,doctor} ...
+
+positional arguments:
+  {status,on,off,list,doctor}
+    status              config default + per-agent effective kit (default subcommand)
+    on                  enable by default (config kit.default; missing tools skipped + reported)
+    off                 disable by default (kit.default=none; per-agent --kit still wins)
+    list                tools, install state, how each reaches the model
+    doctor              per agent: which tool actually reaches the model (generated config +
+                        composed prompt)
+
+options:
+  -h, --help            show this help message and exit

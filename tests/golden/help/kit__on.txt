@@ -1,0 +1,5 @@
+usage: ag kit on [-h] [--tools TOOLS]
+
+options:
+  -h, --help     show this help message and exit
+  --tools TOOLS  comma list codegraph,ctx,rtk,style (default all installed)

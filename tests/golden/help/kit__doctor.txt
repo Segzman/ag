@@ -1,0 +1,5 @@
+usage: ag kit doctor [-h] [--agent AGENT]
+
+options:
+  -h, --help     show this help message and exit
+  --agent AGENT  one agent (default: all)

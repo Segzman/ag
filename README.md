@@ -11,7 +11,7 @@ State lives in `./.agent/` (override: `--dir`, `$AGENT_CLI_DIR`). Every command 
 
 - [Quickstart](#quickstart) · [Capability matrix](#capability-matrix)
 - [Part 1 — CLI](#part-1--cli): [Install and updates](#install) · [State dir](#state-dir) · [Sessions](#sessions-pty) · [run / approvals / rtk](#run-approvals-rtk) · [Secrets](#secrets) · [Talk to the user](#talk-to-the-user-ag-ui) · [Browser](#browser-ag-browser) · [Notes / todos](#notes-and-todos) · [Models](#models) · [Setup](#setup) · [TUI](#tui)
-- [Part 2 — Agents](#part-2--agents): [Roster and env](#roster-and-backends) · [Capabilities / modes](#capabilities-and-permission-modes) · [ACP](#acp-transport) · [Routing](#routing) · [Delegation / wake](#delegation-and-wake) · [Cohorts](#delegated-completion-cohorts) · [Queue / stop / steer](#queue-stop-steer) · [Scheduled tasks](#scheduled-tasks) · [Reliability](#reliability) · [Reap / ps](#reap-lost-wakes-process-view) · [Isolation](#isolation-worktree-per-agent) · [Checkpoints](#checkpoints) · [Usage](#usage) · [Context](#context-and-handoff) · [Multi-host](#multi-host) · [Harness profiles](#harness-profiles) · [Roles](#roles)
+- [Part 2 — Agents](#part-2--agents): [Roster and env](#roster-and-backends) · [Capabilities / modes](#capabilities-and-permission-modes) · [ACP](#acp-transport) · [Routing](#routing) · [Delegation / wake](#delegation-and-wake) · [Cohorts](#delegated-completion-cohorts) · [Queue / stop / steer](#queue-stop-steer) · [Scheduled tasks](#scheduled-tasks) · [Reliability](#reliability) · [Reap / ps](#reap-lost-wakes-process-view) · [Isolation](#isolation-worktree-per-agent) · [Checkpoints](#checkpoints) · [Usage](#usage) · [Context](#context-and-handoff) · [Multi-host](#multi-host) · [Harness profiles](#harness-profiles) · [Kit](#kit-token-saving-toolkit) · [Roles](#roles)
 - [Docs](#docs) · [Limitations](#limitations-honest)
 
 ## Quickstart
@@ -689,6 +689,27 @@ ag harness show|export|import|link --to DIR   # sharing; secrets redacted
 ```
 
 Per-backend delivery is in the [capability matrix](#capability-matrix). MCP source accepts `{"mcpServers":...}`, `{"mcp":...}` or bare `{name: entry}`; `{env:X}`/`${X}` refs preserved. `show`/`validate`/`status` print names and counts, never env values. Codex extra config: `--codex-config ./extra.toml` (appended to the scoped `config.toml`; `auth.json` symlinked, never copied).
+
+## Kit (token-saving toolkit)
+
+`ag kit` delivers the token-saving toolkit — codegraph, context-mode, rtk, and the caveman/ponytail/principles style — **per agent**, through the same scoped configs as profiles. No global CLI config writes, so backends that miss global wiring (claude `-p` never loads `~/.claude/AGENTS.md`; codex/gemini/cursor get partial wiring from toksave) still get all of it, uniformly.
+
+```sh
+ag kit list                                    # tools, install state, delivery per backend
+ag kit status                                  # config default + per-agent effective kit
+ag kit on [--tools codegraph,ctx,rtk,style]    # default kit (config kit.default; default all installed)
+ag kit off                                     # default none (per-agent --kit still wins)
+ag agents set NAME --kit codegraph,ctx         # per-agent: list | all | none ("" = config default)
+ag kit doctor [--agent NAME]                    # what actually reaches the model, per tool
+```
+
+Delivery per backend: **claude** `--mcp-config` JSON, **opencode** the `mcp` section of the generated `OPENCODE_CONFIG`, **codex** `[mcp_servers.*]` in the scoped `CODEX_HOME/config.toml`; **gemini/cursor** have no verified scoped MCP hook yet (TODO — skipped and reported; style and the rtk prompt hint still reach them). `toksave runmcp` proxy when toksave is installed, direct binaries otherwise (`codegraph serve --mcp`, `context-mode server --agent <id>`; cursor has no context-mode agent id). Missing tools are skipped and reported (`kit status`, `kit doctor`), never silently dropped. An agent with a profile keeps its profile MCP servers: kit and profile merge into the same scoped file, one flag/env var total.
+
+The style block comes from the toksave section of `~/.claude/AGENTS.md` (between `TOKSAVE` markers) or a built-in default, and is injected into the composed system prompt — never duplicated when the backend already loads it itself (opencode's global `AGENTS.md`, or a project `AGENTS.md`/`CLAUDE.md` carrying the markers). `ag kit doctor` reads the generated configs and the composed prompt, never backend self-reports.
+
+Worktrees: `agents add|set|fork --worktree` seeds the new worktree's code index in the background — copy the main checkout's `.codegraph/` + `codegraph sync <wt>`, or `codegraph init` when there is no index (repo under 50k files); never blocks launch. `AG_KIT_WT=fg` runs it in the foreground for debugging.
+
+Ledger: every finished turn is tagged `kit=on|off` plus the tools used (usage ledger row and the `chat` event), so token savings can be A/B-tested later.
 
 ## Roles
 

@@ -1,10 +1,10 @@
 usage: ag [-h] [--dir DIR] [--json] [--version]
-          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,route,ratelimit,access,usage,budget,policy,setup,link} ...
+          {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,kit,route,ratelimit,access,usage,budget,policy,setup,link} ...
 
 CLI helper for autonomous agents
 
 positional arguments:
-  {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,route,ratelimit,access,usage,budget,policy,setup,link}
+  {run,read,write,edit,ls,grep,note,notify,notes,needs,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,kit,route,ratelimit,access,usage,budget,policy,setup,link}
     run                 run shell cmd, logged
     read                read file numbered
     write               write file (arg or stdin)
@@ -66,6 +66,7 @@ positional arguments:
     update              update ag from GitHub (fast-forward only)
     push                git push, then signal relay peers to update and sync
     models              live model lists per backend (cached 24h)
+    kit                 token-saving toolkit (codegraph/ctx/rtk/style) delivered per agent, scoped
     route               effective job-type model routing
     ratelimit           rate-limit slots + cooldowns (opencode free-tier)
     access              allow/deny backend/model globs (routing.json access)

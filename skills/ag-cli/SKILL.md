@@ -47,5 +47,6 @@ Single-file Python CLI, stdlib only, POSIX. Binary: `{{AG}}`. Delegating to othe
 - `references/setup-update.md` - `ag setup` flags and UIs, `ag update`, `ag push`.
 - `references/schedule-relay-tick.md` - global schedule tick install, relay tick/admin, `ratelimit`.
 - `references/access-budget-link.md` - `access`, `usage`, `budget`, `policy`, VM -> Mac `link`.
+- `references/kit.md` - `kit` status/on/off/list/doctor, `agents set --kit`, scoped MCP + style delivery, worktree index seeding.
 
 Deeper: `README.md`, `docs/INSTALL.md` in the ag repo.

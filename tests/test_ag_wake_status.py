@@ -157,12 +157,12 @@ def test_queued_with_timeout_never_stalls():
     assert run(td, "agents", "add", "qs", "--backend", "echo", "--role", "sub").returncode == 0
     lk = hold_agent_lock(td, "qs")
     try:
-        _, o = run_json(td, "wake", "qs", "patient", "--timeout", "1")
+        _, o = run_json(td, "wake", "qs", "patient", "--timeout", "4")  # > cold-cache turn runtime (~2s once running)
         assert o.get("ok"), o
         jid = o["data"].get("job")
         assert jid, o
         assert wait_for(lambda: job(td, jid).get("status") == "queued", timeout=10), wakes(td)
-        time.sleep(3)  # past the 1s timeout while still queued
+        time.sleep(5)  # past the 4s timeout while still queued
         j = job(td, jid)
         assert j.get("status") == "queued", j
         assert not j.get("stalled"), j

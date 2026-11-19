@@ -8,11 +8,14 @@
 {{AG}} --dir <state> access deny GLOB [--scope global|project] [--data work|public]
 {{AG}} --dir <state> access rm GLOB [--scope global|project] [--data work|public]
 {{AG}} --dir <state> usage [--by provider|model|agent|project|day] [--since 1d|7d|30d] [--json]
+{{AG}} --dir <state> agents set NAME --budget-ctx on|off
 {{AG}} --dir <state> budget show
 {{AG}} --dir <state> budget set [--daily USD] [--monthly USD] [--provider P --rpd N]
 ```
 
 `access` = `routing.json` allow/deny globs over `backend/model` + `provider/*` (deny wins; per-`--data work|public`). Ledger `$AG_CACHE_HOME/usage.jsonl`. `budget` refuses turns (exit 2) unless `--force`; 80% warns `[budget]`.
+
+Quota awareness (all opt-in, in `routing.json` `usage`): `usage --json` adds `windows` (today / rolling 5h / 7d / 30d per backend + model), `limits` (% of `usage.limits.<backend|provider|model-prefix>` = `{rolling_5h|weekly|monthly: tokens | {tokens|requests|cost}}`), `limit_hits` (recorded plan-limit hits + reset times), and `opencode_stats` (parsed `opencode stats --days 30 --models --cost` when installed). `usage.inject` (default OFF; per-agent `agents set NAME --budget-ctx on|off` wins) appends one `budget: ...` line to wake/chat prompts. `usage.adapt` (default OFF, `usage.adapt_threshold` 85, `usage.adapt_effort` on) makes turns + `route` prefer the agent's `--fallback` or the cheapest same-backend model, effort one notch down, when a backend is >= threshold % or parked; adaptations log as `[usage-adapt]` + a `usage_adapt` event.
 
 ## Policy compiler
 

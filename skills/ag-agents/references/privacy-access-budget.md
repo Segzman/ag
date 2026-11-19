@@ -23,4 +23,4 @@ Work code only to zdr models (`space-bunny-free`, `longcat-2.5-preview-free`, `s
 {{AG}} --dir <state> budget set [--daily USD] [--monthly USD] [--provider P --rpd N]
 ```
 
-`access`: deny wins; `agents add/set` + turns refuse with exit 2. `budget` breach refuses unless `chat send|wake|delegate --force`; 80% warns `[budget]`. Full flag reference: skill `ag-cli` `references/access-budget-link.md`.
+`access`: deny wins; `agents add/set` + turns refuse with exit 2. `budget` breach refuses unless `chat send|wake|delegate --force`; 80% warns `[budget]`. Quota awareness is opt-in (`routing.json` `usage`): `usage --json` reports today/5h/7d/30d windows per backend+model, configured `usage.limits` percentages, recorded limit hits with reset times, and parsed `opencode stats`; `usage.inject` / `agents set NAME --budget-ctx on|off` adds a one-line `budget:` context to prompts (default OFF); `usage.adapt` (default OFF, threshold 85) reroutes turns at >= threshold % or when parked to the agent's `--fallback` / cheapest same-backend model with effort stepped down, logged as `[usage-adapt]`. Full flag reference: skill `ag-cli` `references/access-budget-link.md`.

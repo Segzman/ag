@@ -6,7 +6,7 @@ usage: ag agents set [-h] [--worktree] [--base BASE]
                      [--env-clear] [--claude-config-dir CLAUDE_CONFIG_DIR]
                      [--subscription-only {on,off}] [--transport {acp,cli}] [--acp-cmd ACP_CMD]
                      [--effort EFFORT] [--fallback FALLBACK] [--data DATA] [--stall-s STALL_S]
-                     [--kit KIT] [--wake-require-diff {on,off}]
+                     [--kit KIT] [--wake-require-diff {on,off}] [--budget-ctx {on,off}]
                      name
 
 positional arguments:
@@ -53,3 +53,6 @@ options:
                         wake diff gate default for this agent: fail wakes that change nothing in
                         the worktree (on|off; default on with --verify on an agent with a
                         worktree)
+  --budget-ctx {on,off}
+                        inject the one-line budget context into this agent's wake/chat prompts
+                        (on|off; default: routing.json usage.inject)

@@ -276,6 +276,9 @@ _TL_SEQ
 _TRANSIENT_RE
 _UL_DEFAULT_S
 _USAGE_LIMIT_RE
+_USAGE_LIMIT_WINDOWS
+_USAGE_WINDOWS
+_USAGE_WIN_ALIAS
 _WEB_CSP
 _WEB_PAGE
 _WEB_ROW_KEYS
@@ -401,6 +404,7 @@ _do_relay_say
 _do_relay_secret
 _eff_check
 _eff_norm
+_eff_step_down
 _eff_validate
 _effort_disp
 _etime_s
@@ -521,6 +525,8 @@ _oc_session_dir
 _opencode_bin
 _opencode_error_message
 _opencode_major
+_opencode_stats
+_opencode_stats_parse
 _opencode_variants_fetch
 _or_date
 _or_fetch_all
@@ -792,11 +798,22 @@ _update_download
 _update_remote_sha
 _update_stamp
 _update_status_data
+_usage_adapt
+_usage_agg
+_usage_budget_line
+_usage_cheapest_model
+_usage_hits_path
+_usage_key_match
+_usage_limit_clean
+_usage_limit_hits
+_usage_limit_status
 _usage_park_epoch
 _usage_parse_since
+_usage_pressure
 _usage_read
 _usage_rpd
 _usage_ts
+_usage_windows
 _valid_runtime
 _variants_from
 _ver_tuple
@@ -1373,6 +1390,7 @@ ui_enabled
 ui_run
 update_agent_settings
 update_installed_commit
+usage_cfg
 usage_cost
 usage_ledger_path
 usage_limit_scan

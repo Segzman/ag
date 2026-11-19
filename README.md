@@ -557,6 +557,7 @@ ag chat revert w [--turn N]      # whole repo worktree back to before turn N
 
 ```sh
 ag usage [--by provider|model|agent|project|day] [--since 1d|7d|30d] [--json]
+ag agents set NAME --budget-ctx on|off   # per-agent budget-context override (see Quota limits)
 ag budget show
 ag budget set [--daily USD] [--monthly USD] [--provider P --rpd N]
 ag access show [--scope global|project] [--data work|public]
@@ -568,7 +569,10 @@ ag chat send w "task" --force | ag wake w "task" --force | ag delegate w "task" 
 
 - **Access:** `routing.json` `access: {allow:[globs], deny:[globs]}` (global < project, unioned; per-data `access.work`/`access.public` unioned over base) matching `backend/model` and `provider/*` (deny wins). Enforced at `agents add/set` and at turn time (exit 2, error row, never sent).
 - **Ledger:** one JSON line per finished turn to `$AG_CACHE_HOME/usage.jsonl` (global): ts, agent, project, backend, model, provider, in/out/cache, requests=1, exit, cost (tokens x models.dev via `catalog_info`; free=$0; claude/codex=`subscription`, cost null, plus `cost_equiv` = the CLI-reported API-equivalent USD when the backend gives one, e.g. claude `total_cost_usd`).
-- **Usage:** totals + per-provider daily requests vs `providers.json` rpd with % used; `--by` groups, `--since` filters.
+- **Usage:** totals + per-provider daily requests vs `providers.json` rpd with % used; `--by` groups, `--since` filters. `--json` also carries `windows` (today, rolling 5h, 7d, 30d totals per backend and per model), `limits` (configured-limit percentages, below), `limit_hits` (every detected plan limit hit with its reset time, recorded to `$AG_CACHE_HOME/usage-limit-hits.jsonl`), and `opencode_stats` (`opencode stats --days 30 --models --cost` parsed when opencode is installed, else null).
+- **Quota limits (opt-in config):** `routing.json` (global < project) `usage.limits`, keyed by backend, provider, or model prefix, e.g. `"usage": {"limits": {"opencode-go": {"rolling_5h": 2000000, "weekly": {"tokens": 20000000}, "monthly": {"requests": 9000}}}}` — a bare number is a token cap (in+out) over the rolling window (5h / 7d / 30d); a dict may cap `tokens`, `requests`, or `cost`. A window's reset is when its oldest usage rolls off. With no limits set, `ag usage` shows raw numbers and the last limit-hit/reset time.
+- **Budget context (opt-in, default OFF):** `routing.json` `usage.inject: true`, overridden per agent by `ag agents set NAME --budget-ctx on|off`: one short line appended to every wake/chat prompt, e.g. `budget: opencode-go 5h 62% (resets 14:20), week 87% -> prefer flash models, low effort`. With no limits configured the line falls back to raw 5h/7d token totals for the agent's backend (or the active limit hit).
+- **Adaptive routing (opt-in, default OFF):** `routing.json` `usage.adapt: true` (threshold `usage.adapt_threshold`, default 85; `usage.adapt_effort`, default on): when a backend reaches the threshold % of a configured window, or is parked on a usage limit, wake/chat turns and `ag route` prefer the agent's `--fallback` (same- or cross-backend), else the cheapest model in the same backend, and `--effort` steps down one notch. Every adaptation is logged (`[usage-adapt]` chat row + `usage_adapt` event; `ag route` annotates the job). Nothing changes unless enabled.
 - **Budgets:** daily/monthly USD + per-provider rpd; at turn start a breach refuses (exit 2) unless `--force`; at 80% one `[budget]` warning row.
 
 ## Context and handoff

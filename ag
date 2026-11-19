@@ -8858,7 +8858,7 @@ def do_agents_fork(a, sdir):
         "persona": pers, "system": scol.get("system", "") or "",
         "instructions": list(scol.get("instructions") or []),
         "forked_from": src, "forked_at": now_iso(), "fork_turn": fork_turn}
-    for k in ("mode", "plan", "effort", "transport", "acp_cmd", "profile", "env", "env_unset", "subscription_only", "data", "fallback", "claude_config_dir", "allow_cmd", "kit"):  # data: a fork must not silently change privacy class
+    for k in ("mode", "plan", "effort", "transport", "acp_cmd", "profile", "env", "env_unset", "subscription_only", "budget_ctx", "data", "fallback", "claude_config_dir", "allow_cmd", "kit"):  # data: a fork must not silently change privacy class
         if k == "effort":
             if eff not in (None, ""): row["effort"] = eff
             continue
@@ -9220,6 +9220,7 @@ def do_agents(a):
             if getattr(a, k, None) is not None: updates[k] = getattr(a, k)
         if getattr(a, "fallback", None) is not None:
             updates["fallback"] = [s.strip() for s in (a.fallback or []) if (s or "").strip() and (s or "").strip() != ""]
+        if getattr(a, "budget_ctx", None) is not None: updates["budget_ctx"] = (a.budget_ctx == "on")
         if getattr(a, "stall_s", None) is not None:
             if a.stall_s == "": updates["_pop_stall_s"] = True
             else:
@@ -10586,6 +10587,9 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs, kit=None):
         # edits deny-by-default shell is invisible to the agent until it wastes a turn: say what runs
         _sh = edits_shell_hint(a.get("allow_cmd") if isinstance(a.get("allow_cmd"), list) else ())
         if _sh: prompt = f"{prompt}\n\n{_sh}"
+    if not command:
+        _bl = _usage_budget_line(sdir, a)  # opt-in quota context (usage.inject / agent budget_ctx)
+        if _bl: prompt = f"{prompt}\n\n{_bl}" if prompt else _bl
     return prompt, sys_txt, prof_name
 
 def _turn_argv(sdir, a, backend, model, workdir, sid, prompt, sys_txt, command, prof_name, kit=None, kf=None):
@@ -10766,6 +10770,15 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         if _fo:
             backend, model = _fo
             a = {k: v for k, v in a.items() if k not in ("effort", "acp_cmd", "transport")}; a["backend"], a["model"] = backend, model
+        if not _fo and not _rs and not command:
+            _ad = _usage_adapt(sdir, a, backend, model, a.get("effort") or "")  # opt-in quota routing (usage.adapt)
+            if _ad:
+                _ab, _am, _ae, _an = _ad
+                if (_ab, _am) != (backend, model):
+                    if _ab != backend: a = {k: v for k, v in a.items() if k not in ("effort", "acp_cmd", "transport")}
+                    backend, model = _ab, _am; a["backend"], a["model"] = _ab, _am
+                if _ae and _ae != (a.get("effort") or ""): a = dict(a, effort=_ae)
+                _ul_note(sdir, name, _an, on_event, "usage_adapt", backend=_ab, model=_am)
         workdir = os.path.abspath(a.get("dir",".") or ".")
         if command and backend != "opencode":
             _release_agent_turn(_turn_lock); _turn_lock = None
@@ -11353,6 +11366,11 @@ def _ul_record(a, backend, info):
         p = _rl_cooldown_path(_ul_key(a, backend)); p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"until": info["until"], "hits": 1, "usage_limit": True, "label": info["label"],
             "msg": info["msg"], "when": info.get("when", "")}))
+        try:  # persistent hit history for `ag usage` (survives cooldown clear/expiry)
+            hp = _usage_hits_path(); hp.parent.mkdir(parents=True, exist_ok=True)
+            with open(hp, "a") as f: f.write(json.dumps({"ts": now_iso(), "backend": backend, "key": _ul_key(a, backend),
+                "until": info["until"], "label": info["label"], "msg": info["msg"]}) + "\n")
+        except Exception: pass
     except Exception: pass
 def _ul_active(a, backend):
     """Cooldown record {until,label,msg} while this backend/account is limited, else None. Never raises."""
@@ -18876,19 +18894,285 @@ def do_access(a):
     try: _put_file(p, json.dumps(doc, indent=2) + "\n")
     except Exception as e: return emit(a, "access", error=f"cannot write {p}: {e}")
     return emit(a, "access", {"_text": f"access {sub} {pat!r} ({scope}{('/' + data) if data else ''}) -> {p}", "scope": scope, "glob": pat})
+# ---- quota awareness: windows, config limits, budget context, adaptive routing ----
+# Config: routing.json (global < project) top-level "usage": {inject: bool (default OFF),
+# adapt: bool (default OFF), adapt_threshold: pct (default 85), adapt_effort: bool (default ON),
+# limits: {KEY: {rolling_5h|weekly|monthly: N tokens | {tokens|requests|cost: N}}}} where KEY
+# matches a ledger row's backend, provider, or model prefix (e.g. "opencode-go"). Windows are
+# rolling (5h / 7d / 30d); a window's reset = oldest in-window row + window length. Limit hits
+# are appended to $AG_CACHE_HOME/usage-limit-hits.jsonl by _ul_record and read back here.
+_USAGE_WINDOWS = (("today", None), ("rolling_5h", 5 * 3600), ("7d", 7 * 86400), ("30d", 30 * 86400))
+_USAGE_LIMIT_WINDOWS = (("rolling_5h", 5 * 3600), ("weekly", 7 * 86400), ("monthly", 30 * 86400))
+_USAGE_WIN_ALIAS = {"rolling_5h": "rolling_5h", "5h": "rolling_5h", "weekly": "weekly", "week": "weekly", "7d": "weekly", "monthly": "monthly", "month": "monthly", "30d": "monthly"}
+def _usage_agg(rows):
+    """One window total: requests/tokens/cache/cost (+cost_equiv for subscription backends). Pure."""
+    return {"requests": sum(int(r.get("requests") or 1) for r in rows), "turns": len(rows),
+        "in": sum(int(r.get("in") or 0) for r in rows), "out": sum(int(r.get("out") or 0) for r in rows),
+        "cache": sum(int(r.get("cache") if r.get("cache") is not None else r.get("cache_read") or 0) for r in rows),
+        "cost": round(sum(float(r["cost"]) for r in rows if r.get("cost") is not None), 6),
+        "cost_equiv": round(sum(float(r["cost_equiv"]) for r in rows if r.get("cost_equiv") is not None), 6)}
+def _usage_windows(rows, now=None):
+    """{today|rolling_5h|7d|30d: {total, by_backend, by_model}} from ledger rows. Pure."""
+    now = now or time.time()
+    lt = time.localtime(now); day0 = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    out = {}
+    for name, span in _USAGE_WINDOWS:
+        cut = day0 if span is None else now - span
+        wr = [r for r in rows if _usage_ts(r) >= cut]
+        bb, bm = {}, {}
+        for r in wr:
+            b = r.get("backend") or "?"; m = r.get("model") or "default"
+            bb.setdefault(b, []).append(r); bm.setdefault(m, []).append(r)
+        out[name] = {"total": _usage_agg(wr),
+            "by_backend": {k: _usage_agg(v) for k, v in sorted(bb.items())},
+            "by_model": {k: {**_usage_agg(v), "backend": (v[0].get("backend") or "?")} for k, v in sorted(bm.items())}}
+    return out
+def _usage_limit_clean(v):
+    """One window limit -> {tokens|requests|cost: float>0} (bare number = tokens). Pure."""
+    if isinstance(v, (int, float)) and v > 0: return {"tokens": float(v)}
+    if isinstance(v, dict):
+        out = {}
+        for k in ("tokens", "requests", "cost"):
+            try:
+                if v.get(k) is not None and float(v[k]) > 0: out[k] = float(v[k])
+            except Exception: continue
+        return out
+    return {}
+def usage_cfg(sdir=None):
+    """Effective usage config from routing.json (global < project): inject/adapt/threshold/effort/limits. Never raises."""
+    cfg = {"inject": False, "adapt": False, "adapt_threshold": 85.0, "adapt_effort": True, "limits": {}}
+    try:
+        gp, pp = routing_paths(_proj_of(sdir)) if sdir else routing_paths()
+        for p in (gp, pp):
+            u = _json_or_empty(p).get("usage")
+            if not isinstance(u, dict): continue
+            for k in ("inject", "adapt", "adapt_effort"):
+                if isinstance(u.get(k), bool): cfg[k] = u[k]
+            try:
+                if u.get("adapt_threshold") is not None and 0 < float(u["adapt_threshold"]) <= 1000: cfg["adapt_threshold"] = float(u["adapt_threshold"])
+            except Exception: pass
+            lim = u.get("limits") if isinstance(u.get("limits"), dict) else {}
+            for key, wins in lim.items():
+                if not isinstance(wins, dict): continue
+                ent = cfg["limits"].setdefault(str(key), {})
+                for wk, wv in wins.items():
+                    wn = _USAGE_WIN_ALIAS.get(str(wk).strip().lower())
+                    c = _usage_limit_clean(wv)
+                    if wn and c: ent[wn] = c
+                if not ent: cfg["limits"].pop(str(key), None)
+    except Exception: pass
+    return cfg
+def _usage_key_match(row, key):
+    """True when a limits KEY names this ledger row (backend, provider, model prefix/id, backend/model). Pure."""
+    try:
+        b, m = (row.get("backend") or ""), (row.get("model") or "")
+        cands = {b, row.get("provider") or "", m, m.split("/", 1)[0] if "/" in m else "", f"{b}/{m}"}
+        return key in cands
+    except Exception: return False
+def _usage_limit_status(rows, cfg=None, now=None):
+    """{KEY: {window: {used, limit, pct, resets_at, resets}}} for configured limits. Pure given rows."""
+    cfg = cfg if cfg is not None else usage_cfg()
+    now = now or time.time()
+    out = {}
+    for key, wins in (cfg.get("limits") or {}).items():
+        ent = {}
+        for wn, span in _USAGE_LIMIT_WINDOWS:
+            lim = wins.get(wn)
+            if not lim: continue
+            wr = [r for r in rows if _usage_ts(r) >= now - span and _usage_key_match(r, key)]
+            agg = _usage_agg(wr)
+            used = {"tokens": agg["in"] + agg["out"], "requests": agg["requests"], "cost": agg["cost"] + agg["cost_equiv"]}  # cost_equiv: subscription backends keep cost null
+            pct = max((used[u] / lim[u] * 100 for u in lim if lim.get(u)), default=0.0)
+            ra = (min((_usage_ts(r) for r in wr), default=None) or 0) + span if wr else None
+            ent[wn] = {"used": used, "limit": lim, "pct": round(pct, 1),
+                "resets_at": datetime.fromtimestamp(ra, timezone.utc).isoformat() if ra else None,
+                "resets": datetime.fromtimestamp(ra).strftime("%H:%M") if ra else ""}
+        if ent: out[key] = ent
+    return out
+def _usage_hits_path(): return ag_cache_home() / "usage-limit-hits.jsonl"
+def _usage_limit_hits():
+    """Recorded limit hits, newest first: append-only history + live cooldown files. Never raises."""
+    hits, seen = [], set()
+    try:
+        for ln in reversed(_usage_hits_path().read_text().splitlines()):
+            try: o = json.loads(ln)
+            except Exception: continue
+            if not isinstance(o, dict) or not o.get("backend"): continue
+            k = (o.get("backend"), o.get("until"), o.get("ts"))
+            if k in seen: continue
+            seen.add(k)
+            hits.append({"backend": o.get("backend"), "key": o.get("key") or "", "at": o.get("ts") or "",
+                "until": o.get("until"), "reset_at": datetime.fromtimestamp(float(o["until"]), timezone.utc).isoformat() if o.get("until") else None,
+                "label": o.get("label") or "", "msg": o.get("msg") or "", "active": bool(o.get("until") and float(o["until"]) > time.time())})
+    except Exception: pass
+    try:
+        for p in sorted((_rl_base() / "cooldown").glob("*usage-limit*.json")):
+            try: d = json.loads(p.read_text())
+            except Exception: continue
+            if not d.get("usage_limit"): continue
+            ent = {"backend": p.stem.split("_usage-limit")[0], "key": p.stem, "at": "", "until": d.get("until"),
+                "reset_at": datetime.fromtimestamp(float(d["until"]), timezone.utc).isoformat() if d.get("until") else None,
+                "label": d.get("label") or "", "msg": d.get("msg") or "", "active": bool(d.get("until") and float(d["until"]) > time.time())}
+            if not any(h["backend"] == ent["backend"] and h["until"] == ent["until"] for h in hits): hits.append(ent)
+    except Exception: pass
+    return hits
+def _opencode_stats_parse(text):
+    """Tolerant parse of `opencode stats` text: model rows (id, numeric cols, $cost) + total cost. Pure."""
+    models, total = {}, None
+    for ln in (text or "").splitlines():
+        s = ln.strip().strip("│┃|┌┐└┘├┤").strip()
+        m = re.search(r"total\s+cost\D{0,4}\$?\s*([\d,]+(?:\.\d+)?)", s, re.I)
+        if m and total is None:
+            try: total = float(m.group(1).replace(",", ""))
+            except Exception: pass
+        toks = s.split()
+        if len(toks) < 3 or "/" not in toks[0]: continue
+        nums, cost = [], None
+        for t in toks[1:]:
+            if t.startswith("$"):
+                try: cost = float(t[1:].replace(",", ""))
+                except Exception: pass
+            elif re.fullmatch(r"[\d,]+(?:\.\d+)?", t): nums.append(float(t.replace(",", "")))
+            else: break
+        if len(nums) < 2: continue
+        models[toks[0]] = {"in": int(nums[0]), "out": int(nums[1]),
+            **({"cache": int(nums[2])} if len(nums) > 2 else {}), **({"cost": cost} if cost is not None else {})}
+    return {"models": models, "total_cost": total}
+def _opencode_stats(days=30):
+    """Parsed `opencode stats --days N --models --cost`, or None when opencode is absent/failing. Never raises."""
+    try:
+        b = shutil.which("opencode")
+        if not b: return None
+        p = subprocess.run([b, "stats", "--days", str(days), "--models", "--cost"],
+            capture_output=True, text=True, timeout=25, stdin=subprocess.DEVNULL)
+        if p.returncode != 0: return None
+        return _opencode_stats_parse(p.stdout)
+    except Exception: return None
+def _usage_pressure(sdir, a, backend, model, cfg=None):
+    """(pct|None, parked, key) for a backend: worst configured-limit pct among keys naming
+    this agent's backend/provider/model; parked = an active usage-limit cooldown. Never raises."""
+    cfg = cfg if cfg is not None else usage_cfg(sdir)
+    parked = False
+    try: parked = _ul_active(a or {}, backend) is not None
+    except Exception: pass
+    pct, key = None, ""
+    try:
+        row = {"backend": backend, "model": model, "provider": usage_provider(backend, model)}
+        for k, wins in _usage_limit_status(_usage_read(), cfg).items():
+            if not _usage_key_match(row, k): continue
+            for w in wins.values():
+                if pct is None or w["pct"] > pct: pct, key = w["pct"], k
+    except Exception: pass
+    return pct, parked, key
+def _usage_budget_line(sdir, a):
+    """One-line budget context for wake/chat prompts, or '' when off/nothing to say. Never raises.
+    On when the agent's budget_ctx is set, else routing.json usage.inject (default OFF)."""
+    try:
+        cfg = usage_cfg(sdir)
+        on = a.get("budget_ctx") if isinstance((a or {}).get("budget_ctx"), bool) else cfg.get("inject")
+        if not on: return ""
+        backend, model = a.get("backend", "claude"), a.get("model", "default") or "default"
+        rows = _usage_read(); now = time.time()
+        row = {"backend": backend, "model": model, "provider": usage_provider(backend, model)}
+        for k, wins in _usage_limit_status(rows, cfg, now).items():
+            if not _usage_key_match(row, k): continue
+            parts, worst, reset = [], 0.0, ""
+            for wn, _span in _USAGE_LIMIT_WINDOWS:
+                if wn not in wins: continue
+                w = wins[wn]
+                if w["pct"] >= worst: worst, reset = w["pct"], w.get("resets") or reset
+                parts.append(f"{'5h' if wn == 'rolling_5h' else 'week' if wn == 'weekly' else 'month'} {w['pct']:.0f}%")
+            line = f"budget: {k} " + ", ".join(parts) + (f" (resets {reset})" if reset else "")
+            if worst >= cfg.get("adapt_threshold", 85): line += " -> prefer flash models, low effort"
+            return line
+        for h in _usage_limit_hits():
+            if h.get("backend") == backend and h.get("active"):
+                return f"budget: {backend} usage limit hit" + (f" (resets {datetime.fromtimestamp(float(h['until'])).strftime('%H:%M')})" if h.get("until") else "") + " -> prefer fallback models, low effort"
+        agg = _usage_windows(rows, now)
+        t5 = agg["rolling_5h"]["by_backend"].get(backend, {}); t7 = agg["7d"]["by_backend"].get(backend, {})
+        tok5, tok7 = (t5.get("in", 0) + t5.get("out", 0)), (t7.get("in", 0) + t7.get("out", 0))
+        if tok5 or tok7: return f"budget: {backend} 5h {tok5} tokens, 7d {tok7} tokens (no limits configured)"
+        return ""
+    except Exception: return ""
+def _eff_step_down(backend, model, effort):
+    """Effort one notch below the given/stored one (model variants when known, else EFFORT_ORDER)."""
+    e = _eff_norm(effort or "")
+    try: vs = model_variants(backend, model)
+    except Exception: vs = None
+    if vs:
+        cur = e
+        if cur == "highest": cur = vs[-1]
+        elif cur == "lowest": cur = vs[0]
+        elif not cur:
+            try: d = model_default_variant(backend, model)
+            except Exception: d = None
+            cur = d if d in vs else ""
+        if cur not in vs: return effort or ""
+        i = vs.index(cur)
+        return vs[i - 1] if i > 0 else cur
+    if e in EFFORT_ORDER:
+        i = EFFORT_ORDER.index(e)
+        return EFFORT_ORDER[i - 1] if i > 0 else e
+    return effort or ""
+def _usage_cheapest_model(backend, cur):
+    """Cheapest other model of the same backend by catalog $in+$out (free = 0); None when unknown/not cheaper."""
+    try:
+        def cost(m):
+            info = catalog_info(backend, m)
+            if info.get("free"): return 0.0
+            ci, co = info.get("cost_in"), info.get("cost_out")
+            return (float(ci) + float(co)) if isinstance(ci, (int, float)) and isinstance(co, (int, float)) else None
+        cc, best, bc = cost(cur), None, None
+        for m in model_choices(backend):
+            if m in ("default", cur): continue
+            c = cost(m)
+            if c is None: continue
+            if bc is None or c < bc: best, bc = m, c
+        if best is not None and (cc is None or bc < cc): return best
+    except Exception: pass
+    return None
+def _usage_adapt(sdir, a, backend, model, effort):
+    """(backend, model, effort, note) when usage.adapt is on and the backend is >= adapt_threshold%
+    of a configured window or parked; else None. Picks the agent's fallback first, else the cheapest
+    same-backend model; effort steps down one notch unless usage.adapt_effort is off. Never raises."""
+    try:
+        cfg = usage_cfg(sdir)
+        if not cfg.get("adapt"): return None
+        pct, parked, key = _usage_pressure(sdir, a, backend, model, cfg)
+        if not parked and (pct is None or pct < cfg.get("adapt_threshold", 85)): return None
+        tb, tm = backend, model
+        fbs = a.get("fallback") or []
+        for e in ([fbs] if isinstance(fbs, str) else fbs):
+            x = _fb_split(e, backend)
+            if x:
+                if not _ul_active(a, x[0]): tb, tm = x; break
+                continue
+            s = (e or "").strip()
+            if s and s != model: tm = s; break
+        if (tb, tm) == (backend, model):
+            cm = _usage_cheapest_model(backend, model)
+            if cm: tm = cm
+        ne = _eff_step_down(tb, tm, effort) if cfg.get("adapt_effort", True) else (effort or "")
+        if (tb, tm) == (backend, model) and ne == (effort or ""): return None
+        why = "parked (usage limit)" if parked else f"at {pct:.0f}% of {key} limit"
+        note = f"[usage-adapt] {backend} {why} -> {tb}/{tm}" + (f" effort {effort or 'default'}->{ne}" if ne != (effort or "") else "")
+        return tb, tm, ne, note
+    except Exception: return None
+
 def do_usage(a):
     by = getattr(a, "by", None) or None
     if by is not None and by not in ("provider", "model", "agent", "project", "day"): return emit(a, "usage", error=f"bad --by {by!r}: provider|model|agent|project|day")
     try: cut = _usage_parse_since(getattr(a, "since", None))
     except ValueError as e: return emit(a, "usage", error=str(e))
-    rows = [r for r in _usage_read() if cut is None or _usage_ts(r) >= cut]
+    all_rows = _usage_read()
+    rows = [r for r in all_rows if cut is None or _usage_ts(r) >= cut]
     tot = {"requests": sum(int(r.get("requests") or 1) for r in rows), "in": sum(int(r.get("in") or 0) for r in rows),
         "out": sum(int(r.get("out") or 0) for r in rows), "cache": sum(int(r.get("cache") if r.get("cache") is not None else r.get("cache_read") or 0) for r in rows),
         "cost": round(sum(float(r["cost"]) for r in rows if r.get("cost") is not None), 6), "turns": len(rows)}
     rpd = _usage_rpd()
     now = datetime.now(timezone.utc); day0 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp()
     prov_day = {}
-    for r in _usage_read():
+    for r in all_rows:
         if _usage_ts(r) < day0: continue
         prov_day[r.get("provider") or "?"] = prov_day.get(r.get("provider") or "?", 0) + int(r.get("requests") or 1)
     lim_lines = [f"  {p}: {prov_day.get(p, 0)}/{n} today ({prov_day.get(p, 0) / n * 100:.0f}% used)" for p, n in sorted(rpd.items())] if rpd else []
@@ -18906,11 +19190,35 @@ def do_usage(a):
             g["requests"] += int(r.get("requests") or 1); g["in"] += int(r.get("in") or 0); g["out"] += int(r.get("out") or 0)
             g["cache"] += int(r.get("cache") if r.get("cache") is not None else r.get("cache_read") or 0)
             if r.get("cost") is not None: g["cost"] = round(g["cost"] + float(r["cost"]), 6)
-    data = {"total": tot, "by": by, "groups": groups, "since": getattr(a, "since", None), "rpd": rpd, "provider_today": prov_day}
+    cfg = usage_cfg()
+    wins = _usage_windows(all_rows)
+    lim_status = _usage_limit_status(all_rows, cfg)
+    hits = _usage_limit_hits()
+    last_hits = {}
+    for h in hits: last_hits.setdefault(h["backend"], h)
+    oc = _opencode_stats()
+    data = {"total": tot, "by": by, "groups": groups, "since": getattr(a, "since", None), "rpd": rpd, "provider_today": prov_day,
+        "windows": wins, "limits": lim_status, "limit_hits": {"recent": hits[:10], "last_by_backend": last_hits}, "opencode_stats": oc}
     if getattr(a, "json", False): return emit(a, "usage", data)
     L = [f"usage{' --since ' + getattr(a, 'since', '') if getattr(a, 'since', None) else ''}: {tot['requests']} requests, {tot['turns']} turns, in={tot['in']} out={tot['out']} cache={tot['cache']} cost=${tot['cost']:.4f}" if tot["turns"] else "(no usage recorded yet)"]
     if lim_lines: L.append("daily limits (rpd):"); L += lim_lines
     elif rpd: L.append("daily limits: none used today")
+    if all_rows:
+        L.append("windows:")
+        for wn, _span in _USAGE_WINDOWS:
+            t = wins[wn]["total"]
+            L.append(f"  {wn}: {t['requests']} req in={t['in']} out={t['out']} cache={t['cache']} cost=${t['cost']:.4f}")
+            for b, bt in wins[wn]["by_backend"].items(): L.append(f"    {b}: {bt['requests']} req in={bt['in']} out={bt['out']} cache={bt['cache']} cost=${bt['cost']:.4f}")
+    if lim_status:
+        L.append("limits (routing.json usage.limits):")
+        for k, ws in sorted(lim_status.items()):
+            L.append(f"  {k}: " + ", ".join(f"{wn} {w['pct']:.0f}% ({w['used']['tokens']} tok" + (f", resets {w['resets']}" if w.get("resets") else "") + ")" for wn, w in ws.items()))
+    elif hits:
+        h = hits[0]
+        L.append(f"limits: none configured; last limit hit: {h['backend']} {h['label']}" + (f" (reset {h['reset_at']})" if h.get("reset_at") else ""))
+    if oc:
+        L.append(f"opencode stats (30d): total ${oc['total_cost']:.2f}" if oc.get("total_cost") is not None else "opencode stats (30d):")
+        for m, s in sorted(oc["models"].items()): L.append(f"  {m}: in={s['in']} out={s['out']}" + (f" cache={s['cache']}" if "cache" in s else "") + (f" cost=${s['cost']:.2f}" if s.get("cost") is not None else ""))
     if by and groups:
         L.append(f"by {by}:")
         for k in sorted(groups): L.append(f"  {k}: {groups[k]['requests']} req in={groups[k]['in']} out={groups[k]['out']} cache={groups[k]['cache']} cost=${groups[k]['cost']:.4f}")
@@ -19686,6 +19994,16 @@ def do_route(a):
     if getattr(a, "check", False): return emit(a, "route", route_check(hn, prof))
     eff, gp, pp = routing_now(profile=prof)
     jobs = {a.job: eff[a.job]} if a.job else eff
+    try:  # opt-in quota routing hint (usage.adapt): show the model/effort a turn would actually get
+        if usage_cfg().get("adapt"):
+            jobs = dict(jobs)
+            for j, e in list(jobs.items()):
+                _ad = _usage_adapt(None, {"name": j, "fallback": []}, e["ag"]["backend"], e["ag"]["model"], e["ag"].get("effort") or "")
+                if _ad:
+                    _ab, _am, _ae, _an = _ad
+                    _nag = {"backend": _ab, "model": _am, **({"effort": _ae} if _ae else {})}
+                    jobs[j] = {**e, "ag": _nag, "usage_adapt": {"from": dict(e["ag"]), "to": dict(_nag), "note": _an}}
+    except Exception: pass
     bk = backends_effective(_json_or_empty(gp), _json_or_empty(pp))
     warn = [f"{j}: routed to disabled backend {b} (ag setup: enable {b} or re-route {j})" for j, b in routing_disabled(jobs, bk)]
     data = {"harness": hn, "via": via, "profile": prof, "jobs": jobs, "backends": bk, "warnings": warn, "global": str(gp), "project": str(pp)}
@@ -19693,7 +20011,7 @@ def do_route(a):
     off = dict(routing_disabled(jobs, bk))
     out = [f"harness: {hn} (via {via})  profile: {prof}"]
     out += [f'{j:10} claude={e["claude"]:7} ({e["source"]["claude"]})  ag={e["ag"]["backend"]}/{_route_model(e["ag"])}{"@" + e["ag"]["effort"] if e["ag"].get("effort") else ""} ({e["source"]["ag"]})'
-        + ("  ! backend disabled" if j in off else "") for j, e in jobs.items()]
+        + ("  ! backend disabled" if j in off else "") + (f'  usage-adapt (was {e["usage_adapt"]["from"]["backend"]}/{_route_model(e["usage_adapt"]["from"])})' if "usage_adapt" in e else "") for j, e in jobs.items()]
     if not a.job:
         out += [f'backend {b:9} ' + (f'model={eff_model(b, e["model"]) or "default"}{"@" + e["effort"] if e.get("effort") else ""} mode={e["mode"] or "-"}{" plan" if e["plan"] else ""}'
             if e["enabled"] else "disabled") + f' ({e["source"]})' for b, e in bk.items()]
@@ -22119,6 +22437,7 @@ def build():
     agrs=ags.add_parser("reset",help="clear stored backend session ids; keep config and chat log"); agrs.add_argument("name")
     agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
     ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback when rate-limited: MODEL, or BACKEND/MODEL | BACKEND:MODEL to fail over to another backend on a usage limit (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)'); ags2.add_argument("--kit",default=None,help='token-saving kit tools: codegraph,ctx,rtk,style | all | none ("" clears to config kit.default; scoped MCP + style, ag kit doctor)'); ags2.add_argument("--wake-require-diff",dest="wake_require_diff",default=None,choices=["on","off"],help="wake diff gate default for this agent: fail wakes that change nothing in the worktree (on|off; default on with --verify on an agent with a worktree)")
+    ags2.add_argument("--budget-ctx",dest="budget_ctx",default=None,choices=["on","off"],help="inject the one-line budget context into this agent's wake/chat prompts (on|off; default: routing.json usage.inject)")
     ags.add_parser("doctor").add_argument("--refresh",action="store_true",help="ignore the 60s probe cache")
     age=ags.add_parser("env",help="effective per-agent env diff vs os.environ (secrets redacted)"); age.add_argument("name")
     agc=ags.add_parser("caps",help="backend capability table + mode enforcement"); agc.add_argument("backend",nargs="?",default=None)

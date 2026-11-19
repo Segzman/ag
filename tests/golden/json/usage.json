@@ -14,6 +14,66 @@
     "groups": {},
     "since": null,
     "rpd": {},
-    "provider_today": {}
+    "provider_today": {},
+    "windows": {
+      "today": {
+        "total": {
+          "requests": 0,
+          "turns": 0,
+          "in": 0,
+          "out": 0,
+          "cache": 0,
+          "cost": 0,
+          "cost_equiv": 0
+        },
+        "by_backend": {},
+        "by_model": {}
+      },
+      "rolling_5h": {
+        "total": {
+          "requests": 0,
+          "turns": 0,
+          "in": 0,
+          "out": 0,
+          "cache": 0,
+          "cost": 0,
+          "cost_equiv": 0
+        },
+        "by_backend": {},
+        "by_model": {}
+      },
+      "7d": {
+        "total": {
+          "requests": 0,
+          "turns": 0,
+          "in": 0,
+          "out": 0,
+          "cache": 0,
+          "cost": 0,
+          "cost_equiv": 0
+        },
+        "by_backend": {},
+        "by_model": {}
+      },
+      "30d": {
+        "total": {
+          "requests": 0,
+          "turns": 0,
+          "in": 0,
+          "out": 0,
+          "cache": 0,
+          "cost": 0,
+          "cost_equiv": 0
+        },
+        "by_backend": {},
+        "by_model": {}
+      }
+    },
+    "limits": {},
+    "limit_hits": {
+      "recent": [],
+      "last_by_backend": {}
+    },
+    "opencode_stats": null
   }
 }

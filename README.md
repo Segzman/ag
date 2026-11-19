@@ -288,6 +288,7 @@ ag agents doctor | list
 ag agents add w --backend opencode --role sub [--model ID] [--data work|public] [--dir D] [--persona P|--system TEXT|@file] [--job JOB]
 ag agents set w --backend B --model ID --persona P --worktree      # refused while busy
 ag agents rm w [--force] [--purge]
+ag agents gc [--failed] [--idle-days N] [--yes]   # lists by default; --yes removes agents whose last wake failed (--failed) or idle > N days (default 14), plus merged worktrees; never removes unmerged/dirty worktrees, orchestrators, or agents with no recorded activity
 ag agents reset w                           # forget backend session ids; keep config + chat log
 ag agents create "a careful reviewer for the payments service that never edits files" [--name N] [--dir WORKDIR] [--using AGENT] [--yes] [--dry-run] [--json]   # a model drafts {name, job, mode, system, worktree}; ag clamps it (unknown job -> implement, mode full only if the text asks for full access/unrestricted, name sanitized + unique) and routes backend/model from the job; without --yes it only prints the proposal + the exact `agents add` command; --yes creates via `agents add` (instructions stored as --system); --json = {proposal, command, created}; drafter = --using, else the routing `plan` job (temporary headless turn), else the first orchestrator; AG_CREATE_PROPOSAL_JSON = test-only reply override
 ag agents fork src new [--backend B] [--model ID] [--effort E] [--worktree] [--base REF]   # clone config + chat history, fresh session; list shows `<- src`; refused while src busy
@@ -507,9 +508,10 @@ Agents sharing a `dir` clobber each other. Give each a worktree:
 ag agents add w1 --backend claude --dir ~/proj --worktree [--base main]   # branch ag/w1, worktree ~/proj.ag-wt/w1
 ag agents set existing --worktree        # idle agent only
 ag agents rm w1 [--force]                # clean: removes worktree; --force drops uncommitted work; branch kept
+ag merge w1 [--into BRANCH] [--verify CMD] [--squash] [--keep]   # merge ag/w1 into its base; never pushes
 ```
 
-`list` shows `[ag/<name>]`; `--json` has `worktree`. Merge yourself (`git merge ag/w1`); ag has no merge. An identical existing worktree is reused; other clashes error with a hint.
+`list` shows `[ag/<name>]`; `--json` has `worktree`. `ag merge` refuses a dirty worktree or main checkout, shows the diff stat, runs `--verify CMD` in the worktree (must exit 0), then merges into `--into` (default: the base branch recorded at creation; the main checkout must be on it). A conflict aborts the merge (nothing changed) and lists the files. On success it removes the worktree and branch and sets the agent `dormant` (kept in the roster, no worktree); `--keep` skips the cleanup. An identical existing worktree is reused; other clashes error with a hint.
 
 **Worktree escape guard.** A worktree is not a sandbox: an agent can still write to the main checkout by absolute path. ag closes the known causes and detects the rest:
 

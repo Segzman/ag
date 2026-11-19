@@ -5,9 +5,11 @@
 ```sh
 {{AG}} --dir <state> agents add w1 --backend claude --dir ~/proj --worktree [--base main]
 {{AG}} --dir <state> agents rm w1 [--force]     # clean: removes worktree; --force drops dirty work; branch ag/w1 kept
+{{AG}} --dir <state> merge w1 [--into BRANCH] [--verify CMD] [--squash] [--keep]   # merge ag/w1 into its base (refuses dirty trees; aborts on conflict; removes worktree+branch, agent dormant; never pushes)
+{{AG}} --dir <state> agents gc [--failed] [--idle-days N] [--yes]   # dry-run unless --yes; keeps agents with unmerged commits
 ```
 
-Branch `ag/<name>`, worktree `~/proj.ag-wt/<name>`. Merge it yourself (`git merge ag/w1`); ag has no merge. Shared dir = agents clobber each other.
+Branch `ag/<name>`, worktree `~/proj.ag-wt/<name>`. Merge with `ag merge w1 --verify 'make test'`; `--keep` leaves the worktree. Shared dir = agents clobber each other.
 
 A worktree is not a sandbox. ag exports `$PWD` = the agent dir on every turn (opencode 2.x trusts `$PWD` over cwd, so a wake launched from the main checkout used to bind the session there), moves an opencode session bound to another dir back to the agent dir before resuming (`[session]` note in `chat log`), and fails any worktree-agent turn that changed the main checkout (`worktree escape: ... files`, exit 1, no retry; `AG_ESCAPE_GUARD=0` off, e.g. for a merge agent). opencode 2.x `plan`/`ro`/`edits`/profile turns run `--standalone` so the permission block applies (the shared service ignores per-turn config). `AG_SANDBOX=1` (macOS) additionally denies shell writes to the main checkout via `sandbox-exec`. Never put the main checkout's absolute path in a brief unless it must be read.
 

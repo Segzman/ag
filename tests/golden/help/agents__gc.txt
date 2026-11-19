@@ -1,0 +1,9 @@
+usage: ag agents gc [-h] [--failed] [--idle-days IDLE_DAYS] [--dry-run] [--yes]
+
+options:
+  -h, --help            show this help message and exit
+  --failed              also remove agents whose last wake failed
+  --idle-days IDLE_DAYS
+                        remove agents idle longer than N days (default 14)
+  --dry-run             list only (default)
+  --yes                 actually remove

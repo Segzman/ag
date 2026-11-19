@@ -8003,7 +8003,8 @@ def wt_create(name, adir, base=None, sdir=None, spec=None):
     path = repo.parent/f"{repo.name}.ag-wt"/name
     sha = _git(repo,"rev-parse","--verify","--quiet",f"{base or 'HEAD'}^{{commit}}")
     if sha.returncode: return None, f"bad --base: {base or 'HEAD'}", "pass a branch, tag or commit"
-    info = {"repo":str(repo),"path":str(path),"branch":branch,"base":sha.stdout.strip()}
+    info = {"repo":str(repo),"path":str(path),"branch":branch,"base":sha.stdout.strip(),
+        "base_ref": base or _git(repo,"symbolic-ref","--short","-q","HEAD").stdout.strip()}
     reg = _git(repo,"worktree","list","--porcelain").stdout
     same = any(b.splitlines()[0]=="worktree "+str(path) and f"branch refs/heads/{branch}" in b.splitlines()
                for b in reg.split("\n\n") if b.strip())
@@ -8018,18 +8019,121 @@ def wt_create(name, adir, base=None, sdir=None, spec=None):
         except Exception: pass
     return info, None, None
 
+def _wt_dirty(path):
+    """Uncommitted work in a worktree, ignoring ag's own kit index (.codegraph/). 'unreadable' when status fails."""
+    st = _git(path,"status","--porcelain","--",":!.codegraph")
+    return st.stdout.strip() if st.returncode==0 else "unreadable"
+
 def wt_remove(wt, force=False):
     """Remove an agent worktree if clean (or --force); the branch is always kept. -> (err, hint)."""
     path, repo = wt["path"], wt["repo"]
     if Path(path).is_dir():
-        st = _git(path,"status","--porcelain")
-        if st.returncode==0 and st.stdout.strip() and not force:
+        if _wt_dirty(path) and not force:
             return (f"worktree {path} has uncommitted changes",
                     f"commit in {path} (branch {wt['branch']}), or rm --force to drop the worktree (branch kept)")
-        r = _git(repo,"worktree","remove",*(["--force"] if force else []),path)
+        r = _git(repo,"worktree","remove","--force",path)
         if r.returncode: return "git worktree remove failed: "+r.stderr.strip()[:200], None
     else: _git(repo,"worktree","prune")
     return None, None
+
+def _wt_unmerged(repo, branch):
+    """Commits on BRANCH not in the main checkout's HEAD; None when the branch cannot be read."""
+    r = _git(repo,"rev-list","--count",f"HEAD..{branch}")
+    return int(r.stdout.strip()) if r.returncode==0 and r.stdout.strip().isdigit() else None
+
+def _agent_wakes(sdir, name):
+    """Wake jobs of agent NAME, oldest first."""
+    rows = []
+    for p in _wake_dirs(sdir)[1].glob("*.json"):
+        try: j = json.loads(p.read_text())
+        except Exception: continue
+        if j.get("agent")==name: rows.append(j)
+    return sorted(rows, key=lambda j: str(j.get("ts") or ""))
+
+def _agent_last_activity(sdir, name):
+    """Epoch of agent NAME's newest chat row or finished wake job; None when nothing is recorded."""
+    ts = [_relay_epoch(r.get("ts")) for r in load_chat_log(sdir, name)]
+    ts += [_relay_epoch(j.get("ended_at") or j.get("ts")) for j in _agent_wakes(sdir, name)]
+    ts = [t for t in ts if t]
+    return max(ts) if ts else None
+
+def do_merge(a):
+    """ag merge AGENT: merge a worktree agent's branch into its target (never pushes). Aborts on conflict."""
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    rows = load_agents(sdir)
+    row = next((r for r in rows if r["name"]==a.agent and r.get("worktree")), None)
+    if row is None: return emit(a,"merge",error=f"{a.agent} has no worktree",hint="only worktree agents merge (ag agents add NAME --worktree)")
+    if agent_busy(sdir, a.agent): return emit(a,"merge",error=f"{a.agent} is busy (turn or handoff running); retry when idle.")
+    wt = row["worktree"]; path, repo, br = wt["path"], wt["repo"], wt["branch"]
+    target = a.into or wt.get("base_ref") or _git(repo,"symbolic-ref","--short","-q","HEAD").stdout.strip()
+    if not target: return emit(a,"merge",error="no target branch",hint="pass --into BRANCH")
+    if not Path(path).is_dir(): return emit(a,"merge",error=f"worktree {path} is missing",hint=f"ag agents rm {a.agent}")
+    if _wt_dirty(path):
+        return emit(a,"merge",error=f"worktree {path} has uncommitted changes",hint=f"commit in {path} first")
+    cur = _git(repo,"symbolic-ref","--short","-q","HEAD").stdout.strip()
+    if cur != target: return emit(a,"merge",error=f"main checkout {repo} is on {cur or 'a detached HEAD'}, not {target}",hint=f"git -C {repo} switch {target}")
+    if _git(repo,"status","--porcelain").stdout.strip():
+        return emit(a,"merge",error=f"main checkout {repo} has uncommitted changes",hint=f"commit or discard in {repo} first")
+    stat = _git(repo,"diff","--stat",f"{target}...{br}").stdout.strip() or "(no changes)"
+    if a.verify:
+        v = subprocess.run(a.verify, shell=True, cwd=path, capture_output=True, text=True)
+        if v.returncode: return emit(a,"merge",error=f"verify failed (exit {v.returncode}): {a.verify}",hint=(v.stdout+v.stderr).strip()[-400:] or "no output")
+    if a.squash:
+        m = _git(repo,"merge","--squash",br)
+        if m.returncode==0: m = _git(repo,"commit","-m",f"Squash merge {br}")
+    else: m = _git(repo,"merge","--no-edit",br)
+    if m.returncode:
+        files = _git(repo,"diff","--name-only","--diff-filter=U").stdout.split()
+        _git(repo,*(["reset","--merge"] if a.squash else ["merge","--abort"]))
+        why = f"conflicts in {len(files)} file(s): {', '.join(files)}" if files else (m.stderr or m.stdout).strip()[:200]
+        return emit(a,"merge",error=f"merge of {br} into {target} aborted, nothing changed: {why}",hint=f"resolve in {path} (git merge {target}) or rebase onto {target}")
+    out = [stat, f"merged {br} into {target}" + (" (squash)" if a.squash else "")]
+    if a.keep: return emit(a,"merge",{"_text":"\n".join(out+[f"kept worktree {path} and branch {br} (--keep)"])})
+    err, hint = wt_remove(wt)
+    if err: return emit(a,"merge",error=f"merged, but {err}",hint=hint)
+    _git(repo,"branch","-D",br)
+    rows = load_agents(sdir)
+    for r in rows:
+        if r["name"]==a.agent: r.pop("worktree",None); r["dir"]=repo; r["dormant"]=True
+    save_agents(sdir, rows)
+    return emit(a,"merge",{"_text":"\n".join(out+[f"removed worktree {path} and branch {br}; {a.agent} dormant"]),"into":target})
+
+def do_agents_gc(a, sdir, rows):
+    """ag agents gc: remove agents whose last wake failed (--failed) or idle > --idle-days, plus their merged worktrees.
+    Orchestrators and agents with no recorded activity are never removed; unmerged or dirty worktrees are kept and listed."""
+    if a.idle_days < 0: return emit(a,"agents",error="--idle-days must be >= 0")
+    now = time.time(); cut = now - a.idle_days*86400
+    doomed, kept = [], []
+    for r in rows:
+        n = r["name"]
+        if r.get("role")=="orchestrator": continue
+        why = []
+        wakes = _agent_wakes(sdir, n)
+        if a.failed and wakes and _wake_terminal(wakes[-1])=="failed": why.append("last wake failed")
+        last = _agent_last_activity(sdir, n)
+        if last is not None and last < cut: why.append(f"idle {int((now-last)//86400)}d")
+        if not why: continue
+        wt = r.get("worktree")
+        if wt:
+            if Path(wt["path"]).is_dir() and _wt_dirty(wt["path"]):
+                kept.append(f"{n}: uncommitted changes in {wt['path']}"); continue
+            left = _wt_unmerged(wt["repo"], wt["branch"])
+            if left is None or left: kept.append(f"{n}: {wt['branch']} has {left} unmerged commit(s)" if left else f"{n}: cannot read {wt['branch']}"); continue
+        doomed.append((n, ", ".join(why)))
+    if a.dry_run or not a.yes:
+        txt = [f"gc dry-run: {len(doomed)} to remove"] + [f"  remove {n} ({w})" for n, w in doomed] + [f"  keep {k}" for k in kept]
+        return emit(a,"agents",{"_text":"\n".join(txt+(["re-run with --yes to remove"] if doomed else [])),"remove":[n for n,_ in doomed],"keep":kept})
+    import io, contextlib
+    done = []
+    for n, _ in doomed:
+        wt = next((r.get("worktree") for r in rows if r["name"]==n), None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf): rc = do_agents(build().parse_args(["--dir", str(sdir), "agents", "rm", n]))
+        if rc: kept.append(f"{n}: remove failed: {buf.getvalue().strip()[:160]}"); continue
+        if wt: _git(wt["repo"],"branch","-d",wt["branch"])
+        done.append(n)
+    txt = [f"gc removed {len(done)}: {', '.join(done) or '-'}"] + [f"  keep {k}" for k in kept]
+    return emit(a,"agents",{"_text":"\n".join(txt),"removed":done,"keep":kept})
 
 import concurrent.futures as _cf
 # ---- provider probe (installed/version/auth/compat) + idempotent receipts ----
@@ -8467,6 +8571,7 @@ def do_agents(a):
         txt = "\n".join(f'{"ok " if r["ok"] else "BAD"} {r["backend"]:9} {r["version"]:28} compat={r.get("compat","-"):8} auth={r.get("auth","-"):8} {r["hint"]}'.rstrip() if "compat" in r else f'{"ok " if r["ok"] else "BAD"} {r["backend"]:9} {r["version"]} {r["hint"]}' for r in rows)
         return emit(a,"agents",{"_text":txt})
     rows = load_agents(sdir)
+    if a.sub=="gc": return do_agents_gc(a, sdir, rows)
     if a.sub=="list":
         if getattr(a,"json",False): return emit(a,"agents",{"agents":[{**r,"queue":len(queue_list(sdir,r["name"])),"queue_held":queue_held(sdir,r["name"])} for r in rows]})
         txt = "\n".join(f'{r["name"]:10} {r["backend"]:9} {r.get("model","default"):12} {r.get("role","sub"):12} {r.get("persona","") or "-":12} {r.get("profile","") or "-":12} {(r.get("mode") or "-")+("+plan" if r.get("plan") else ""):9} {r.get("dir",".")}{"  ["+r["worktree"]["branch"]+"]" if r.get("worktree") else ""}{"  <- "+r["forked_from"] if r.get("forked_from") else ""}' for r in rows) or "(none)"
@@ -20968,6 +21073,7 @@ def build():
     aga=ags.add_parser("add"); aga.add_argument("name"); aga.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); aga.add_argument("--model",default=None); aga.add_argument("--job",default=None,choices=JOB_KEYS,help="take backend/model from job routing (ag route) when --backend is omitted"); aga.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="routing profile for --job (default: detected harness)"); aga.add_argument("--dir",dest="adir",default="."); aga.add_argument("--role",default="sub",choices=["orchestrator","sub"]); aga.add_argument("--persona",default=None,help="behavior preset from roles"); aga.add_argument("--system",default=None,help="inline custom system prompt (overrides persona)"); aga.add_argument("--instructions",action="append",default=None,help="explicit .md guidance file (repeatable, project-relative)"); aga.add_argument("--worktree",action="store_true",help="isolated git worktree + branch ag/<name> (--dir must be in a git repo)"); aga.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); aga.add_argument("--mode",default=None,choices=MODES,help="permission mode (default: backend default)"); aga.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); aga.add_argument("--plan",action="store_true",default=None,help="plan (read-only) mode"); aga.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); aga.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); aga.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); aga.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); aga.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); aga.add_argument("--transport",default=None,choices=["acp","cli"],help="acp: speak Agent Client Protocol (gemini/cursor/opencode)"); aga.add_argument("--acp-cmd",dest="acp_cmd",default=None,help='ACP agent command for --backend acp'); aga.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); aga.add_argument("--fallback",action="append",default=None,help='fallback when rate-limited: MODEL, or BACKEND/MODEL | BACKEND:MODEL to fail over to another backend on a usage limit (repeatable, "" clears)'); aga.add_argument("--data",default=None,choices=["work","public"],help="data class: work = zero-retention models only (default from routing.json privacy.default), public = any model"); aga.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears -> AG_STALL_S/backend default)')
     agc=ags.add_parser("create",help="draft an agent from one sentence (proposal; --yes creates)"); agc.add_argument("description"); agc.add_argument("--name",default=None); agc.add_argument("--dir",dest="adir",default="."); agc.add_argument("--using",default=None,help="agent that drafts the proposal (default: routing plan job, else first orchestrator)"); agc.add_argument("--yes",action="store_true",help="create the agent (default: show proposal + command only)"); agc.add_argument("--dry-run",dest="dry_run",action="store_true")
     agrm=ags.add_parser("rm"); agrm.add_argument("name"); agrm.add_argument("--force",action="store_true",help="remove a dirty worktree (branch is kept)"); agrm.add_argument("--purge",action="store_true",help="also remove chat log and metadata")
+    agg=ags.add_parser("gc",help="remove failed/idle agents + their merged worktrees (lists unless --yes)"); agg.add_argument("--failed",action="store_true",help="also remove agents whose last wake failed"); agg.add_argument("--idle-days",dest="idle_days",type=float,default=14,help="remove agents idle longer than N days (default 14)"); agg.add_argument("--dry-run",dest="dry_run",action="store_true",help="list only (default)"); agg.add_argument("--yes",action="store_true",help="actually remove")
     agrs=ags.add_parser("reset",help="clear stored backend session ids; keep config and chat log"); agrs.add_argument("name")
     agf=ags.add_parser("fork",help="clone config + chat history with fresh session (lineage: forked_from/forked_at/fork_turn)"); agf.add_argument("src",help="agent to copy"); agf.add_argument("new",help="new agent name"); agf.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","acp","api"]); agf.add_argument("--model",default=None); agf.add_argument("--effort",default=None,help="reasoning effort override (claude --effort, opencode --variant, codex model_reasoning_effort)"); agf.add_argument("--worktree",action="store_true",help="new agent gets its own git worktree + branch ag/<new>"); agf.add_argument("--base",default=None,help="base ref for --worktree (default HEAD)"); agf.add_argument("--acp-cmd",dest="acp_cmd",default=None)
     ags2=ags.add_parser("set"); ags2.add_argument("name"); ags2.add_argument("--worktree",action="store_true",help="move agent into an isolated git worktree"); ags2.add_argument("--base",default=None); ags2.add_argument("--backend",default=None,choices=["claude","opencode","gemini","codex","cursor","echo","api"]); ags2.add_argument("--model",default=None); ags2.add_argument("--dir",dest="adir",default=None); ags2.add_argument("--role",default=None,choices=["orchestrator","sub"]); ags2.add_argument("--persona",default=None,help='behavior preset from roles ("" clears)'); ags2.add_argument("--system",default=None,help='inline custom system prompt ("" clears)'); ags2.add_argument("--instructions",action="append",default=None,help='explicit .md guidance files (repeatable; "" clears)'); ags2.add_argument("--mode",default=None,help='permission mode ro|edits|auto|full ("" clears)'); ags2.add_argument("--allow-cmd",dest="allow_cmd",action="append",default=None,metavar="PATTERN",help='extra edits-mode shell allowlist prefix, opencode + claude (repeatable; "" clears)'); ags2.add_argument("--plan",dest="plan",action="store_true",default=None); ags2.add_argument("--no-plan",dest="plan",action="store_false"); ags2.add_argument("--env",action="append",default=None,metavar="K=V",help="child env var (repeatable; secret-looking keys need ${VAR}; PATH+=dir prepends)"); ags2.add_argument("--env-unset",dest="env_unset",action="append",default=None,metavar="K",help="remove var from child env (repeatable)"); ags2.add_argument("--env-clear",dest="env_clear",action="store_true",help="drop all per-agent env"); ags2.add_argument("--claude-config-dir",dest="claude_config_dir",default=None,help="CLAUDE_CONFIG_DIR for this agent (second account); clears claude session on change"); ags2.add_argument("--subscription-only",dest="subscription_only",default=None,choices=["on","off"],help="strip API-key env (ANTHROPIC_*/OPENAI_*/GEMINI_/CURSOR_) so CLIs use subscription login"); ags2.add_argument("--transport",default=None,choices=["acp","cli"]); ags2.add_argument("--acp-cmd",dest="acp_cmd",default=None); ags2.add_argument("--effort",default=None,help='reasoning effort, checked per model (highest|lowest resolve; "" clears): claude --effort, opencode --variant, codex model_reasoning_effort'); ags2.add_argument("--fallback",action="append",default=None,help='fallback when rate-limited: MODEL, or BACKEND/MODEL | BACKEND:MODEL to fail over to another backend on a usage limit (repeatable, "" clears)'); ags2.add_argument("--data",default=None,help='data class work|public ("" clears to routing.json privacy.default)'); ags2.add_argument("--stall-s",dest="stall_s",default=None,help='stall watchdog seconds for this agent (0 = off; "" clears)'); ags2.add_argument("--kit",default=None,help='token-saving kit tools: codegraph,ctx,rtk,style | all | none ("" clears to config kit.default; scoped MCP + style, ag kit doctor)'); ags2.add_argument("--wake-require-diff",dest="wake_require_diff",default=None,choices=["on","off"],help="wake diff gate default for this agent: fail wakes that change nothing in the worktree (on|off; default on with --verify on an agent with a worktree)")
@@ -21073,6 +21179,10 @@ def build():
     up = sub.add_parser("update",help="update ag from GitHub (fast-forward only)"); up.add_argument("--auto",choices=["on","off"],default=None,help="toggle the daily background auto-update"); up.add_argument("--status",action="store_true"); up.add_argument("--quiet",action="store_true",help=argparse.SUPPRESS)
     pu = sub.add_parser("push",help="git push, then signal relay peers to update and sync"); pu.add_argument("push_args",nargs=argparse.REMAINDER,help="git push arguments (e.g. origin master)")
     mo=sub.add_parser("models",help="live model lists per backend (cached 24h)"); mo.add_argument("--backend",default=None,choices=MODEL_BACKENDS+("api",)); mo.add_argument("--provider",default=None,help="with --backend api: list GET {base}/models of this provider (ollama|lmstudio|custom)"); mo.add_argument("--refresh",action="store_true",help="re-fetch now"); mo.add_argument("--rank",action="store_true",help="rank by Artificial Analysis intelligence/coding/agentic score, speed, tier (openrouter.ai/rankings + models.dev)"); mo.add_argument("--tier",choices=("small","balanced","big")); mo.add_argument("--free",action="store_true",help="free models only"); mo.add_argument("--sort",choices=("intel","coding","speed","popular"),default=None,help="rank order (implies --rank)"); mo.add_argument("--auto",choices=("on","off"),default=None,help="toggle background catalog refresh (config.json catalog_auto)"); mo.add_argument("--status",action="store_true",help="last fetch per catalog source + auto state"); mo.add_argument("--zdr",action="store_true",help="zero-retention models only (data privacy)"); mo.add_argument("--bg",action="store_true",help=argparse.SUPPRESS)
+    mgp = sub.add_parser("merge", help="merge a worktree agent's branch into its target (never pushes); removes the worktree unless --keep")
+    mgp.add_argument("agent"); mgp.add_argument("--into",default=None,help="target branch (default: the worktree's base branch)")
+    mgp.add_argument("--verify",default=None,help="shell command run in the worktree before merging (must exit 0)")
+    mgp.add_argument("--squash",action="store_true",help="squash the branch into one commit"); mgp.add_argument("--keep",action="store_true",help="keep worktree, branch and agent")
     kt = sub.add_parser("kit", help="token-saving toolkit (codegraph/ctx/rtk/style) delivered per agent, scoped"); kts=kt.add_subparsers(dest="ksub",required=False)
     kts.add_parser("status", help="config default + per-agent effective kit (default subcommand)")
     kto=kts.add_parser("on", help="enable by default (config kit.default; missing tools skipped + reported)")
@@ -21804,7 +21914,7 @@ def main(argv=None):
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"browser":do_browser,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"channel":do_channel,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
-        "access":do_access,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit}[a.subcmd]
+        "access":do_access,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit,"merge":do_merge}[a.subcmd]
     maybe_auto_update(a.subcmd)
     return fn(a)
 

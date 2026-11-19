@@ -10463,6 +10463,8 @@ ACP_MAX_MSG = 4 << 20
 ACP_INIT_S, ACP_LOAD_S = 15, 30
 CAPS["acp"] = {**_CAP_BASE, "resume": True, "modes": list(MODES)}
 
+ACP_PERMISSION_HOOK = None  # serve mode only: callable(pr_params) -> {"outcome": {...}} | None (None = auto policy)
+
 class AcpErr(Exception):
     """kind: fallback (pre-prompt, rerun via cli) | auth | load_missing | fatal."""
     def __init__(self, kind, msg): super().__init__(msg); self.kind = kind
@@ -10628,9 +10630,17 @@ def acp_turn_lines(argv, env, workdir, sid, prompt, mode="edits", model="", ctl=
             if "method" in m and "id" in m:  # agent -> client request
                 if m["method"] == "session/request_permission":
                     pr = m.get("params") or {}; tc = pr.get("toolCall") or {}
-                    ok = acp_permission(tc, mode, workdir); oid = _acp_pick(pr.get("options"), ok)
-                    send({"jsonrpc": "2.0", "id": m["id"], "result": {"outcome": {"outcome": "selected", "optionId": oid} if oid else {"outcome": "cancelled"}}})
-                    if not (ok and oid): yield note(f'[acp] denied {tc.get("kind") or "other"} {tc.get("title") or ""} (mode={mode})'.replace("  ", " "))
+                    fwd = None
+                    if ACP_PERMISSION_HOOK is not None:
+                        try: fwd = ACP_PERMISSION_HOOK(pr)
+                        except Exception: fwd = None
+                    if isinstance(fwd, dict) and isinstance(fwd.get("outcome"), dict):  # serve mode: the editor decided
+                        send({"jsonrpc": "2.0", "id": m["id"], "result": fwd})
+                        if fwd["outcome"].get("outcome") != "selected": yield note(f'[acp] denied by editor: {tc.get("kind") or "other"} {tc.get("title") or ""}'.replace("  ", " "))
+                    else:
+                        ok = acp_permission(tc, mode, workdir); oid = _acp_pick(pr.get("options"), ok)
+                        send({"jsonrpc": "2.0", "id": m["id"], "result": {"outcome": {"outcome": "selected", "optionId": oid} if oid else {"outcome": "cancelled"}}})
+                        if not (ok and oid): yield note(f'[acp] denied {tc.get("kind") or "other"} {tc.get("title") or ""} (mode={mode})'.replace("  ", " "))
                 else:
                     send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": f"method not supported by ag: {m['method']}"}})
             elif "method" in m:
@@ -10777,6 +10787,197 @@ def _acp_selfcheck(td):
     assert parse_timeline("gemini", L({"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hi"}}})) == [{"op": "assistant_delta", "seg": "acp:2", "delta": "hi"}]
     assert parse_events("opencode", json.dumps({"ag_acp": "session", "sessionId": "s1"})) == [("meta", "s1")]
     assert parse_usage("acp", json.dumps({"ag_acp": "done", "usage": {"inputTokens": 5, "outputTokens": 2, "cachedReadTokens": 3}}))["in"] == 8
+
+
+# --- ACP server (`ag serve --acp`): ag AS an ACP agent over stdio, for editors (Zed, T3 Code, any ACP client) ---
+# Inverse of the ACP client above: JSON-RPC 2.0, one message per line on stdin/stdout (stdout is the protocol
+# channel: nothing else may print there). session/prompt routes through run_turn -- the same call `chat send`
+# makes -- and streams its text events back as session/update agent_message_chunk notifications. Prompts run
+# on a worker thread so session/cancel and replies to forwarded session/request_permission requests are read
+# while a turn is in flight. Usage-limit / policy (privacy/access/budget, exit 2) denials become JSON-RPC
+# errors with the denial text, never a fake end_turn.
+def _acp_prompt_text(blocks):
+    """Text of an ACP prompt block list (text blocks only; others skipped)."""
+    out = []
+    for b in blocks or []:
+        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str): out.append(b["text"])
+    return "\n".join(out).strip()
+
+def _acp_serve_error(r):
+    """run_turn result -> (code, message) JSON-RPC error, or None when the turn may report a stopReason."""
+    if r.get("usage_limit"):
+        msg = f"usage limit: {r.get('error') or 'backend usage limit reached'}"
+        if r.get("reset_at"): msg += f" (resets {r['reset_at']}; the turn was not run to completion)"
+        return -32002, msg
+    if r.get("timed_out"): return -32603, f"turn timed out: {r.get('error') or 'max-runtime exceeded'}"
+    if "error" in r:
+        if r.get("exit") == 2: return -32003, f"denied by policy: {r['error']}"
+        return -32603, str(r["error"])
+    if r.get("exit") not in (None, 0):
+        tail = str(r.get("stderr") or r.get("reply") or "turn failed").strip().splitlines()
+        return -32603, f"turn failed (exit {r.get('exit')}): {tail[-1][:300] if tail else 'turn failed'}"
+    return None
+
+def _acp_serve_pick(sdir, agent_name, job):
+    """(agent row, error). --agent wins; --job reuses a roster row tagged with the job, else creates
+    `acp-<job>` from job routing (as `agents add --job` does); neither = first roster row."""
+    rows = load_agents(sdir)
+    if agent_name:
+        row = next((x for x in rows if x.get("name") == agent_name), None)
+        return (row, "") if row else (None, f"no such agent: {agent_name} (ag agents list)")
+    if job:
+        row = next((x for x in rows if x.get("job") == job), None)
+        if row: return row, ""
+        ra = routing_now()[0][job]["ag"]; name = f"acp-{job}"
+        row = next((x for x in rows if x.get("name") == name), None)
+        if row: return row, ""
+        row = {"name": name, "backend": ra["backend"], "model": ra["model"] or "default", "dir": ".", "role": "sub", "job": job}
+        if ra.get("effort"): row["effort"] = ra["effort"]
+        rows.append(row); save_agents(sdir, rows)
+        return row, ""
+    return (rows[0], "") if rows else (None, "no agents in roster (ag agents list)")
+
+class _AcpServe:
+    def __init__(self, sdir, agent_name, job, inp, out):
+        self.sdir, self.agent_name, self.job = sdir, agent_name, job
+        self.inp, self.out = inp, out
+        self.wlock = threading.Lock(); self.n = 0; self.seq = 0
+        self.sessions = {}  # sid -> {agent, cwd, cancel: Event, busy: bool}
+        self.pending = {}   # forwarded request id -> [Event, result|None]
+        self.plock = threading.Lock(); self.dead = threading.Event()
+
+    def send(self, o):
+        with self.wlock:
+            try: self.out.write(json.dumps(o) + "\n"); self.out.flush()
+            except Exception: self.dead.set()
+
+    def reply(self, rid, result): self.send({"jsonrpc": "2.0", "id": rid, "result": result})
+    def fail(self, rid, code, msg): self.send({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": msg}})
+    def update(self, sid, upd): self.send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": upd}})
+    def chunk(self, sid, text): self.update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}})
+
+    def request_permission(self, pr):
+        """ACP_PERMISSION_HOOK: forward an inner agent's session/request_permission to the editor and
+        wait for its choice. None on timeout/EOF/cancel -> the caller falls back to the auto policy."""
+        sid = self._active_sid()
+        if not sid or self.dead.is_set(): return None
+        with self.plock: self.n += 1; rid = f"ag-perm-{self.n}"
+        ev = threading.Event(); slot = [ev, None]
+        with self.plock: self.pending[rid] = slot
+        params = dict(pr or {}); params["sessionId"] = sid
+        self.send({"jsonrpc": "2.0", "id": rid, "method": "session/request_permission", "params": params})
+        end = time.monotonic() + 300
+        while time.monotonic() < end and not self.dead.is_set():
+            if ev.wait(0.2): break
+            sess = self.sessions.get(sid) or {}
+            if sess.get("cancel") and sess["cancel"].is_set(): break
+        else: pass
+        with self.plock: self.pending.pop(rid, None)
+        res = slot[1]
+        if isinstance(res, dict) and isinstance(res.get("outcome"), dict): return res
+        if res is not None: return {"outcome": {"outcome": "cancelled"}}
+        return None
+
+    def _active_sid(self):
+        for sid, s in self.sessions.items():
+            if s.get("busy"): return sid
+        return None
+
+    def _prompt(self, rid, sess, sid, text):
+        global ACP_PERMISSION_HOOK
+        streamed = []
+        def on_event(name, kind, txt):
+            if kind == "text" and isinstance(txt, str) and txt:
+                streamed.append(txt); self.chunk(sid, txt)
+        prev, ACP_PERMISSION_HOOK = ACP_PERMISSION_HOOK, self.request_permission
+        try: r = run_turn(self.sdir, sess["agent"], text, on_event=on_event)
+        except Exception as e: r = {"error": f"{type(e).__name__}: {e}", "exit": 1}
+        finally: ACP_PERMISSION_HOOK = prev; sess["busy"] = False
+        if sess["cancel"].is_set() or r.get("interrupted"): return self.reply(rid, {"stopReason": "cancelled"})
+        err = _acp_serve_error(r)
+        if err: return self.fail(rid, err[0], err[1])
+        if not streamed and (r.get("reply") or "").strip(): self.chunk(sid, r["reply"])
+        res = {"stopReason": "end_turn"}
+        if r.get("usage"): res["usage"] = r["usage"]
+        self.reply(rid, res)
+
+    def _dispatch(self, m):
+        method, rid, params = m.get("method"), m.get("id"), m.get("params") or {}
+        if not isinstance(params, dict): params = {}
+        if method == "initialize":
+            return self.reply(rid, {"protocolVersion": 1,
+                "agentCapabilities": {"loadSession": False,
+                    "promptCapabilities": {"image": False, "audio": False, "embeddedContext": False},
+                    "mcpCapabilities": {"http": False, "sse": False}, "sessionCapabilities": {}},
+                "agentInfo": {"name": "ag", "title": "ag", "version": VERSION}, "authMethods": []})
+        if method == "session/new":
+            row, err = _acp_serve_pick(self.sdir, self.agent_name, self.job)
+            if err: return self.fail(rid, -32602, err)
+            self.seq += 1; sid = f"acp-{os.getpid()}-{self.seq}"
+            mode = "ro" if row.get("plan") else (row.get("mode") or "edits")
+            self.sessions[sid] = {"agent": row["name"], "cwd": str(params.get("cwd") or row.get("dir") or "."), "cancel": threading.Event(), "busy": False}
+            return self.reply(rid, {"sessionId": sid, "modes": {"currentModeId": mode,
+                "availableModes": [{"id": x, "name": x} for x in MODES]}, "configOptions": []})
+        if method == "session/prompt":
+            sid = str(params.get("sessionId") or ""); sess = self.sessions.get(sid)
+            if not sess: return self.fail(rid, -32602, f"unknown session: {sid or '(missing sessionId)'} (start with session/new)")
+            text = _acp_prompt_text(params.get("prompt"))
+            if not text: return self.fail(rid, -32602, "empty prompt: need at least one text block")
+            if sess["busy"]: return self.fail(rid, -32603, f"session {sid} already has a prompt in flight (session/cancel first)")
+            sess["busy"] = True; sess["cancel"].clear()
+            threading.Thread(target=self._prompt, args=(rid, sess, sid, text), daemon=True).start()
+            return
+        if method == "session/cancel":
+            sid = str(params.get("sessionId") or ""); sess = self.sessions.get(sid)
+            if sess:
+                sess["cancel"].set()
+                try: agent_interrupt(self.sdir, sess["agent"], wait_s=2)
+                except Exception: pass
+            if rid is not None: self.reply(rid, {})
+            return
+        if method == "session/load": return self.fail(rid, -32601, "session/load not supported (loadSession=false); use session/new")
+        return self.fail(rid, -32601, f"method not supported by ag serve --acp: {method}")
+
+    def loop(self):
+        for line in self.inp:
+            if self.dead.is_set(): break
+            line = line.strip()
+            if not line: continue
+            try: m = json.loads(line)
+            except Exception:
+                self.send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error: not a JSON object per line"}}); continue
+            if not isinstance(m, dict): continue
+            if "method" not in m:  # a response: to a forwarded request_permission, or stray
+                with self.plock: slot = self.pending.get(m.get("id"))
+                if slot:
+                    slot[1] = m.get("result") if "result" in m else {"outcome": {"outcome": "cancelled"}}; slot[0].set()
+                continue
+            try: self._dispatch(m)
+            except Exception as e:
+                if m.get("id") is not None: self.fail(m["id"], -32603, f"{type(e).__name__}: {e}")
+        self.dead.set()
+        for sess in self.sessions.values(): sess["cancel"].set()
+        return 0
+
+def do_serve(a):
+    """`ag serve --acp [--agent NAME | --job JOB]`: ACP agent over stdio (see _AcpServe)."""
+    if not getattr(a, "acp", False):
+        return emit(a, "serve", error="only --acp is supported", hint="ag serve --acp [--agent NAME | --job implement]")
+    if getattr(a, "agent", None) and getattr(a, "job", None):
+        return emit(a, "serve", error="--agent and --job are alternatives", hint="ag serve --acp --agent NAME  |  ag serve --acp --job implement")
+    sdir = state_dir(a.dir); ensure_state(sdir)
+    return _AcpServe(sdir, getattr(a, "agent", None), getattr(a, "job", None), sys.stdin, sys.stdout).loop()
+
+def _acp_serve_selfcheck(td):
+    assert _acp_prompt_text([{"type": "text", "text": "hi"}, {"type": "image", "data": "x"}, {"type": "text", "text": "yo"}]) == "hi\nyo"
+    assert _acp_prompt_text([]) == "" and _acp_prompt_text(None) == ""
+    assert _acp_serve_error({"exit": 0, "reply": "ok"}) is None
+    c, m = _acp_serve_error({"usage_limit": True, "error": "claude usage limit", "reset_at": "2027-01-01T00:00:00+00:00", "exit": 2})
+    assert c == -32002 and "usage limit" in m and "2027-01-01" in m
+    c, m = _acp_serve_error({"error": "privacy: model not zero-retention", "exit": 2}); assert c == -32003 and m.startswith("denied by policy:")
+    c, m = _acp_serve_error({"exit": 1, "reply": "boom"}); assert c == -32603 and "exit 1" in m
+    rows = load_agents(Path(td)); assert _acp_serve_pick(Path(td), rows[0]["name"], None)[0]["name"] == rows[0]["name"]
+    assert _acp_serve_pick(Path(td), "no-such-agent-zzz", None)[0] is None
 
 # --- run_turn seams: each turn feature edits ONE helper ---
 def _turn_prompt(sdir, a, backend, sid, text, command, _rs, kit=None):
@@ -18329,6 +18530,7 @@ def do_selfcheck(a):
     orcat_selfcheck()
     _setup_selfcheck()
     _acp_selfcheck(str(td))
+    _acp_serve_selfcheck(str(td))
     assert compat_verdict("claude","2.1.10")=="graceful" and compat_verdict("claude","2.1.289")=="ok" and auth_parse("codex","Not logged in")=="no"
     assert do_agents(mk(sub="add",name="alpha",backend="echo",model="default",adir=".",role="sub",persona=None,system=None))==0
     assert "ag agents list" in _agent_hint(td, "alpah") and "alpha" in _agent_hint(td, "alpah")
@@ -23356,6 +23558,10 @@ def build():
     plo=pos.add_parser("log",help="policy events from the ledger (denials, compiles, checks)")
     plo.add_argument("--limit",type=int,default=20,help="max events to show")
     st=sub.add_parser("setup",help="pick model routing, install ag skills (shared ~/.agents/skills + links), write ag pointer blocks into harness instruction files"); st.add_argument("--scope",default=None,choices=["global","project"]); st.add_argument("--harness",default=None,help=",".join(SETUP_HARNESSES) + " | all | none (default: detected)"); st.add_argument("--preset",default=None,choices=list(ROUTING_PRESETS)); st.add_argument("--set",action="append",default=[],help="JOB=claude:ALIAS | JOB=ag:BACKEND/MODEL[@EFFORT] | backend.B.(enabled|model|mode|plan|effort)=V (repeatable)"); st.add_argument("--claude-md",dest="claude_md",action="store_true",default=None); st.add_argument("--no-claude-md",dest="claude_md",action="store_false"); st.add_argument("--profile",default=None,choices=ROUTE_PROFILES,help="profile whose jobs to edit (default: detected harness)"); st.add_argument("--answers",default=None,metavar="JSON",help="apply `route --check` answers non-interactively (project scope): marks the project configured, writes overrides + project skills"); st.add_argument("--yes",action="store_true",help="no prompts; defaults for unset flags"); st.add_argument("--dry-run",action="store_true",help="write nothing, print diffs"); st.add_argument("--ui",default=None,choices=list(SETUP_UIS),help="interactive front-end: web (local browser form; default on a desktop) | mac (= web) | cli (full-screen) | plain (prompts); env AG_SETUP_UI")
+    sv = sub.add_parser("serve", help="serve ag as an ACP agent over stdio (editors: Zed, T3 Code, any ACP client)")
+    sv.add_argument("--acp", action="store_true", help="Agent Client Protocol: JSON-RPC 2.0, newline-delimited, on stdin/stdout")
+    sv.add_argument("--agent", default=None, help="agent to drive for every session (default: first roster agent)")
+    sv.add_argument("--job", default=None, choices=JOB_KEYS, help="drive the agent tagged with this job, or create acp-<job> from job routing")
     lk = sub.add_parser("link", help="VM -> Mac view over outbound reverse SSH (docs/LINK.md)"); lks = lk.add_subparsers(dest="lsub", required=True)
     lki = lks.add_parser("init", help="write link.json + create the key + print the Mac authorized_keys line"); lki.add_argument("--to", required=True, help="USER@HOST"); lki.add_argument("--key", default=None, help="private key path (default ~/.ssh/ag_link, created when missing)"); lki.add_argument("--ports", default="auto", help="auto | 3000,8080"); lki.add_argument("--base", type=int, default=41000, help="mac port base"); lki.add_argument("--watch-port", dest="watch_port", type=int, default=7790, help="vm watch page port")
     lku = lks.add_parser("up", help="start the supervisor (ssh -R forwards + watch page; detached unless --foreground)"); lku.add_argument("--foreground", action="store_true"); lku.add_argument("--no-watch", dest="no_watch", action="store_true", help="no watch page / no watch forward")
@@ -24092,7 +24298,7 @@ def main(argv=None):
         "delegate":do_delegate,"crosscheck":do_crosscheck,"wake":do_wake,"wakes":do_wakes,"context":do_context,"compact":do_compact,
         "_wake_run":do__wake_run,"_acp":do__acp,"askpass":do_askpass,"ui":do_ui,"browser":do_browser,"_sudo":do__sudo,"update":do_update,
         "models":do_models,"route":do_route,"setup":do_setup,"receipts":do_receipts,"channel":do_channel,"schedule":do_schedule,"relay":do_relay,"push":do_push,"queue":do_queue,"stop":do_stop,"ratelimit":do_ratelimit,
-        "access":do_access,"grant":do_grant,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit,"merge":do_merge,"mem":do_mem,"bench":do_bench}[a.subcmd]
+        "access":do_access,"grant":do_grant,"usage":do_usage,"budget":do_budget,"policy":do_policy,"link":do_link,"kit":do_kit,"merge":do_merge,"mem":do_mem,"bench":do_bench,"serve":do_serve}[a.subcmd]
     maybe_auto_update(a.subcmd)
     g = gate_check(a, argv0)
     if g is not None: return g

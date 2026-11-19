@@ -3,6 +3,7 @@ ACP_BACKENDS
 ACP_INIT_S
 ACP_LOAD_S
 ACP_MAX_MSG
+ACP_PERMISSION_HOOK
 AGENT_BACKENDS_ALIAS
 AG_ASCII_GLYPHS
 ANSI
@@ -215,6 +216,7 @@ WS
 WS_GUID
 _ACTIVE_BACKEND
 _ANSI_RE
+_AcpServe
 _BIG_RE
 _BOOL
 _BR_HTTP
@@ -297,7 +299,11 @@ _acp_canon
 _acp_model_req
 _acp_obj
 _acp_pick
+_acp_prompt_text
 _acp_selfcheck
+_acp_serve_error
+_acp_serve_pick
+_acp_serve_selfcheck
 _acp_tool_out
 _acquire_agent_turn
 _acquire_wake_job
@@ -1108,6 +1114,7 @@ do_run
 do_schedule
 do_selfcheck
 do_send
+do_serve
 do_sessions
 do_setup
 do_shell

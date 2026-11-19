@@ -1,0 +1,9 @@
+usage: ag serve [-h] [--acp] [--agent AGENT]
+                [--job {mechanical,implement,review,debug,plan,hardest}]
+
+options:
+  -h, --help            show this help message and exit
+  --acp                 Agent Client Protocol: JSON-RPC 2.0, newline-delimited, on stdin/stdout
+  --agent AGENT         agent to drive for every session (default: first roster agent)
+  --job {mechanical,implement,review,debug,plan,hardest}
+                        drive the agent tagged with this job, or create acp-<job> from job routing

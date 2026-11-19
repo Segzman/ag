@@ -58,6 +58,8 @@ Per-backend permission modes and capability flags: `ag agents caps` ([Capabiliti
 
 Requires Python 3.9+, POSIX, git. `./install.sh [--prefix DIR] [--force]` copies only the `ag` file (default `~/.local/bin/ag`); no rc edits. Put the dir on `PATH`. Running `./ag` from the checkout also works. Details, SSH use, uninstall: [docs/INSTALL.md](docs/INSTALL.md). Tip: symlink `~/.local/bin/ag` to the checkout's `ag` so updates land in place.
 
+**Homebrew (head-only, unpublished formula).** The repo ships a formula at `packaging/homebrew/ag.rb` — it is not in any tap and nothing is published; install it from a checkout with `brew install --HEAD ./packaging/homebrew/ag.rb`. The formula tracks the GitHub repo HEAD (`head "https://github.com/Segzman/ag.git"`), depends on `python@3`, and installs the single `ag` file into `bin`. Upgrade with `brew upgrade --fetch-HEAD ag`; uninstall with `brew uninstall ag`.
+
 **Updates.** ag checks GitHub at most once a day, in a detached background process, and applies updates on the next run. `schedule tick` runs the same daily check inline, so a node driven only by its timer still updates. A git checkout gets `fetch` + `merge --ff-only`, but only when the tree is clean, tracking a remote, and not ahead; local commits or edits are never touched. A copy install does a cheap `git ls-remote` sha check (GitHub API fallback when git is missing), downloads that pinned sha from raw (never a moving `master`), checks that it compiles, swaps it in atomically, and records it in `~/.cache/ag/update-commit` (also the relay heartbeat commit). The raw download is chunked: a dropped connection resumes with `Range: bytes=<have>-` (up to 8 attempts, with backoff); a server that ignores Range (200) restarts clean; the length must match Content-Length before the compile check. `ag update` runs it now, `ag update --status` shows mode, interval, installed commit, last check and last result, `ag update --auto off|on` toggles (`~/.config/ag/config.json`), and `AG_AUTO_UPDATE=0` disables per shell. Log: `~/.cache/ag/update.log`. Inside an ag git checkout, `ag push [GIT_PUSH_ARGS…]` pushes, asks every relay peer to run the `update` admin op, and syncs.
 
 ## State dir
@@ -363,6 +365,21 @@ Opt-in per agent: `ag agents add|set W --transport acp|cli` (gemini/cursor/openc
 - Failure: agent dies / no `initialize` in 15s / `session/new` fails / model cannot be set, all before `session/prompt` → `[acp] fallback to cli: <reason>` and the turn reruns once on the normal CLI argv. Never after the prompt was sent. Auth errors (`-32000`) fail with `acp auth required: ... (ag agents doctor)`. A failed/unsupported `session/load` takes the stale-session path (fresh session + history replay).
 - Timeout / `ag stop`: `session/cancel`, ≤1.5s grace, then the agent's process group is killed. Runs in a private `_acp` bridge process so run_turn's guard, queue pid, retry and usage paths apply unchanged.
 - Verified 2026-10-08: opencode 1.18.31 full round-trip (new, load replay, set_config_option, tools, usage); cursor `agent acp` and gemini 0.45.2 `--acp` initialize fine but `session/new` returns `-32000` here (cursor logged out; gemini personal OAuth retired).
+
+## Serving ag over ACP (`ag serve --acp`)
+
+The inverse direction: `ag serve --acp [--agent NAME | --job implement]` makes ag itself an ACP agent over stdio (JSON-RPC 2.0, one message per line; stdout is the protocol channel), so editors — Zed, T3 Code, any ACP client — can drive an ag agent. Point the editor's custom-agent command at `ag --dir <state> serve --acp --agent NAME` (state dir as usual: `--dir` / `$AGENT_CLI_DIR`).
+
+```sh
+ag --dir "$PWD/.agent" serve --acp                  # first roster agent
+ag --dir "$PWD/.agent" serve --acp --agent claude   # one named agent for every session
+ag --dir "$PWD/.agent" serve --acp --job implement  # agent tagged implement, else creates acp-implement from job routing
+```
+
+- Methods: `initialize` (protocol 1; `loadSession=false`, no fs/terminal/image/audio caps), `session/new` (returns a session id + the agent's permission mode from `ro`/`edits`/`auto`/`full`), `session/prompt`, `session/cancel`. `session/load` and anything else answer `-32601` with the reason. Bad JSON answers `-32700`; an unknown session or a text-less prompt answers `-32602`.
+- `session/prompt` routes through the same `run_turn` call as `chat send` for the chosen agent and streams reply text back as `session/update` `agent_message_chunk` notifications in order, then answers `{stopReason: "end_turn"}` (or `"cancelled"` after `session/cancel`, which interrupts the running backend turn like `ag stop`'s interrupt, without holding the queue). One prompt per session at a time; a second answers `-32603`.
+- Permissions: when the driven agent itself speaks ACP (`--transport acp` / `--backend acp`), its inner `session/request_permission` requests are forwarded to the editor as `session/request_permission` with the same tool call + options, and the editor's selected/cancelled outcome is returned to the inner agent; no answer within 300s (or a cancel) falls back to ag's mode-based auto policy (see [ACP transport](#acp-transport)).
+- Denials are errors, never fake replies: a backend usage limit answers `-32002` (`usage limit: ... (resets <time>)`), a policy denial (privacy/access/budget, the exit-2 paths) answers `-32003` (`denied by policy: ...`), and a failed/timed-out turn answers `-32603` with the exit and last error line.
 
 ## Routing
 

@@ -76,6 +76,14 @@ Custom/local: `providers add ID --base-url URL --no-key [--zdr]`; list models: `
 
 Pre-prompt failure -> `[acp] fallback to cli: <reason>` and one CLI rerun. Permissions answered from agent mode. `AG_ACP=0` disables. Verified: opencode; cursor/gemini need login.
 
+Serve ag itself as an ACP agent (editors: Zed, T3 Code, any ACP client):
+
+```sh
+{{AG}} --dir <state> serve --acp [--agent NAME | --job implement]
+```
+
+JSON-RPC 2.0 over stdio (newline-delimited; stdout is protocol-only). `initialize`, `session/new`, `session/prompt` (routes through `chat send`'s run_turn; reply text streams as `session/update` `agent_message_chunk`, then `stopReason: end_turn`), `session/cancel` (interrupts the turn). `--agent` fixes one roster agent; `--job` reuses the job-tagged agent or creates `acp-<job>` from routing; neither = first roster row. An inner ACP agent's `session/request_permission` is forwarded to the editor; usage-limit denials answer `-32002`, policy denials (privacy/access/budget) `-32003`, both with the denial text. `session/load` unsupported (`loadSession=false`).
+
 ## Roles
 
 `roles list|show|add|set|rm|reset`. Presets: `planner` (assumptions, verifiable steps), `implementer` (minimal diffs), `reviewer` (terse bug/security). Per call `--persona`/`--system @file`; persist via `agents set --persona`.

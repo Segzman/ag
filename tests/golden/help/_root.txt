@@ -1,10 +1,10 @@
 usage: ag [-h] [--dir DIR] [--json] [--version]
-          {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,mem,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,bench,budget,policy,setup,link} ...
+          {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,mem,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,bench,budget,policy,setup,serve,link} ...
 
 CLI helper for autonomous agents
 
 positional arguments:
-  {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,mem,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,bench,budget,policy,setup,link}
+  {run,read,write,edit,ls,grep,note,notify,notes,needs,feedback,todo,history,approvals,approve,spawn,send,askpass,ui,browser,_sudo,snap,sessions,kill,wait,events,_daemon,harness,agents,roles,chat,queue,stop,handoff,status,tui,attach,forget,keys,providers,delegate,crosscheck,context,compact,wake,channel,schedule,relay,mem,receipts,wakes,_wake_run,_acp,hosts,sync,shell,selfcheck,update,push,models,merge,kit,route,ratelimit,access,grant,usage,bench,budget,policy,setup,serve,link}
     run                 run shell cmd, logged
     read                read file numbered
     write               write file (arg or stdin)
@@ -84,6 +84,8 @@ positional arguments:
     policy              compile an ag-policy.json into backend policy files
     setup               pick model routing, install ag skills (shared ~/.agents/skills + links),
                         write ag pointer blocks into harness instruction files
+    serve               serve ag as an ACP agent over stdio (editors: Zed, T3 Code, any ACP
+                        client)
     link                VM -> Mac view over outbound reverse SSH (docs/LINK.md)
 
 options:

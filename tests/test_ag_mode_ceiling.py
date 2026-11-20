@@ -77,8 +77,9 @@ class Ceiling(unittest.TestCase):
         rc, out = self.cli("agents", "add", "c3", "--backend", "echo", "--mode", "auto", env=e2)
         self.assertNotEqual(rc, 0); self.assertIn("mode auto exceeds parent ceiling edits", out)
         self.assertEqual(self.cli("agents", "add", "c3", "--backend", "echo", "--mode", "edits", env=e2)[0], 0)
-        self.assertEqual(self.cli("agents", "add", "c4", "--backend", "echo", "--mode", "full",
-            env=self.ceil_env("ro", off=True))[0], 0)  # off disables
+        rc, out = self.cli("agents", "add", "c4", "--backend", "echo", "--mode", "full", env=self.ceil_env("ro", off=True))
+        self.assertEqual(rc, 3); self.assertIn("pending approval", out)  # ceiling off: the human gate still stops an agent raising itself to full
+        self.assertNotIn("c4", self.cli("agents", "list")[1])
 
     def test_set_reject(self):
         self.assertEqual(self.cli("agents", "add", "s1", "--backend", "echo", "--mode", "edits")[0], 0)

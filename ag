@@ -478,6 +478,7 @@ def gate_check(a, argv):
     m = _gate_match(a)
     if m is None or _gate_off(): return None
     key, why = m
+    if key in ("agents add", "agents set") and _mode_ceiling_err(getattr(a, "mode", "")): return None  # the child<=parent mode ceiling refuses outright; no request
     sdir = state_dir(getattr(a, "dir", None)); details = _gate_details(key, a)
     if _gate_interactive():
         ok, how = _human_confirm_ex(key, details)

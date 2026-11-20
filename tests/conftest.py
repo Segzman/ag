@@ -19,6 +19,12 @@ def _ag_isolated_state(tmp_path, monkeypatch):
     monkeypatch.setenv("AG_KIT", "none")
     # real opencode 2.x on the box: ag would exec `opencode --version` (extra fake-binary call) and switch argv shape
     monkeypatch.setenv("AG_OPENCODE_MAJOR", "1")
+    # No test may reach osascript / Notification Center or a real ag-auth popup: ui_run() execs AG_UI_CMD instead
+    # of osascript, and AG_AUTH_HELPER (honoured outside agent envs) is a deny-stub. Tests that need a log set their own.
+    noop = tmp_path / "noop-ui"; noop.write_text("#!/bin/sh\nexit 0\n"); noop.chmod(0o755)
+    deny = tmp_path / "deny-auth"; deny.write_text("#!/bin/sh\nexit 1\n"); deny.chmod(0o755)
+    monkeypatch.setenv("AG_UI_CMD", str(noop))
+    monkeypatch.setenv("AG_AUTH_HELPER", str(deny))
     # human gate: tests drive gated commands directly; the gate itself is tested in test_ag_human_gate.py.
     # Agent-runtime markers are scrubbed so a run inside Claude Code behaves like a plain terminal.
     monkeypatch.setenv("AG_HUMAN_GATE", "off")

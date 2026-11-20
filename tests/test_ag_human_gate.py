@@ -24,7 +24,7 @@ class Gate(unittest.TestCase):
         self.ui = self.script("ui", UI)
         base = {k: v for k, v in os.environ.items() if k not in AGENT_KEYS}
         self.human = dict(base, AG_HOME=str(self.td / "home"), AG_CONFIG_HOME=str(self.cfg), AG_CACHE_HOME=str(self.cache), AG_AUTO_UPDATE="0",
-            AG_PROBE="0", AG_HUMAN_GATE="off", FAKE_AUTH_LOG=str(self.auth_log), FAKE_UI_LOG=str(self.ui_log), AG_UI_CMD=str(self.ui), AG_NOTIFY_DIR=str(self.td / "notify"))
+            AG_PROBE="0", AG_HUMAN_GATE="off", FAKE_AUTH_LOG=str(self.auth_log), FAKE_UI_LOG=str(self.ui_log), AG_UI_CMD=str(self.ui), AG_AUTH_HELPER=self.bad, AG_NOTIFY_DIR=str(self.td / "notify"))
         self.agent = dict(self.human, AG_PARENT_AGENT="bot")
 
     def script(self, name, body):

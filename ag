@@ -316,6 +316,7 @@ GATED_ACTIONS = {
     "policy render": (lambda a: bool(getattr(a, "out", None)) and not getattr(a, "dry_run", False), "writes backend policy files"),
     "relay admin": (lambda a: (getattr(a, "op", "") or "").startswith("trust"), "changes trust on another node"),
     "kit on": (lambda a: (getattr(a, "tools", None) or "all").strip().lower() != "none", "enables MCP kit tools by default"),
+    "mem rm": (None, "deletes a shared memory entry on every relay node"),
 }
 # Swift helper source; compiled once into <cache>/bin/ag-auth (keyed by this source's hash). Exit 0 approved,
 # 1 denied/failed, 2 no authentication available on this Mac.
@@ -354,7 +355,7 @@ def _gate_off():
 
 def _gate_key(a):
     parts = [getattr(a, "subcmd", "") or ""]
-    for at in ("rsub", "asub", "sub", "polsub", "ksub"):
+    for at in ("rsub", "asub", "sub", "polsub", "ksub", "memsub"):
         v = getattr(a, at, None)
         if isinstance(v, str) and v: parts.append(v)
     return " ".join(parts)

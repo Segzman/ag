@@ -1467,6 +1467,8 @@ ws_accept
 ws_frame
 ws_parse
 wt_create
+wt_guard_line
+wt_path_prepend
 wt_remove
 zed_policy_render
 zen_privacy_load

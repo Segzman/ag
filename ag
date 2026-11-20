@@ -6868,6 +6868,20 @@ def escape_message(snap, changed):
             "Revert those edits there (they are not in the worktree). If another writer legitimately changed main meanwhile, or this agent is meant to "
             "merge into main, set AG_ESCAPE_GUARD=0.")
 
+def wt_guard_line(agent):
+    """System-prompt line for worktree agents: where their copy is and which tools to run."""
+    wt = (agent or {}).get("worktree") or {}
+    return f"Your working copy is {wt.get('path') or (agent or {}).get('dir') or ''}. Never edit files outside it; run tools from it (e.g. ./ag, not the ag on PATH)."
+
+def wt_path_prepend(workdir, path_str):
+    """workdir when the repo ships an executable named like a PATH command (./ag shadows the `ag` on PATH), else None."""
+    try:
+        for n in sorted(os.listdir(workdir)):
+            p = os.path.join(workdir, n)
+            if os.path.isfile(p) and os.access(p, os.X_OK) and shutil.which(n, path=path_str or ""): return workdir
+    except Exception: pass
+    return None
+
 def macos_sandbox_argv(argv, workdir):
     """AG_SANDBOX=1 (macOS): run the backend under sandbox-exec with every write into the MAIN checkout denied
     (its .git stays writable so worktree commits work; the agent's own worktree, if nested, stays writable).
@@ -11034,6 +11048,9 @@ def _turn_prompt(sdir, a, backend, sid, text, command, _rs, kit=None):
     if backend in RTK_NOHOOK and not command and rtk_on() and "rtk" in _kit["tools"]:
         sys_txt = (sys_txt + "\n\n" + RTK_HINT) if sys_txt else RTK_HINT
     if not command and secret_enabled(): sys_txt = (sys_txt + "\n\n" + SECRET_HINT) if sys_txt else SECRET_HINT
+    if not command and (a or {}).get("worktree"):
+        _gl = wt_guard_line(a)  # tell a worktree agent where its copy lives (the escape guard only catches it afterwards)
+        sys_txt = (sys_txt + "\n\n" + _gl) if sys_txt else _gl
     if not command and feedback_prompt_on(): sys_txt = (sys_txt + "\n\n" + FEEDBACK_SENTENCE) if sys_txt else FEEDBACK_SENTENCE
     if sys_txt and backend not in ("claude","codex") and not sid and not command:
         # backends without a native system flag: lead the first turn with the role block
@@ -11097,6 +11114,10 @@ def _turn_env(sdir, a, backend, prof, notes=None, kit=None, kf=None):
     merge_agent_env(sdir, a, prof, env, notes)
     env["AG_PARENT_AGENT"] = a.get("name", "") or ""  # dispatch mode ceiling: children inherit this turn's agent+mode
     env["AG_PARENT_MODE"] = "plan" if a.get("plan") else (a.get("mode") or "")
+    if a.get("worktree"):
+        # worktree root first on PATH when the repo ships a PATH-named executable (./ag), so the agent runs its own copy
+        _wtp = wt_path_prepend(os.path.abspath(a.get("dir", ".") or "."), env.get("PATH", ""))
+        if _wtp and _wtp not in env.get("PATH", "").split(os.pathsep): env["PATH"] = _wtp + os.pathsep + env.get("PATH", os.defpath)
     _pa = globals().get("providers_apply")
     if callable(_pa):
         try: env = _pa(sdir, a, env, notes)

@@ -42,7 +42,7 @@ Timeout always queues (exit 2 still, output names the id); `--queue` also record
 
 ## Human gate (`ag grant`)
 
-Gated grants (`relay alias add|rm`, `relay trust`, `access allow|rm`, `agents add|set --mode auto|full`, `policy render --out`, `kit on`, plus `gate.json` extras) need a human at the Mac. As an agent you are not that human: the command exits 3 with `pending approval ID; human runs: ag grant ID --dir <state>` and the user gets a notification. Tell the user the id; never try to approve it yourself (the Touch ID / password popup is the proof, `AG_AUTH_HELPER`/`AG_HUMAN_GATE=off` are ignored in agent envs).
+Gated grants (`relay alias add|rm`, `relay trust`, `access allow|rm`, `agents add|set --mode full`, `policy render --out`, `kit on`, plus `gate.json` extras) need a human at the Mac. As an agent you are not that human: the command exits 3 with `pending approval ID; human runs: ag grant ID --dir <state>` and the user gets a notification. Tell the user the id; never try to approve it yourself (the Touch ID / password popup is the proof, `AG_AUTH_HELPER`/`AG_HUMAN_GATE=off` are ignored in agent envs).
 
 ```sh
 {{AG}} --dir <state> grant --list [--all]      # pending requests

@@ -27,7 +27,7 @@
 
 `agents add` without `--model/--mode/--plan/--effort` takes backend defaults from routing (set via `ag setup`). `--job JOB` fills backend+model+effort from routing when `--backend` absent (`ag route` shows `backend/model@effort`). `agents rm` clears stored session ids but keeps chat history; `--purge` also deletes chat log and metadata. Re-adding the name starts a fresh session. `agents reset` clears every backend session id while keeping config and chat history. Switches refuse while busy. `default` model = no `-m`. `echo` = keyless test backend. `doctor` probe: logged-out backend fails turns fast (`not logged in to <backend>`), unknown proceeds; cache 60s; `AG_PROBE=0` disables. Local keyless models: `agents add l --backend api --model ollama/qwen3:8b` (presets ollama|lmstudio, zdr, cost 0).
 
-Raising an agent to `--mode auto|full` (`agents add|set`) is human-gated: from an agent it files a pending request (`pending approval ID; human runs: ag grant ID`), approved by Touch ID / device password. See `ag grant --list`.
+Raising an agent to `--mode full` (`agents add|set`) is human-gated: from an agent it files a pending request (`pending approval ID; human runs: ag grant ID`), approved by Touch ID / device password. See `ag grant --list`.
 
 ## Caps and permission modes
 

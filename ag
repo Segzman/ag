@@ -2656,13 +2656,12 @@ def _feedback_load(sdir):
     except OSError: pass
     return out
 
-def _feedback_redact_text(text): return REDACT_VALS.sub("REDACTED", str(text or ""))
+def _feedback_redact_text(text): return relay_redact(text)
 
 def _feedback_redact_row(row):
     r = json.loads(json.dumps(row))  # deep copy: _redact_json mutates
     _redact_json(r)
-    if isinstance(r.get("text"), str): r["text"] = _feedback_redact_text(r["text"])
-    return r
+    return _relay_redact(r)  # emails/phones/user literals too, whichever survived the key scan
 
 def _feedback_epoch(v):
     if isinstance(v, (int, float)) and v: return float(v)
@@ -3621,6 +3620,53 @@ def _redact_json(obj, path=""):
                 obj[i]="REDACTED"; red.append(p)
             elif isinstance(v,(dict,list)): red += _redact_json(v,p)
     return red
+
+# ---- relay PII gate: every byte ag writes into the relay mailbox goes through relay_redact ----
+# Ceiling: pattern-based (emails, formatted phones, REDACT_VALS secrets, user literals); an unusual
+# number shape slips through. Fix: add the literal to $AG_CONFIG_HOME/pii.txt (never committed).
+PII_EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?![\w-])")
+PII_PHONE_RE = re.compile(r"(?<![\w+])\+?\d[\d ()./-]{6,20}\d(?![\w])")
+PII_DATE_RE = re.compile(r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T ].*)?$")
+
+def _pii_phone_ok(s):
+    """Phone-shaped: 9-15 digits, explicit formatting (separator or +country), never a date/timestamp."""
+    if PII_DATE_RE.match(s): return False
+    d = re.sub(r"\D", "", s)
+    if not 9 <= len(d) <= 15: return False
+    return s.startswith("+") or bool(re.search(r"[ ()]|(?<=\d)[.-](?=\d)", s))
+
+def _pii_extra_patterns():
+    """User literals from $AG_CONFIG_HOME/pii.txt, one per line (# comments ok, never committed).
+    Lines under 3 chars are ignored so a tiny pattern cannot rewrite a redaction token (idempotence)."""
+    try: lines = (ag_config_home() / "pii.txt").read_text(errors="replace").splitlines()
+    except OSError: return []
+    return [l.strip() for l in lines if len(l.strip()) >= 3 and not l.strip().startswith("#")]
+
+def relay_redact(text, extra=None):
+    """ONE redaction gate for everything ag writes into the relay: emails -> [email], phones -> [phone],
+    known secret shapes (REDACT_VALS) -> [secret], user literals (pii.txt) -> [pii]. Idempotent."""
+    s = "" if text is None else str(text)
+    if not s: return s
+    s = REDACT_VALS.sub("[secret]", s)
+    s = PII_EMAIL_RE.sub("[email]", s)
+    s = PII_PHONE_RE.sub(lambda m: "[phone]" if _pii_phone_ok(m.group(0)) else m.group(0), s)
+    for lit in (_pii_extra_patterns() if extra is None else extra):
+        if lit: s = s.replace(lit, "[pii]")
+    return s
+
+def _relay_redact_walk(obj, extra):
+    if isinstance(obj, str): return relay_redact(obj, extra)
+    if isinstance(obj, dict): return {k: _relay_redact_walk(v, extra) for k, v in obj.items()}
+    if isinstance(obj, list): return [_relay_redact_walk(v, extra) for v in obj]
+    return obj
+
+def _relay_redact(obj, extra=None):
+    """Deep copy with every string redacted (keys and numbers untouched); pii.txt read once per call."""
+    return _relay_redact_walk(obj, _pii_extra_patterns() if extra is None else extra)
+
+def _relay_write_json(path, obj):
+    """Write one relay mailbox JSON file through the redactor exactly once."""
+    _atomic_write(path, json.dumps(_relay_redact(obj), indent=1))
 
 def harness_inventory(home, cwd):
     inv = {"home":str(home),"cwd":str(cwd),"claude_home":[],"project":[],"env":{},"notes":[]}
@@ -13701,7 +13747,7 @@ def relay_publish_schedule(cfg, row, agent_spec):
     elif row.get("at"): mail["at"], mail["days"], mail["tz"] = row["at"], row.get("days"), row.get("tz") or _sched_local_tz()
     f = relay_root(cfg) / "schedules" / row["on"] / f'{cfg["node"]}--{row["id"]}.json'
     f.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(f, json.dumps(mail, indent=1))
+    _relay_write_json(f, mail)
     return f
 def relay_unpublish_schedule(cfg, target, sid):
     """Delete our published schedule file for target. True if something was removed. No git ops."""
@@ -13715,7 +13761,7 @@ def relay_publish_admin(cfg, target, op, arg=None):
     rec = {"op": op, "arg": arg, "origin": cfg["node"], "target": target, "id": aid, "ts": time.time()}
     f = relay_root(cfg) / "admin" / target / f'{cfg["node"]}--{aid}.json'
     f.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(f, json.dumps(rec, indent=1))
+    _relay_write_json(f, rec)
     return rec
 def _relay_state(cfg): return Path(os.path.expanduser(str(cfg["state"])))
 def _relay_jload(p):
@@ -13992,7 +14038,7 @@ def _relay_report(cfg, root, now, out, errs):
             if j.get("verify"): res["verify"] = j["verify"]
             try:
                 f.parent.mkdir(parents=True, exist_ok=True)
-                _atomic_write(f, json.dumps(res, indent=1))
+                _relay_write_json(f, res)
             except OSError as e: errs.append(f"{f.name}: {e}"); continue
             r["relay_reported"] = r["last_job"]
             if r.get("relay_alias"): _relay_alias_done(cfg, r, j, res, now)
@@ -14148,7 +14194,7 @@ def _relay_admin(cfg, root, now, out, errs):
         rf = root / "results" / m["origin"] / f'{node}--{m["id"]}--admin.json'
         try:
             rf.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write(rf, json.dumps(res, indent=1))
+            _relay_write_json(rf, res)
         except OSError as e:
             errs.append(f"{rf.name}: {e}"); continue
         cache[f.name] = int(now); dirty = True
@@ -14187,11 +14233,57 @@ def _relay_heartbeat(cfg, root, now, cache):
     old = _relay_jload(f) or {}
     if old.get("age_recipient"): hb["age_recipient"] = old["age_recipient"]  # cached ssh recipient survives heartbeats
     f.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(f, json.dumps(hb, indent=1))
+    _relay_write_json(f, hb)
     return hb
+def _relay_push_path(): return ag_cache_home() / "relay" / "push-blocked.json"
+
+def _relay_push_state():
+    """Recorded push block: {reason, since, commits, notified[]} or None (last push succeeded)."""
+    d = _json_or_empty(_relay_push_path())
+    return d if isinstance(d, dict) and d.get("reason") else None
+
+def _relay_push_clear():
+    try: _relay_push_path().unlink()
+    except OSError: pass
+
+def _relay_unpushed(cfg):
+    """(count, oldest_epoch) of commits no remote ref has yet; (0, now) when it cannot be read."""
+    co, now = str(cfg.get("checkout") or ""), int(time.time())
+    if not co or not Path(co).is_dir(): return 0, now
+    rc, txt = _relay_cmd(["git", "-C", co, "rev-list", "--count", "HEAD", "--not", "--remotes"])
+    lines = [l for l in (txt or "").splitlines() if l.strip().isdigit()]
+    n = int(lines[-1]) if rc == 0 and lines else 0
+    rc, ts = _relay_cmd(["git", "-C", co, "log", "--format=%ct", "--not", "--remotes", "HEAD"])
+    stamps = [int(l) for l in (ts or "").splitlines() if l.strip().isdigit()]
+    return n, (min(stamps) if rc == 0 and stamps else now)
+
+def _relay_push_blocked(cfg, reason):
+    """A push failed: persist it (status), send ONE macOS notification per distinct reason, add an event.
+    Never raises and never retries by itself; the next sync tries again."""
+    try:
+        first = next((l.strip() for l in str(reason or "").splitlines() if l.strip()), "push failed")[:200]
+        commits, since = _relay_unpushed(cfg)
+        old = _relay_push_state() or {}
+        known = [str(x) for x in (old.get("notified") or [])]
+        st = {"reason": first, "since": int(old["since"]) if old.get("reason") == first and old.get("since") else since or int(time.time()),
+            "commits": commits, "notified": known}
+        if first not in known:
+            body = f"{first} ({commits} commit{'s' if commits != 1 else ''} waiting)"
+            if re.search(r"\b(pii|personal|email|e-?mail address)\b", first, re.I):
+                body += "; fix: ag relay doctor --redact"
+            _relay_alias_notify("ag: relay push blocked", body)
+            st["notified"] = (known + [first])[-20:]
+        _put_file(_relay_push_path(), json.dumps(st, indent=1))
+        sdir = _relay_state(cfg)
+        try: sdir.mkdir(parents=True, exist_ok=True)
+        except OSError: pass
+        _event(sdir, "relay_push_blocked", node=cfg.get("node"), reason=first, commits=commits)
+    except Exception: pass
+
 def _relay_push(cfg, out, errs):
     """add -A, commit (only when something changed), push; rejection ('cannot lock ref', 'fetch first')
-    -> pull --rebase + jittered backoff, 5 attempts. A rebase left behind is continued/aborted first."""
+    -> pull --rebase + jittered backoff, 5 attempts. A rebase left behind is continued/aborted first.
+    A hard failure is recorded once (status + notification + event) instead of retrying forever."""
     node, co = cfg["node"], Path(cfg["checkout"])
     who = _relay_who(cfg)
     if _relay_git(["git", "-C", str(co), "add", "-A"]) is not None: errs.append("git add failed"); return
@@ -14203,7 +14295,7 @@ def _relay_push(cfg, out, errs):
     last = ""
     for attempt in range(RELAY_PUSH_TRIES):
         rc, msg = _relay_cmd(["git", "-C", str(co), "push", "--quiet", "-u", "origin", "HEAD"])
-        if rc == 0: out["pushed"] = True; return
+        if rc == 0: out["pushed"] = True; _relay_push_clear(); return
         last = (msg or "").strip() or last
         low = last.lower()
         permanent = any(x in low for x in ("permission denied", "authentication failed", "could not read username",
@@ -14213,7 +14305,48 @@ def _relay_push(cfg, out, errs):
         _relay_finish_rebase(cfg, co)  # conflict/empty todo: abort so the next attempt starts clean
         if e: last = e
         time.sleep(min(4.0, 0.25 * (2 ** attempt)) + (os.urandom(1)[0] / 255) * 0.25)  # jitter: peers do not retry in lockstep
+    _relay_push_blocked(cfg, last or "rejected")
     errs.append(f"push: {(last or 'rejected')[:150]}")
+
+def _relay_remote_ref(co):
+    """Commit a remote ref points at (origin/<branch>, then @{upstream}), or '' when the repo has none."""
+    rc, br = _relay_cmd(["git", "-C", co, "symbolic-ref", "--short", "HEAD"])
+    br = (br or "").strip().splitlines()[0] if rc == 0 and (br or "").strip() else ""
+    for cand in ([f"refs/remotes/origin/{br}"] if br else []) + ["@{upstream}"]:
+        rc, sha = _relay_cmd(["git", "-C", co, "rev-parse", "--verify", "--quiet", cand])
+        lines = [l.strip() for l in (sha or "").splitlines() if l.strip()]
+        if rc == 0 and lines and re.fullmatch(r"[0-9a-f]{7,64}", lines[-1]): return lines[-1]
+    return ""
+
+def _relay_redact_outgoing(cfg):
+    """`relay doctor --redact`: run relay_redact over every text file in the checkout, then squash the
+    unpushed commits into ONE local commit on top of the remote ref. Pushed history is never rewritten.
+    -> (files changed, error|None)."""
+    co = str(cfg.get("checkout") or "")
+    if not co or not Path(co).is_dir(): return 0, "no relay checkout"
+    base = _relay_remote_ref(co)
+    if not base: return 0, "no remote ref to squash onto (push the mailbox once before redacting)"
+    rc, txt = _relay_cmd(["git", "-C", co, "rev-list", "--count", f"{base}..HEAD"])
+    nums = [l for l in (txt or "").splitlines() if l.strip().isdigit()]
+    if rc != 0 or not nums: return 0, f"git rev-list: {(txt or 'failed')[:160]}"
+    if int(nums[-1]) <= 0: return 0, None  # nothing outgoing
+    changed = 0
+    for f in sorted(Path(co).rglob("*")):
+        if not f.is_file() or ".git" in f.relative_to(co).parts: continue
+        try: before = f.read_text()
+        except (OSError, UnicodeDecodeError): continue  # binary or unreadable: leave it alone
+        after = relay_redact(before)
+        if after == before: continue
+        try: f.write_text(after); changed += 1
+        except OSError: pass
+    if not changed: return 0, None
+    node = cfg["node"]
+    for args, label in ((["reset", "--soft", base], "reset --soft"), (["add", "-A"], "add")):
+        e = _relay_git(["git", "-C", co, *args])
+        if e: return changed, f"{label}: {e}"
+    e = _relay_git(["git", "-C", co, *_relay_who(cfg), "commit", "--quiet",
+        f"--author=ag-relay <{node}@ag-relay>", "-m", f"relay: {node} sync (redacted)"])
+    return (changed, f"commit: {e}") if e else (changed, None)
 
 def relay_sync(cfg, now=None):
     """One mailbox round: pull, materialize+prune (target), report results (target), ingest (origin),
@@ -14255,7 +14388,11 @@ def _relay_status(cfg):
     monitored = {"node": cfg["node"], "peers": [], "sent": [], "received": [], "results": [], "alerts": [],
         "undelivered": _relay_undelivered(cfg, now), "aliases": [_relay_alias_row(cfg, k, v) for k, v in sorted(_relay_aliases(cfg).items())],
         "root": str(root), "backends": _relay_backends(), "commit": ours,
-        "last_seen": hb.get("last_seen"), "ag_version": hb.get("ag_version") or VERSION}
+        "last_seen": hb.get("last_seen"), "ag_version": hb.get("ag_version") or VERSION, "push_blocked": None}
+    if cfg.get("transport") == "git" and (pb := _relay_push_state()):
+        n, since = _relay_unpushed(cfg)
+        if n: monitored["push_blocked"] = {**pb, "commits": n, "since": pb.get("since") or since}
+        else: _relay_push_clear()  # pushed outside ag since the block: nothing is waiting any more
     for f in sorted((root / "nodes").glob("*.json")):
         if f.stem == cfg["node"]: continue
         p = _relay_jload(f) or {}
@@ -14367,7 +14504,7 @@ def _relay_inbox_log_append(m, now):
     rows = _relay_inbox_log_file(f)
     if any(str(r.get("id")) == str(m.get("id")) for r in rows): return
     rows.append({"id": m.get("id"), "origin": m.get("origin"), "agent": m.get("agent"),
-        "message": str(m.get("message") or "")[:20000], "at_epoch": int(m.get("at_epoch") or now), "seen": False})
+        "message": relay_redact(str(m.get("message") or ""))[:20000], "at_epoch": int(m.get("at_epoch") or now), "seen": False})
     if len(rows) > 5000: rows = rows[-5000:]
     _atomic_write(f, "\n".join(json.dumps(r) for r in rows) + ("\n" if rows else ""))
 def _relay_inbox_log_rows(st, name=None):
@@ -14483,6 +14620,7 @@ def _do_relay_inbox(a, cfg):
     return 0
 def _relay_say_mail(cfg, peer, name, text, spec):
     """Publish one once-mail addressed to relay name `name` on `peer`. No git ops. -> mail id."""
+    text = relay_redact(text)  # the message lands in the mailbox repo: no personal data leaves this node
     rid = "w-" + hashlib.sha1(f'{cfg["node"]}\0{peer}\0{name}\0{time.time()}\0{os.getpid()}\0{text}'.encode()).hexdigest()[:12]
     srow = {"id": rid, "on": peer, "agent": name, "message": text, "once": True, "at_epoch": int(time.time()),
         "enabled": True, "max_runtime_s": 0, "job": None, "notify_done": True}
@@ -14508,7 +14646,7 @@ def _do_relay_say(a, cfg):
     if name in st["names"]: _relay_ensure_echo_agent(sdir, name)  # claim's echo agent lives in the cwd-relative state dir
     row = next((r for r in load_agents(sdir) if r.get("name") == name), None)
     if row is None: return err(f"no such agent: {name}", f"ag relay name claim {name}")
-    text = f"[from {name}] {msg}"
+    text = relay_redact(f"[from {name}] {msg}")  # local wake sidecar too: same bytes as the mailbox mail
     spec = {k: row.get(k) for k in ("backend", "model", "effort", "mode", "data", "stall_s")}
     try:
         rid = _relay_say_mail(cfg, peer, name, text, spec)
@@ -14609,7 +14747,7 @@ def _relay_alias_result(cfg, root, m, now, status, reply="", error=""):
         "exit": 0 if status == "inbox" else 1, "reply": reply[:20000], "error": error[:200], "started": int(now), "reported": int(now), "once": True}
     f = root / "results" / m["origin"] / f'{cfg["node"]}--{m["id"]}--{int(now)}.json'
     f.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(f, json.dumps(res, indent=1))
+    _relay_write_json(f, res)
 def _relay_alias_prepare(cfg, sdir, al, ali):
     """Ensure agent alias-<al> matches the alias (capped mode) and, for --resume latest|SID, points at the Claude session. -> None | error."""
     name, mode = f"alias-{al}", _relay_alias_mode(cfg, ali.get("mode"))
@@ -14890,6 +15028,10 @@ def do_relay(a):
             + (f"  last sync {_relay_ago(time.time() - st['last_seen'])} ago" if st.get("last_seen") else "  last sync never")]
         for p in st["peers"]:
             L.append(f'  {p["node"]:14} commit {p["commit"] or "-":12} seen {(_relay_ago(time.time() - p["last_seen"]) if p.get("last_seen") else "never"):8} schedules {p.get("schedules_in", 0)}' + (f"  ALERT: {'; '.join(p['alerts'])}" if p["alerts"] else ""))
+        if st.get("push_blocked"):
+            b = st["push_blocked"]
+            L.append(f'PUSH BLOCKED: {b["reason"]} ({b.get("commits", 0)} commits waiting since {_sched_ts(b.get("since"))})'
+                + (" -- fix: ag relay doctor --redact" if re.search(r"\b(pii|personal|email|e-?mail address)\b", b["reason"], re.I) else ""))
         L.append("sent: " + (", ".join(f'{x["id"]} -> {x["target"]} ({x["spec"]})' + ("" if x["enabled"] else " [disabled]") + f', agent {x["agent"]}' for x in st["sent"]) or "none"))
         L.append("received: " + (", ".join(f'{x["origin"]}--{x["id"]} ({x["spec"]})' + ("" if x["enabled"] else " [disabled]") + f', agent {x["agent"]}' for x in st["received"]) or "none"))
         L.append("recent results: " + (", ".join(f'{x["id"]} via {x["target"]} {x["status"] or "-"} {_sched_ts(x["ts"])}' for x in st["results"]) or "none"))
@@ -14938,12 +15080,27 @@ def do_relay(a):
         txt = f'admin {op} -> {target} queued (id {rec["id"]})'
         if hit: txt = f'admin {op} -> {target}: {hit.get("status") or "-"} {hit.get("detail") or ""}'.strip()
         return emit(a, cmd, {"_text": txt, **data}, error=out.get("error"))
+    if a.rsub == "doctor":
+        pb = _relay_push_state()
+        if not getattr(a, "redact", False):
+            txt = f'PUSH BLOCKED: {pb["reason"]} ({pb.get("commits", 0)} commits waiting since {_sched_ts(pb.get("since"))})' if pb else "push ok"
+            return emit(a, cmd, {"_text": f"relay doctor: {txt}", "push_blocked": pb},
+                hint=(None if not pb else "ag relay doctor --redact redacts the unpushed commits only"))
+        pre = relay_sync(cfg)  # flush this node's pending writes first (and try the plain push)
+        n, e = _relay_redact_outgoing(cfg)
+        if e: return err(f"redact: {e}")
+        out = relay_sync(cfg)  # push the squashed, redacted commit through the pre-push hook
+        pb = _relay_push_state()
+        txt = f"relay doctor: redacted {n} file(s) and squashed the unpushed commits; " + \
+            ("push ok" if out.get("pushed") else f'push still blocked: {(pb or {}).get("reason") or out.get("error") or "unknown"}')
+        return emit(a, cmd, {"_text": txt, "files": n, "push_blocked": pb, "pushed": out.get("pushed"),
+            "pre_error": pre.get("error")}, error=(None if out.get("pushed") else out.get("error")))
     if a.rsub == "name": return _do_relay_names(a, cfg)
     if a.rsub == "inbox": return _do_relay_inbox(a, cfg)
     if a.rsub == "say": return _do_relay_say(a, cfg)
     if a.rsub == "alias": return _do_relay_alias(a, cfg)
     if a.rsub == "secret": return _do_relay_secret(a, cfg)
-    return err("relay: init | sync | status | results | admin | name | inbox | say | alias | secret")
+    return err("relay: init | sync | status | results | admin | name | inbox | say | alias | secret | doctor")
 
 # ---- shared memory (`ag mem`): one store for every node/backend, synced through the relay
 # mailbox. Store = $AG_CONFIG_HOME/memory/<name>.md, frontmatter name/scope/visibility/
@@ -15084,7 +15241,7 @@ def mem_sync(cfg):
         f = rdir / f'{e["name"]}.md'
         cur = mem_parse(f.read_text()) if f.exists() else None
         if cur is None or (e.get("updated") or "") >= (cur.get("updated") or ""):
-            _atomic_write(f, mem_render(e)); out["published"].append(e["name"])
+            _atomic_write(f, relay_redact(mem_render(e))); out["published"].append(e["name"])
     r2 = relay_sync(cfg)
     out["relay_error"] = r2.get("error") or out["relay_error"]
     return out
@@ -23486,7 +23643,8 @@ def build():
     ry_=sub.add_parser("relay",help="run schedules made here on another machine (mailbox: git repo | synced folder)"); rys=ry_.add_subparsers(dest="rsub",required=True)
     ryi=rys.add_parser("init",help="write relay.json; clone for --git; first heartbeat"); ryi.add_argument("--git",dest="git_url",default=None,help="private repo URL (a bare/local git path works too)"); ryi.add_argument("--dir",dest="relay_dir",default=None,help="folder used directly as the mailbox (sync it yourself)"); ryi.add_argument("--node",default=None,help="this machine's name (default: short hostname, [a-z0-9-])"); ryi.add_argument("--state",default=None,help="ag state dir where inbound schedules materialise (default ~/.agent-relay)"); ryi.add_argument("--workdir",default=None,help="parent of per-origin agent workdirs (default ~/ag-relay-work)"); ryi.add_argument("--max-mode",dest="max_mode",default=None,choices=MODES,help="highest --mode a target accepts from the mailbox (default edits)")
     rys.add_parser("sync",help="pull mailbox, materialise/report inbound schedules, ingest results, heartbeat, push")
-    rys.add_parser("status",help="this node + peers, schedules in flight, recent results")
+    rys.add_parser("status",help="this node + peers, schedules in flight, recent results, push-blocked state")
+    ryd=rys.add_parser("doctor",help="push diagnostics; --redact rewrites the unpushed commits and squashes them"); ryd.add_argument("--redact",action="store_true",help="redact PII/secrets in every file of the outgoing (unpushed) commits and squash them into one local commit")
     ryr=rys.add_parser("results",help="ingested remote results, newest first"); ryr.add_argument("--id",default=None,help="filter by schedule id"); ryr.add_argument("--limit",type=int,default=20); ryr.add_argument("--last",action="store_true",help="print only the newest result's reply text")
     rya=rys.add_parser("admin",help="run a relay admin op on another node (update | notify-dir PATH | status)"); rya.add_argument("node"); rya.add_argument("op"); rya.add_argument("arg",nargs="?",default=None); rya.add_argument("--wait",type=float,default=0,help="poll sync every 10s up to S seconds for the result")
     ryn=rys.add_parser("name",help="claim/release/list a relay name; one private mailbox per local session"); ryns=ryn.add_subparsers(dest="nsub",required=True)

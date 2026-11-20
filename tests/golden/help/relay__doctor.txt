@@ -1,0 +1,6 @@
+usage: ag relay doctor [-h] [--redact]
+
+options:
+  -h, --help  show this help message and exit
+  --redact    redact PII/secrets in every file of the outgoing (unpushed) commits and squash them
+              into one local commit

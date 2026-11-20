@@ -92,6 +92,9 @@ OR_RANK_URL
 OR_SITE_URL
 OR_UA
 PAIR_ROLES
+PII_DATE_RE
+PII_EMAIL_RE
+PII_PHONE_RE
 POLICY_BACKEND_TARGETS
 POLICY_CLAUDE_MODE
 POLICY_CODEX_ALLOW
@@ -573,6 +576,8 @@ _parse_opencode
 _parse_opencode_verbose
 _pick
 _pid_alive
+_pii_extra_patterns
+_pii_phone_ok
 _policy_gate
 _policy_glob_any
 _policy_glob_re
@@ -669,7 +674,15 @@ _relay_once_cleanup
 _relay_once_result_exists
 _relay_pull
 _relay_push
+_relay_push_blocked
+_relay_push_clear
+_relay_push_path
+_relay_push_state
 _relay_rebase_pending
+_relay_redact
+_relay_redact_outgoing
+_relay_redact_walk
+_relay_remote_ref
 _relay_remote_wake_dir
 _relay_reply
 _relay_report
@@ -686,7 +699,9 @@ _relay_state
 _relay_status
 _relay_undelivered
 _relay_undelivered_reason
+_relay_unpushed
 _relay_who
+_relay_write_json
 _release_agent_turn
 _release_wake_job
 _require_diff
@@ -1344,6 +1359,7 @@ recent_history
 relay_cfg
 relay_publish_admin
 relay_publish_schedule
+relay_redact
 relay_root
 relay_sync
 relay_unpublish_schedule

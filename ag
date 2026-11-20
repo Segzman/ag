@@ -15087,7 +15087,9 @@ def do_relay(a):
             return emit(a, cmd, {"_text": f"relay doctor: {txt}", "push_blocked": pb},
                 hint=(None if not pb else "ag relay doctor --redact redacts the unpushed commits only"))
         pre = relay_sync(cfg)  # flush this node's pending writes first (and try the plain push)
-        n, e = _relay_redact_outgoing(cfg)
+        _lk = _relay_git_lock(cfg)  # the tick's relay_sync must not commit/push mid-squash
+        try: n, e = _relay_redact_outgoing(cfg)
+        finally: _ctx_unlock(_lk)
         if e: return err(f"redact: {e}")
         out = relay_sync(cfg)  # push the squashed, redacted commit through the pre-push hook
         pb = _relay_push_state()

@@ -15,7 +15,7 @@ Rate limits (429 / `Rate limit exceeded` / `Endpoint is unavailable` / stall) us
 
 ## Usage and spend limits
 
-Usage/spend limits (claude `hit your ... spend limit ... resets 7:40pm (TZ)`, codex `hit your usage limit`, gemini quota) are not retried: result gets `usage_limit: true` + `reset_at`, chat row `[limit] claude usage limit (resets 19:40 TZ)`, shared cooldown per backend (+ `claude_config_dir`) fails later turns fast until reset (`ag ratelimit` shows, `ag ratelimit clear` drops).
+Usage/spend limits (claude `hit your ... spend limit ... resets 7:40pm (TZ)`, codex `hit your usage limit`, gemini quota) are not retried: result gets `usage_limit: true` + `reset_at`, chat row `[limit] claude usage limit (resets 19:40 TZ)`, shared cooldown per backend (+ `claude_config_dir`; opencode: per plan = model provider prefix, so an `opencode-go/*` cap never blocks `opencode/*` free models) fails later turns fast until reset (`ag ratelimit` shows, `ag ratelimit clear` drops).
 
 Failover:
 

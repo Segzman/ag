@@ -11234,7 +11234,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         model = _mo or a.get("model","default") or "default"
         if _rs and _rs.get("fb"): model = _rs["fb"]  # ratelimit fallback: this attempt runs on the fallback model
         _fo = (_rs or {}).get("xb")  # usage-limit failover: (backend, model) on another backend
-        if not _fo and not _rs and not command and (_ulc := _ul_active(a, backend)):
+        if not _fo and not _rs and not command and (_ulc := _ul_active(a, backend, model)):
             _fo = _ul_pick(sdir, a, backend)
             if _fo: _ul_note(sdir, name, f"[fallback] {backend} usage limit -> {_fo[0]}/{_fo[1]}", on_event, "usage_fallback", primary=backend, fallback=f"{_fo[0]}/{_fo[1]}")
             else:
@@ -11603,9 +11603,9 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
         # that dies with empty stderr (opencode JSON error events) must still
         # report its real error instead of "(exit 1) turn failed" / "(failed)".
         _fail_text = (err.strip() or _erows.strip())
-        _uli = usage_limit_scan(backend, err, _erows, full if len(full) < 1500 else "") if rc and not command and not _intr and not _timed_out["hit"] else None
+        _uli = usage_limit_scan(backend, err, _erows, full if len(full) < 1500 else "", plan=_ul_plan(backend, model)) if rc and not command and not _intr and not _timed_out["hit"] else None
         if _uli:  # plan cap, not a 429: shared cooldown + log, never retry
-            _ul_record(a, backend, _uli)
+            _ul_record(a, backend, _uli, model)
             _ul_note(sdir, name, f"[limit] {_uli['label']}", on_event, "usage_limit", backend=backend, reset_when=_uli["when"])
             if not _fo and (_xf := _ul_pick(sdir, a, backend)):
                 _ul_note(sdir, name, f"[fallback] {backend} usage limit -> {_xf[0]}/{_xf[1]}", on_event, "usage_fallback", primary=backend, fallback=f"{_xf[0]}/{_xf[1]}")
@@ -11681,7 +11681,7 @@ def run_turn(sdir,name,text,on_event=None,command=None,on_start=None,timeout_s=0
                 if _a is not None and _a.pop("pending_handoff", None) is not None:
                     save_agents(sdir, _rows)
             except Exception: pass
-            try: _rl_clear_cooldown(_rl_key(backend, model)); _rl_clear_cooldown(_ul_key(a, backend))  # ratelimit hits reset after a success
+            try: _rl_clear_cooldown(_rl_key(backend, model)); _rl_clear_cooldown(_ul_key(a, backend, model))  # ratelimit hits reset after a success
             except Exception: pass
         return out
     finally:
@@ -11793,7 +11793,9 @@ def _retry_plan(sdir,name,backend,sid,rc,err,timed_out,got_output,rs,lock,t0,tim
     return None
 
 # ---- usage/spend limits: plan caps (claude "You've hit your ... limit", codex, gemini quota) ----
-# Not a 429: no auto-retry. Cooldown key <backend>/usage-limit[@sha1(claude_config_dir)[:8]] in the
+# Not a 429: no auto-retry. Cooldown key <backend>/usage-limit[@sha1(claude_config_dir)[:8]] (claude) or
+# <backend>/usage-limit@<provider> (opencode: the model's provider prefix is the plan, so an opencode-go cap
+# never blocks opencode/* free models; old backend-wide opencode records are ignored and expire) in the
 # ratelimit cooldown dir (until = parsed reset, else +1h; shows in `ag ratelimit`). Failover: agent
 # `fallback` entries BACKEND/MODEL | BACKEND:MODEL on another backend run the turn fresh with history replay.
 _USAGE_LIMIT_RE = re.compile(
@@ -11822,8 +11824,8 @@ def _ul_reset(t, now=None):
             dt += timedelta(days=1)
         return dt.timestamp(), f"{h:02d}:{mi:02d}" + (f" {tzn}" if tzn else "")
     return None, ""
-def usage_limit_scan(backend, *texts, now=None):
-    """First usage-limit hit in texts -> {until, when, label, msg} or None. Pure."""
+def usage_limit_scan(backend, *texts, now=None, plan=""):
+    """First usage-limit hit in texts -> {until, when, label, msg} or None. Pure. plan (opencode provider) names the label."""
     now = now or time.time()
     for t in texts:
         t = _ANSI_RE.sub("", t or "")[-2000:]
@@ -11833,26 +11835,32 @@ def usage_limit_scan(backend, *texts, now=None):
         if ep is None: ep, when = now + _UL_DEFAULT_S, ""
         ls = t.rfind("\n", 0, m.start()) + 1; le = t.find("\n", m.end()); msg = t[ls:le if le >= 0 else None].strip()[:300]
         return {"until": ep, "when": when, "msg": msg,
-                "label": f"{backend} usage limit (" + (f"resets {when}" if when else "reset time unknown; cooling 1h") + ")"}
+                "label": f"{backend}{'/' + plan if plan else ''} usage limit (" + (f"resets {when}" if when else "reset time unknown; cooling 1h") + ")"}
     return None
-def _ul_key(a, backend):
+def _ul_plan(backend, model):
+    """Plan key a usage limit applies to: opencode = model provider prefix (opencode-go vs opencode vs azure), else '' (backend-wide). Pure."""
+    if backend != "opencode": return ""
+    try: return usage_provider(backend, model)
+    except Exception: return ""
+def _ul_key(a, backend, model=None):
     d = (a.get("claude_config_dir") or "").strip() if backend == "claude" else ""
-    return f"{backend}/usage-limit" + (f"@{hashlib.sha1(d.encode()).hexdigest()[:8]}" if d else "")
-def _ul_record(a, backend, info):
+    pl = _ul_plan(backend, model if model is not None else a.get("model"))
+    return f"{backend}/usage-limit" + (f"@{hashlib.sha1(d.encode()).hexdigest()[:8]}" if d else "") + (f"@{pl}" if pl else "")
+def _ul_record(a, backend, info, model=None):
     try:
-        p = _rl_cooldown_path(_ul_key(a, backend)); p.parent.mkdir(parents=True, exist_ok=True)
+        p = _rl_cooldown_path(_ul_key(a, backend, model)); p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"until": info["until"], "hits": 1, "usage_limit": True, "label": info["label"],
             "msg": info["msg"], "when": info.get("when", "")}))
         try:  # persistent hit history for `ag usage` (survives cooldown clear/expiry)
             hp = _usage_hits_path(); hp.parent.mkdir(parents=True, exist_ok=True)
-            with open(hp, "a") as f: f.write(json.dumps({"ts": now_iso(), "backend": backend, "key": _ul_key(a, backend),
+            with open(hp, "a") as f: f.write(json.dumps({"ts": now_iso(), "backend": backend, "key": _ul_key(a, backend, model),
                 "until": info["until"], "label": info["label"], "msg": info["msg"]}) + "\n")
         except Exception: pass
     except Exception: pass
-def _ul_active(a, backend):
-    """Cooldown record {until,label,msg} while this backend/account is limited, else None. Never raises."""
+def _ul_active(a, backend, model=None):
+    """Cooldown record {until,label,msg} while this backend/account/plan is limited, else None. Never raises."""
     try:
-        d = json.loads(_rl_cooldown_path(_ul_key(a, backend)).read_text())
+        d = json.loads(_rl_cooldown_path(_ul_key(a, backend, model)).read_text())
         if d.get("usage_limit") and float(d.get("until") or 0) > time.time(): return d
     except Exception: pass
     return None
@@ -11869,7 +11877,7 @@ def _ul_pick(sdir, a, backend):
         fbs = a.get("fallback") or []
         for e in ([fbs] if isinstance(fbs, str) else fbs):
             x = _fb_split(e, backend)
-            if not x or _ul_active(a, x[0]): continue
+            if not x or _ul_active(a, x[0], x[1]): continue
             if privacy_error(x[0], x[1], agent_data(a)) or access_error(x[0], x[1], agent_data(a), sdir=sdir): continue
             return x
     except Exception: pass
@@ -19755,7 +19763,7 @@ def _usage_pressure(sdir, a, backend, model, cfg=None):
     this agent's backend/provider/model; parked = an active usage-limit cooldown. Never raises."""
     cfg = cfg if cfg is not None else usage_cfg(sdir)
     parked = False
-    try: parked = _ul_active(a or {}, backend) is not None
+    try: parked = _ul_active(a or {}, backend, model) is not None
     except Exception: pass
     pct, key = None, ""
     try:
@@ -19847,7 +19855,7 @@ def _usage_adapt(sdir, a, backend, model, effort):
         for e in ([fbs] if isinstance(fbs, str) else fbs):
             x = _fb_split(e, backend)
             if x:
-                if not _ul_active(a, x[0]): tb, tm = x; break
+                if not _ul_active(a, x[0], x[1]): tb, tm = x; break
                 continue
             s = (e or "").strip()
             if s and s != model: tm = s; break

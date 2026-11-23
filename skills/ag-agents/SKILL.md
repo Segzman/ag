@@ -39,7 +39,7 @@ First ag delegation in a project: `{{AG}} route --check --json`; if `configured`
 - `--verify "<cmd>"` runs via `sh -c` in the agent's workdir: give test paths relative to it.
 - Verify must see work: `wake --verify` on a worktree agent also requires a diff (new commits or uncommitted changes since the wake started; `--no-require-diff` off, `agents set N --wake-require-diff on|off` pins it); a no-op turn fails `no changes produced` and escalates like a failed verify. Job json carries `base_sha`/`head_sha`/`diff_stat`.
 - `wake` is at-most-once *launch*: verify via `events` + `wakes`; relaunch lost ones with `wakes --reap`.
-- Usage limit hit: not retried; result has `usage_limit: true` + `reset_at`. Configure failover with `agents add|set --fallback BACKEND/MODEL` (e.g. `codex/default`).
+- Usage limit hit: not retried; result has `usage_limit: true` + `reset_at`; the cooldown is per backend (opencode: per provider plan, e.g. `opencode-go/*` only). Configure failover with `agents add|set --fallback BACKEND/MODEL` (e.g. `codex/default`).
 - `chat steer` interrupts the running turn (queued turns keep FIFO order). Idle agent: steer says so and exits - use `chat send`. A stuck-looking agent: `ag stop NAME` (or `ag chat stop NAME`), then `ag queue NAME --release`.
 - Wait with `wakes --wait` or `events --follow --exit-on-match`, never shell polling loops.
 - Agent self-reports lie: use `--verify "<cmd>"` with a real check; review `chat diff` before accepting.

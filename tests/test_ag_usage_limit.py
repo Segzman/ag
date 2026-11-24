@@ -35,13 +35,22 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"codex ok"}
 echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
 """
 
+FAKE_OPENCODE = """#!/bin/sh
+echo "launched $@" >> "$FAKE_DIR/opencode.log"
+case "$*" in
+  *opencode-go/*)
+    echo '{"type":"error","timestamp":1,"sessionID":"oc_1","error":"OpenCode Go weekly usage limit reached. Upgrade or wait."}'; exit 1;;
+esac
+echo '{"type":"text","timestamp":2,"sessionID":"oc_2","part":{"type":"text","text":"opencode ok"}}'
+"""
+
 
 class UsageLimit(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory(); self.addCleanup(self._td.cleanup)
         r = self.root = Path(self._td.name).resolve()
         for d in ("home/.codex", "fake", "proj", "cfg", "cache", "state"): (r / d).mkdir(parents=True)
-        for n, body in (("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX)):
+        for n, body in (("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX), ("opencode", FAKE_OPENCODE)):
             (r / "fake" / n).write_text(body); (r / "fake" / n).chmod(0o755)
         (r / "home/.codex/models_cache.json").write_text(json.dumps({"models": []}))
         subprocess.run(["git", "init", "-q", str(r / "proj")], check=True)
@@ -164,6 +173,37 @@ class UsageLimit(unittest.TestCase):
         self.assertEqual(ag._ul_pick(self.root / "state", a, "claude"), ("codex", "default"))
         self.add("--fallback", "m2")
         self.agj("agents", "set", "w", "--fallback", "codex/default", "--fallback", "m3")
+
+    def test_opencode_limit_is_scoped_to_plan(self):
+        """An opencode-go cap must not block opencode/* (free Zen) agents: cooldown keyed by model provider."""
+        ag = self.lib()
+        go, free = "opencode-go/glm-5", "opencode/deepseek-v4.1-flash-free"
+        k = ag._ul_key({"model": go}, "opencode")
+        self.assertNotEqual(k, ag._ul_key({"model": free}, "opencode"))
+        self.assertEqual(ag._ul_key({}, "opencode", go), k)
+        self.assertEqual(ag._ul_key({"model": go}, "codex"), "codex/usage-limit")  # other backends stay backend-wide
+        self.assertEqual(ag._ul_key({"model": "azure/x"}, "claude"), "claude/usage-limit")
+        for n, m in (("g", go), ("f", free)):
+            self.agj("agents", "add", n, "--backend", "opencode", "--model", m, "--dir", str(self.root / "proj"))
+        def send(n):
+            o = json.loads(self.run_ag("--json", "chat", "send", n, "hi").stdout)
+            return {**o.get("data", {}), **({"error": o["error"]} if "error" in o else {})}
+        out = send("g")
+        self.assertTrue(out["usage_limit"], out); self.assertIn("opencode/opencode-go", out["error"])
+        self.assertEqual(len(self.launches("opencode")), 1)
+        out = send("g")  # same plan: fails fast, CLI not launched
+        self.assertTrue(out["usage_limit"], out); self.assertEqual(len(self.launches("opencode")), 1)
+        out = send("f")  # different plan: runs
+        self.assertIn("opencode ok", out.get("reply", ""), out); self.assertFalse(out.get("usage_limit"))
+        self.assertEqual(len(self.launches("opencode")), 2)
+        # legacy backend-wide record (pre-scoping) never blocks any plan
+        legacy = ag._rl_cooldown_path("opencode/usage-limit"); legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({"until": time.time() + 3600, "usage_limit": True, "label": "old"}))
+        self.assertIsNone(ag._ul_active({"model": free}, "opencode")); self.assertIsNone(ag._ul_active({}, "opencode", free))
+        self.assertIn("opencode ok", send("f").get("reply", ""))
+        # fallback pick skips only the cooling plan
+        self.assertIsNone(ag._ul_pick(self.root / "state", {"fallback": [f"opencode:{go}"]}, "claude"))
+        self.assertEqual(ag._ul_pick(self.root / "state", {"fallback": [f"opencode:{free}"]}, "claude"), ("opencode", free))
 
 
 if __name__ == "__main__":
